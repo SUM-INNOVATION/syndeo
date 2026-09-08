@@ -1,0 +1,24 @@
+[package]
+name = "syndeo-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The process boundaries: framed transport, typed protocols, and shell-issued signing confirmations"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+hex.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"

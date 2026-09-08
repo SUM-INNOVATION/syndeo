@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy"]
+members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore"]
 
 [workspace.package]
 version = "0.1.0"
@@ -45,6 +45,12 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hmac = "0.12"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 rand = "0.8"
+argon2 = { version = "0.5", features = ["std", "zeroize"] }
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+bip39 = { version = "2", features = ["rand"] }
+keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
+subtle = "2"
+rpassword = "7"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

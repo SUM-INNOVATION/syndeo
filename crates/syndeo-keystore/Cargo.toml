@@ -1,0 +1,44 @@
+[package]
+name = "syndeo-keystore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The keystore process: sealed root secret, per-origin derivation, one operation"
+
+[lib]
+name = "syndeo_keystore"
+path = "src/lib.rs"
+
+[[bin]]
+name = "syndeo-keystore"
+path = "src/main.rs"
+
+[dependencies]
+syndeo-ipc.workspace = true
+
+ed25519-dalek.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
+bip39.workspace = true
+keyring.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+blake3.workspace = true
+bs58.workspace = true
+hex.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+rpassword.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
