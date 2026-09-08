@@ -1,0 +1,57 @@
+# Run from day one. The failure mode this exists to prevent is discovering a GPL
+# transitive dependency six months in.
+
+[graph]
+targets = [
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-pc-windows-msvc" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "Unlicense",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+# libzstd is dual BSD-3-Clause / GPL-2.0. We take the BSD side.
+[[licenses.clarify]]
+name = "zstd-sys"
+expression = "BSD-3-Clause"
+license-files = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # Nothing that drags in OpenSSL: rustls is the only TLS in this tree.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
