@@ -48,13 +48,13 @@ of hours.
 2. **Wrap it in a local intercepting proxy.** Point ordinary Chrome at it. Measure
    hit rate and dedupe ratio on real traffic. This is the go/no-go. — *done*
 3. **Net process**: hyper, rustls, the cache behind a fetch API. Still no
-   browser. — *done, h1 and h2; QUIC and HTTP/3 not yet wired*
+   browser. — *done, h1 and h2; QUIC and HTTP/3 not yet wired (#3)*
 4. **Embed Servo**, replace its net crate with this one, run servoshell's UI
-   as-is. — *not started*
+   as-is. — *not started (#4)*
 5. **Split the process model out properly.** Keystore, then agent. — *done, ahead
    of step four, because the boundaries are cheaper to draw before there is a
    renderer to draw them around*
-6. **Replace the shell UI** with our own. — *not started; the shell is a terminal*
+6. **Replace the shell UI** with our own. — *not started; the shell is a terminal (#5)*
 
 The agent-first alternative to step four — a headless DOM rather than pixels — is
 `syndeo-dom`, and it is what the agent reads today.
@@ -172,7 +172,11 @@ Two things provide it, and they are not the same:
 Because the platform cannot enforce presence here, the passphrase is mandatory
 rather than optional. That is the rule for platforms that cannot enforce
 presence, applied to this one. When the binding lands, `available()` returns true
-and the requirement relaxes on its own; nothing else changes.
+and the requirement relaxes on its own; nothing else changes. Tracked in #1.
+
+The SLIP-0044 coin type in `derive.rs` is provisional. It has to be pinned
+before anyone holds a balance at an address this derives, because changing it
+afterwards strands funds. Tracked in #2.
 
 ## Licensing
 
@@ -186,6 +190,21 @@ outright; rustls is the only TLS in the tree.
 ```sh
 cargo deny check licenses bans sources
 ```
+
+## Known gaps
+
+Everything that is missing or deferred is filed rather than left in a comment.
+The ones worth knowing before you rely on any of this:
+
+| | |
+| --- | --- |
+| #1 | Secure Enclave presence is not enforced; shell confirmation stands in for it |
+| #2 | The SLIP-0044 coin type is provisional |
+| #7 | `stale-while-revalidate` serves stale but never refreshes |
+| #10 | The cache has no eviction policy and no size bound |
+| #12 | Peer discovery is bootstrap-only, so peer fetch is not usable between machines yet |
+| #13 | Response bodies are buffered whole and capped at 64 MiB |
+| #15 | The cache index has no schema version |
 
 ## Tests
 
