@@ -15,6 +15,9 @@ pub struct NetConfig {
     pub honour_stale_if_error: bool,
     /// How many redirects to follow before giving up.
     pub max_redirects: u8,
+    /// Join the peer swarm. A peer is only ever asked for a body the caller can
+    /// already name by hash, so this is off by default and harmless when on.
+    pub peers: Option<syndeo_peer::PeerConfig>,
 }
 
 impl Default for NetConfig {
@@ -27,6 +30,7 @@ impl Default for NetConfig {
             user_agent: concat!("Syndeo/", env!("CARGO_PKG_VERSION")).to_string(),
             honour_stale_if_error: true,
             max_redirects: 10,
+            peers: None,
         }
     }
 }

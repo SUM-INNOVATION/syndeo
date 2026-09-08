@@ -294,6 +294,10 @@ async fn forward(proxy: Arc<Proxy>, req: Request<Incoming>, origin: Option<Strin
         url: url.clone(),
         headers,
         body,
+        // A proxied browser does not tell us what a subresource's integrity is,
+        // so nothing here is ever eligible for peer fetch. The measurement is of
+        // the cache, uncontaminated.
+        integrity: None,
     };
 
     match proxy.net.fetch(fetch).await {

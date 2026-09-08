@@ -43,16 +43,26 @@ impl Supervisor {
 
     /// The network process. Every other process reaches the outside world
     /// through this one.
-    pub async fn start_net(&mut self, dns: &str) -> Result<Endpoint> {
+    pub async fn start_net(&mut self, dns: &str, peers: &[String]) -> Result<Endpoint> {
         let endpoint = Endpoint::new(self.runtime_dir().join("net.sock"));
         clear_stale(endpoint.path());
-        let child = Command::new(Self::binary("syndeo-net")?)
+        let mut command = Command::new(Self::binary("syndeo-net")?);
+        command
             .arg("--socket")
             .arg(endpoint.path())
             .arg("--home")
             .arg(&self.home)
             .arg("--dns")
-            .arg(dns)
+            .arg(dns);
+        if !peers.is_empty() {
+            command.arg("--peers");
+            for address in peers {
+                if address != "on" {
+                    command.arg("--bootstrap").arg(address);
+                }
+            }
+        }
+        let child = command
             .stdin(Stdio::null())
             .kill_on_drop(true)
             .spawn()

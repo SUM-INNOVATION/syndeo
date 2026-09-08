@@ -19,6 +19,13 @@ struct Cli {
     dns: String,
     #[arg(long)]
     home: Option<PathBuf>,
+    /// Join the peer swarm. A peer is only ever asked for a body the caller can
+    /// already name by hash.
+    #[arg(long)]
+    peers: bool,
+    /// Multiaddresses to dial on start, repeatable.
+    #[arg(long = "bootstrap")]
+    bootstrap: Vec<String>,
 }
 
 #[tokio::main]
@@ -48,11 +55,28 @@ async fn main() -> Result<()> {
         .parse()
         .map_err(|e: String| anyhow::anyhow!("--dns: {e}"))?;
 
+    let peers = if cli.peers {
+        let mut config = syndeo_peer::PeerConfig::default();
+        for address in &cli.bootstrap {
+            match address.parse() {
+                Ok(parsed) => config.bootstrap.push(parsed),
+                Err(err) => anyhow::bail!("--bootstrap {address}: {err}"),
+            }
+        }
+        Some(config)
+    } else {
+        None
+    };
+
     let net = Arc::new(Net::new(NetConfig {
         cache_root: cli.cache.unwrap_or_else(|| home.join("cache")),
         dns,
+        peers,
         ..NetConfig::default()
     })?);
+    if let Some(peer_id) = net.peer_id() {
+        tracing::info!(%peer_id, "peer fetch is on");
+    }
 
     let endpoint = match cli.socket {
         Some(path) => Endpoint::new(path),

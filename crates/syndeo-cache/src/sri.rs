@@ -124,6 +124,15 @@ impl Integrity {
         self.hashes.iter().map(|h| h.algorithm).max()
     }
 
+    /// One hash at the strongest level named — the hash to ask a peer for.
+    pub fn strongest_hash(&self) -> Option<Hash> {
+        let strongest = self.strongest()?;
+        self.hashes
+            .iter()
+            .find(|h| h.algorithm == strongest)
+            .cloned()
+    }
+
     /// True when the bytes satisfy the metadata.
     pub fn verify(&self, bytes: &[u8]) -> bool {
         let Some(strongest) = self.strongest() else {
@@ -209,6 +218,17 @@ mod tests {
     fn unknown_algorithms_are_ignored() {
         let integrity = Integrity::parse("md5-abc sha256-xyz?opt").unwrap_or_default();
         assert!(integrity.is_empty() || integrity.strongest() == Some(Algorithm::Sha256));
+    }
+
+    #[test]
+    fn the_strongest_hash_is_the_one_worth_asking_for() {
+        let value = format!("{} {}", token(Algorithm::Sha256), token(Algorithm::Sha512));
+        let integrity = Integrity::parse(&value).unwrap();
+        assert_eq!(
+            integrity.strongest_hash().unwrap().algorithm,
+            Algorithm::Sha512
+        );
+        assert!(Integrity::default().strongest_hash().is_none());
     }
 
     #[test]

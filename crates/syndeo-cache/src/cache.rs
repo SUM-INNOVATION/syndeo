@@ -261,6 +261,28 @@ impl Cache {
         })
     }
 
+    /// Find a stored body by the Subresource Integrity digest a page declared.
+    ///
+    /// This is what makes peer fetch usable for a subresource nobody has fetched
+    /// before: the page names a sha384, a peer is asked for that sha384, and the
+    /// bytes that come back either hash to it or are discarded.
+    pub fn content_for_integrity(&self, hash: &crate::sri::Hash) -> Result<Option<ContentId>> {
+        self.index.content_for_sri(&sri_key(hash.algorithm, &hash.digest))
+    }
+
+    /// Record that an SRI digest names a stored body.
+    ///
+    /// The store computes these itself on write, so this exists for importing an
+    /// index built elsewhere — and for tests that need to poison one. It asserts
+    /// an association without checking it, so a caller that has not verified the
+    /// body against the digest is putting a lie into the index. The requesting
+    /// side of peer fetch re-derives the hash regardless, which is why a lie here
+    /// costs a wasted round trip and nothing more.
+    pub fn associate_integrity(&self, hash: &crate::sri::Hash, content: ContentId) -> Result<()> {
+        self.index
+            .index_sri(&[(sri_key(hash.algorithm, &hash.digest), content.0)])
+    }
+
     /// Read a body straight out of the blob store by content address. This is
     /// what a peer request is answered from — it never consults the index, so it
     /// cannot leak which URL the body came from.
@@ -362,6 +384,7 @@ impl Cache {
             created: now,
         };
         self.index.put_entry(&record, blob)?;
+        self.index.index_sri(&sri_digests(body, receipt.id))?;
         self.index.bump(counters::STORES, 1)?;
 
         Ok(StoreOutcome::Stored {
@@ -515,4 +538,28 @@ pub fn to_header_map(pairs: &[(String, String)]) -> HeaderMap {
         }
     }
     headers
+}
+
+/// The key an SRI digest is stored under: one byte of algorithm, then the digest.
+pub fn sri_key(algorithm: crate::sri::Algorithm, digest: &[u8]) -> Vec<u8> {
+    let tag = match algorithm {
+        crate::sri::Algorithm::Sha256 => 1u8,
+        crate::sri::Algorithm::Sha384 => 2,
+        crate::sri::Algorithm::Sha512 => 3,
+    };
+    let mut key = Vec::with_capacity(1 + digest.len());
+    key.push(tag);
+    key.extend_from_slice(digest);
+    key
+}
+
+/// Every SRI digest a body could be named by. Computing all three on store costs
+/// a few hundred microseconds and saves needing the caller to have known the
+/// page's `integrity` attribute at the time.
+fn sri_digests(body: &[u8], content: ContentId) -> Vec<(Vec<u8>, [u8; 32])> {
+    use crate::sri::Algorithm;
+    [Algorithm::Sha256, Algorithm::Sha384, Algorithm::Sha512]
+        .into_iter()
+        .map(|algorithm| (sri_key(algorithm, &algorithm.digest(body)), content.0))
+        .collect()
 }

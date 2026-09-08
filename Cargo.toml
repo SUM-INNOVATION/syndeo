@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore", "crates/syndeo-dom", "crates/syndeo-agent", "crates/syndeo-shell"]
+members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore", "crates/syndeo-dom", "crates/syndeo-agent", "crates/syndeo-shell", "crates/syndeo-peer"]
 
 [workspace.package]
 version = "0.1.0"
@@ -51,6 +51,18 @@ bip39 = { version = "2", features = ["rand"] }
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
 subtle = "2"
 rpassword = "7"
+# Matching the sub-crate set sum-chain settled on: the libp2p umbrella pulls in
+# libp2p-mdns and with it hickory-proto, which stays in the lock file whatever
+# the features say. Depending on the exact sub-crates keeps it out.
+libp2p-swarm = { version = "0.44", features = ["macros", "tokio"] }
+libp2p-request-response = "0.26"
+libp2p-tcp = { version = "0.41", features = ["tokio"] }
+libp2p-noise = "0.44"
+libp2p-yamux = "0.45"
+libp2p-identify = "0.44"
+libp2p-core = "0.41"
+libp2p-identity = { version = "0.2", features = ["ed25519", "rand", "peerid"] }
+async-trait = "0.1"
 html5ever = "0.39"
 markup5ever_rcdom = "0.39"
 

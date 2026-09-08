@@ -74,6 +74,7 @@ pub async fn handle(net: &Net, request: NetRequest) -> NetResponse {
                     url: url.clone(),
                     headers: map,
                     body: bytes::Bytes::from(body),
+                    integrity: declared.clone(),
                 })
                 .await
             {

@@ -15,6 +15,10 @@ const ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("entries");
 const BLOBS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blobs");
 const VARIANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("variants");
 const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
+/// Subresource Integrity digest to content address. A peer can be asked for a
+/// body by its SRI digest, which is the only hash a page declares, and the
+/// answer is still self-verifying.
+const SRI: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sri");
 
 /// Where a stored body came from. A peer-supplied body is only ever recorded
 /// after it has been checked against a hash obtained independently.
@@ -83,6 +87,7 @@ impl Index {
             tx.open_table(BLOBS)?;
             tx.open_table(VARIANTS)?;
             tx.open_table(COUNTERS)?;
+            tx.open_table(SRI)?;
         }
         tx.commit()?;
         Ok(Index { db })
@@ -335,6 +340,34 @@ impl Index {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    // ---- integrity index ---------------------------------------------------
+
+    /// Record the SRI digests of a body so it can be found by the hash a page
+    /// declares rather than by our internal address.
+    pub fn index_sri(&self, digests: &[(Vec<u8>, [u8; 32])]) -> Result<()> {
+        if digests.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(SRI)?;
+            for (key, content) in digests {
+                table.insert(key.as_slice(), content.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn content_for_sri(&self, key: &[u8]) -> Result<Option<ContentId>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(SRI)?;
+        match table.get(key)? {
+            Some(bytes) => Ok(<[u8; 32]>::try_from(bytes.value()).ok().map(ContentId)),
+            None => Ok(None),
+        }
     }
 
     // ---- counters ----------------------------------------------------------

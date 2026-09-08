@@ -35,6 +35,10 @@ struct Cli {
     /// system | dot:cloudflare | doh:cloudflare | doh:google | doh:quad9
     #[arg(long, global = true, default_value = "system")]
     dns: String,
+    /// Join the peer swarm. Repeat with a multiaddress to dial a bootstrap peer.
+    /// A peer is only ever asked for a body the page already named by hash.
+    #[arg(long = "peer", global = true)]
+    peers: Vec<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -120,8 +124,8 @@ async fn main() -> Result<()> {
             full,
             json,
             twice,
-        } => browse(&home, &cli.dns, &url, full, json, twice).await,
-        Command::Agent { task } => agent(&home, &cli.dns, &task).await,
+        } => browse(&home, &cli.dns, &cli.peers, &url, full, json, twice).await,
+        Command::Agent { task } => agent(&home, &cli.dns, &cli.peers, &task).await,
         Command::Sign {
             origin,
             message,
@@ -139,13 +143,14 @@ async fn main() -> Result<()> {
 async fn browse(
     home: &std::path::Path,
     dns: &str,
+    peers: &[String],
     url: &str,
     full: bool,
     json: bool,
     twice: bool,
 ) -> Result<()> {
     let mut supervisor = Supervisor::new(home);
-    let net = supervisor.start_net(dns).await?;
+    let net = supervisor.start_net(dns, peers).await?;
 
     let fetch = || async {
         let mut channel = Channel::connect(&net).await?;
@@ -294,11 +299,11 @@ fn truncate(s: &str, width: usize) -> String {
 
 // -------------------------------------------------------------------- agent
 
-async fn agent(home: &std::path::Path, dns: &str, task: &str) -> Result<()> {
+async fn agent(home: &std::path::Path, dns: &str, peers: &[String], task: &str) -> Result<()> {
     let secret = SessionSecret::generate();
     let mut supervisor = Supervisor::new(home);
 
-    let net = supervisor.start_net(dns).await?;
+    let net = supervisor.start_net(dns, peers).await?;
     let keystore = supervisor.start_keystore(&secret).await?;
     unseal(&keystore).await?;
 

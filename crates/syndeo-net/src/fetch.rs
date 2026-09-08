@@ -35,6 +35,8 @@ pub enum Source {
     Origin,
     /// Origin was unreachable and `stale-if-error` covered it.
     StaleOnError,
+    /// A peer supplied the body, and it hashed to what the page declared.
+    Peer,
     /// Not cacheable; passed straight through.
     PassThrough,
 }
@@ -47,6 +49,7 @@ impl Source {
             Source::Revalidated => "revalidated",
             Source::Origin => "origin",
             Source::StaleOnError => "stale-on-error",
+            Source::Peer => "peer",
             Source::PassThrough => "pass-through",
         }
     }
@@ -55,7 +58,11 @@ impl Source {
     pub fn avoided_transfer(self) -> bool {
         matches!(
             self,
-            Source::Cache | Source::CacheStale | Source::Revalidated | Source::StaleOnError
+            Source::Cache
+                | Source::CacheStale
+                | Source::Revalidated
+                | Source::StaleOnError
+                | Source::Peer
         )
     }
 }
@@ -66,6 +73,9 @@ pub struct FetchRequest {
     pub url: String,
     pub headers: HeaderMap,
     pub body: Bytes,
+    /// What the page says this resource's bytes must hash to. Without it, a peer
+    /// is never asked, and the origin is the only source.
+    pub integrity: Option<syndeo_cache::Integrity>,
 }
 
 impl FetchRequest {
@@ -75,6 +85,7 @@ impl FetchRequest {
             url: url.into(),
             headers: HeaderMap::new(),
             body: Bytes::new(),
+            integrity: None,
         }
     }
 
@@ -111,6 +122,7 @@ pub struct Net {
     cache: Arc<Cache>,
     client: HttpsClient,
     config: NetConfig,
+    peers: Option<syndeo_peer::PeerHandle>,
 }
 
 impl Net {
@@ -142,11 +154,30 @@ impl Net {
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build(https);
 
+        let peers = match &config.peers {
+            Some(peer_config) => match syndeo_peer::PeerNode::start(cache.clone(), peer_config.clone()) {
+                Ok(handle) => {
+                    tracing::info!(peer = %handle.peer_id(), "joined the peer swarm");
+                    Some(handle)
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "could not join the peer swarm; continuing without it");
+                    None
+                }
+            },
+            None => None,
+        };
+
         Ok(Net {
             cache,
             client,
             config,
+            peers,
         })
+    }
+
+    pub fn peer_id(&self) -> Option<syndeo_peer::swarm::PeerId> {
+        self.peers.as_ref().map(|p| p.peer_id())
     }
 
     pub fn cache(&self) -> &Arc<Cache> {
@@ -207,6 +238,9 @@ impl Net {
                 url: next.to_string(),
                 headers: forwardable_headers(&current.headers, &current.url, next.as_str()),
                 body: if preserve { current.body.clone() } else { Bytes::new() },
+                // Integrity was declared for the resource, not for a redirect
+                // hop, and it still describes whatever finally answers.
+                integrity: current.integrity.clone(),
             };
             redirects += 1;
         }
@@ -305,6 +339,9 @@ impl Net {
             }
 
             Lookup::Miss(_) => {
+                if let Some(response) = self.try_peers(&request, started).await {
+                    return Ok(response);
+                }
                 let (status, headers, body) = self.origin(&request, &[]).await?;
                 let content = self.store(&request, status, &headers, &body, started);
                 let source = if content.is_some() { Source::Origin } else { Source::PassThrough };
@@ -342,6 +379,57 @@ impl Net {
                 None
             }
         }
+    }
+
+    /// Ask the swarm, but only when the caller can already say what the bytes
+    /// must hash to.
+    ///
+    /// This is the rule, at the one place it could be broken: no declared
+    /// integrity, no peer request. A body that comes back is checked against the
+    /// declared hash inside the swarm before it is ever returned, and checked
+    /// again here before it is stored, because the cost of the second check is
+    /// nothing and the cost of being wrong is everything.
+    async fn try_peers(&self, request: &FetchRequest, started: Instant) -> Option<FetchResponse> {
+        let peers = self.peers.as_ref()?;
+        let integrity = request.integrity.as_ref()?;
+        let hash = integrity.strongest_hash()?;
+
+        let body = match peers.fetch_integrity(&hash).await {
+            Ok(body) => body,
+            Err(err) => {
+                tracing::debug!(url = %request.url, %err, "no peer had it");
+                return None;
+            }
+        };
+        if let Err(err) = self
+            .cache
+            .accept_peer_body(&syndeo_cache::PeerProof::Integrity(integrity.clone()), &body)
+        {
+            tracing::warn!(url = %request.url, %err, "a peer body failed its own declared hash");
+            return None;
+        }
+
+        let body = Bytes::from(body);
+        let mut headers = HeaderMap::new();
+        // A peer hands over bytes, not a response. The only header we can honestly
+        // synthesise is a type inferred from the URL.
+        if let Some(content_type) = infer_content_type(&request.url) {
+            if let Ok(value) = HeaderValue::from_str(content_type) {
+                headers.insert(http::header::CONTENT_TYPE, value);
+            }
+        }
+        if let Ok(value) = HeaderValue::from_str(&body.len().to_string()) {
+            headers.insert(http::header::CONTENT_LENGTH, value);
+        }
+
+        Some(self.finish(
+            200,
+            headers,
+            body.clone(),
+            Source::Peer,
+            Some(syndeo_cache::ContentId::of(&body)),
+            started,
+        ))
     }
 
     fn spawn_refresh(&self, _request: FetchRequest) {
@@ -482,4 +570,27 @@ fn forwardable_headers(headers: &HeaderMap, from: &str, to: &str) -> HeaderMap {
         out.append(name.clone(), value.clone());
     }
     out
+}
+
+/// The media type a URL suggests. Used only for a peer-supplied body, where
+/// there is no response to take one from.
+fn infer_content_type(url: &str) -> Option<&'static str> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let extension = path.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "wasm" => "application/wasm",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "gif" => "image/gif",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "html" | "htm" => "text/html; charset=utf-8",
+        _ => return None,
+    })
 }

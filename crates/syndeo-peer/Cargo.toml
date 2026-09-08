@@ -1,0 +1,32 @@
+[package]
+name = "syndeo-peer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Peer fetch: ask the swarm for a body by its hash, and believe nothing that does not hash to it"
+
+[dependencies]
+syndeo-cache.workspace = true
+
+libp2p-swarm.workspace = true
+libp2p-request-response.workspace = true
+libp2p-tcp.workspace = true
+libp2p-noise.workspace = true
+libp2p-yamux.workspace = true
+libp2p-identify.workspace = true
+libp2p-core.workspace = true
+libp2p-identity.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+tokio.workspace = true
+serde.workspace = true
+bincode.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+http.workspace = true
