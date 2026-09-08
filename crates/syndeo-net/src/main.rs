@@ -1,0 +1,63 @@
+//! The network process.
+
+use anyhow::Result;
+use clap::Parser;
+use std::path::PathBuf;
+use std::sync::Arc;
+use syndeo_ipc::transport::{Endpoint, Server};
+use syndeo_net::{DnsMode, Net, NetConfig};
+
+#[derive(Parser)]
+#[command(name = "syndeo-net", version, about = "The only process that opens a socket")]
+struct Cli {
+    #[arg(long)]
+    socket: Option<PathBuf>,
+    #[arg(long)]
+    cache: Option<PathBuf>,
+    /// system | dot:cloudflare | doh:cloudflare | doh:google | doh:quad9
+    #[arg(long, default_value = "system")]
+    dns: String,
+    #[arg(long)]
+    home: Option<PathBuf>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("syndeo_net=info")),
+        )
+        .with_target(false)
+        .init();
+
+    let cli = Cli::parse();
+    let home = cli.home.unwrap_or_else(|| {
+        std::env::var_os("SYNDEO_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".syndeo")
+            })
+    });
+
+    let dns: DnsMode = cli
+        .dns
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("--dns: {e}"))?;
+
+    let net = Arc::new(Net::new(NetConfig {
+        cache_root: cli.cache.unwrap_or_else(|| home.join("cache")),
+        dns,
+        ..NetConfig::default()
+    })?);
+
+    let endpoint = match cli.socket {
+        Some(path) => Endpoint::new(path),
+        None => Endpoint::in_runtime_dir(syndeo_ipc::transport::runtime_dir_for(&home), "net")?,
+    };
+    syndeo_net::service::serve(net, Server::bind(endpoint)?).await;
+    Ok(())
+}

@@ -13,6 +13,8 @@ pub struct NetConfig {
     /// Serve a stale body when the origin is unreachable and `stale-if-error`
     /// still covers it.
     pub honour_stale_if_error: bool,
+    /// How many redirects to follow before giving up.
+    pub max_redirects: u8,
 }
 
 impl Default for NetConfig {
@@ -24,6 +26,7 @@ impl Default for NetConfig {
             max_body_bytes: 64 * 1024 * 1024,
             user_agent: concat!("Syndeo/", env!("CARGO_PKG_VERSION")).to_string(),
             honour_stale_if_error: true,
+            max_redirects: 10,
         }
     }
 }

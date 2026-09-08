@@ -26,4 +26,4 @@ pub use protocol::{
     AgentEvent, KeystoreRequest, KeystoreResponse, NetRequest, NetResponse, ShellRequest,
     ShellResponse, SignaturePurpose,
 };
-pub use transport::{Channel, Endpoint, Server, TransportError};
+pub use transport::{runtime_dir_for, Channel, Endpoint, Server, TransportError};

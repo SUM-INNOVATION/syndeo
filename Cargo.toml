@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore"]
+members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore", "crates/syndeo-dom", "crates/syndeo-agent", "crates/syndeo-shell"]
 
 [workspace.package]
 version = "0.1.0"
@@ -51,6 +51,8 @@ bip39 = { version = "2", features = ["rand"] }
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
 subtle = "2"
 rpassword = "7"
+html5ever = "0.39"
+markup5ever_rcdom = "0.39"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

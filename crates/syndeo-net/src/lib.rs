@@ -8,6 +8,7 @@ pub mod config;
 pub mod dns;
 pub mod error;
 pub mod fetch;
+pub mod service;
 pub mod tls;
 
 pub use config::NetConfig;

@@ -1,0 +1,26 @@
+[package]
+name = "syndeo-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The shell: owns the process model, prompts the user, and is the only thing that talks to the keystore"
+
+[[bin]]
+name = "syndeo"
+path = "src/main.rs"
+
+[dependencies]
+syndeo-ipc.workspace = true
+syndeo-dom.workspace = true
+syndeo-cache.workspace = true
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+hex.workspace = true
+blake3.workspace = true
+rpassword.workspace = true

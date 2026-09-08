@@ -16,6 +16,10 @@ pub enum NetError {
     Tls(String),
     #[error("body exceeds the {limit} byte ceiling")]
     BodyTooLarge { limit: u64 },
+    #[error("more than {limit} redirects")]
+    TooManyRedirects { limit: u8 },
+    #[error("redirect loop back to {0}")]
+    RedirectLoop(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

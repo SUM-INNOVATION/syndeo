@@ -25,6 +25,7 @@ pub mod address;
 pub mod custody;
 pub mod derive;
 pub mod keystore;
+pub mod passphrase;
 pub mod presence;
 pub mod seal;
 pub mod service;

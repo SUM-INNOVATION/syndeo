@@ -118,6 +118,13 @@ pub fn freshness_lifetime(meta: &StoredMeta, opts: &CacheOptions) -> (u64, bool)
         return (0, false);
     }
 
+    // A permanent redirect with no directives is exactly what heuristic
+    // freshness is for: the origin has said the move is permanent, and a cache
+    // that refetches it on every navigation is doing nothing useful.
+    if matches!(meta.status, 301 | 308) {
+        return (opts.max_heuristic_lifetime, true);
+    }
+
     if let Some(last_modified) = header_date(&meta.headers, http::header::LAST_MODIFIED) {
         let date = header_date(&meta.headers, http::header::DATE).unwrap_or(meta.response_time);
         let delta = date.saturating_sub(last_modified) as f64;

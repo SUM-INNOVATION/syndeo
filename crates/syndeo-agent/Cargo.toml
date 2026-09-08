@@ -1,0 +1,21 @@
+[package]
+name = "syndeo-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The agent process: reads pages through the net process, asks the shell for anything a human must approve"
+
+[[bin]]
+name = "syndeo-agent"
+path = "src/main.rs"
+
+[dependencies]
+syndeo-ipc.workspace = true
+syndeo-dom.workspace = true
+
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "syndeo-dom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A headless DOM: parse, extract text and subresources, and read integrity metadata"
+
+[dependencies]
+syndeo-cache.workspace = true
+html5ever.workspace = true
+markup5ever_rcdom.workspace = true
+url.workspace = true
+serde.workspace = true

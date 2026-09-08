@@ -95,6 +95,10 @@ pub struct FetchResponse {
     pub elapsed_ms: u64,
     /// The BLAKE3 content address, when the body passed through the cache.
     pub content: Option<syndeo_cache::ContentId>,
+    /// Where the response actually came from, after redirects.
+    pub final_url: String,
+    /// How many redirects were followed to get here.
+    pub redirects: u8,
 }
 
 type HttpsClient = Client<
@@ -153,8 +157,62 @@ impl Net {
         &self.config
     }
 
-    /// Fetch a URL, consulting the cache first.
+    /// Fetch a URL, following redirects and consulting the cache at every hop.
+    ///
+    /// Each hop is a cache lookup in its own right, so a permanent redirect is
+    /// answered from the store on the second visit and the destination is too.
     pub async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse> {
+        let mut current = request;
+        let mut redirects = 0u8;
+        let mut visited = vec![Cache::normalize_url(&current.url)];
+
+        loop {
+            let mut response = self.fetch_once(current.clone()).await?;
+            response.final_url = current.url.clone();
+            response.redirects = redirects;
+
+            let Some(location) = redirect_target(&response) else {
+                return Ok(response);
+            };
+            if redirects >= self.config.max_redirects {
+                return Err(NetError::TooManyRedirects {
+                    limit: self.config.max_redirects,
+                });
+            }
+
+            let next = match url::Url::parse(&current.url).and_then(|base| base.join(&location)) {
+                Ok(u) => u,
+                Err(_) => return Ok(response),
+            };
+            // Only http and https; a redirect is not a way to reach another
+            // scheme's handler.
+            if !matches!(next.scheme(), "http" | "https") {
+                return Ok(response);
+            }
+            let normalized = Cache::normalize_url(next.as_str());
+            if visited.contains(&normalized) {
+                return Err(NetError::RedirectLoop(normalized));
+            }
+            visited.push(normalized);
+
+            // 303, and 301/302 in practice, turn anything into a GET and drop
+            // the body. 307 and 308 preserve both.
+            let preserve = matches!(response.status, 307 | 308);
+            current = FetchRequest {
+                method: if preserve {
+                    current.method.clone()
+                } else {
+                    Method::GET
+                },
+                url: next.to_string(),
+                headers: forwardable_headers(&current.headers, &current.url, next.as_str()),
+                body: if preserve { current.body.clone() } else { Bytes::new() },
+            };
+            redirects += 1;
+        }
+    }
+
+    async fn fetch_once(&self, request: FetchRequest) -> Result<FetchResponse> {
         let started = Instant::now();
         let method = request.method.as_str().to_string();
 
@@ -309,6 +367,8 @@ impl Net {
             source,
             elapsed_ms: started.elapsed().as_millis() as u64,
             content,
+            final_url: String::new(),
+            redirects: 0,
         }
     }
 
@@ -377,4 +437,49 @@ impl Net {
 
         Ok((status, headers, body))
     }
+}
+
+/// The `Location` of a redirect we should follow, if this is one.
+fn redirect_target(response: &FetchResponse) -> Option<String> {
+    if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    response
+        .headers
+        .get(http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Headers that may follow a redirect.
+///
+/// Credentials do not cross an origin boundary: a redirect to another host must
+/// not carry the first host's `Authorization` or `Cookie` with it.
+fn forwardable_headers(headers: &HeaderMap, from: &str, to: &str) -> HeaderMap {
+    let same_origin = match (url::Url::parse(from), url::Url::parse(to)) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme()
+                && a.host_str() == b.host_str()
+                && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    };
+
+    let mut out = HeaderMap::new();
+    for (name, value) in headers.iter() {
+        let sensitive = matches!(
+            name.as_str(),
+            "authorization" | "cookie" | "proxy-authorization"
+        );
+        if sensitive && !same_origin {
+            continue;
+        }
+        // The new target has its own host and its own body.
+        if matches!(name.as_str(), "host" | "content-length" | "content-type") {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+    out
 }

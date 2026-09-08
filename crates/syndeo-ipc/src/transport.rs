@@ -44,6 +44,43 @@ impl Endpoint {
     }
 }
 
+/// Longest socket path a `sockaddr_un` will hold: 104 bytes on macOS, 108 on
+/// Linux. Take the smaller, and leave room for the longest file name we use.
+const MAX_SOCKET_PATH: usize = 104;
+
+/// Where this home's sockets should live.
+///
+/// `<home>/run` when it fits, and a short directory under the temporary
+/// directory when it does not — a deeply nested home would otherwise make every
+/// socket path unbindable, with an error that says nothing about the cause.
+pub fn runtime_dir_for(home: &Path) -> PathBuf {
+    const LONGEST_NAME: usize = "/keystore.sock".len();
+    let preferred = home.join("run");
+    if preferred.as_os_str().len() + LONGEST_NAME < MAX_SOCKET_PATH {
+        return preferred;
+    }
+
+    let digest = blake3::hash(home.to_string_lossy().as_bytes());
+    let name = format!("syndeo-{}-{}", current_uid(), &digest.to_hex()[..12]);
+    for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
+        let candidate = base.join(&name);
+        if candidate.as_os_str().len() + LONGEST_NAME < MAX_SOCKET_PATH {
+            return candidate;
+        }
+    }
+    preferred
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    unsafe { libc_getuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
 #[derive(Debug)]
 pub struct Server {
     listener: UnixListener,
@@ -180,6 +217,20 @@ mod tests {
             let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700);
         }
+    }
+
+    #[test]
+    fn a_deeply_nested_home_still_gets_a_bindable_socket_path() {
+        let deep = PathBuf::from("/tmp").join("x".repeat(120));
+        let dir = runtime_dir_for(&deep);
+        assert!(
+            dir.as_os_str().len() + "/keystore.sock".len() < MAX_SOCKET_PATH,
+            "{} is still too long",
+            dir.display()
+        );
+
+        let shallow = PathBuf::from("/tmp/syndeo-home");
+        assert_eq!(runtime_dir_for(&shallow), shallow.join("run"));
     }
 
     #[test]

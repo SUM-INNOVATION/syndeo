@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
 
             let endpoint = match socket {
                 Some(path) => Endpoint::new(path),
-                None => Endpoint::in_runtime_dir(home.join("run"), "keystore")?,
+                None => Endpoint::in_runtime_dir(syndeo_ipc::transport::runtime_dir_for(&home), "keystore")?,
             };
             let server = Server::bind(endpoint)?;
             syndeo_keystore::service::serve(keystore, Arc::new(Confirmer::new(secret)), server).await;
@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Identity { origin } => {
-            let passphrase = rpassword::prompt_password("Passphrase: ")?;
+            let passphrase = syndeo_keystore::passphrase::read("Passphrase: ")?;
             keystore.unseal(Some(&passphrase))?;
             let (public_key, address) = keystore.public_identity(&origin)?;
             println!("origin      {}", syndeo_keystore::derive::canonical_origin(&origin));
@@ -176,13 +176,5 @@ async fn main() -> Result<()> {
 }
 
 fn read_new_passphrase() -> Result<String> {
-    let first = rpassword::prompt_password("Passphrase: ")?;
-    if first.len() < 8 {
-        anyhow::bail!("use at least eight characters");
-    }
-    let again = rpassword::prompt_password("Again: ")?;
-    if first != again {
-        anyhow::bail!("the passphrases do not match");
-    }
-    Ok(first)
+    Ok(syndeo_keystore::passphrase::read_new()?)
 }
