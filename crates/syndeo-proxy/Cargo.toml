@@ -1,0 +1,32 @@
+[package]
+name = "syndeo-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A local intercepting proxy that puts the Syndeo cache in front of an ordinary browser"
+
+[[bin]]
+name = "syndeo-proxy"
+path = "src/main.rs"
+
+[dependencies]
+syndeo-cache.workspace = true
+syndeo-net.workspace = true
+
+tokio.workspace = true
+bytes.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+rcgen.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
