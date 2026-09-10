@@ -64,6 +64,7 @@ libp2p-tcp = { version = "0.41", features = ["tokio"] }
 libp2p-noise = "0.44"
 libp2p-yamux = "0.45"
 libp2p-identify = "0.44"
+libp2p-kad = "0.45"
 libp2p-core = "0.41"
 libp2p-identity = { version = "0.2", features = ["ed25519", "rand", "peerid"] }
 async-trait = "0.1"

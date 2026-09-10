@@ -26,6 +26,14 @@ struct Cli {
     /// Multiaddresses to dial on start, repeatable.
     #[arg(long = "bootstrap")]
     bootstrap: Vec<String>,
+    /// Multiaddress to listen on for peers, repeatable. Defaults to an
+    /// ephemeral port on every interface.
+    #[arg(long = "listen")]
+    listen: Vec<String>,
+    /// Join the swarm and answer, but never ask. For a node whose job is to
+    /// seed rather than to browse.
+    #[arg(long)]
+    serve_only: bool,
 }
 
 #[tokio::main]
@@ -55,12 +63,21 @@ async fn main() -> Result<()> {
         .parse()
         .map_err(|e: String| anyhow::anyhow!("--dns: {e}"))?;
 
-    let peers = if cli.peers {
+    let peers = if cli.peers || cli.serve_only {
         let mut config = syndeo_peer::PeerConfig::default();
         for address in &cli.bootstrap {
             match address.parse() {
                 Ok(parsed) => config.bootstrap.push(parsed),
                 Err(err) => anyhow::bail!("--bootstrap {address}: {err}"),
+            }
+        }
+        if !cli.listen.is_empty() {
+            config.listen.clear();
+            for address in &cli.listen {
+                match address.parse() {
+                    Ok(parsed) => config.listen.push(parsed),
+                    Err(err) => anyhow::bail!("--listen {address}: {err}"),
+                }
             }
         }
         Some(config)

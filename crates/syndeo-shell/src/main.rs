@@ -86,8 +86,34 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Run or inspect a peer node.
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
+    },
     /// Report the state of the process model and its boundaries.
     Doctor,
+}
+
+#[derive(Subcommand)]
+enum PeerCommand {
+    /// Join the swarm and serve bodies until interrupted.
+    ///
+    /// `syndeo browse --peer on` joins for the life of one command and then
+    /// exits, so nothing seeds. This is the mode that does.
+    Serve {
+        /// Multiaddress to listen on, repeatable.
+        #[arg(long = "listen")]
+        listen: Vec<String>,
+        /// Answer, but never ask.
+        #[arg(long)]
+        serve_only: bool,
+    },
+    /// What the swarm looks like from a node started here.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn home(override_path: Option<PathBuf>) -> PathBuf {
@@ -134,6 +160,12 @@ async fn main() -> Result<()> {
         } => sign(&home, &origin, &message, &purpose, yes).await,
         Command::Identity { origin } => identity(&home, &origin).await,
         Command::Stats { json } => stats(&home, json),
+        Command::Peer { command } => match command {
+            PeerCommand::Serve { listen, serve_only } => {
+                peer_serve(&home, &cli.dns, &cli.peers, &listen, serve_only).await
+            }
+            PeerCommand::Status { json } => peer_status(&home, &cli.dns, &cli.peers, json).await,
+        },
         Command::Doctor => doctor(&home).await,
     }
 }
@@ -446,6 +478,95 @@ async fn unseal(keystore: &Endpoint) -> Result<()> {
         KeystoreResponse::Ok => Ok(()),
         KeystoreResponse::Error(e) => bail!(e),
         _ => bail!("unexpected reply from the keystore"),
+    }
+}
+
+// --------------------------------------------------------------------- peer
+
+/// Join the swarm and stay in it.
+async fn peer_serve(
+    home: &std::path::Path,
+    dns: &str,
+    peers: &[String],
+    listen: &[String],
+    serve_only: bool,
+) -> Result<()> {
+    let mut supervisor = Supervisor::new(home);
+    let net = supervisor
+        .start_peer_node(dns, peers, listen, serve_only)
+        .await?;
+
+    let status = peer_status_value(&net).await?;
+    println!("peer      {}", status["peer_id"].as_str().unwrap_or("?"));
+    for address in status["listeners"].as_array().into_iter().flatten() {
+        println!("listening {}", address.as_str().unwrap_or_default());
+    }
+    println!("serving   {}", status["serving"]);
+    println!();
+    println!("Dial this node from another with:");
+    if let Some(first) = status["listeners"].as_array().and_then(|a| a.first()) {
+        println!(
+            "  syndeo peer serve --peer {}/p2p/{}",
+            first.as_str().unwrap_or_default(),
+            status["peer_id"].as_str().unwrap_or_default()
+        );
+    }
+    println!();
+    println!("Serving until interrupted.");
+
+    tokio::signal::ctrl_c().await?;
+    println!();
+    println!("stopping");
+    supervisor.shutdown().await;
+    Ok(())
+}
+
+async fn peer_status(
+    home: &std::path::Path,
+    dns: &str,
+    peers: &[String],
+    json: bool,
+) -> Result<()> {
+    let mut supervisor = Supervisor::new(home);
+    let net = supervisor.start_peer_node(dns, peers, &[], false).await?;
+    let status = peer_status_value(&net).await?;
+    supervisor.shutdown().await;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+
+    println!("peer          {}", status["peer_id"].as_str().unwrap_or("?"));
+    println!("serving       {}", status["serving"]);
+    println!("routing table {} peers", status["routing_table"]);
+    println!("announced     {} bodies", status["announced"]);
+    let connected = status["connected"].as_array().cloned().unwrap_or_default();
+    println!("connected     {}", connected.len());
+    if !connected.is_empty() {
+        println!();
+        println!("  {:<54} {:>6} {:>6} {:>9}", "peer", "gave", "took", "standing");
+        for report in &connected {
+            println!(
+                "  {:<54} {:>6} {:>6} {:>9}",
+                report["peer"].as_str().unwrap_or_default(),
+                report["received"].as_u64().unwrap_or(0),
+                report["served"].as_u64().unwrap_or(0),
+                report["standing"].as_i64().unwrap_or(0),
+            );
+        }
+        println!();
+        println!("`gave` is bodies that peer handed us; `took` is bodies we handed it.");
+    }
+    Ok(())
+}
+
+async fn peer_status_value(net: &Endpoint) -> Result<serde_json::Value> {
+    let mut channel = Channel::connect(net).await?;
+    match channel.call(&NetRequest::PeerStatus).await? {
+        NetResponse::PeerStatus(value) => Ok(value),
+        NetResponse::Error(e) => bail!(e),
+        _ => bail!("unexpected reply from the network process"),
     }
 }
 

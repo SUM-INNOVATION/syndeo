@@ -73,6 +73,30 @@ pub enum BlobResponse {
     Have(Vec<u8>),
     /// The peer does not have it. Says nothing about what it does have.
     Missing,
+    /// The peer has spent its credit here and is being asked to wait. Distinct
+    /// from `Missing` because it is not an answer about the body at all, and a
+    /// requester should try somewhere else rather than conclude nobody has it.
+    Throttled,
+}
+
+/// The DHT key a body is announced and looked up under.
+///
+/// Derived from the hash and nothing else, so a provider record says "somebody
+/// has these bytes" and never says which URL they came from. It is still a
+/// disclosure — see the note in the crate documentation.
+pub fn record_key(request: &BlobRequest) -> Vec<u8> {
+    let mut key = Vec::with_capacity(33);
+    match request {
+        BlobRequest::Content(id) => {
+            key.push(0);
+            key.extend_from_slice(id);
+        }
+        BlobRequest::Integrity { algorithm, digest } => {
+            key.push(*algorithm);
+            key.extend_from_slice(digest);
+        }
+    }
+    key
 }
 
 pub fn algorithm_tag(algorithm: Algorithm) -> u8 {

@@ -6,6 +6,7 @@ use syndeo_cache::sri::{Algorithm, Hash};
 use syndeo_cache::{Cache, ContentId};
 use syndeo_peer::{BlobRequest, PeerConfig, PeerHandle, PeerNode};
 
+
 fn cache(dir: &std::path::Path) -> Arc<Cache> {
     Arc::new(Cache::open(dir).unwrap())
 }
@@ -188,4 +189,162 @@ async fn with_no_peers_a_fetch_fails_immediately_rather_than_hanging() {
     .await;
     assert!(result.is_ok(), "it should not have waited");
     assert!(result.unwrap().is_err());
+}
+
+// ------------------------------------------------------- discovery and standing
+
+/// A body stored in a cache, and the integrity hash a page would declare for it.
+fn seed(cache: &Arc<Cache>, body: &[u8]) -> Hash {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("cache-control", "max-age=600".parse().unwrap());
+    let now = cache.now();
+    cache
+        .store(
+            "GET",
+            "https://example.test/lib.js",
+            &http::HeaderMap::new(),
+            200,
+            &headers,
+            body,
+            now,
+            now,
+        )
+        .unwrap();
+    Hash::compute(Algorithm::Sha384, body)
+}
+
+#[tokio::test]
+async fn a_node_reaches_a_peer_it_was_never_told_about() {
+    // Three nodes in a line: the newcomer only ever hears about the introducer,
+    // and has to find the holder through it. Without a DHT this is a miss.
+    let holder_dir = tempfile::tempdir().unwrap();
+    let introducer_dir = tempfile::tempdir().unwrap();
+    let newcomer_dir = tempfile::tempdir().unwrap();
+
+    let body = vec![b'd'; 40_000];
+    let holder_cache = cache(holder_dir.path());
+    let hash = seed(&holder_cache, &body);
+
+    let holder = PeerNode::start(holder_cache, config()).unwrap();
+    let introducer = PeerNode::start(cache(introducer_dir.path()), config()).unwrap();
+    let newcomer = PeerNode::start(cache(newcomer_dir.path()), config()).unwrap();
+
+    // The holder tells the DHT it has these bytes.
+    connect(&introducer, &holder).await;
+    holder.announce_integrity(&hash).await.unwrap();
+
+    // The newcomer knows the introducer and nothing else.
+    connect(&introducer, &newcomer).await;
+    assert!(
+        !newcomer.peers().await.unwrap().contains(&holder.peer_id()),
+        "the newcomer was told about the holder after all"
+    );
+
+    let found = wait_for(|| async {
+        newcomer
+            .fetch_integrity(&hash)
+            .await
+            .ok()
+            .filter(|found| found == &body)
+    })
+    .await;
+    assert!(
+        found.is_some(),
+        "the body was never found through a peer nobody named"
+    );
+}
+
+#[tokio::test]
+async fn what_a_peer_gave_and_took_is_recorded() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let client_dir = tempfile::tempdir().unwrap();
+
+    let body = vec![b'l'; 10_000];
+    let server_cache = cache(server_dir.path());
+    let hash = seed(&server_cache, &body);
+
+    let server = PeerNode::start(server_cache, config()).unwrap();
+    let client = PeerNode::start(cache(client_dir.path()), config()).unwrap();
+    connect(&server, &client).await;
+
+    assert_eq!(client.fetch_integrity(&hash).await.unwrap(), body);
+
+    let client_view = client.status().await.unwrap();
+    let server_side = client_view
+        .connected
+        .iter()
+        .find(|report| report.peer == server.peer_id())
+        .expect("the server is connected");
+    assert_eq!(server_side.ledger.received, 1, "the client did not record the gift");
+    assert_eq!(server_side.ledger.bytes_received, body.len() as u64);
+    assert!(server_side.ledger.standing() > 0, "a giver should stand well");
+
+    let server_view = server.status().await.unwrap();
+    let client_side = server_view
+        .connected
+        .iter()
+        .find(|report| report.peer == client.peer_id())
+        .expect("the client is connected");
+    assert_eq!(client_side.ledger.served, 1, "the server did not record the gift");
+    assert_eq!(client_side.ledger.debt, 1);
+    assert!(
+        client_side.ledger.standing() < 0,
+        "a taker should not look like a giver"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_that_only_takes_is_eventually_asked_to_wait() {
+    use syndeo_peer::swarm::OPENING_CREDIT;
+
+    let server_dir = tempfile::tempdir().unwrap();
+    let client_dir = tempfile::tempdir().unwrap();
+
+    let server_cache = cache(server_dir.path());
+    // More distinct bodies than the opening credit allows.
+    let hashes: Vec<Hash> = (0..OPENING_CREDIT + 4)
+        .map(|i| {
+            let body = format!("body number {i}").repeat(64).into_bytes();
+            let hash = Hash::compute(Algorithm::Sha384, &body);
+            let mut headers = http::HeaderMap::new();
+            headers.insert("cache-control", "max-age=600".parse().unwrap());
+            let now = server_cache.now();
+            server_cache
+                .store(
+                    "GET",
+                    &format!("https://example.test/{i}.js"),
+                    &http::HeaderMap::new(),
+                    200,
+                    &headers,
+                    &body,
+                    now,
+                    now,
+                )
+                .unwrap();
+            hash
+        })
+        .collect();
+
+    let server = PeerNode::start(server_cache, config()).unwrap();
+    let client = PeerNode::start(cache(client_dir.path()), config()).unwrap();
+    connect(&server, &client).await;
+
+    let mut given = 0;
+    for hash in &hashes {
+        if client.fetch_integrity(hash).await.is_ok() {
+            given += 1;
+        }
+    }
+
+    assert_eq!(
+        given, OPENING_CREDIT as usize,
+        "a node that only takes should get exactly its opening credit and no more"
+    );
+    let view = server.status().await.unwrap();
+    let report = view
+        .connected
+        .iter()
+        .find(|r| r.peer == client.peer_id())
+        .expect("the client is connected");
+    assert!(!report.ledger.in_credit(), "the taker still has credit");
 }

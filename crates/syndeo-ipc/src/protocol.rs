@@ -21,6 +21,10 @@ pub enum NetRequest {
         integrity: Option<String>,
     },
     Stats,
+    /// What the peer swarm looks like from the network process. Reports nothing
+    /// about what is stored — only who is connected and what they have
+    /// contributed.
+    PeerStatus,
     Ping,
 }
 
@@ -36,6 +40,7 @@ pub enum NetResponse {
         content: Option<String>,
     },
     Stats(serde_json::Value),
+    PeerStatus(serde_json::Value),
     Pong,
     Error(String),
 }

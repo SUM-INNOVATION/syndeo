@@ -14,6 +14,7 @@ libp2p-tcp.workspace = true
 libp2p-noise.workspace = true
 libp2p-yamux.workspace = true
 libp2p-identify.workspace = true
+libp2p-kad.workspace = true
 libp2p-core.workspace = true
 libp2p-identity.workspace = true
 async-trait.workspace = true

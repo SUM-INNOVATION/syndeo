@@ -111,6 +111,26 @@ pub async fn handle(net: &Net, request: NetRequest) -> NetResponse {
             Err(err) => NetResponse::Error(err.to_string()),
         },
 
+        NetRequest::PeerStatus => match net.peer_status().await {
+            Some(status) => NetResponse::PeerStatus(serde_json::json!({
+                "peer_id": status.peer_id.to_string(),
+                "serving": status.serving,
+                "listeners": status.listeners.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                "routing_table": status.routing_table,
+                "announced": status.announced,
+                "connected": status.connected.iter().map(|report| serde_json::json!({
+                    "peer": report.peer.to_string(),
+                    "served": report.ledger.served,
+                    "bytes_served": report.ledger.bytes_served,
+                    "received": report.ledger.received,
+                    "bytes_received": report.ledger.bytes_received,
+                    "debt": report.ledger.debt,
+                    "standing": report.ledger.standing(),
+                })).collect::<Vec<_>>(),
+            })),
+            None => NetResponse::Error("this node is not in the peer swarm".into()),
+        },
+
         NetRequest::Ping => NetResponse::Pong,
     }
 }

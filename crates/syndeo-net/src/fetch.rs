@@ -356,9 +356,43 @@ impl Net {
                 }
                 let (status, headers, body) = self.origin(&request, &[]).await?;
                 let content = self.store(&request, status, &headers, &body, started);
+                if content.is_some() {
+                    self.announce(&request);
+                }
                 let source = if content.is_some() { Source::Origin } else { Source::PassThrough };
                 Ok(self.finish(status, headers, body, source, content, started))
             }
+        }
+    }
+
+    /// Tell the swarm we hold a body someone else could ask for.
+    ///
+    /// Only bodies a page declared an integrity hash for: those are exactly the
+    /// ones another node can name and check, and announcing anything else would
+    /// be disclosing what we have been reading for no one's benefit. Every
+    /// declared digest is published, not just the strongest, because a different
+    /// page may name the same body by a different algorithm.
+    fn announce(&self, request: &FetchRequest) {
+        let (Some(peers), Some(integrity)) = (&self.peers, &request.integrity) else {
+            return;
+        };
+        let hashes = integrity.hashes.clone();
+        let peers = peers.clone();
+        tokio::spawn(async move {
+            for hash in hashes {
+                if let Err(err) = peers.announce_integrity(&hash).await {
+                    tracing::debug!(%err, "could not announce a body to the swarm");
+                    return;
+                }
+            }
+        });
+    }
+
+    /// What the swarm looks like from here, when we are in one.
+    pub async fn peer_status(&self) -> Option<syndeo_peer::swarm::SwarmStatus> {
+        match self.peers.as_ref() {
+            Some(peers) => peers.status().await.ok(),
+            None => None,
         }
     }
 
@@ -439,6 +473,9 @@ impl Net {
         if let Ok(value) = HeaderValue::from_str(&body.len().to_string()) {
             headers.insert(http::header::CONTENT_LENGTH, value);
         }
+
+        // We hold it now, so the next node to want it has one more place to ask.
+        self.announce(request);
 
         Some(self.finish(
             200,

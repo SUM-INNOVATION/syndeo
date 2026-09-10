@@ -72,6 +72,47 @@ impl Supervisor {
         Ok(endpoint)
     }
 
+    /// A network process that is in the swarm, for a node whose job is to seed
+    /// rather than to browse.
+    pub async fn start_peer_node(
+        &mut self,
+        dns: &str,
+        peers: &[String],
+        listen: &[String],
+        serve_only: bool,
+    ) -> Result<Endpoint> {
+        let endpoint = Endpoint::new(self.runtime_dir().join("net.sock"));
+        clear_stale(endpoint.path());
+        let mut command = Command::new(Self::binary("syndeo-net")?);
+        command
+            .arg("--socket")
+            .arg(endpoint.path())
+            .arg("--home")
+            .arg(&self.home)
+            .arg("--dns")
+            .arg(dns)
+            .arg("--peers");
+        if serve_only {
+            command.arg("--serve-only");
+        }
+        for address in listen {
+            command.arg("--listen").arg(address);
+        }
+        for address in peers {
+            if address != "on" {
+                command.arg("--bootstrap").arg(address);
+            }
+        }
+        let child = command
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawning the network process")?;
+        self.children.push(("net".into(), child));
+        wait_for(endpoint.path()).await?;
+        Ok(endpoint)
+    }
+
     /// The keystore. The session secret goes across on the environment of this
     /// one spawn and is not put anywhere else.
     pub async fn start_keystore(&mut self, secret: &SessionSecret) -> Result<Endpoint> {
