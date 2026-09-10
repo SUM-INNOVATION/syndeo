@@ -90,8 +90,33 @@ impl Cache {
     pub fn with_options(root: impl AsRef<Path>, options: CacheOptions) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
-        let index = Index::open(root.join("index.redb"))?;
-        let blobs = BlobStore::open(root.join("blobs"))?;
+        let index_path = root.join("index.redb");
+        let blob_path = root.join("blobs");
+
+        // A cache is disposable, and that is the whole answer to a schema
+        // change. Migrating records we could just refetch would be a
+        // considerable amount of code to preserve something the origin will
+        // hand back anyway; discarding is cheaper and cannot corrupt.
+        //
+        // The blobs go with the index. Without the index nothing refers to them,
+        // so keeping them would be keeping garbage with no refcount to free it.
+        let index = match Index::open(&index_path) {
+            Ok(index) => index,
+            Err(CacheError::SchemaMismatch { found, expected }) => {
+                tracing::warn!(
+                    ?found,
+                    expected,
+                    path = %index_path.display(),
+                    "the cache was written under a different schema; discarding and rebuilding it"
+                );
+                let _ = std::fs::remove_file(&index_path);
+                let _ = std::fs::remove_dir_all(&blob_path);
+                Index::open(&index_path)?
+            }
+            Err(err) => return Err(err),
+        };
+
+        let blobs = BlobStore::open(&blob_path)?;
         Ok(Cache {
             index,
             blobs,
@@ -562,4 +587,46 @@ fn sri_digests(body: &[u8], content: ContentId) -> Vec<(Vec<u8>, [u8; 32])> {
         .into_iter()
         .map(|algorithm| (sri_key(algorithm, &algorithm.digest(body)), content.0))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored(cache: &Cache, url: &str, body: &[u8]) {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CACHE_CONTROL, "max-age=600".parse().unwrap());
+        let now = cache.now();
+        cache
+            .store("GET", url, &HeaderMap::new(), 200, &headers, body, now, now)
+            .unwrap();
+    }
+
+    #[test]
+    fn an_index_from_another_schema_is_discarded_and_rebuilt_rather_than_mis_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let cache = Cache::open(dir.path()).unwrap();
+            stored(&cache, "https://a.test/one", b"hello");
+            assert_eq!(cache.stats().unwrap().entries, 1);
+        }
+
+        // What a layout change looks like on a user's real cache.
+        crate::index::stamp_schema_version(&dir.path().join("index.redb"), Some(9_999)).unwrap();
+
+        let rebuilt = Cache::open(dir.path()).unwrap();
+        assert_eq!(
+            rebuilt.stats().unwrap().entries,
+            0,
+            "a cache is disposable; a schema it does not understand is discarded"
+        );
+        assert!(
+            !dir.path().join("blobs").join("hello").exists(),
+            "the blobs go with the index that referred to them"
+        );
+
+        // And it is a working cache afterwards, not a wedged one.
+        stored(&rebuilt, "https://a.test/two", b"world");
+        assert_eq!(rebuilt.stats().unwrap().entries, 1);
+    }
 }

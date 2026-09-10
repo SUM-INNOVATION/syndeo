@@ -15,6 +15,11 @@ pub enum CacheError {
     Integrity { expected: String, actual: String },
     #[error("malformed integrity metadata: {0}")]
     BadIntegrity(String),
+    #[error(
+        "the cache index was written under schema {} but this build understands {expected}",
+        match found { Some(v) => v.to_string(), None => "an unversioned layout".to_string() }
+    )]
+    SchemaMismatch { found: Option<u64>, expected: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, CacheError>;

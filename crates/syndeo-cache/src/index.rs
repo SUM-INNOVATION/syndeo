@@ -6,10 +6,26 @@
 //! all a peer ever needs to be checked against.
 
 use crate::blob::{Compression, ContentId};
-use crate::error::Result;
+use crate::error::{CacheError, Result};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// Bumped whenever the layout of anything `bincode` writes into this file
+/// changes. `bincode` has no field names and no tolerance for change: a record
+/// written under one layout deserializes into garbage under another, silently.
+/// The version is written before any record is, and checked before any record
+/// is read, so a layout change is a clear error rather than a mis-parse.
+///
+/// Version 1 is the first layout to carry a version at all. An index written by
+/// the unversioned build reads as `None` and is refused for the same reason a
+/// version we do not recognise is.
+pub const SCHEMA_VERSION: u64 = 1;
+
+/// Index-wide scalars. Not `bincode`, so it stays readable across any change to
+/// the record layout — a version check that could itself mis-parse is no check.
+const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+const SCHEMA_KEY: &str = "schema_version";
 
 const ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("entries");
 const BLOBS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blobs");
@@ -76,13 +92,40 @@ pub struct Index {
     db: Database,
 }
 
+impl std::fmt::Debug for Index {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Index")
+    }
+}
+
 impl Index {
+    /// Open an index, refusing one written under a layout we do not understand.
+    ///
+    /// The refusal is the point. Reading a foreign record with `bincode` does not
+    /// fail cleanly; it produces a struct full of plausible nonsense. So the
+    /// version is settled before the first record is touched.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = Database::create(path.as_ref())?;
+        let path = path.as_ref();
+        // A path that does not exist yet, or exists and is empty, is ours to
+        // stamp. Anything else has to say which layout it was written under.
+        let fresh = std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+        let db = Database::create(path)?;
+
+        if !fresh {
+            let found = read_schema_version(&db)?;
+            if found != Some(SCHEMA_VERSION) {
+                return Err(CacheError::SchemaMismatch {
+                    found,
+                    expected: SCHEMA_VERSION,
+                });
+            }
+        }
+
         // Materialise every table up front so read transactions never trip over
         // a table that has not been written yet.
         let tx = db.begin_write()?;
         {
+            tx.open_table(META)?.insert(SCHEMA_KEY, SCHEMA_VERSION)?;
             tx.open_table(ENTRIES)?;
             tx.open_table(BLOBS)?;
             tx.open_table(VARIANTS)?;
@@ -91,6 +134,11 @@ impl Index {
         }
         tx.commit()?;
         Ok(Index { db })
+    }
+
+    /// The layout this index was written under.
+    pub fn schema_version(&self) -> Result<Option<u64>> {
+        read_schema_version(&self.db)
     }
 
     // ---- entries -----------------------------------------------------------
@@ -417,4 +465,93 @@ fn release(
         return Ok(zero);
     }
     Ok(false)
+}
+
+/// The recorded layout version, or `None` for an index written before there was
+/// one. Deliberately does not touch any `bincode` record.
+fn read_schema_version(db: &Database) -> Result<Option<u64>> {
+    let tx = db.begin_read()?;
+    let table = match tx.open_table(META) {
+        Ok(t) => t,
+        // No `meta` table at all: an index from the unversioned build.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(table.get(SCHEMA_KEY)?.map(|v| v.value()))
+}
+
+/// Write a chosen schema version into an index file, so a test can produce the
+/// thing this check exists to catch without keeping an old build around.
+#[cfg(test)]
+pub(crate) fn stamp_schema_version(path: &Path, version: Option<u64>) -> Result<()> {
+    let db = Database::create(path)?;
+    let tx = db.begin_write()?;
+    {
+        let mut table = tx.open_table(META)?;
+        match version {
+            Some(v) => {
+                table.insert(SCHEMA_KEY, v)?;
+            }
+            None => {
+                table.remove(SCHEMA_KEY)?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        dir.path().join("index.redb")
+    }
+
+    #[test]
+    fn a_new_index_records_the_schema_it_was_written_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(index_path(&dir)).unwrap();
+        assert_eq!(index.schema_version().unwrap(), Some(SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn reopening_the_same_schema_keeps_what_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = index_path(&dir);
+        {
+            let index = Index::open(&path).unwrap();
+            index.bump("requests", 7).unwrap();
+        }
+        let reopened = Index::open(&path).unwrap();
+        assert_eq!(reopened.counter("requests").unwrap(), 7);
+    }
+
+    #[test]
+    fn a_schema_we_do_not_understand_is_an_error_and_not_a_mis_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = index_path(&dir);
+        {
+            let _ = Index::open(&path).unwrap();
+        }
+
+        // A future layout.
+        stamp_schema_version(&path, Some(SCHEMA_VERSION + 1)).unwrap();
+        match Index::open(&path) {
+            Err(CacheError::SchemaMismatch { found, expected }) => {
+                assert_eq!(found, Some(SCHEMA_VERSION + 1));
+                assert_eq!(expected, SCHEMA_VERSION);
+            }
+            other => panic!("expected a schema mismatch, got {other:?}"),
+        }
+
+        // And the layout that predates the version, which is the one actually
+        // out there on disk today.
+        stamp_schema_version(&path, None).unwrap();
+        match Index::open(&path) {
+            Err(CacheError::SchemaMismatch { found: None, .. }) => {}
+            other => panic!("expected an unversioned index to be refused, got {other:?}"),
+        }
+    }
 }
