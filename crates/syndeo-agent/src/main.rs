@@ -8,6 +8,9 @@
 //! When the agent needs something only a human can authorise, it asks the shell
 //! and waits. The shell is free to say no.
 
+mod sandbox;
+mod tools;
+
 use anyhow::{bail, Result};
 use clap::Parser;
 use std::path::PathBuf;
@@ -22,9 +25,13 @@ struct Cli {
     net_socket: PathBuf,
     #[arg(long)]
     shell_socket: PathBuf,
-    /// `read <url>`, `crawl <url>`, `identity <origin>`, or `sign <origin> <message>`.
+    /// `read <url>`, `crawl <url>`, `identity <origin>`, `sign <origin> <message>`,
+    /// `tools`, or `tool <name> <url>`.
     #[arg(long)]
     task: String,
+    /// Where `.wasm` tools live. Defaults to `<home>/tools`.
+    #[arg(long)]
+    tools: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -47,6 +54,20 @@ async fn main() -> Result<()> {
         bail!("the session secret is visible to the agent; refusing to run");
     }
 
+    let net_path = cli.net_socket.clone();
+    let shell_path = cli.shell_socket.clone();
+    let tool_directory = cli.tools.clone().unwrap_or_else(default_tool_directory);
+
+    // Second layer. The process boundary above is the first, and the check just
+    // made is the third; a sandbox does not replace either.
+    let mut grant = sandbox::grant_for(&net_path, &shell_path);
+    grant.readable.push(tool_directory.clone());
+    let confinement = sandbox::confine(&grant);
+    match &confinement {
+        c if c.is_enforced() => tracing::info!(sandbox = c.describe(), "confined"),
+        c => tracing::warn!(reason = c.describe(), "not confined by the platform"),
+    }
+
     let net = Endpoint::new(cli.net_socket);
     let shell = Endpoint::new(cli.shell_socket);
 
@@ -64,8 +85,91 @@ async fn main() -> Result<()> {
             };
             request_signature(&shell, origin, &message.join(" ")).await
         }
-        other => bail!("unknown task {other}; try read, crawl, identity or sign"),
+        "tools" => list_tools(&tool_directory, &confinement),
+        "tool" => {
+            let Some((name, rest)) = rest.split_first() else {
+                bail!("tool needs a name and a url");
+            };
+            run_tool(&net, &tool_directory, name, rest.first().copied().unwrap_or_default()).await
+        }
+        other => bail!("unknown task {other}; try read, crawl, identity, sign, tools or tool"),
     }
+}
+
+fn default_tool_directory() -> PathBuf {
+    std::env::var_os("SYNDEO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".syndeo")
+        })
+        .join("tools")
+}
+
+/// What this agent can run, and what is stopping it doing anything else.
+fn list_tools(directory: &std::path::Path, confinement: &sandbox::Confinement) -> Result<()> {
+    println!("sandbox   {}", confinement.describe());
+    println!("tools     {}", directory.display());
+    println!();
+
+    let found = tools::discover(directory);
+    if found.is_empty() {
+        println!("No tools. A tool is a .wasm or .wat module in that directory exporting");
+        println!("`memory`, `alloc(len) -> ptr` and `run(ptr, len) -> packed`.");
+        println!("It is loaded with no imports at all, so it can reach nothing");
+        println!("the host does not hand it.");
+        return Ok(());
+    }
+    for (path, tool) in found {
+        match tool {
+            Ok(tool) => println!("  {:<20} ready", tool.name),
+            Err(err) => println!("  {:<20} refused: {err:#}", file_stem(&path)),
+        }
+    }
+    Ok(())
+}
+
+fn file_stem(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Fetch a page and run it through a tool.
+///
+/// The tool gets the page's text and nothing else — not the URL, not the
+/// headers, not a socket. Whatever it returns is printed.
+async fn run_tool(
+    net: &Endpoint,
+    directory: &std::path::Path,
+    name: &str,
+    url: &str,
+) -> Result<()> {
+    if url.is_empty() {
+        bail!("tool needs a url to run against");
+    }
+    let path = tools::EXTENSIONS
+        .iter()
+        .map(|extension| directory.join(format!("{name}.{extension}")))
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| anyhow::anyhow!("no tool named {name} in {}", directory.display()))?;
+    let tool = tools::Tool::load(&path)?;
+
+    let (body, source, elapsed) = fetch(net, url, None).await?;
+    let document = Document::parse_bytes(&body, Some(url));
+    let input = document.text();
+
+    let started = std::time::Instant::now();
+    let output = tool.run(input.as_bytes())?;
+    println!("{name}  {source} in {elapsed}ms, tool in {}ms", started.elapsed().as_millis());
+    println!();
+    match std::str::from_utf8(&output) {
+        Ok(text) => println!("{text}"),
+        Err(_) => println!("{} bytes of non-text output", output.len()),
+    }
+    Ok(())
 }
 
 /// Fetch and summarise one page.

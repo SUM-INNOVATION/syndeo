@@ -68,6 +68,8 @@ libp2p-kad = "0.45"
 libp2p-core = "0.41"
 libp2p-identity = { version = "0.2", features = ["ed25519", "rand", "peerid"] }
 async-trait = "0.1"
+wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "std", "gc-drc", "wat"] }
+landlock = "0.4"
 html5ever = "0.39"
 markup5ever_rcdom = "0.39"
 

@@ -143,6 +143,8 @@ impl Supervisor {
             .arg(shell.path())
             .arg("--task")
             .arg(task)
+            .arg("--tools")
+            .arg(self.home.join("tools"))
             // No keystore socket. No session secret. There is nothing in this
             // environment that would let the agent reach a key.
             .env_remove("SYNDEO_SESSION_SECRET")
