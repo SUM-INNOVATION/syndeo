@@ -154,10 +154,30 @@ async fn main() -> Result<()> {
             }
             if !status.presence_enforced {
                 println!();
-                println!(
-                    "User presence is enforced by shell confirmation of each payload,\n\
-                     not by the Secure Enclave. See syndeo_keystore::presence."
-                );
+                if cfg!(target_os = "macos") {
+                    println!(
+                        "The Secure Enclave is not gating the wrapping key on this build.\n\
+                         The binding is there; the data protection keychain it needs is\n\
+                         only reachable from a binary signed with a keychain access group:\n\
+                         \n\
+                         \x20 codesign --force --sign \"Apple Development: you\" \\\n\
+                         \x20   --entitlements crates/syndeo-keystore/Syndeo.entitlements \\\n\
+                         \x20   target/release/syndeo-keystore\n\
+                         \n\
+                         It has to be a real signing identity. Ad-hoc signing (--sign -)\n\
+                         with this entitlement gets the process killed at launch, because\n\
+                         the access group has no team prefix behind it.\n\
+                         \n\
+                         Until then the passphrase is mandatory rather than optional, and\n\
+                         per-signature consent rests on shell confirmation of each payload."
+                    );
+                } else {
+                    println!(
+                        "This platform's credential store cannot enforce user presence,\n\
+                         so the passphrase is mandatory and per-signature consent rests on\n\
+                         shell confirmation of each payload. See syndeo_keystore::presence."
+                    );
+                }
             }
             Ok(())
         }

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    The keystore's wrapping key is held in the macOS data protection keychain,
+    with a SecAccessControl requiring user presence. That keychain is only
+    reachable from a binary signed with a keychain access group; without this
+    entitlement SecItemAdd returns errSecMissingEntitlement, the keystore falls
+    back to the ordinary keychain, and it reports platform presence as
+    unenforced — at which point the passphrase becomes mandatory instead.
+
+    Sign with a real identity, not ad-hoc: `codesign --sign -` with this
+    entitlement produces a binary the kernel kills at launch, because the access
+    group has no team prefix behind it. $(AppIdentifierPrefix) is substituted by
+    Xcode; signing from the command line wants the literal team prefix in its
+    place.
+
+    See crates/syndeo-keystore/src/presence.rs.
+  -->
+  <key>keychain-access-groups</key>
+  <array>
+    <string>$(AppIdentifierPrefix)com.sum.syndeo.keystore</string>
+  </array>
+</dict>
+</plist>

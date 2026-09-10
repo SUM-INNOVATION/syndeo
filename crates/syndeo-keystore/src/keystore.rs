@@ -116,12 +116,20 @@ impl Keystore {
     pub fn status(&self) -> Status {
         let sealed = self.load_sealed().ok();
         let user_set_a_passphrase = sealed.map(|s| s.passphrase_layer).unwrap_or(false);
-        let policy = presence::policy(user_set_a_passphrase);
+        // With a key enrolled, the question is about that key. With none, it is
+        // about what the next enrolment will get — which is what lets setup
+        // relax the passphrase requirement before there is a key to inspect.
+        let presence_enforced = if self.vault.exists() {
+            self.wrapping.presence_enforced()
+        } else {
+            presence::available()
+        };
+        let policy = presence::policy(presence_enforced, user_set_a_passphrase);
         Status {
             initialized: self.vault.exists(),
             unsealed: self.master.lock().unwrap().is_some(),
             passphrase_required: policy.passphrase_required,
-            presence_enforced: self.wrapping.presence_enforced(),
+            presence_enforced,
             idle_timeout_secs: self.watch.timeout().map(|t| t.as_secs()),
             idle_for_secs: self.watch.idle_for(),
         }
@@ -256,8 +264,11 @@ impl Keystore {
         Ok(SealedSeed::from_bytes(&self.vault.read_sealed()?)?)
     }
 
+    /// Enrolment is about to write a new wrapping key, so what matters is what
+    /// the platform will enforce on it, not what it is enforcing on a key that
+    /// is about to be replaced.
     fn require_passphrase(&self, passphrase: Option<&str>) -> Result<()> {
-        let policy = presence::policy(passphrase.is_some());
+        let policy = presence::policy(presence::available(), passphrase.is_some());
         if policy.passphrase_required && passphrase.is_none() {
             return Err(KeystoreError::PassphraseRequired);
         }

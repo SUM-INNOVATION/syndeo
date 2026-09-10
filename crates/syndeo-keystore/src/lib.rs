@@ -24,6 +24,8 @@
 pub mod address;
 pub mod custody;
 pub mod derive;
+#[cfg(target_os = "macos")]
+pub mod enclave;
 pub mod idle;
 pub mod keystore;
 pub mod passphrase;

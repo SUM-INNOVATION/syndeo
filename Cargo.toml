@@ -52,6 +52,9 @@ keyring = { version = "3", features = ["apple-native", "sync-secret-service", "w
 subtle = "2"
 rpassword = "7"
 core-foundation = "0.10"
+core-foundation-sys = "0.8"
+security-framework = { version = "3", features = ["OSX_10_15"] }
+security-framework-sys = { version = "2", features = ["OSX_10_15"] }
 # Matching the sub-crate set sum-chain settled on: the libp2p umbrella pulls in
 # libp2p-mdns and with it hickory-proto, which stays in the lock file whatever
 # the features say. Depending on the exact sub-crates keeps it out.
