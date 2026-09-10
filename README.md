@@ -247,6 +247,11 @@ file-level copyleft, so modifications to their files get published and the
 surrounding code does not, which GPL would not have allowed. OpenSSL is banned
 outright; rustls is the only TLS in the tree.
 
+The windowed shell added three entries, all permissive and all noted in
+`deny.toml` with why: BSL-1.0 for egui's clipboard support, and OFL-1.1 and
+Ubuntu-font-1.0 for the fonts egui embeds — font licences rather than code
+licences, whose conditions bite on modifying and renaming the font files.
+
 ```sh
 cargo deny check licenses bans sources
 ```

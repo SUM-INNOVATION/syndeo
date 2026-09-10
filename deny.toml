@@ -27,6 +27,16 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "Unicode-3.0",
+    # Boost, via clipboard-win and error-code under egui's clipboard support.
+    # Permissive, OSI approved, and with no attribution requirement at all.
+    "BSL-1.0",
+    # The fonts egui embeds — Ubuntu Light, Hack, Noto Emoji. Both are font
+    # licences rather than code licences: they permit embedding and
+    # redistribution, and their conditions bite on modifying and renaming the
+    # font files, which we do not do. OFL's reserved-font-name clause is the one
+    # to remember if that ever changes.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 
 # libzstd is dual BSD-3-Clause / GPL-2.0. We take the BSD side.
