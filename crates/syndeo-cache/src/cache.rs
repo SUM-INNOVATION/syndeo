@@ -647,6 +647,121 @@ impl Cache {
         })
     }
 
+    /// Begin a body that will arrive in pieces.
+    ///
+    /// The caller writes chunks as they come and hands the writer back to
+    /// [`finish_streamed`]. Nothing is visible under a content address until
+    /// that happens, so an interrupted transfer leaves the store as it was.
+    ///
+    /// [`finish_streamed`]: Cache::finish_streamed
+    pub fn begin_streamed(&self) -> Result<crate::blob::BlobWriter> {
+        self.blobs.writer()
+    }
+
+    /// Store a body that arrived in pieces, now that it is all here.
+    ///
+    /// The same policy decisions as [`store`] apply, but the body is already on
+    /// disk and its hashes were computed on the way past. A body the policy
+    /// declines, or one past the size bound, is discarded rather than kept —
+    /// the caller has already been given the bytes either way, which is the
+    /// point: `max_body_bytes` bounds what is *cached*, not what can be fetched.
+    ///
+    /// [`store`]: Cache::store
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_streamed(
+        &self,
+        method: &str,
+        url: &str,
+        request_headers: &HeaderMap,
+        status: u16,
+        response_headers: &HeaderMap,
+        writer: crate::blob::BlobWriter,
+        request_time: u64,
+        response_time: u64,
+        provenance: Provenance,
+    ) -> Result<StoreOutcome> {
+        let url = Self::normalize_url(url);
+        let len = writer.len();
+        self.index.bump(counters::BYTES_FROM_ORIGIN, len)?;
+
+        let meta = StoredMeta {
+            status,
+            headers: response_headers.clone(),
+            request_time,
+            response_time,
+        };
+
+        if let Storability::Reject(reason) =
+            policy::storability(method, request_headers, &meta, len, &self.options)
+        {
+            writer.abandon();
+            self.index.bump(counters::REJECTS, 1)?;
+            return Ok(StoreOutcome::NotStored(reason));
+        }
+        // A partial response arriving as a stream is not merged here: combining
+        // ranges needs the stored segments, and this path deliberately does not
+        // read them back. It falls through to the buffered path instead.
+        if status == 206 {
+            writer.abandon();
+            self.index.bump(counters::REJECTS, 1)?;
+            return Ok(StoreOutcome::NotStored("a streamed 206 is not combined"));
+        }
+
+        let fields = vary::vary_fields(response_headers);
+        let vkey = vary::vary_key(&fields, request_headers);
+        let (receipt, digests) = self.blobs.commit(writer)?;
+        if !receipt.newly_written {
+            self.index.bump(counters::BYTES_DEDUPED, receipt.len)?;
+        }
+
+        let now = self.now();
+        let record = EntryRecord {
+            url: url.clone(),
+            method: method.to_ascii_uppercase(),
+            status,
+            headers: sanitize(response_headers),
+            vary_fields: fields,
+            vary_key: vkey,
+            body: StoredBody::Complete {
+                content: receipt.id.0,
+                len: receipt.len,
+            },
+            request_time,
+            response_time,
+            stored_at: now,
+            last_used: now,
+            hits: 0,
+            provenance,
+        };
+        let blob = BlobRecord {
+            len: receipt.len,
+            stored_len: receipt.stored_len,
+            compression: receipt.compression,
+            refcount: 0,
+            created: now,
+        };
+        let orphaned = self.index.put_entry(&record, &[(receipt.id, blob)])?;
+        self.drop_blobs(&orphaned)?;
+
+        let rows: Vec<(Vec<u8>, [u8; 32])> = digests
+            .each()
+            .into_iter()
+            .map(|(algorithm, digest)| (sri_key(algorithm, digest), receipt.id.0))
+            .collect();
+        self.index.index_sri(&rows)?;
+        self.index.bump(counters::STORES, 1)?;
+
+        if method.eq_ignore_ascii_case("HEAD") {
+            self.reconcile_head(&url, request_headers, response_headers)?;
+        }
+        self.enforce_budget()?;
+
+        Ok(StoreOutcome::Stored {
+            content: receipt.id,
+            deduped: !receipt.newly_written,
+        })
+    }
+
     /// A 206, folded into whatever partial representation is already stored.
     ///
     /// The rule that keeps this honest is RFC 9111 §3.3: ranges may only be

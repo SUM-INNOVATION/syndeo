@@ -12,9 +12,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use syndeo_dom::Document;
-use syndeo_ipc::protocol::{
-    NetRequest, NetResponse, ShellRequest, ShellResponse, SignaturePurpose,
-};
+use syndeo_ipc::protocol::{NetRequest, ShellRequest, ShellResponse, SignaturePurpose};
 use syndeo_ipc::transport::{Channel, Endpoint};
 
 #[derive(Parser)]
@@ -159,8 +157,11 @@ async fn crawl(net: &Endpoint, url: &str) -> Result<()> {
 
 async fn fetch(net: &Endpoint, url: &str, integrity: Option<String>) -> Result<(Vec<u8>, String, u64)> {
     let mut channel = Channel::connect(net).await?;
-    let response: NetResponse = channel
-        .call(&NetRequest::Fetch {
+    // The agent summarises whole pages, so it waits for the whole body. The
+    // frames it arrives in are what stop the transport from capping how large a
+    // page it can read.
+    let response = channel
+        .fetch(&NetRequest::Fetch {
             method: "GET".into(),
             url: url.to_string(),
             headers: vec![("accept".into(), "text/html,*/*".into())],
@@ -168,16 +169,7 @@ async fn fetch(net: &Endpoint, url: &str, integrity: Option<String>) -> Result<(
             integrity,
         })
         .await?;
-    match response {
-        NetResponse::Fetched {
-            body,
-            source,
-            elapsed_ms,
-            ..
-        } => Ok((body, source, elapsed_ms)),
-        NetResponse::Error(e) => bail!(e),
-        _ => bail!("unexpected reply from the network process"),
-    }
+    Ok((response.body, response.source, response.elapsed_ms))
 }
 
 async fn identity(shell: &Endpoint, origin: &str) -> Result<()> {

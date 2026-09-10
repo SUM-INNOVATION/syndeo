@@ -3,14 +3,18 @@
 
 use bytes::Bytes;
 use http::StatusCode;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::Response;
 use syndeo_net::Net;
+
+/// The proxy's body type. These replies are short and whole, but they share the
+/// shape of the streamed ones so one function can return either.
+pub type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
 
 const HOSTS: &[&str] = &["http://syndeo.local/", "https://syndeo.local/"];
 
 /// Answer `syndeo.local` locally instead of sending it to a name server.
-pub fn intercept(net: &Net, url: &str) -> Option<Response<Full<Bytes>>> {
+pub fn intercept(net: &Net, url: &str) -> Option<Response<Body>> {
     let path = HOSTS.iter().find_map(|prefix| url.strip_prefix(prefix))?;
     let (path, _) = path.split_once('?').unwrap_or((path, ""));
 
@@ -40,11 +44,11 @@ pub fn intercept(net: &Net, url: &str) -> Option<Response<Full<Bytes>>> {
     }
 }
 
-fn reply(status: StatusCode, content_type: &str, body: String) -> Response<Full<Bytes>> {
+fn reply(status: StatusCode, content_type: &str, body: String) -> Response<Body> {
     Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, content_type)
         .header(http::header::CACHE_CONTROL, "no-store")
-        .body(Full::new(Bytes::from(body)))
+        .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed_unsync())
         .expect("static response")
 }

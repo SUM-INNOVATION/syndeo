@@ -5,12 +5,14 @@
 //! boundary is the reason the cache can be swapped, shared, or fed from a peer
 //! without anything upstream noticing.
 
+use crate::body::{FetchBody, Tee};
 use crate::config::NetConfig;
 use crate::dns::Dns;
 use crate::error::{NetError, Result};
 use crate::tls;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri};
+use futures::stream::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -20,7 +22,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use syndeo_cache::headers::now_secs;
-use syndeo_cache::{Cache, CacheOptions, Lookup, StoreOutcome};
+use syndeo_cache::{Cache, CacheOptions, Lookup, Provenance, StoreOutcome};
 
 /// Where the bytes actually came from. The proxy reports this per request, and
 /// it is the whole point of the measurement step.
@@ -98,14 +100,18 @@ impl FetchRequest {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FetchResponse {
     pub status: u16,
     pub headers: HeaderMap,
-    pub body: Bytes,
+    /// The body, which may not have arrived yet. Nothing above this line has to
+    /// wait for the last byte before it can act on the first.
+    pub body: FetchBody,
     pub source: Source,
     pub elapsed_ms: u64,
-    /// The BLAKE3 content address, when the body passed through the cache.
+    /// The BLAKE3 content address, when the body passed through the cache and
+    /// was complete before this response was built. A streamed body does not
+    /// have one yet: it is not addressable until its last byte has arrived.
     pub content: Option<syndeo_cache::ContentId>,
     /// Where the response actually came from, after redirects.
     pub final_url: String,
@@ -213,6 +219,9 @@ impl Net {
             let Some(location) = redirect_target(&response) else {
                 return Ok(response);
             };
+            // A redirect's own body is not wanted by anyone. Dropping the stream
+            // closes it rather than reading it to the end.
+            drop(std::mem::replace(&mut response.body, FetchBody::empty()));
             if redirects >= self.config.max_redirects {
                 return Err(NetError::TooManyRedirects {
                     limit: self.config.max_redirects,
@@ -354,15 +363,53 @@ impl Net {
                 if let Some(response) = self.try_peers(&request, started).await {
                     return Ok(response);
                 }
-                let (status, headers, body) = self.origin(&request, &[]).await?;
-                let content = self.store(&request, status, &headers, &body, started);
-                if content.is_some() {
-                    self.announce(&request);
-                }
-                let source = if content.is_some() { Source::Origin } else { Source::PassThrough };
-                Ok(self.finish(status, headers, body, source, content, started))
+                self.from_origin(&request, &[], started).await
             }
         }
+    }
+
+    /// Fetch from the origin and answer with it, streaming where we can.
+    ///
+    /// **Where we cannot** is when the caller declared an integrity hash. A hash
+    /// is checked against all of the bytes, and bytes already handed to the
+    /// caller cannot be taken back — so a resource with declared integrity is
+    /// buffered, checked, and only then returned. Those are subresources named
+    /// in markup, which is a bounded set; everything else streams.
+    async fn from_origin(
+        &self,
+        request: &FetchRequest,
+        extra: &[(HeaderName, String)],
+        started: Instant,
+    ) -> Result<FetchResponse> {
+        let (status, headers, incoming) =
+            origin_headers(&self.client, &self.config, request, extra).await?;
+
+        if request.integrity.is_some() {
+            let body = collect_body(incoming, self.config.max_body_bytes).await?;
+            let content = self.store(request, status, &headers, &body, started);
+            if content.is_some() {
+                self.announce(request);
+            }
+            let source = if content.is_some() {
+                Source::Origin
+            } else {
+                Source::PassThrough
+            };
+            return Ok(self.finish(status, headers, body, source, content, started));
+        }
+
+        let body = stream_body(
+            self.cache.clone(),
+            self.peers.clone(),
+            request.clone(),
+            status,
+            headers.clone(),
+            incoming,
+            self.config.max_body_bytes,
+        );
+        // The address is not known yet — a body is not addressable until its
+        // last byte — so `content` is None and the entry appears when it lands.
+        Ok(self.finish(status, headers, body, Source::Origin, None, started))
     }
 
     /// Tell the swarm we hold a body someone else could ask for.
@@ -526,7 +573,7 @@ impl Net {
         &self,
         status: u16,
         headers: HeaderMap,
-        body: Bytes,
+        body: impl Into<FetchBody>,
         source: Source,
         content: Option<syndeo_cache::ContentId>,
         started: Instant,
@@ -534,7 +581,7 @@ impl Net {
         FetchResponse {
             status,
             headers,
-            body,
+            body: body.into(),
             source,
             elapsed_ms: started.elapsed().as_millis() as u64,
             content,
@@ -556,12 +603,17 @@ impl Net {
 
 /// The origin request, as a free function, so a background refresh can make one
 /// without borrowing the whole [`Net`].
-async fn origin_request(
+///
+/// Returns as soon as the status line and headers are in. The body has not been
+/// read at this point and may not have been sent — which is the whole point:
+/// deciding what to do with a response should not cost the time it takes to
+/// receive it.
+async fn origin_headers(
     client: &HttpsClient,
     config: &NetConfig,
     request: &FetchRequest,
     extra: &[(HeaderName, String)],
-) -> Result<(u16, HeaderMap, Bytes)> {
+) -> Result<(u16, HeaderMap, hyper::body::Incoming)> {
     let uri: Uri = request
         .url
         .parse()
@@ -590,8 +642,8 @@ async fn origin_request(
                 headers.insert(http::header::USER_AGENT, v);
             }
         }
-        // We buffer whole bodies, so never invite a chunked stream we then
-        // have to reassemble differently.
+        // What we cache is what the origin sent, so never invite an encoding we
+        // would then have to undo before hashing it.
         headers.remove(http::header::ACCEPT_ENCODING);
     }
 
@@ -606,9 +658,16 @@ async fn origin_request(
 
     let status = response.status().as_u16();
     let headers = response.headers().clone();
-    let limit = config.max_body_bytes;
-    let collected = response
-        .into_body()
+    Ok((status, headers, response.into_body()))
+}
+
+/// Read a whole body into memory, refusing one past the ceiling.
+///
+/// The ceiling is real here, because this is the path that holds the body: it is
+/// taken when the caller declared an integrity hash, and a hash cannot be
+/// checked against bytes that have already been handed out.
+async fn collect_body(incoming: hyper::body::Incoming, limit: u64) -> Result<Bytes> {
+    let collected = incoming
         .collect()
         .await
         .map_err(|e| NetError::Transport(e.to_string()))?;
@@ -616,8 +675,152 @@ async fn origin_request(
     if body.len() as u64 > limit {
         return Err(NetError::BodyTooLarge { limit });
     }
+    Ok(body)
+}
 
+/// One request to the origin, buffered. Kept for the paths that need the whole
+/// body before they can decide anything.
+async fn origin_request(
+    client: &HttpsClient,
+    config: &NetConfig,
+    request: &FetchRequest,
+    extra: &[(HeaderName, String)],
+) -> Result<(u16, HeaderMap, Bytes)> {
+    let (status, headers, incoming) = origin_headers(client, config, request, extra).await?;
+    let body = collect_body(incoming, config.max_body_bytes).await?;
     Ok((status, headers, body))
+}
+
+/// The state a teed body carries between chunks.
+struct Teed {
+    frames: http_body_util::BodyStream<hyper::body::Incoming>,
+    tee: Tee,
+    cache: Arc<Cache>,
+    request: FetchRequest,
+    status: u16,
+    headers: HeaderMap,
+    request_time: u64,
+    peers: Option<syndeo_peer::PeerHandle>,
+    done: bool,
+}
+
+/// Hand the bytes to the caller and to the cache at the same time.
+///
+/// The caller gets each chunk as it arrives; the cache gets a copy, hashed on
+/// the way past, and the entry is written when the last one lands. A transfer
+/// that fails part way leaves nothing behind, because a body is not addressable
+/// until it is complete, and an incomplete one is deleted rather than kept.
+///
+/// A cache failure never fails the transfer. `max_body_bytes` stops the storing,
+/// not the download — which is the difference between a size bound on the cache
+/// and a size bound on the web.
+fn stream_body(
+    cache: Arc<Cache>,
+    peers: Option<syndeo_peer::PeerHandle>,
+    request: FetchRequest,
+    status: u16,
+    headers: HeaderMap,
+    incoming: hyper::body::Incoming,
+    limit: u64,
+) -> FetchBody {
+    let writer = match cache.begin_streamed() {
+        Ok(writer) => writer,
+        Err(err) => {
+            tracing::warn!(%err, "could not open a cache writer; streaming without caching");
+            return FetchBody::Stream(
+                http_body_util::BodyStream::new(incoming)
+                    .filter_map(|frame| async move {
+                        match frame {
+                            Ok(frame) => frame.into_data().ok().map(Ok),
+                            Err(e) => Some(Err(NetError::Transport(e.to_string()))),
+                        }
+                    })
+                    .boxed(),
+            );
+        }
+    };
+
+    let state = Teed {
+        frames: http_body_util::BodyStream::new(incoming),
+        tee: Tee::new(writer, limit),
+        cache,
+        request,
+        status,
+        headers,
+        request_time: now_secs(),
+        peers,
+        done: false,
+    };
+
+    FetchBody::Stream(
+        futures::stream::unfold(state, |mut state| async move {
+            if state.done {
+                return None;
+            }
+            loop {
+                match state.frames.next().await {
+                    Some(Ok(frame)) => match frame.into_data() {
+                        Ok(chunk) => {
+                            state.tee.observe(&chunk);
+                            return Some((Ok(chunk), state));
+                        }
+                        // Trailers carry no body bytes; keep reading.
+                        Err(_) => continue,
+                    },
+                    Some(Err(err)) => {
+                        state.tee.discard();
+                        state.done = true;
+                        return Some((Err(crate::body::truncated(err)), state));
+                    }
+                    None => {
+                        // The last byte. This is where the entry appears.
+                        finish_streamed(&mut state);
+                        return None;
+                    }
+                }
+            }
+        })
+        .boxed(),
+    )
+}
+
+/// The last byte has arrived: write the entry.
+fn finish_streamed(state: &mut Teed) {
+    let Some(writer) = state.tee.take() else {
+        return;
+    };
+    let now = now_secs();
+    let outcome = state.cache.finish_streamed(
+        state.request.method.as_str(),
+        &state.request.url,
+        &state.request.headers,
+        state.status,
+        &state.headers,
+        writer,
+        state.request_time,
+        now,
+    Provenance::Origin,
+    );
+    match outcome {
+        Ok(StoreOutcome::Stored { .. }) => {
+            if let (Some(peers), Some(integrity)) = (&state.peers, &state.request.integrity) {
+                let hashes = integrity.hashes.clone();
+                let peers = peers.clone();
+                tokio::spawn(async move {
+                    for hash in hashes {
+                        if peers.announce_integrity(&hash).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        }
+        Ok(StoreOutcome::NotStored(reason)) => {
+            tracing::debug!(url = %state.request.url, reason, "not cached");
+        }
+        Ok(StoreOutcome::StoredPartial { .. }) => {}
+        Err(err) => tracing::warn!(url = %state.request.url, %err, "cache write failed"),
+    }
 }
 
 /// Revalidate one stored entry, out of band. Returns whether the store changed.

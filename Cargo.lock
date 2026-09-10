@@ -3209,6 +3209,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "futures",
  "http 1.5.0",
  "http-body-util",
  "hyper",

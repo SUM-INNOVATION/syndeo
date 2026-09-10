@@ -242,3 +242,66 @@ mod tests {
         assert!(Integrity::parse(&format!("sha256-{short}")).is_err());
     }
 }
+
+/// The three Subresource Integrity digests of one body, computed as it passes.
+///
+/// All three, because the body is stored before anyone knows which algorithm a
+/// page will name it by, and hashing three times on the way past costs a few
+/// hundred microseconds against a re-read that costs the whole body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Digests {
+    pub sha256: Vec<u8>,
+    pub sha384: Vec<u8>,
+    pub sha512: Vec<u8>,
+}
+
+impl Digests {
+    /// Each digest with the algorithm that produced it.
+    pub fn each(&self) -> [(Algorithm, &[u8]); 3] {
+        [
+            (Algorithm::Sha256, self.sha256.as_slice()),
+            (Algorithm::Sha384, self.sha384.as_slice()),
+            (Algorithm::Sha512, self.sha512.as_slice()),
+        ]
+    }
+}
+
+/// The three digests, in progress.
+pub struct StreamingDigests {
+    sha256: sha2::Sha256,
+    sha384: sha2::Sha384,
+    sha512: sha2::Sha512,
+}
+
+impl StreamingDigests {
+    pub fn new() -> Self {
+        use sha2::Digest;
+        StreamingDigests {
+            sha256: sha2::Sha256::new(),
+            sha384: sha2::Sha384::new(),
+            sha512: sha2::Sha512::new(),
+        }
+    }
+
+    pub fn update(&mut self, chunk: &[u8]) {
+        use sha2::Digest;
+        self.sha256.update(chunk);
+        self.sha384.update(chunk);
+        self.sha512.update(chunk);
+    }
+
+    pub fn finish(self) -> Digests {
+        use sha2::Digest;
+        Digests {
+            sha256: self.sha256.finalize().to_vec(),
+            sha384: self.sha384.finalize().to_vec(),
+            sha512: self.sha512.finalize().to_vec(),
+        }
+    }
+}
+
+impl Default for StreamingDigests {
+    fn default() -> Self {
+        Self::new()
+    }
+}

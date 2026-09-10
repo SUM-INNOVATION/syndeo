@@ -7,8 +7,12 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Largest single message we will read. Bodies travel as blobs elsewhere; this
-/// carries control messages only.
+/// Largest single message we will read.
+///
+/// This is a bound on one frame, not on a response: a fetch is answered as a
+/// `FetchBegin`, a run of `FetchChunk`s and a `FetchEnd`, so a resource larger
+/// than this still arrives. It exists so a peer cannot make us allocate on
+/// demand, which is a different question from how large the web is allowed to be.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +25,10 @@ pub enum FrameError {
     Codec(#[from] serde_json::Error),
     #[error("the peer closed the connection")]
     Closed,
+    #[error("{0}")]
+    Refused(String),
+    #[error("unexpected reply: {0}")]
+    Unexpected(String),
 }
 
 /// A message-oriented wrapper over a byte stream.
@@ -60,6 +68,51 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
         let mut body = vec![0u8; length as usize];
         self.stream.read_exact(&mut body).await?;
         Ok(serde_json::from_slice(&body)?)
+    }
+
+    /// Send a fetch and reassemble the reply from its frames.
+    ///
+    /// For a caller that was going to hold the whole body anyway — the agent
+    /// summarising a page, the shell printing one. A caller that wants the first
+    /// bytes early reads the frames itself.
+    pub async fn fetch(
+        &mut self,
+        request: &crate::protocol::NetRequest,
+    ) -> Result<crate::protocol::Fetched, FrameError> {
+        use crate::protocol::NetResponse;
+
+        self.send(request).await?;
+        let (status, headers, source, elapsed_ms) = match self.recv::<NetResponse>().await? {
+            NetResponse::FetchBegin {
+                status,
+                headers,
+                source,
+                elapsed_ms,
+            } => (status, headers, source, elapsed_ms),
+            NetResponse::Error(e) => return Err(FrameError::Refused(e)),
+            other => return Err(FrameError::Unexpected(format!("{other:?}"))),
+        };
+
+        let mut body = Vec::new();
+        loop {
+            match self.recv::<NetResponse>().await? {
+                NetResponse::FetchChunk { bytes } => body.extend_from_slice(&bytes),
+                NetResponse::FetchEnd { content } => {
+                    return Ok(crate::protocol::Fetched {
+                        status,
+                        headers,
+                        body,
+                        source,
+                        elapsed_ms,
+                        content,
+                    })
+                }
+                // A body cut short mid-transfer. Returning what arrived would be
+                // handing the caller a truncated page as if it were the page.
+                NetResponse::Error(e) => return Err(FrameError::Refused(e)),
+                other => return Err(FrameError::Unexpected(format!("{other:?}"))),
+            }
+        }
     }
 
     /// One round trip: send a request, read the reply.

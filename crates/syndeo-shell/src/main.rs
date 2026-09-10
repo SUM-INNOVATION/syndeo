@@ -186,8 +186,8 @@ async fn browse(
 
     let fetch = || async {
         let mut channel = Channel::connect(&net).await?;
-        let response: NetResponse = channel
-            .call(&NetRequest::Fetch {
+        let response = channel
+            .fetch(&NetRequest::Fetch {
                 method: "GET".into(),
                 url: url.to_string(),
                 headers: vec![("accept".into(), "text/html,*/*".into())],
@@ -202,20 +202,14 @@ async fn browse(
     let second = if twice { Some(fetch().await?) } else { None };
     supervisor.shutdown().await;
 
-    let NetResponse::Fetched {
+    let syndeo_ipc::protocol::Fetched {
         status,
         headers,
         body,
         source,
         elapsed_ms,
         content,
-    } = first
-    else {
-        if let NetResponse::Error(e) = first {
-            bail!(e);
-        }
-        bail!("unexpected reply from the network process");
-    };
+    } = first;
 
     let document = Document::parse_bytes(&body, Some(url));
 
@@ -253,12 +247,7 @@ async fn browse(
         println!("  type    {}", ct.1);
     }
     if let Some(second) = second {
-        if let NetResponse::Fetched {
-            source, elapsed_ms, ..
-        } = second
-        {
-            println!("  again   {source}  {elapsed_ms}ms");
-        }
+        println!("  again   {}  {}ms", second.source, second.elapsed_ms);
     }
     println!();
 

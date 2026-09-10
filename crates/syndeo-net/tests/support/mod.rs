@@ -75,6 +75,50 @@ impl Origin {
     }
 }
 
+/// An origin whose replies carry a body that is still being produced.
+pub type StreamHandler = Arc<
+    dyn Fn(&Request<hyper::body::Incoming>, usize) -> Response<StreamedBody> + Send + Sync,
+>;
+
+pub type StreamedBody = http_body_util::StreamBody<
+    futures::stream::BoxStream<'static, Result<hyper::body::Frame<Bytes>, std::io::Error>>,
+>;
+
+impl Origin {
+    /// Like [`Origin::start`], but the handler returns a body in pieces.
+    pub async fn start_streaming(handler: StreamHandler) -> Origin {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let handler = handler.clone();
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                        let handler = handler.clone();
+                        let counter = counter.clone();
+                        async move {
+                            let n = counter.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, std::convert::Infallible>(handler(&request, n))
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        Origin { address, hits }
+    }
+}
+
 pub fn respond(status: u16, headers: &[(&str, &str)], body: &'static [u8]) -> Response<Full<Bytes>> {
     let mut builder = Response::builder().status(status);
     for (name, value) in headers {

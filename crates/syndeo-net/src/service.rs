@@ -5,10 +5,12 @@
 //! bytes back; they never learn a host, an address, or a certificate.
 
 use crate::fetch::{FetchRequest, Net};
+use futures::StreamExt;
 use std::sync::Arc;
 use syndeo_cache::Integrity;
 use syndeo_ipc::protocol::{NetRequest, NetResponse};
 use syndeo_ipc::transport::Server;
+use syndeo_ipc::{FrameError, Framed};
 
 pub async fn serve(net: Arc<Net>, server: Server) {
     tracing::info!(socket = %server.endpoint().path().display(), "net listening");
@@ -31,8 +33,7 @@ pub async fn serve(net: Arc<Net>, server: Server) {
                         return;
                     }
                 };
-                let response = handle(&net, request).await;
-                if framed.send(&response).await.is_err() {
+                if respond(&net, request, &mut framed).await.is_err() {
                     return;
                 }
             }
@@ -40,7 +41,16 @@ pub async fn serve(net: Arc<Net>, server: Server) {
     }
 }
 
-pub async fn handle(net: &Net, request: NetRequest) -> NetResponse {
+/// Serve one request.
+///
+/// A fetch is answered as a sequence of frames rather than as one message,
+/// because the alternative is a hard ceiling on how large a resource the browser
+/// can load — a ceiling imposed by our own transport rather than by the web.
+/// Everything else is a single reply.
+pub async fn respond<S>(net: &Net, request: NetRequest, framed: &mut Framed<S>) -> Result<(), FrameError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     match request {
         NetRequest::Fetch {
             method,
@@ -48,62 +58,157 @@ pub async fn handle(net: &Net, request: NetRequest) -> NetResponse {
             headers,
             body,
             integrity,
-        } => {
-            let Ok(method) = method.parse::<http::Method>() else {
-                return NetResponse::Error(format!("unknown method {method}"));
-            };
-            let mut map = http::HeaderMap::new();
-            for (name, value) in &headers {
-                if let (Ok(n), Ok(v)) = (
-                    http::HeaderName::from_bytes(name.as_bytes()),
-                    http::HeaderValue::from_str(value),
-                ) {
-                    map.append(n, v);
-                }
-            }
+        } => fetch(net, method, url, headers, body, integrity, framed).await,
+        other => {
+            let response = handle(net, other).await;
+            framed.send(&response).await
+        }
+    }
+}
 
-            let declared = match integrity.as_deref().map(Integrity::parse) {
-                Some(Ok(i)) if !i.is_empty() => Some(i),
-                Some(Err(err)) => return NetResponse::Error(format!("integrity: {err}")),
-                _ => None,
-            };
+/// Largest body chunk we put in one frame. Well under the frame ceiling, so a
+/// large read from the origin is split rather than refused.
+const CHUNK: usize = 512 * 1024;
 
-            match net
-                .fetch(FetchRequest {
-                    method,
-                    url: url.clone(),
-                    headers: map,
-                    body: bytes::Bytes::from(body),
-                    integrity: declared.clone(),
-                })
+#[allow(clippy::too_many_arguments)]
+async fn fetch<S>(
+    net: &Net,
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    integrity: Option<String>,
+    framed: &mut Framed<S>,
+) -> Result<(), FrameError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Ok(parsed) = method.parse::<http::Method>() else {
+        return framed
+            .send(&NetResponse::Error(format!("unknown method {method}")))
+            .await;
+    };
+    let mut map = http::HeaderMap::new();
+    for (name, value) in &headers {
+        if let (Ok(n), Ok(v)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) {
+            map.append(n, v);
+        }
+    }
+
+    let declared = match integrity.as_deref().map(Integrity::parse) {
+        Some(Ok(i)) if !i.is_empty() => Some(i),
+        Some(Err(err)) => {
+            return framed
+                .send(&NetResponse::Error(format!("integrity: {err}")))
                 .await
-            {
-                Ok(response) => {
-                    // When the caller declared what the bytes must hash to, the
-                    // bytes have to hash to it, whatever produced them.
-                    if let Some(integrity) = declared {
-                        if let Err(err) = integrity.check(&response.body) {
-                            tracing::warn!(%url, %err, "integrity check failed");
-                            return NetResponse::Error(format!("integrity: {err}"));
-                        }
-                    }
-                    NetResponse::Fetched {
-                        status: response.status,
-                        headers: response
-                            .headers
-                            .iter()
-                            .filter_map(|(n, v)| {
-                                v.to_str().ok().map(|v| (n.as_str().to_string(), v.to_string()))
-                            })
-                            .collect(),
-                        body: response.body.to_vec(),
-                        source: response.source.as_str().to_string(),
-                        elapsed_ms: response.elapsed_ms,
-                        content: response.content.map(|c| c.to_hex()),
-                    }
+        }
+        _ => None,
+    };
+
+    let response = match net
+        .fetch(FetchRequest {
+            method: parsed,
+            url: url.clone(),
+            headers: map,
+            body: bytes::Bytes::from(body),
+            integrity: declared.clone(),
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => return framed.send(&NetResponse::Error(err.to_string())).await,
+    };
+
+    // A caller that declared what the bytes must hash to gets bytes that hash to
+    // it, whatever produced them. `Net::fetch` buffers such a response for
+    // exactly this reason, so the check happens before anything is sent on.
+    if let Some(integrity) = &declared {
+        let whole = match response.body.collect().await {
+            Ok(bytes) => bytes,
+            Err(err) => return framed.send(&NetResponse::Error(err.to_string())).await,
+        };
+        if let Err(err) = integrity.check(&whole) {
+            tracing::warn!(%url, %err, "integrity check failed");
+            return framed
+                .send(&NetResponse::Error(format!("integrity: {err}")))
+                .await;
+        }
+        framed
+            .send(&NetResponse::FetchBegin {
+                status: response.status,
+                headers: header_pairs(&response.headers),
+                source: response.source.as_str().to_string(),
+                elapsed_ms: response.elapsed_ms,
+            })
+            .await?;
+        for chunk in whole.chunks(CHUNK) {
+            framed
+                .send(&NetResponse::FetchChunk {
+                    bytes: chunk.to_vec(),
+                })
+                .await?;
+        }
+        return framed
+            .send(&NetResponse::FetchEnd {
+                content: response.content.map(|c| c.to_hex()),
+            })
+            .await;
+    }
+
+    framed
+        .send(&NetResponse::FetchBegin {
+            status: response.status,
+            headers: header_pairs(&response.headers),
+            source: response.source.as_str().to_string(),
+            elapsed_ms: response.elapsed_ms,
+        })
+        .await?;
+
+    let content = response.content;
+    let mut stream = response.body.into_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                for piece in bytes.chunks(CHUNK) {
+                    framed
+                        .send(&NetResponse::FetchChunk {
+                            bytes: piece.to_vec(),
+                        })
+                        .await?;
                 }
-                Err(err) => NetResponse::Error(err.to_string()),
             }
+            // The body was cut short. `Error` after `FetchBegin` is how the
+            // caller learns that what it has is not the whole thing.
+            Err(err) => return framed.send(&NetResponse::Error(err.to_string())).await,
+        }
+    }
+
+    framed
+        .send(&NetResponse::FetchEnd {
+            content: content.map(|c| c.to_hex()),
+        })
+        .await
+}
+
+fn header_pairs(headers: &http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(n, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (n.as_str().to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Everything that is not a fetch, which is everything that fits in one reply.
+pub async fn handle(net: &Net, request: NetRequest) -> NetResponse {
+    match request {
+        NetRequest::Fetch { .. } => {
+            NetResponse::Error("a fetch is answered in frames; use `respond`".into())
         }
 
         NetRequest::Stats => match net.cache().stats() {

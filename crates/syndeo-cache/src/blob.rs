@@ -140,6 +140,98 @@ impl BlobStore {
         })
     }
 
+    /// Begin a body whose length is not known yet.
+    ///
+    /// The address of a body is a hash of all of it, which reads like an
+    /// argument for buffering: you cannot name the bytes until you have them
+    /// all. You can, though, hash them as they pass and name them at the end —
+    /// which is what this is. Bytes land in a temporary file under the store,
+    /// and only a completed write is ever renamed into place under its address,
+    /// so a torn or abandoned transfer leaves nothing that could be served.
+    pub fn writer(&self) -> Result<BlobWriter> {
+        let staging = self.root.join("staging");
+        fs::create_dir_all(&staging)?;
+        let path = staging.join(format!(
+            "{}-{}",
+            std::process::id(),
+            hex::encode(rand_suffix())
+        ));
+        let file = fs::File::create(&path)?;
+        Ok(BlobWriter {
+            file: Some(file),
+            path,
+            hasher: blake3::Hasher::new(),
+            digests: Some(crate::sri::StreamingDigests::new()),
+            len: 0,
+        })
+    }
+
+    /// Take ownership of a completed streaming write.
+    ///
+    /// Compression is decided here rather than while streaming: it needs the
+    /// whole body to be worth doing, and by this point the whole body is on
+    /// disk. A body already present under this address costs a delete rather
+    /// than a rewrite, which is the dedupe path.
+    fn adopt(&self, writer: &FinishedWrite) -> Result<WriteReceipt> {
+        let id = writer.id;
+        let path = self.path_for(id);
+        if path.exists() {
+            let _ = fs::remove_file(&writer.path);
+            let stored_len = fs::metadata(&path)?.len();
+            return Ok(WriteReceipt {
+                id,
+                len: writer.len,
+                stored_len,
+                compression: read_compression(&path)?,
+                newly_written: false,
+            });
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let raw = fs::read(&writer.path)?;
+        let (payload, compression) = if raw.len() >= self.compress_threshold {
+            let compressed = zstd::stream::encode_all(raw.as_slice(), self.zstd_level)?;
+            if compressed.len() < raw.len() {
+                (compressed, Compression::Zstd)
+            } else {
+                (raw, Compression::None)
+            }
+        } else {
+            (raw, Compression::None)
+        };
+
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(&[compression_tag(compression)])?;
+            f.write_all(&payload)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
+        let _ = fs::remove_file(&writer.path);
+
+        Ok(WriteReceipt {
+            id,
+            len: writer.len,
+            stored_len: payload.len() as u64 + 1,
+            compression,
+            newly_written: true,
+        })
+    }
+
+    /// Finish a streaming write and put the body under its address.
+    ///
+    /// Returns the receipt and the Subresource Integrity digests, which were
+    /// computed on the way past rather than by re-reading the body.
+    pub fn commit(&self, writer: BlobWriter) -> Result<(WriteReceipt, crate::sri::Digests)> {
+        let finished = writer.finish()?;
+        let receipt = self.adopt(&finished)?;
+        Ok((receipt, finished.digests))
+    }
+
     /// Read a body back, verifying that the bytes still hash to their address.
     pub fn get(&self, id: ContentId) -> Result<Vec<u8>> {
         let path = self.path_for(id);
@@ -195,6 +287,102 @@ impl BlobStore {
         walk(&self.root, &mut total)?;
         Ok(total)
     }
+}
+
+/// A body being written as it arrives.
+///
+/// Dropping one without committing removes the partial file: an interrupted
+/// download costs nothing and leaves nothing.
+pub struct BlobWriter {
+    file: Option<fs::File>,
+    path: PathBuf,
+    hasher: blake3::Hasher,
+    /// `Option` only so `finish` can take it out past the `Drop` implementation.
+    digests: Option<crate::sri::StreamingDigests>,
+    len: u64,
+}
+
+struct FinishedWrite {
+    id: ContentId,
+    path: PathBuf,
+    len: u64,
+    digests: crate::sri::Digests,
+}
+
+impl BlobWriter {
+    /// Bytes written so far.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn write(&mut self, chunk: &[u8]) -> Result<()> {
+        let Some(file) = self.file.as_mut() else {
+            return Err(CacheError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "this body has already been finished",
+            )));
+        };
+        file.write_all(chunk)?;
+        self.hasher.update(chunk);
+        if let Some(digests) = self.digests.as_mut() {
+            digests.update(chunk);
+        }
+        self.len += chunk.len() as u64;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<FinishedWrite> {
+        if let Some(mut file) = self.file.take() {
+            file.flush()?;
+            file.sync_all()?;
+        }
+        let id = ContentId(*self.hasher.finalize().as_bytes());
+        let digests = self
+            .digests
+            .take()
+            .map(|d| d.finish())
+            .unwrap_or_default();
+        Ok(FinishedWrite {
+            id,
+            // Taking the path also disarms `Drop`, which would otherwise delete
+            // the file we are about to adopt.
+            path: std::mem::take(&mut self.path),
+            len: self.len,
+            digests,
+        })
+    }
+
+    /// Throw the partial body away. Also what `Drop` does.
+    pub fn abandon(mut self) {
+        self.file.take();
+        let _ = fs::remove_file(&self.path);
+        self.path = PathBuf::new();
+    }
+}
+
+impl Drop for BlobWriter {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            self.file.take();
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Enough randomness to keep two concurrent writes in one process apart.
+fn rand_suffix() -> [u8; 8] {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (nanos ^ n.rotate_left(32)).to_le_bytes()
 }
 
 fn compression_tag(c: Compression) -> u8 {

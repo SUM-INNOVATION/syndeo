@@ -7,7 +7,14 @@ pub struct NetConfig {
     /// A browser cache is private. The measuring proxy runs shared.
     pub shared_cache: bool,
     pub dns: DnsMode,
-    /// Largest response body we will buffer, and therefore cache.
+    /// Largest response body we are willing to *cache*.
+    ///
+    /// Not a limit on what can be fetched. A body past this still streams
+    /// through to the caller in full; the cache simply declines to keep it, and
+    /// the partial write is discarded. The one exception is a resource whose
+    /// caller declared an integrity hash: that is buffered so the hash can be
+    /// checked before any of it is believed, and there the ceiling does bound
+    /// what we will hold in memory.
     pub max_body_bytes: u64,
     pub user_agent: String,
     /// Serve a stale body when the origin is unreachable and `stale-if-error`

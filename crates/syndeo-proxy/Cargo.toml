@@ -15,6 +15,7 @@ syndeo-net.workspace = true
 
 tokio.workspace = true
 bytes.workspace = true
+futures.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true

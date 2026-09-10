@@ -208,7 +208,32 @@ async fn run(args: RunArgs) -> Result<()> {
     }
 }
 
-type Body = Full<Bytes>;
+/// The proxy's own response body.
+///
+/// Boxed rather than `Full<Bytes>`, because a response out of the network
+/// process may still be arriving. A proxy that buffered every body before
+/// forwarding it would measure a cache that nobody would ship: time-to-first-byte
+/// is most of what a browser experiences, and holding it back would hide exactly
+/// the thing the measurement is for.
+// Unsync, because a streamed body is a boxed `Stream` and those are `Send`
+// but not `Sync`. Hyper does not need it to be.
+type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
+
+fn whole(bytes: Bytes) -> Body {
+    use http_body_util::BodyExt;
+    Full::new(bytes).map_err(|never| match never {}).boxed_unsync()
+}
+
+fn streaming(body: syndeo_net::FetchBody) -> Body {
+    use futures::StreamExt;
+    use http_body_util::{BodyExt, StreamBody};
+    let frames = body.into_stream().map(|chunk| {
+        chunk
+            .map(hyper::body::Frame::data)
+            .map_err(std::io::Error::other)
+    });
+    BodyExt::boxed_unsync(StreamBody::new(frames))
+}
 
 async fn handle(proxy: Arc<Proxy>, req: Request<Incoming>) -> Result<Response<Body>, hyper::Error> {
     if req.method() == hyper::Method::CONNECT {
@@ -267,7 +292,7 @@ fn connect(proxy: Arc<Proxy>, req: Request<Incoming>) -> Response<Body> {
 
     Response::builder()
         .status(StatusCode::OK)
-        .body(Full::new(Bytes::new()))
+        .body(whole(Bytes::new()))
         .expect("static response")
 }
 
@@ -308,7 +333,10 @@ async fn forward(proxy: Arc<Proxy>, req: Request<Incoming>, origin: Option<Strin
                     response.source.as_str(),
                     response.status,
                     response.elapsed_ms,
-                    syndeo_cache::stats::human(response.body.len() as u64),
+                    match response.body.known_len() {
+                        Some(len) => syndeo_cache::stats::human(len as u64),
+                        None => "streaming".to_string(),
+                    },
                     url
                 );
             }
@@ -331,7 +359,7 @@ async fn forward(proxy: Arc<Proxy>, req: Request<Incoming>, origin: Option<Strin
                 );
             }
             builder
-                .body(Full::new(response.body))
+                .body(streaming(response.body))
                 .unwrap_or_else(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "malformed response"))
         }
         Err(err) => {
@@ -359,6 +387,6 @@ fn text(status: StatusCode, message: &str) -> Response<Body> {
     Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Full::new(Bytes::from(message.to_string())))
+        .body(whole(Bytes::from(message.to_string())))
         .expect("static response")
 }

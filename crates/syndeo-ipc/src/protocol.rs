@@ -28,15 +28,28 @@ pub enum NetRequest {
     Ping,
 }
 
+/// A fetch is answered as a sequence, not as a message.
+///
+/// `FetchBegin`, then zero or more `FetchChunk`, then exactly one `FetchEnd` or
+/// `Error`. The reason is the frame ceiling: a response that had to fit in one
+/// frame put a hard limit on how large a resource the browser could load, and
+/// the limit had nothing to do with the web and everything to do with our own
+/// transport. A body in pieces has no such limit, and the renderer above it can
+/// act on the first piece rather than waiting for the last.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetResponse {
-    Fetched {
+    FetchBegin {
         status: u16,
         headers: Vec<(String, String)>,
-        #[serde(with = "base64_bytes")]
-        body: Vec<u8>,
         source: String,
         elapsed_ms: u64,
+    },
+    FetchChunk {
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+    },
+    FetchEnd {
+        /// The content address, known only once the whole body has arrived.
         content: Option<String>,
     },
     Stats(serde_json::Value),
@@ -190,6 +203,26 @@ pub enum AgentEvent {
     Navigated { url: String, title: String },
     Finished { summary: String },
     Failed { error: String },
+}
+
+/// A fetch reassembled from its frames.
+#[derive(Debug, Clone)]
+pub struct Fetched {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub source: String,
+    pub elapsed_ms: u64,
+    pub content: Option<String>,
+}
+
+impl Fetched {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// Byte vectors travel as base64 so a frame stays valid JSON.
