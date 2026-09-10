@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "The shell: owns the process model, prompts the user, and is the only thing that talks to the keystore"
 
+[lib]
+name = "syndeo_shell"
+path = "src/lib.rs"
+
 [[bin]]
 name = "syndeo"
 path = "src/main.rs"

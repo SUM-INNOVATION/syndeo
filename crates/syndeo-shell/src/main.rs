@@ -4,16 +4,12 @@
 //! the agent; it decides what each of them is told; and it is the only thing in
 //! the tree that ever speaks to the keystore.
 
-mod prompt;
-mod service;
-mod supervisor;
-
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use service::Shell;
 use std::path::PathBuf;
 use std::sync::Arc;
-use supervisor::Supervisor;
+use syndeo_shell::prompt::{self, NonInteractive, Prompter, TerminalPrompter};
+use syndeo_shell::{Shell, Supervisor};
 use syndeo_dom::Document;
 use syndeo_ipc::confirm::{Confirmer, SessionSecret};
 use syndeo_ipc::protocol::{
@@ -336,10 +332,17 @@ async fn agent(home: &std::path::Path, dns: &str, peers: &[String], task: &str) 
     // The shell's own socket. This is what the agent is given; the keystore
     // endpoint stays in this process.
     let shell_endpoint = Endpoint::new(supervisor.runtime_dir().join("shell.sock"));
+    // The agent's requests go in front of whoever is at the terminal. When
+    // nobody is, they are declined rather than left waiting.
+    let prompter: Arc<dyn Prompter> = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        Arc::new(TerminalPrompter)
+    } else {
+        Arc::new(NonInteractive)
+    };
     let shell = Arc::new(Shell::new(
         Arc::new(Confirmer::new(secret)),
         keystore,
-        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        prompter,
     ));
     let server = Server::bind(shell_endpoint.clone())?;
     let serving = tokio::spawn(shell.serve(server));
@@ -376,7 +379,11 @@ async fn sign(
     let keystore = supervisor.start_keystore(&secret).await?;
     unseal(&keystore).await?;
 
-    let shell = Shell::new(Arc::new(Confirmer::new(secret)), keystore, true);
+    let shell = Shell::new(
+        Arc::new(Confirmer::new(secret)),
+        keystore,
+        Arc::new(TerminalPrompter),
+    );
     let response = if typed_consent {
         shell
             .sign_with_typed_consent(
@@ -422,7 +429,11 @@ async fn identity(home: &std::path::Path, origin: &str) -> Result<()> {
     let keystore = supervisor.start_keystore(&secret).await?;
     unseal(&keystore).await?;
 
-    let shell = Shell::new(Arc::new(Confirmer::new(secret)), keystore, true);
+    let shell = Shell::new(
+        Arc::new(Confirmer::new(secret)),
+        keystore,
+        Arc::new(TerminalPrompter),
+    );
     let response = shell
         .handle(ShellRequest::IdentityFor {
             origin: origin.to_string(),

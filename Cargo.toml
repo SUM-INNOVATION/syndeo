@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore", "crates/syndeo-dom", "crates/syndeo-agent", "crates/syndeo-shell", "crates/syndeo-peer"]
+members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore", "crates/syndeo-dom", "crates/syndeo-agent", "crates/syndeo-shell", "crates/syndeo-peer", "crates/syndeo-ui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,7 @@ syndeo-ipc = { path = "crates/syndeo-ipc", version = "0.1.0" }
 syndeo-keystore = { path = "crates/syndeo-keystore", version = "0.1.0" }
 syndeo-dom = { path = "crates/syndeo-dom", version = "0.1.0" }
 syndeo-peer = { path = "crates/syndeo-peer", version = "0.1.0" }
+syndeo-shell = { path = "crates/syndeo-shell", version = "0.1.0" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "sync", "time", "process", "signal"] }
 tokio-util = { version = "0.7", features = ["codec"] }
@@ -91,3 +92,11 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 hickory-resolver = { version = "0.24", features = ["dns-over-rustls", "dns-over-https-rustls", "tokio-runtime"] }
 tower-service = "0.3"
 directories = "5"
+
+# The windowed shell. eframe is winit plus wgpu plus egui in one piece, which is
+# the stack servoshell uses; accesskit is named explicitly rather than taken from
+# eframe's defaults, because accessibility being on by accident is how it ends up
+# off by accident later.
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "accesskit", "default_fonts", "wayland", "x11"] }
+egui = { version = "0.36" }
+egui_extras = { version = "0.36" }

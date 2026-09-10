@@ -1,8 +1,10 @@
-//! The confirmation dialog.
+//! Asking the human.
 //!
-//! A terminal for now; the same three questions will be asked by the windowed
-//! shell later. What matters is not the widget but that the payload the user is
-//! shown is byte-for-byte the payload that gets signed.
+//! What matters here is not the widget. It is that the payload the user is
+//! shown is byte-for-byte the payload that gets signed, and that a run with
+//! nobody to ask declines rather than hangs. [`Prompter`] is the seam: the
+//! terminal and the windowed shell implement it differently and the signing
+//! path cannot tell which one it is talking to.
 
 use std::io::{BufRead, IsTerminal, Write};
 use syndeo_ipc::protocol::SignaturePurpose;
@@ -33,6 +35,113 @@ pub fn read_passphrase(label: &str) -> std::io::Result<String> {
 pub enum Decision {
     Yes,
     No,
+}
+
+/// Everything the user must see before a signature exists.
+///
+/// Carried as one value rather than four arguments so that a front end cannot
+/// render three of them and forget the fourth — and the fourth is the payload,
+/// which is the one that matters.
+#[derive(Debug, Clone)]
+pub struct SignatureRequest {
+    pub origin: String,
+    pub purpose: SignaturePurpose,
+    /// What the site says it is asking for, in its own words. Untrusted.
+    pub description: String,
+    /// The exact bytes that will be signed. Not a summary of them.
+    pub payload: Vec<u8>,
+}
+
+impl SignatureRequest {
+    /// The digest shown beside the payload, so a user who cannot read the bytes
+    /// can still compare them against something the site quoted.
+    pub fn digest(&self) -> String {
+        blake3::hash(&self.payload).to_hex().to_string()
+    }
+
+    /// The payload as it should appear on screen: as text when it is text, and
+    /// as a hex dump when it is not. A signature over bytes the user could not
+    /// read is not consent.
+    pub fn rendered_payload(&self) -> Vec<String> {
+        render_payload(&self.payload)
+    }
+}
+
+/// How a front end asks a human.
+///
+/// Implementations must never block forever: a run with nobody to ask returns
+/// [`Decision::No`], which is why [`NonInteractive`] exists as a real type
+/// rather than as a flag somebody could forget to check.
+pub trait Prompter: Send + Sync {
+    /// Show a payload and ask whether to sign it.
+    fn ask_to_sign(&self, request: &SignatureRequest) -> Decision;
+
+    /// Ask a yes/no question.
+    fn ask(&self, title: &str, detail: &str) -> Decision;
+
+    /// Read a passphrase, to unseal the keystore.
+    fn read_passphrase(&self, label: &str) -> std::io::Result<String>;
+
+    /// Whether there is anyone to ask at all.
+    fn is_interactive(&self) -> bool {
+        true
+    }
+}
+
+/// The terminal.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TerminalPrompter;
+
+impl Prompter for TerminalPrompter {
+    fn ask_to_sign(&self, request: &SignatureRequest) -> Decision {
+        ask_to_sign(
+            &request.origin,
+            request.purpose,
+            &request.description,
+            &request.payload,
+        )
+    }
+
+    fn ask(&self, title: &str, detail: &str) -> Decision {
+        ask(title, detail)
+    }
+
+    fn read_passphrase(&self, label: &str) -> std::io::Result<String> {
+        read_passphrase(label)
+    }
+
+    fn is_interactive(&self) -> bool {
+        std::io::stdin().is_terminal()
+    }
+}
+
+/// Nobody is there. Everything is declined, immediately.
+///
+/// The point of this being a type is that an agent cannot hang waiting on a
+/// human who is not present, and the way that property is guaranteed is by
+/// there being no code path that waits.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NonInteractive;
+
+impl Prompter for NonInteractive {
+    fn ask_to_sign(&self, _request: &SignatureRequest) -> Decision {
+        Decision::No
+    }
+
+    fn ask(&self, _title: &str, _detail: &str) -> Decision {
+        Decision::No
+    }
+
+    fn read_passphrase(&self, _label: &str) -> std::io::Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "this run has nobody to ask for a passphrase",
+        ))
+    }
+
+    fn is_interactive(&self) -> bool {
+        false
+    }
 }
 
 pub fn ask(title: &str, detail: &str) -> Decision {
@@ -67,7 +176,7 @@ pub fn ask_to_sign(
 
 /// Show the bytes as text when they are text, and as a hex dump when they are
 /// not. A signature over bytes the user could not read is not consent.
-fn render_payload(payload: &[u8]) -> Vec<String> {
+pub fn render_payload(payload: &[u8]) -> Vec<String> {
     const LIMIT: usize = 512;
     match std::str::from_utf8(payload) {
         Ok(text) if text.chars().all(|c| !c.is_control() || c == '\n' || c == '\t') => {

@@ -4,7 +4,7 @@
 //! prove identity goes in front of a human first, with the exact bytes rendered,
 //! and only then does the shell — never the agent — speak to the keystore.
 
-use crate::prompt::{self, Decision};
+use crate::prompt::{Decision, Prompter, SignatureRequest};
 use anyhow::Result;
 use std::sync::Arc;
 use syndeo_ipc::confirm::Confirmer;
@@ -21,20 +21,24 @@ pub struct Shell {
     keystore: Endpoint,
     /// One keystore conversation at a time; the keystore has no concurrency to win.
     lock: Mutex<()>,
-    /// When false, every prompt is auto-declined instead of asking. Used by
-    /// non-interactive runs so an agent can never hang waiting on a human that
-    /// is not there.
-    interactive: bool,
+    /// How this front end asks a human. A run with nobody to ask holds a
+    /// `NonInteractive`, so an agent cannot hang waiting on someone who is not
+    /// there — the guarantee is in the type rather than in a flag.
+    prompter: Arc<dyn Prompter>,
 }
 
 impl Shell {
-    pub fn new(confirmer: Arc<Confirmer>, keystore: Endpoint, interactive: bool) -> Self {
+    pub fn new(confirmer: Arc<Confirmer>, keystore: Endpoint, prompter: Arc<dyn Prompter>) -> Self {
         Shell {
             confirmer,
             keystore,
             lock: Mutex::new(()),
-            interactive,
+            prompter,
         }
+    }
+
+    pub fn prompter(&self) -> &Arc<dyn Prompter> {
+        &self.prompter
     }
 
     pub async fn serve(self: Arc<Self>, server: Server) {
@@ -92,10 +96,10 @@ impl Shell {
             }
 
             ShellRequest::Confirm { title, detail } => {
-                if !self.interactive {
+                if !self.prompter.is_interactive() {
                     return ShellResponse::Declined("this run is not interactive".into());
                 }
-                match prompt::ask(&title, &detail) {
+                match self.prompter.ask(&title, &detail) {
                     Decision::Yes => ShellResponse::Confirmed(true),
                     Decision::No => ShellResponse::Confirmed(false),
                 }
@@ -151,7 +155,7 @@ impl Shell {
         description: String,
         payload: Vec<u8>,
     ) -> ShellResponse {
-        if !self.interactive {
+        if !self.prompter.is_interactive() {
             return ShellResponse::Declined(
                 "a signature needs a human, and this run is not interactive".into(),
             );
@@ -159,7 +163,13 @@ impl Shell {
 
         // The user sees the origin, the purpose, the description and the exact
         // bytes. Nothing is signed that was not on screen.
-        if prompt::ask_to_sign(&origin, purpose, &description, &payload) == Decision::No {
+        let request = SignatureRequest {
+            origin: origin.clone(),
+            purpose,
+            description: description.clone(),
+            payload: payload.clone(),
+        };
+        if self.prompter.ask_to_sign(&request) == Decision::No {
             return ShellResponse::Declined("the user declined".into());
         }
 
@@ -205,7 +215,7 @@ impl Shell {
             other => return Ok(other),
         }
 
-        if !self.interactive {
+        if !self.prompter.is_interactive() {
             return Ok(KeystoreResponse::Error(
                 "the keystore is locked and this run has no one to ask for a passphrase".into(),
             ));
@@ -240,10 +250,11 @@ impl Shell {
             anyhow::bail!("the keystore did not report a status");
         };
 
-        eprintln!();
-        eprintln!("  The keystore locked itself. Unseal it to continue.");
         let passphrase = if passphrase_required {
-            Some(prompt::read_passphrase("  Keystore passphrase: ")?)
+            Some(
+                self.prompter
+                    .read_passphrase("The keystore locked itself. Passphrase: ")?,
+            )
         } else {
             None
         };

@@ -1,0 +1,30 @@
+[package]
+name = "syndeo-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The windowed shell: winit, wgpu, egui and accesskit, with the signing dialog it exists for"
+
+[[bin]]
+name = "syndeo-ui"
+path = "src/main.rs"
+
+[dependencies]
+syndeo-shell.workspace = true
+syndeo-ipc.workspace = true
+syndeo-dom.workspace = true
+syndeo-cache.workspace = true
+
+# The same stack servoshell uses, so there is a working reference for the day
+# step four lands and a renderer needs a surface to draw into.
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_extras = { workspace = true }
+
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true

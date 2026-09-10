@@ -34,7 +34,8 @@ refactorable; get them wrong and no amount of later work recovers it.
 | `syndeo-keystore` | sealed root secret, SLIP-0010 per-origin derivation, one operation |
 | `syndeo-dom` | a headless DOM: prose, links, forms, subresources, integrity metadata |
 | `syndeo-agent` | the agent process, sandboxed by what it is given |
-| `syndeo-shell` | the `syndeo` binary: owns the process model and prompts the user |
+| `syndeo-shell` | the process model and the prompt, as a library, plus the `syndeo` command |
+| `syndeo-ui` | the windowed shell: winit, wgpu, egui, accesskit |
 | `syndeo-proxy` | a local intercepting proxy, to measure the cache on real traffic |
 
 ## Build order
@@ -48,13 +49,14 @@ of hours.
 2. **Wrap it in a local intercepting proxy.** Point ordinary Chrome at it. Measure
    hit rate and dedupe ratio on real traffic. This is the go/no-go. — *done*
 3. **Net process**: hyper, rustls, the cache behind a fetch API. Still no
-   browser. — *done, h1 and h2; QUIC and HTTP/3 not yet wired (#3)*
+   browser. — *done, including HTTP/3 over QUIC behind `Alt-Svc`*
 4. **Embed Servo**, replace its net crate with this one, run servoshell's UI
    as-is. — *not started (#4)*
 5. **Split the process model out properly.** Keystore, then agent. — *done, ahead
    of step four, because the boundaries are cheaper to draw before there is a
    renderer to draw them around*
-6. **Replace the shell UI** with our own. — *not started; the shell is a terminal (#5)*
+6. **Replace the shell UI** with our own. — *done; `syndeo-ui` is a window, and
+   the terminal front end is still there beside it*
 
 The agent-first alternative to step four — a headless DOM rather than pixels — is
 `syndeo-dom`, and it is what the agent reads today.
@@ -66,7 +68,23 @@ cargo build --release
 export PATH="$PWD/target/release:$PATH"
 ```
 
-### Read a page
+### The window
+
+```sh
+syndeo-ui https://www.rust-lang.org/
+syndeo-ui --no-keys https://example.test/   # browse without opening the keystore
+```
+
+`winit`, `wgpu`, `egui` and `accesskit` — the stack servoshell uses, so there is
+a working reference for the day a renderer needs a surface. The reader pane shows
+the headless DOM rather than a rendered page, and says so; step four is what puts
+layout behind it. The side panels are the cache counters and the peer ledger.
+
+Accessibility is wired from the start rather than retrofitted: the accessibility
+tree is published, and the controls whose visible text is a glyph — back, reload,
+the panel toggles — carry explicit names, because `←` is not a name.
+
+### Read a page from the terminal
 
 ```sh
 syndeo browse https://www.rust-lang.org/ --full --twice
@@ -125,6 +143,36 @@ syndeo browse https://example.test/ --peer /ip4/10.0.0.5/tcp/4001
 A peer is asked only for a body the page already named by hash. No declared
 integrity, no peer request.
 
+To seed rather than browse, run a node that stays up:
+
+```sh
+syndeo peer serve                      # prints the address to dial it at
+syndeo peer serve --serve-only         # answer, never ask
+syndeo --peer <multiaddr> peer status  # who is connected, and what they have given
+```
+
+Discovery is Kademlia on `/syndeo/kad/1.0.0` — deliberately not the public IPFS
+DHT — so a node reaches peers nobody named to it. Each peer has a ledger of what
+it gave and what it took; a node that only takes gets an opening allowance and is
+then asked to wait.
+
+What this does and does not buy is in `syndeo-peer`'s crate documentation, in
+detail. The short version: a peer never learns a URL from you, but it does learn
+which hashes you want and when, and that is not the same as anonymous.
+
+### Tools
+
+The agent can run WebAssembly tools, loaded with no imports at all — no
+filesystem, no clock, no sockets — so a tool reaches exactly what it is handed.
+
+```sh
+syndeo agent "tools"                                  # what is installed
+syndeo agent "tool wordcount https://example.test/"   # run one over a page
+```
+
+`crates/syndeo-agent/tools/wordcount.wat` is an example, written as readable text
+rather than a binary on purpose.
+
 ## Root secret custody
 
 The seed is never a plaintext file. In order of what an attacker has to get past:
@@ -162,21 +210,33 @@ Two things provide it, and they are not the same:
 - **Platform presence** — the Keychain item carrying
   `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` and a `SecAccessControl`
   requiring `.userPresence`, so Touch ID is enforced by the Secure Enclave rather
-  than by our code. Reaching those attributes needs a direct Security.framework
-  binding that the `keyring` crate does not expose, so **this is not enforced in
-  this build**, and `syndeo_keystore::presence::available()` returns false rather
-  than claiming a guarantee the Secure Enclave is not making.
+  than by our code. The Security.framework binding for this is written, in
+  `syndeo_keystore::enclave`, and it is behind the same `WrappingKeyStore` trait
+  as everything else.
 - **Shell confirmation** — the user agreeing to a specific payload. This is
-  enforced today, by our own code, and tested.
+  enforced always, by our own code, and tested.
 
-Because the platform cannot enforce presence here, the passphrase is mandatory
-rather than optional. That is the rule for platforms that cannot enforce
-presence, applied to this one. When the binding lands, `available()` returns true
-and the requirement relaxes on its own; nothing else changes. Tracked in #1.
+Whether the first one is *in force* depends on how the binary was signed. The
+attributes only mean anything in the macOS data protection keychain, which is
+only reachable from a binary signed with a keychain access group; without one
+`SecItemAdd` returns `errSecMissingEntitlement` and the keystore falls back to
+the ordinary keychain and reports presence as unenforced — at which point the
+passphrase is mandatory rather than optional. `syndeo-keystore status` says which
+of the two you are in, and how to change it. The entitlements file is committed
+at `crates/syndeo-keystore/Syndeo.entitlements`; a real signing identity is
+required, since ad-hoc signing with that entitlement produces a binary the kernel
+kills at launch.
 
-The SLIP-0044 coin type in `derive.rs` is provisional. It has to be pinned
-before anyone holds a balance at an address this derives, because changing it
-afterwards strands funds. Tracked in #2.
+The keystore also forgets the seed on its own: after five idle minutes, when the
+machine has slept, or when the screen has locked. A signature after that costs a
+passphrase prompt rather than the operation.
+
+The SLIP-0044 coin type in `derive.rs` is **pinned** at 8848 and documented as
+SUM's by declaration rather than by allocation. A committed test vector — a
+published mnemonic in, an address out — guards the whole derivation path, so a
+change is caught by the suite rather than discovered by a user whose funds went
+somewhere else. SUM Chain's network id, 1, is recorded beside it and marked as
+not the coin type.
 
 ## Licensing
 
@@ -194,17 +254,21 @@ cargo deny check licenses bans sources
 ## Known gaps
 
 Everything that is missing or deferred is filed rather than left in a comment.
-The ones worth knowing before you rely on any of this:
+What is worth knowing before you rely on any of this:
 
 | | |
 | --- | --- |
-| #1 | Secure Enclave presence is not enforced; shell confirmation stands in for it |
-| #2 | The SLIP-0044 coin type is provisional |
-| #7 | `stale-while-revalidate` serves stale but never refreshes |
-| #10 | The cache has no eviction policy and no size bound |
-| #12 | Peer discovery is bootstrap-only, so peer fetch is not usable between machines yet |
-| #13 | Response bodies are buffered whole and capped at 64 MiB |
-| #15 | The cache index has no schema version |
+| #4 | Servo is not embedded, so nothing draws a page — the window shows the headless DOM |
+
+Two things are done but not *demonstrated* on an ordinary developer machine, and
+both say so where you would meet them:
+
+- Secure Enclave presence needs a signed build (#1's binding is in the tree;
+  `syndeo-keystore status` reports which side of that line you are on).
+- The agent's Landlock confinement compiles for Linux and has not been exercised
+  on a Linux kernel from here. macOS Seatbelt confinement is tested, including a
+  case that builds a fixture and holds TCP, UDP, file writes and `exec` to
+  failing.
 
 ## Tests
 
@@ -212,4 +276,4 @@ The ones worth knowing before you rely on any of this:
 cargo test --workspace
 ```
 
-124 of them. Thirty-seven cite the RFC 9111 section they cover.
+192 of them. Thirty-seven cite the RFC 9111 section they cover.
