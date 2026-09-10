@@ -192,9 +192,66 @@ impl Shell {
     }
 
     /// The only path to the keystore in the whole tree.
+    ///
+    /// A locked keystore is not a failure to report upward. The seed is
+    /// forgotten on a timer now, so an operation arriving after a quiet spell is
+    /// the normal case, and the right answer is to ask the user to unseal and
+    /// carry on — not to make them retype the command.
     pub async fn keystore_call(&self, request: KeystoreRequest) -> Result<KeystoreResponse> {
         let _guard = self.lock.lock().await;
+
+        match self.call_once(&request).await? {
+            KeystoreResponse::Locked => {}
+            other => return Ok(other),
+        }
+
+        if !self.interactive {
+            return Ok(KeystoreResponse::Error(
+                "the keystore is locked and this run has no one to ask for a passphrase".into(),
+            ));
+        }
+
+        self.unseal_now().await?;
+        // Once. A second `Locked` means the session ended again between the
+        // unseal and the retry, and looping on that is how you get a prompt
+        // storm rather than a working keystore.
+        match self.call_once(&request).await? {
+            KeystoreResponse::Locked => Ok(KeystoreResponse::Error(
+                "the keystore locked again immediately after unsealing".into(),
+            )),
+            other => Ok(other),
+        }
+    }
+
+    /// One request, on its own connection. Does not take the lock.
+    async fn call_once(&self, request: &KeystoreRequest) -> Result<KeystoreResponse> {
         let mut channel = Channel::connect(&self.keystore).await?;
-        Ok(channel.call(&request).await?)
+        Ok(channel.call(request).await?)
+    }
+
+    /// Ask the keystore what it needs, then supply it. The passphrase is read
+    /// here, in the shell, and never reaches the agent.
+    async fn unseal_now(&self) -> Result<()> {
+        let KeystoreResponse::Status {
+            passphrase_required,
+            ..
+        } = self.call_once(&KeystoreRequest::Status).await?
+        else {
+            anyhow::bail!("the keystore did not report a status");
+        };
+
+        eprintln!();
+        eprintln!("  The keystore locked itself. Unseal it to continue.");
+        let passphrase = if passphrase_required {
+            Some(prompt::read_passphrase("  Keystore passphrase: ")?)
+        } else {
+            None
+        };
+
+        match self.call_once(&KeystoreRequest::Unseal { passphrase }).await? {
+            KeystoreResponse::Ok => Ok(()),
+            KeystoreResponse::Error(e) => anyhow::bail!(e),
+            _ => anyhow::bail!("unexpected reply from the keystore"),
+        }
     }
 }

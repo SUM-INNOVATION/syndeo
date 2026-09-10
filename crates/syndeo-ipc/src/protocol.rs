@@ -158,7 +158,15 @@ pub enum KeystoreResponse {
         unsealed: bool,
         passphrase_required: bool,
         presence_enforced: bool,
+        /// After how many idle seconds the seed is forgotten, if ever.
+        idle_timeout_secs: Option<u64>,
+        /// How long since the last operation.
+        idle_for_secs: u64,
     },
+    /// The session has ended and the seed is gone. Recoverable: the shell asks
+    /// the user to unseal and tries again. Distinct from `Error` so the shell
+    /// does not have to read an error message to know that.
+    Locked,
     /// Shown to the user once, at setup, and never written to disk.
     Initialized {
         mnemonic: String,

@@ -7,6 +7,28 @@
 use std::io::{BufRead, IsTerminal, Write};
 use syndeo_ipc::protocol::SignaturePurpose;
 
+/// Read a passphrase.
+///
+/// A terminal gets a hidden prompt; a pipe gets a line. Scripted runs may set
+/// `SYNDEO_PASSPHRASE`, which is read once and then removed from this process so
+/// it cannot be inherited by anything the shell spawns — the agent especially.
+pub fn read_passphrase(label: &str) -> std::io::Result<String> {
+    if let Ok(value) = std::env::var("SYNDEO_PASSPHRASE") {
+        std::env::remove_var("SYNDEO_PASSPHRASE");
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    if std::io::stdin().is_terminal() {
+        return rpassword::prompt_password(label);
+    }
+    eprint!("{label}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Yes,

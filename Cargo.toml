@@ -51,6 +51,7 @@ bip39 = { version = "2", features = ["rand"] }
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
 subtle = "2"
 rpassword = "7"
+core-foundation = "0.10"
 # Matching the sub-crate set sum-chain settled on: the libp2p umbrella pulls in
 # libp2p-mdns and with it hickory-proto, which stays in the lock file whatever
 # the features say. Depending on the exact sub-crates keeps it out.

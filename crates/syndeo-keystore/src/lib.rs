@@ -24,14 +24,17 @@
 pub mod address;
 pub mod custody;
 pub mod derive;
+pub mod idle;
 pub mod keystore;
 pub mod passphrase;
 pub mod presence;
 pub mod seal;
 pub mod service;
+pub mod session;
 pub mod wrapping;
 
 pub use address::Address;
-pub use derive::{origin_key, ExtendedKey, SUM_COIN_TYPE};
+pub use derive::{origin_key, ExtendedKey, SUM_CHAIN_ID, SUM_COIN_TYPE};
+pub use idle::Reason as LockReason;
 pub use keystore::{Keystore, KeystoreError, Signed, Status};
 pub use wrapping::{OsKeyring, WrappingKeyStore};

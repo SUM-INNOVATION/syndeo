@@ -5,12 +5,32 @@
 
 use crate::keystore::{Keystore, KeystoreError};
 use std::sync::Arc;
+use std::time::Duration;
 use syndeo_ipc::confirm::Confirmer;
 use syndeo_ipc::protocol::{KeystoreRequest, KeystoreResponse};
 use syndeo_ipc::transport::Server;
 
+/// How often the idle policy is checked. Fine enough that a locked screen takes
+/// effect promptly, coarse enough to cost nothing.
+const TICK: Duration = Duration::from_secs(5);
+
 pub async fn serve(keystore: Arc<Keystore>, confirmer: Arc<Confirmer>, server: Server) {
     tracing::info!(socket = %server.endpoint().path().display(), "keystore listening");
+    if let Some(timeout) = keystore.status().idle_timeout_secs {
+        tracing::info!(timeout, "the seed is forgotten after this many idle seconds");
+    }
+    // Nothing was calling `lock`, so an unsealed session lasted as long as the
+    // process. This is what ends one.
+    tokio::spawn({
+        let keystore = keystore.clone();
+        async move {
+            loop {
+                tokio::time::sleep(TICK).await;
+                keystore.lock_if_expired();
+            }
+        }
+    });
+
     loop {
         let mut framed = match server.accept().await {
             Ok(f) => f,
@@ -81,6 +101,8 @@ pub fn handle(
                 unsealed: status.unsealed,
                 passphrase_required: status.passphrase_required,
                 presence_enforced: status.presence_enforced,
+                idle_timeout_secs: status.idle_timeout_secs,
+                idle_for_secs: status.idle_for_secs,
             }
         }
 
@@ -119,7 +141,15 @@ pub fn handle(
 
 /// Errors cross the boundary as text. Nothing derived from key material, the
 /// passphrase, or the seed is ever put in one.
+///
+/// A locked keystore is the exception, and gets its own variant: the shell's
+/// answer to it is to ask the user to unseal and try again, and matching on a
+/// string to decide that would be a bug waiting for someone to reword an error.
 fn refuse(err: KeystoreError) -> KeystoreResponse {
+    if matches!(err, KeystoreError::Locked) {
+        tracing::info!("refused: the keystore is locked");
+        return KeystoreResponse::Locked;
+    }
     tracing::warn!(%err, "refused");
     KeystoreResponse::Error(err.to_string())
 }

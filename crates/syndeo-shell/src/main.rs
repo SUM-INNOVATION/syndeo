@@ -419,25 +419,6 @@ async fn identity(home: &std::path::Path, origin: &str) -> Result<()> {
     }
 }
 
-/// A terminal gets a hidden prompt; a pipe gets a line. Scripted runs may set
-/// `SYNDEO_PASSPHRASE`, which is read once and then removed from this process.
-fn read_passphrase() -> Result<String> {
-    use std::io::{BufRead, IsTerminal};
-    if let Ok(value) = std::env::var("SYNDEO_PASSPHRASE") {
-        std::env::remove_var("SYNDEO_PASSPHRASE");
-        if !value.is_empty() {
-            return Ok(value);
-        }
-    }
-    if std::io::stdin().is_terminal() {
-        return Ok(rpassword::prompt_password("Keystore passphrase: ")?);
-    }
-    eprint!("Keystore passphrase: ");
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    Ok(line.trim_end_matches(['\n', '\r']).to_string())
-}
-
 /// Ask the keystore what it needs, then supply it. The passphrase is read here,
 /// in the shell, and sent to the keystore — it never reaches the agent.
 async fn unseal(keystore: &Endpoint) -> Result<()> {
@@ -456,7 +437,7 @@ async fn unseal(keystore: &Endpoint) -> Result<()> {
     }
 
     let passphrase = if passphrase_required {
-        Some(read_passphrase().context("reading the passphrase")?)
+        Some(prompt::read_passphrase("Keystore passphrase: ").context("reading the passphrase")?)
     } else {
         None
     };
@@ -505,11 +486,17 @@ async fn doctor(home: &std::path::Path) -> Result<()> {
                 unsealed,
                 passphrase_required,
                 presence_enforced,
+                idle_timeout_secs,
+                ..
             } = channel.call(&KeystoreRequest::Status).await?
             {
                 println!("keystore    initialized {initialized}, unsealed {unsealed}");
                 println!("            passphrase required {passphrase_required}");
                 println!("            platform presence enforced {presence_enforced}");
+                match idle_timeout_secs {
+                    Some(secs) => println!("            idle auto-lock after {secs}s"),
+                    None => println!("            idle auto-lock off"),
+                }
             }
         }
         Err(err) => println!("keystore    not reachable: {err}"),
@@ -521,5 +508,6 @@ async fn doctor(home: &std::path::Path) -> Result<()> {
     println!("  renderers and the agent reach the network only through the net process");
     println!("  the agent has no keystore socket and no session secret");
     println!("  the keystore signs only what the shell confirmed, once, for one payload");
+    println!("  the seed is forgotten on idleness, on sleep, and on screen lock");
     Ok(())
 }

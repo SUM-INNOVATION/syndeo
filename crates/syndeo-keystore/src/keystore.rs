@@ -11,12 +11,14 @@
 use crate::address::Address;
 use crate::custody::Vault;
 use crate::derive::{self, ExtendedKey};
+use crate::idle::{self, Watch};
 use crate::presence;
 use crate::seal::{self, KdfParams, SealedSeed};
 use crate::wrapping::WrappingKeyStore;
 use bip39::{Language, Mnemonic};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use syndeo_ipc::confirm::{Confirmation, Confirmer};
 use syndeo_ipc::protocol::SignaturePurpose;
 use zeroize::Zeroizing;
@@ -51,13 +53,25 @@ pub struct Status {
     pub unsealed: bool,
     pub passphrase_required: bool,
     pub presence_enforced: bool,
+    /// After how many seconds without an operation the seed is forgotten.
+    pub idle_timeout_secs: Option<u64>,
+    /// How long it has been since the last operation.
+    pub idle_for_secs: u64,
 }
+
+/// How long an unsealed session survives with nothing using it.
+///
+/// Short on purpose. The cost of it being too short is a passphrase prompt; the
+/// cost of it being too long is a signing oracle on an unattended machine.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub struct Keystore {
     vault: Vault,
     wrapping: Arc<dyn WrappingKeyStore>,
     /// The master key, present only while the session is unsealed.
     master: Mutex<Option<ExtendedKey>>,
+    /// What ends that session without anyone asking.
+    watch: Watch,
 }
 
 impl Keystore {
@@ -66,7 +80,37 @@ impl Keystore {
             vault: Vault::open(home)?,
             wrapping,
             master: Mutex::new(None),
+            watch: Watch::new(Some(DEFAULT_IDLE_TIMEOUT)),
         })
+    }
+
+    /// Replace the idle policy. `None` disables idle expiry, which is only ever
+    /// right for a one-shot command that locks when it is done.
+    pub fn with_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.watch = Watch::new(timeout);
+        self
+    }
+
+    /// Replace the clocks the idle policy reads. Tests advance time with this
+    /// rather than waiting for it.
+    pub fn with_clock(mut self, timeout: Option<Duration>, clock: idle::Clock) -> Self {
+        self.watch = Watch::with_clock(timeout, clock);
+        self
+    }
+
+    /// Forget the seed if the session has ended. Returns why, when it did.
+    ///
+    /// Called on a timer by the service loop, and again at the top of every
+    /// operation so that a request arriving after the session ended cannot slip
+    /// in ahead of the timer.
+    pub fn lock_if_expired(&self) -> Option<idle::Reason> {
+        if self.master.lock().unwrap().is_none() {
+            return None;
+        }
+        let reason = self.watch.expired()?;
+        self.lock();
+        tracing::info!(reason = reason.as_str(), "locked the keystore");
+        Some(reason)
     }
 
     pub fn status(&self) -> Status {
@@ -78,6 +122,8 @@ impl Keystore {
             unsealed: self.master.lock().unwrap().is_some(),
             passphrase_required: policy.passphrase_required,
             presence_enforced: self.wrapping.presence_enforced(),
+            idle_timeout_secs: self.watch.timeout().map(|t| t.as_secs()),
+            idle_for_secs: self.watch.idle_for(),
         }
     }
 
@@ -137,6 +183,7 @@ impl Keystore {
         self.vault.write_sealed(&sealed.to_bytes())?;
 
         *self.master.lock().unwrap() = Some(master);
+        self.watch.touch();
         Ok(identity)
     }
 
@@ -149,6 +196,7 @@ impl Keystore {
         let wrapping_key = self.wrapping.load()?;
         let seed = seal::unseal(&sealed, &wrapping_key, passphrase)?;
         *self.master.lock().unwrap() = Some(ExtendedKey::master(seed.as_ref()));
+        self.watch.touch();
         Ok(())
     }
 
@@ -160,9 +208,11 @@ impl Keystore {
     /// The public identity for an origin. Public keys are not secret, but the
     /// derivation is still done here and nowhere else.
     pub fn public_identity(&self, origin: &str) -> Result<(String, Address)> {
+        self.lock_if_expired();
         let guard = self.master.lock().unwrap();
         let master = guard.as_ref().ok_or(KeystoreError::Locked)?;
         let key = derive::origin_key(master, origin);
+        self.watch.touch();
         Ok((hex::encode(key.public_key()), key.address()))
     }
 
@@ -179,12 +229,17 @@ impl Keystore {
         confirmation: &Confirmation,
         payload: &[u8],
     ) -> Result<Signed> {
+        // Ahead of the confirmation check, so a request that arrives after the
+        // session ended is refused as locked rather than burning the single-use
+        // confirmation on an operation that was going to fail anyway.
+        self.lock_if_expired();
         confirmer.verify(confirmation, payload)?;
 
         let guard = self.master.lock().unwrap();
         let master = guard.as_ref().ok_or(KeystoreError::Locked)?;
         let key = derive::origin_key(master, &confirmation.origin);
         let signature = key.sign(payload);
+        self.watch.touch();
 
         Ok(Signed {
             signature: hex::encode(signature.to_bytes()),
@@ -420,6 +475,104 @@ mod tests {
             keystore.initialize(None),
             Err(KeystoreError::PassphraseRequired)
         ));
+    }
+
+    // ---- idle auto-lock ---------------------------------------------------
+
+    /// A keystore whose clocks the test moves by hand.
+    fn keystore_with_clock(
+        timeout: Option<Duration>,
+    ) -> (tempfile::TempDir, Keystore, Arc<std::sync::atomic::AtomicU64>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let wrapping = Arc::new(InMemoryKeyStore::default());
+        let ticks = Arc::new(AtomicU64::new(0));
+        let handle = ticks.clone();
+        let clock: crate::idle::Clock = Arc::new(move || {
+            let t = handle.load(Ordering::SeqCst);
+            // Both clocks move together: this is time passing, not a suspend.
+            crate::idle::Reading {
+                monotonic: t,
+                wall: t,
+            }
+        });
+        let keystore = Keystore::open(dir.path(), wrapping)
+            .unwrap()
+            .with_clock(timeout, clock);
+        (dir, keystore, ticks)
+    }
+
+    #[test]
+    fn an_idle_session_forgets_the_seed() {
+        use std::sync::atomic::Ordering;
+        let (_dir, keystore, ticks) = keystore_with_clock(Some(Duration::from_secs(300)));
+        keystore.initialize(Some(PASS)).unwrap();
+        assert!(keystore.status().unsealed);
+
+        ticks.store(299, Ordering::SeqCst);
+        assert_eq!(keystore.lock_if_expired(), None);
+        assert!(keystore.status().unsealed, "locked a second too early");
+
+        ticks.store(300, Ordering::SeqCst);
+        assert_eq!(keystore.lock_if_expired(), Some(crate::idle::Reason::Idle));
+        assert!(
+            !keystore.status().unsealed,
+            "the master key survived the idle timeout"
+        );
+        assert!(matches!(
+            keystore.public_identity("https://a.test"),
+            Err(KeystoreError::Locked)
+        ));
+    }
+
+    #[test]
+    fn use_keeps_a_session_alive_and_a_signature_after_it_ends_is_refused() {
+        use std::sync::atomic::Ordering;
+        let (_dir, keystore, ticks) = keystore_with_clock(Some(Duration::from_secs(300)));
+        keystore.initialize(Some(PASS)).unwrap();
+
+        // Something touches the seed every four minutes for an hour.
+        for step in 1..=15 {
+            ticks.store(step * 240, Ordering::SeqCst);
+            keystore.public_identity("https://a.test").unwrap();
+        }
+        assert!(keystore.status().unsealed, "use did not keep the session alive");
+
+        // Then the machine is left alone.
+        let secret = SessionSecret::generate();
+        let shell = Confirmer::new(secret.clone());
+        let side = Confirmer::new(secret);
+        let payload = b"transfer 10 SUM to alice";
+        let confirmation = shell.issue(
+            "https://wallet.test",
+            SignaturePurpose::ChainTransaction,
+            "Send 10 SUM to alice",
+            payload,
+        );
+
+        ticks.fetch_add(301, Ordering::SeqCst);
+        assert!(
+            matches!(
+                keystore.sign_confirmed(&side, &confirmation, payload),
+                Err(KeystoreError::Locked)
+            ),
+            "an unattended machine signed"
+        );
+
+        // And unsealing brings it back rather than the confirmation being lost
+        // — though this one is spent either way, which is the point of it.
+        keystore.unseal(Some(PASS)).unwrap();
+        assert!(keystore.status().unsealed);
+    }
+
+    #[test]
+    fn a_session_with_no_timeout_stays_open() {
+        use std::sync::atomic::Ordering;
+        let (_dir, keystore, ticks) = keystore_with_clock(None);
+        keystore.initialize(Some(PASS)).unwrap();
+        ticks.store(86_400 * 7, Ordering::SeqCst);
+        assert_eq!(keystore.lock_if_expired(), None);
+        assert!(keystore.status().unsealed);
     }
 
     #[test]

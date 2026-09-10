@@ -15,10 +15,29 @@ type HmacSha512 = Hmac<Sha512>;
 const CURVE: &[u8] = b"ed25519 seed";
 const HARDENED: u32 = 0x8000_0000;
 
-/// SLIP-0044 coin type. SUM has no registered index yet, so this is provisional
-/// and deliberately in one place: changing it changes every address, so it must
-/// be pinned before anyone holds a balance.
+/// SLIP-0044 coin type for SUM. **Pinned.**
+///
+/// SUM has no registered SLIP-0044 index, so this is ours by declaration rather
+/// than by allocation. It is pinned at 8848 because that is the value every
+/// address this tree has ever derived already used: the alternative was to
+/// change every address for no gain, which is free today and impossible the
+/// moment anyone holds a balance. If an index is registered later it will have
+/// to be this one.
+///
+/// Changing it changes every address the browser will ever show. The test vector
+/// in this module exists so that a change is caught by the suite rather than
+/// discovered by a user whose funds went somewhere else.
 pub const SUM_COIN_TYPE: u32 = 8848;
+
+/// SUM Chain's network id, which is **not** the coin type and must never be
+/// substituted for it.
+///
+/// They are two different numbers doing two different jobs: the chain id
+/// identifies the network a transaction is valid on, and the coin type
+/// identifies the branch of the key tree an address is derived from. Recorded
+/// here because 1 and 8848 sitting in separate files is exactly how one ends up
+/// in the other's place.
+pub const SUM_CHAIN_ID: u64 = 1;
 
 /// BIP-44 purpose.
 const PURPOSE: u32 = 44;
@@ -184,6 +203,47 @@ mod tests {
             hex::encode(deep.key),
             "8f94d394a8e8fd6b1bc2f3f49f5c47e385281d5c17e65324b0f62483e37e8793"
         );
+    }
+
+    /// Mnemonic in, address out.
+    ///
+    /// This is the vector that pins the derivation. Every part of the path
+    /// contributes: BIP-39 to seed, SLIP-0010 master, `m/44'/8848'/0'` for the
+    /// identity, and `m/44'/8848'/a'/b'/c'` for an origin. A change to any of
+    /// them — including to [`SUM_COIN_TYPE`] — moves these addresses, and moving
+    /// them after anyone holds a balance strands it.
+    #[test]
+    fn the_pinned_derivation_produces_these_addresses_and_no_others() {
+        use bip39::{Language, Mnemonic};
+
+        // The BIP-39 English test mnemonic. Chosen because it is published, so
+        // this vector can be reproduced by hand against any other SLIP-0010
+        // implementation.
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                              abandon abandon abandon abandon abandon abandon abandon abandon \
+                              abandon abandon abandon abandon abandon abandon abandon art";
+
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, PHRASE).unwrap();
+        let seed = mnemonic.to_seed_normalized("");
+        let master = ExtendedKey::master(&seed);
+
+        assert_eq!(SUM_COIN_TYPE, 8848, "the coin type is pinned");
+        assert_eq!(SUM_CHAIN_ID, 1, "the chain id is not the coin type");
+
+        let identity = master.derive_path(&[PURPOSE, SUM_COIN_TYPE, 0]);
+        assert_eq!(identity.address().to_base58(), "6d3w7V1x5bVHK7xf6s75JpHQWd9Ed6Xsg");
+        assert_eq!(hex::encode(identity.public_key()), "35a597be28cd361d3f33143093ca0f120276b75ea701c47e7c45a49a76b9fc5d");
+
+        for (origin, address) in [
+            ("https://wallet.test", "8rNvk67chDLXGE4pgD6Ns49b6StyrARNd"),
+            ("https://example.test", "AsU26q61p6mSRgZDM8iWRhiBfHFngvjyh"),
+        ] {
+            assert_eq!(
+                origin_key(&master, origin).address().to_base58(),
+                address,
+                "the derived identity for {origin} moved"
+            );
+        }
     }
 
     #[test]
