@@ -205,6 +205,9 @@ fn header_pairs(headers: &http::HeaderMap) -> Vec<(String, String)> {
 }
 
 /// Everything that is not a fetch, which is everything that fits in one reply.
+///
+/// Public because it is the whole surface for anything embedding the network
+/// process in-tree rather than across a socket.
 pub async fn handle(net: &Net, request: NetRequest) -> NetResponse {
     match request {
         NetRequest::Fetch { .. } => {

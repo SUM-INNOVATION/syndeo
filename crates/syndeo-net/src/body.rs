@@ -117,7 +117,9 @@ impl Tee {
         if writer.len() + chunk.len() as u64 > self.limit {
             tracing::debug!(limit = self.limit, "body outgrew the cache budget; not storing it");
             self.over_budget = true;
-            self.writer.take().map(|w| w.abandon());
+            if let Some(writer) = self.writer.take() {
+                writer.abandon();
+            }
             return;
         }
         if let Err(err) = writer.write(chunk) {

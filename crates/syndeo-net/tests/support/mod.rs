@@ -1,5 +1,10 @@
 //! A tiny origin to fetch from, so the cache-aware paths can be driven end to
 //! end without the internet.
+//!
+//! Each integration test compiles its own copy of this module, so not every
+//! helper is used by every one of them.
+
+#![allow(dead_code)]
 
 use http_body_util::Full;
 use hyper::body::Bytes;

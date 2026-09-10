@@ -155,10 +155,14 @@ fn generate() -> Result<(String, String)> {
 /// The first CERTIFICATE block of a PEM document, as DER.
 fn der_from_pem(pem: &str) -> Result<Vec<u8>> {
     let mut reader = std::io::BufReader::new(pem.as_bytes());
-    for item in rustls_pemfile::certs(&mut reader) {
-        return Ok(item.context("parsing the authority certificate")?.to_vec());
+    let first = rustls_pemfile::certs(&mut reader)
+        .next()
+        .transpose()
+        .context("parsing the authority certificate")?;
+    match first {
+        Some(certificate) => Ok(certificate.to_vec()),
+        None => bail!("the authority file contains no certificate"),
     }
-    bail!("the authority file contains no certificate")
 }
 
 /// The authority key is as sensitive as any private key on the machine.
