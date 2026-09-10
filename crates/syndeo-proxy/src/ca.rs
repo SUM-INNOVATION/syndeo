@@ -5,17 +5,22 @@
 //! leaves the machine, and exists solely so hit rate can be measured on real
 //! traffic before any of the browser is written.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub struct CertificateAuthority {
-    issuer: rcgen::Certificate,
-    issuer_key: KeyPair,
+    /// The signing identity, derived from the stored certificate rather than
+    /// from a fresh one minted to look like it.
+    issuer: Issuer<'static, KeyPair>,
+    /// The stored authority, verbatim. This is what goes in the chain, so what a
+    /// client is offered is byte-for-byte what the user installed.
+    issuer_der: Vec<u8>,
     ca_pem: String,
     dir: PathBuf,
     leaves: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
@@ -43,17 +48,60 @@ impl CertificateAuthority {
         };
 
         let issuer_key = KeyPair::from_pem(&key_pem).context("reading the authority key")?;
-        let params = CertificateParams::from_ca_cert_pem(&ca_pem)
+        // Not `from_ca_cert_pem` plus `self_signed`, which mints a *different*
+        // certificate on every run — a new serial, and a randomised ECDSA
+        // signature regardless — and then chains leaves against that copy rather
+        // than against the one the user actually installed. `Issuer` takes the
+        // stored certificate's identity without reissuing it.
+        let issuer = Issuer::from_ca_cert_pem(&ca_pem, issuer_key)
             .context("reading the authority certificate")?;
-        let issuer = params.self_signed(&issuer_key)?;
+        let issuer_der = der_from_pem(&ca_pem)?;
 
         Ok(CertificateAuthority {
             issuer,
-            issuer_key,
+            issuer_der,
             ca_pem,
             dir,
             leaves: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The stored authority certificate, as it is on disk.
+    pub fn issuer_der(&self) -> &[u8] {
+        &self.issuer_der
+    }
+
+    /// A leaf for one origin, and the chain that vouches for it. Split out from
+    /// [`server_config`] so a test can look at what a client would be offered.
+    ///
+    /// [`server_config`]: CertificateAuthority::server_config
+    fn leaf_chain(
+        &self,
+        host: &str,
+    ) -> Result<(
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    )> {
+        let leaf_key = KeyPair::generate()?;
+        let mut params = CertificateParams::new(vec![host.to_string()])?;
+        let mut name = DistinguishedName::new();
+        name.push(DnType::CommonName, host);
+        params.distinguished_name = name;
+        params.use_authority_key_identifier_extension = true;
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+
+        let leaf = params.signed_by(&leaf_key, &self.issuer)?;
+        let chain = vec![
+            rustls::pki_types::CertificateDer::from(leaf.der().to_vec()),
+            rustls::pki_types::CertificateDer::from(self.issuer_der.clone()),
+        ];
+        let key = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der())
+            .map_err(|e| anyhow::anyhow!("leaf key: {e}"))?;
+        Ok((chain, key))
     }
 
     pub fn certificate_path(&self) -> PathBuf {
@@ -70,27 +118,7 @@ impl CertificateAuthority {
             return Ok(existing.clone());
         }
 
-        let leaf_key = KeyPair::generate()?;
-        let mut params = CertificateParams::new(vec![host.to_string()])?;
-        let mut name = DistinguishedName::new();
-        name.push(DnType::CommonName, host);
-        params.distinguished_name = name;
-        params.use_authority_key_identifier_extension = true;
-        params.key_usages = vec![
-            KeyUsagePurpose::DigitalSignature,
-            KeyUsagePurpose::KeyEncipherment,
-        ];
-        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-
-        let leaf = params.signed_by(&leaf_key, &self.issuer, &self.issuer_key)?;
-
-        let chain = vec![
-            rustls::pki_types::CertificateDer::from(leaf.der().to_vec()),
-            rustls::pki_types::CertificateDer::from(self.issuer.der().to_vec()),
-        ];
-        let key = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der())
-            .map_err(|e| anyhow::anyhow!("leaf key: {e}"))?;
-
+        let (chain, key) = self.leaf_chain(host)?;
         let mut config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(chain, key)?;
@@ -122,6 +150,15 @@ fn generate() -> Result<(String, String)> {
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
 
+/// The first CERTIFICATE block of a PEM document, as DER.
+fn der_from_pem(pem: &str) -> Result<Vec<u8>> {
+    let mut reader = std::io::BufReader::new(pem.as_bytes());
+    for item in rustls_pemfile::certs(&mut reader) {
+        return Ok(item.context("parsing the authority certificate")?.to_vec());
+    }
+    bail!("the authority file contains no certificate")
+}
+
 /// The authority key is as sensitive as any private key on the machine.
 fn write_private(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(path, contents)?;
@@ -131,4 +168,62 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_authority_served_in_the_chain_is_the_one_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = CertificateAuthority::load_or_create(dir.path()).unwrap();
+        let on_disk = std::fs::read_to_string(first.certificate_path()).unwrap();
+        let expected = der_from_pem(&on_disk).unwrap();
+        assert_eq!(
+            first.issuer_der(),
+            expected.as_slice(),
+            "the authority was regenerated on first load"
+        );
+
+        // The failure this guards against is a second run minting a lookalike:
+        // same subject and key, different serial and signature, so leaves chain
+        // against a certificate the user never installed.
+        let second = CertificateAuthority::load_or_create(dir.path()).unwrap();
+        assert_eq!(
+            first.issuer_der(),
+            second.issuer_der(),
+            "the authority differs between two loads of the same file"
+        );
+        assert_eq!(first.certificate_pem(), second.certificate_pem());
+    }
+
+    #[test]
+    fn a_leaf_is_offered_with_the_stored_authority_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = CertificateAuthority::load_or_create(dir.path()).unwrap();
+
+        let (chain, _) = ca.leaf_chain("example.test").unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(
+            chain[1].as_ref(),
+            ca.issuer_der(),
+            "the chain offers a regenerated authority, not the installed one"
+        );
+
+        // And across a reload, which is where the regeneration used to happen.
+        let reloaded = CertificateAuthority::load_or_create(dir.path()).unwrap();
+        let (again, _) = reloaded.leaf_chain("example.test").unwrap();
+        assert_eq!(chain[1], again[1]);
+    }
+
+    #[test]
+    fn a_host_is_signed_once_and_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = CertificateAuthority::load_or_create(dir.path()).unwrap();
+        let config = ca.server_config("example.test").unwrap();
+        let again = ca.server_config("example.test").unwrap();
+        assert!(Arc::ptr_eq(&config, &again));
+    }
 }
