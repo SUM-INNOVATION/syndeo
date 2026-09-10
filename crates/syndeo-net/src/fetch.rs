@@ -16,7 +16,8 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use syndeo_cache::headers::now_secs;
 use syndeo_cache::{Cache, CacheOptions, Lookup, StoreOutcome};
@@ -123,6 +124,12 @@ pub struct Net {
     client: HttpsClient,
     config: NetConfig,
     peers: Option<syndeo_peer::PeerHandle>,
+    /// Entry keys with a background revalidation already in flight.
+    ///
+    /// A popular entry going stale is exactly when many requests arrive at once,
+    /// and one refresh per request would turn `stale-while-revalidate` from a
+    /// saving into a stampede. They collapse onto the first.
+    refreshing: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Net {
@@ -173,6 +180,7 @@ impl Net {
             client,
             config,
             peers,
+            refreshing: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -273,7 +281,11 @@ impl Net {
                 ..
             } => {
                 if refresh_in_background {
-                    self.spawn_refresh(request.clone());
+                    // The whole point of the directive: move the revalidation
+                    // off this request's critical path, having already answered
+                    // it from the store.
+                    let conditional = syndeo_cache::policy::conditional_headers(&response.meta);
+                    self.spawn_refresh(response.key.clone(), request.clone(), conditional);
                 }
                 Ok(self.finish(
                     response.status,
@@ -438,11 +450,39 @@ impl Net {
         ))
     }
 
-    fn spawn_refresh(&self, _request: FetchRequest) {
-        // A background refresh needs an owned handle; the proxy drives this via
-        // its own task so the network process stays a plain request/response
-        // surface. Left as an explicit no-op rather than a silent one.
-        tracing::debug!("stale-while-revalidate refresh deferred to the caller");
+    /// Revalidate a stale entry behind the response that was just served.
+    ///
+    /// Failures are swallowed on purpose: the stored entry stays exactly as it
+    /// was, so `stale-if-error` keeps applying and the next request is no worse
+    /// off than if we had never tried.
+    fn spawn_refresh(
+        &self,
+        key: String,
+        request: FetchRequest,
+        conditional: Vec<(HeaderName, String)>,
+    ) {
+        {
+            let mut inflight = self.refreshing.lock().expect("refresh set is not poisoned");
+            if !inflight.insert(key.clone()) {
+                tracing::trace!(%key, "a refresh for this entry is already running");
+                return;
+            }
+        }
+
+        let client = self.client.clone();
+        let config = self.config.clone();
+        let cache = self.cache.clone();
+        let inflight = self.refreshing.clone();
+
+        tokio::spawn(async move {
+            let outcome = refresh_entry(&client, &config, &cache, &request, &key, &conditional).await;
+            match outcome {
+                Ok(true) => tracing::debug!(url = %request.url, "refreshed a stale entry"),
+                Ok(false) => tracing::debug!(url = %request.url, "the refresh was not storable"),
+                Err(err) => tracing::debug!(url = %request.url, %err, "background refresh failed; the stored entry stands"),
+            }
+            inflight.lock().expect("refresh set is not poisoned").remove(&key);
+        });
     }
 
     fn finish(
@@ -473,64 +513,105 @@ impl Net {
         request: &FetchRequest,
         extra: &[(HeaderName, String)],
     ) -> Result<(u16, HeaderMap, Bytes)> {
-        let uri: Uri = request
-            .url
-            .parse()
-            .map_err(|_| NetError::InvalidUrl(request.url.clone()))?;
-        if uri.host().is_none() {
-            return Err(NetError::InvalidUrl(request.url.clone()));
-        }
-
-        let mut builder = Request::builder().method(request.method.clone()).uri(uri);
-        {
-            let headers = builder.headers_mut().expect("builder is valid");
-            let tokens = syndeo_cache::headers::connection_tokens(&request.headers);
-            for (name, value) in request.headers.iter() {
-                if syndeo_cache::headers::is_hop_by_hop(name.as_str(), &tokens) {
-                    continue;
-                }
-                headers.append(name.clone(), value.clone());
-            }
-            for (name, value) in extra {
-                if let Ok(v) = HeaderValue::from_str(value) {
-                    headers.insert(name.clone(), v);
-                }
-            }
-            if !headers.contains_key(http::header::USER_AGENT) {
-                if let Ok(v) = HeaderValue::from_str(&self.config.user_agent) {
-                    headers.insert(http::header::USER_AGENT, v);
-                }
-            }
-            // We buffer whole bodies, so never invite a chunked stream we then
-            // have to reassemble differently.
-            headers.remove(http::header::ACCEPT_ENCODING);
-        }
-
-        let req = builder
-            .body(Full::new(request.body.clone()))
-            .map_err(NetError::Http)?;
-
-        let response = self
-            .client
-            .request(req)
-            .await
-            .map_err(|e| NetError::Transport(e.to_string()))?;
-
-        let status = response.status().as_u16();
-        let headers = response.headers().clone();
-        let limit = self.config.max_body_bytes;
-        let collected = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| NetError::Transport(e.to_string()))?;
-        let body = collected.to_bytes();
-        if body.len() as u64 > limit {
-            return Err(NetError::BodyTooLarge { limit });
-        }
-
-        Ok((status, headers, body))
+        origin_request(&self.client, &self.config, request, extra).await
     }
+}
+
+/// The origin request, as a free function, so a background refresh can make one
+/// without borrowing the whole [`Net`].
+async fn origin_request(
+    client: &HttpsClient,
+    config: &NetConfig,
+    request: &FetchRequest,
+    extra: &[(HeaderName, String)],
+) -> Result<(u16, HeaderMap, Bytes)> {
+    let uri: Uri = request
+        .url
+        .parse()
+        .map_err(|_| NetError::InvalidUrl(request.url.clone()))?;
+    if uri.host().is_none() {
+        return Err(NetError::InvalidUrl(request.url.clone()));
+    }
+
+    let mut builder = Request::builder().method(request.method.clone()).uri(uri);
+    {
+        let headers = builder.headers_mut().expect("builder is valid");
+        let tokens = syndeo_cache::headers::connection_tokens(&request.headers);
+        for (name, value) in request.headers.iter() {
+            if syndeo_cache::headers::is_hop_by_hop(name.as_str(), &tokens) {
+                continue;
+            }
+            headers.append(name.clone(), value.clone());
+        }
+        for (name, value) in extra {
+            if let Ok(v) = HeaderValue::from_str(value) {
+                headers.insert(name.clone(), v);
+            }
+        }
+        if !headers.contains_key(http::header::USER_AGENT) {
+            if let Ok(v) = HeaderValue::from_str(&config.user_agent) {
+                headers.insert(http::header::USER_AGENT, v);
+            }
+        }
+        // We buffer whole bodies, so never invite a chunked stream we then
+        // have to reassemble differently.
+        headers.remove(http::header::ACCEPT_ENCODING);
+    }
+
+    let req = builder
+        .body(Full::new(request.body.clone()))
+        .map_err(NetError::Http)?;
+
+    let response = client
+        .request(req)
+        .await
+        .map_err(|e| NetError::Transport(e.to_string()))?;
+
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let limit = config.max_body_bytes;
+    let collected = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| NetError::Transport(e.to_string()))?;
+    let body = collected.to_bytes();
+    if body.len() as u64 > limit {
+        return Err(NetError::BodyTooLarge { limit });
+    }
+
+    Ok((status, headers, body))
+}
+
+/// Revalidate one stored entry, out of band. Returns whether the store changed.
+async fn refresh_entry(
+    client: &HttpsClient,
+    config: &NetConfig,
+    cache: &Cache,
+    request: &FetchRequest,
+    key: &str,
+    conditional: &[(HeaderName, String)],
+) -> Result<bool> {
+    let (status, headers, body) = origin_request(client, config, request, conditional).await?;
+    let now = now_secs();
+
+    if status == 304 {
+        return Ok(cache
+            .record_not_modified(key, &headers, now, now)?
+            .is_some());
+    }
+
+    let outcome = cache.store(
+        request.method.as_str(),
+        &request.url,
+        &request.headers,
+        status,
+        &headers,
+        &body,
+        now,
+        now,
+    )?;
+    Ok(!matches!(outcome, StoreOutcome::NotStored(_)))
 }
 
 /// The `Location` of a redirect we should follow, if this is one.

@@ -27,7 +27,7 @@ http.workspace = true
 http-body-util.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
-rustls-native-certs.workspace = true
+rustls-platform-verifier.workspace = true
 hickory-resolver.workspace = true
 tower-service.workspace = true
 
@@ -36,3 +36,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
