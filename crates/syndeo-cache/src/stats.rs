@@ -18,6 +18,12 @@ pub struct Stats {
     pub bytes_deduped: u64,
     pub peer_accepted: u64,
     pub peer_rejected: u64,
+    /// Requests answered with a byte range out of the store.
+    pub range_hits: u64,
+    /// Stores that left an entry still missing bytes.
+    pub partial_stores: u64,
+    /// Live entries dropped to stay inside the size budget.
+    pub evictions: u64,
 
     pub entries: u64,
     pub blobs: u64,
@@ -27,6 +33,8 @@ pub struct Stats {
     pub on_disk_bytes: u64,
     /// Sum of body sizes counted once per referencing entry.
     pub logical_bytes: u64,
+    /// Rows in the Subresource Integrity index.
+    pub sri_rows: u64,
 }
 
 impl Stats {
@@ -46,6 +54,9 @@ impl Stats {
             c::BYTES_DEDUPED => self.bytes_deduped = value,
             c::PEER_ACCEPTED => self.peer_accepted = value,
             c::PEER_REJECTED => self.peer_rejected = value,
+            c::RANGE_HITS => self.range_hits = value,
+            c::PARTIAL_STORES => self.partial_stores = value,
+            c::EVICTIONS => self.evictions = value,
             _ => {}
         }
     }
@@ -91,6 +102,7 @@ impl Stats {
              hit rate {:.1}%  byte hit rate {:.1}%\n\
              entries {}  blobs {}  dedupe {:.2}x  compression {:.2}x\n\
              unique {}  on disk {}  logical {}\n\
+             range hits {}  partial stores {}  evictions {}\n\
              peer accepted {}  peer rejected {}",
             self.requests,
             self.hits,
@@ -107,6 +119,9 @@ impl Stats {
             human(self.unique_bytes),
             human(self.on_disk_bytes),
             human(self.logical_bytes),
+            self.range_hits,
+            self.partial_stores,
+            self.evictions,
             self.peer_accepted,
             self.peer_rejected,
         )

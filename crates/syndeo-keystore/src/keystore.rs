@@ -248,12 +248,23 @@ mod tests {
         assert!(keystore.status().initialized);
         assert!(keystore.status().unsealed);
 
-        // The phrase is not on disk anywhere under the vault.
-        let sealed = std::fs::read_to_string(keystore.vault.sealed_path()).unwrap();
+        // The phrase is not on disk anywhere under the vault. The check is over
+        // the document's *values*: the field names are ours, and one of them
+        // (`m_cost`) contains a word that is also in the BIP-39 list, which
+        // would otherwise fail this test for about one phrase in eighty.
+        let raw = std::fs::read_to_string(keystore.vault.sealed_path()).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let values: String = document
+            .as_object()
+            .expect("the sealed file is an object")
+            .values()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
         for word in mnemonic.split_whitespace() {
-            assert!(!sealed.contains(word), "the recovery phrase leaked: {word}");
+            assert!(!values.contains(word), "the recovery phrase leaked: {word}");
         }
-        assert!(sealed.contains(&address.to_base58()));
+        assert!(values.contains(&address.to_base58()));
     }
 
     #[test]

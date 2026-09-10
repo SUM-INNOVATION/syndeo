@@ -3,8 +3,9 @@
 use crate::blob::{BlobStore, ContentId};
 use crate::error::{CacheError, Result};
 use crate::headers::{now_secs, sanitize};
-use crate::index::{entry_key, BlobRecord, EntryRecord, Index, Provenance};
+use crate::index::{entry_key, BlobRecord, EntryRecord, Index, Provenance, Segment, StoredBody};
 use crate::policy::{self, CacheOptions, Freshness, StoredMeta, Storability};
+use crate::range::{self, Coverage, Resolved};
 use crate::sri::Integrity;
 use crate::stats::Stats;
 use crate::vary;
@@ -26,6 +27,9 @@ pub mod counters {
     pub const PEER_ACCEPTED: &str = "peer_accepted";
     pub const PEER_REJECTED: &str = "peer_rejected";
     pub const REQUESTS: &str = "requests";
+    pub const RANGE_HITS: &str = "range_hits";
+    pub const PARTIAL_STORES: &str = "partial_stores";
+    pub const EVICTIONS: &str = "evictions";
 }
 
 /// A response reconstructed from the store.
@@ -35,10 +39,17 @@ pub struct StoredResponse {
     pub status: u16,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
-    pub content: ContentId,
+    /// The address of the whole body. A partial entry has none, and a range
+    /// served out of a complete body still names the complete body.
+    pub content: Option<ContentId>,
     pub provenance: Provenance,
     pub age: u64,
     pub meta: StoredMeta,
+    /// Set when this is a 206 we assembled ourselves.
+    pub range: Option<Resolved>,
+    /// True when the request was a HEAD, so the headers are real and the body
+    /// is deliberately empty.
+    pub body_omitted: bool,
 }
 
 #[derive(Debug)]
@@ -67,7 +78,29 @@ pub enum Lookup {
 pub enum StoreOutcome {
     /// Written. `deduped` means the bytes were already on disk under this hash.
     Stored { content: ContentId, deduped: bool },
+    /// A range was written into an entry that is still missing bytes. There is
+    /// no content address yet, because there is no whole body to address.
+    StoredPartial {
+        held: u64,
+        complete_len: Option<u64>,
+    },
     NotStored(&'static str),
+}
+
+/// Which bytes of a stored entry a request can be answered with.
+enum Wanted {
+    /// The whole stored representation.
+    Whole,
+    /// One resolved byte range, entirely covered by what is stored.
+    Range(Resolved),
+    /// This entry cannot answer this request; the reason is the miss reason.
+    Unusable(&'static str),
+}
+
+/// The resolved form of [`Wanted`], plus whether the caller asked with HEAD.
+struct Want {
+    range: Option<Resolved>,
+    omit_body: bool,
 }
 
 /// Source of "now", in Unix seconds. Injectable so freshness is testable without
@@ -170,7 +203,16 @@ impl Cache {
             return Ok(Lookup::Miss("method is not cacheable"));
         }
 
-        let Some((key, record)) = self.select_variant(method, &url, request_headers)? else {
+        // RFC 9111 §4: a stored GET can answer a HEAD, because the GET's headers
+        // are exactly what a HEAD response is. Its own stored variant is tried
+        // first; the fallback is what saves the origin round trip.
+        let head = method.eq_ignore_ascii_case("HEAD");
+        let selected = match self.select_variant(method, &url, request_headers)? {
+            Some(found) => Some(found),
+            None if head => self.select_variant("GET", &url, request_headers)?,
+            None => None,
+        };
+        let Some((key, record)) = selected else {
             self.index.bump(counters::MISSES, 1)?;
             return Ok(Lookup::Miss("no stored variant"));
         };
@@ -183,11 +225,32 @@ impl Cache {
         };
         let now = self.now();
 
+        // Which bytes this request wants out of what we hold. Ranges are decided
+        // here rather than in `policy::evaluate` because resolving one needs the
+        // stored length, which the policy layer deliberately does not know.
+        let want = match self.wanted_bytes(request_headers, &record, &meta) {
+            Wanted::Unusable(reason) => {
+                self.index.bump(counters::MISSES, 1)?;
+                return Ok(Lookup::Miss(reason));
+            }
+            Wanted::Range(resolved) => Want {
+                range: Some(resolved),
+                omit_body: head,
+            },
+            Wanted::Whole => Want {
+                range: None,
+                omit_body: head,
+            },
+        };
+
         match policy::evaluate(request_headers, &meta, now, &self.options) {
             Freshness::Fresh { age, .. } => {
-                let response = self.materialize(key.clone(), &record, &meta, age)?;
+                let response = self.materialize(key.clone(), &record, &meta, age, &want)?;
                 self.index.touch(&key, now)?;
                 self.index.bump(counters::HITS, 1)?;
+                if want.range.is_some() {
+                    self.index.bump(counters::RANGE_HITS, 1)?;
+                }
                 self.index
                     .bump(counters::BYTES_FROM_CACHE, response.body.len() as u64)?;
                 Ok(Lookup::Fresh(Box::new(response)))
@@ -198,9 +261,12 @@ impl Cache {
                 reason,
                 ..
             } => {
-                let response = self.materialize(key.clone(), &record, &meta, age)?;
+                let response = self.materialize(key.clone(), &record, &meta, age, &want)?;
                 self.index.touch(&key, now)?;
                 self.index.bump(counters::STALE_HITS, 1)?;
+                if want.range.is_some() {
+                    self.index.bump(counters::RANGE_HITS, 1)?;
+                }
                 self.index
                     .bump(counters::BYTES_FROM_CACHE, response.body.len() as u64)?;
                 Ok(Lookup::Stale {
@@ -219,7 +285,13 @@ impl Cache {
                     self.index.bump(counters::MISSES, 1)?;
                     return Ok(Lookup::Miss("stale with no validator"));
                 }
-                let response = self.materialize(key.clone(), &record, &meta, age)?;
+                // A stale partial has no whole body to serve if revalidation
+                // succeeds and nothing to fall back on if it does not. Refetch.
+                if !record.body.is_complete() {
+                    self.index.bump(counters::MISSES, 1)?;
+                    return Ok(Lookup::Miss("a stale partial entry is refetched, not revalidated"));
+                }
+                let response = self.materialize(key.clone(), &record, &meta, age, &want)?;
                 self.index.bump(counters::REVALIDATIONS, 1)?;
                 Ok(Lookup::Revalidate {
                     conditional: policy::conditional_headers(&meta),
@@ -233,6 +305,66 @@ impl Cache {
                 Ok(Lookup::Miss(reason))
             }
         }
+    }
+
+    /// What this request wants out of the stored entry.
+    fn wanted_bytes(
+        &self,
+        request_headers: &HeaderMap,
+        record: &EntryRecord,
+        meta: &StoredMeta,
+    ) -> Wanted {
+        // Whether the whole representation is servable from what we hold.
+        let whole = || {
+            if record.body.is_complete() {
+                Wanted::Whole
+            } else {
+                Wanted::Unusable("only part of the body is stored")
+            }
+        };
+
+        let Some(raw) = request_headers
+            .get(http::header::RANGE)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return whole();
+        };
+
+        // `If-Range` asks for the range only if the representation is unchanged.
+        // If it does not match what we hold, the client wants the whole thing
+        // from the origin rather than our copy of an older one.
+        if let Some(condition) = request_headers
+            .get(http::header::IF_RANGE)
+            .and_then(|v| v.to_str().ok())
+        {
+            if !range::if_range_matches(condition, &meta.headers) {
+                return Wanted::Unusable("if-range does not match the stored validator");
+            }
+        }
+
+        // RFC 9110 §14.2: an unparsable Range is ignored, not an error.
+        let Some(specs) = range::parse_range(raw) else {
+            return whole();
+        };
+        if specs.len() > 1 {
+            // A multipart answer has to be assembled and framed; the origin does
+            // that correctly and we pass it through rather than approximate it.
+            return Wanted::Unusable("multipart ranges are not served from the store");
+        }
+
+        let Some(complete_len) = record.body.complete_len() else {
+            return Wanted::Unusable("the length of the whole body is not known");
+        };
+        // Unsatisfiable: ignore the range and serve the representation.
+        let Some(resolved) = range::resolve(specs[0], complete_len) else {
+            return whole();
+        };
+
+        let (start, end) = resolved.half_open();
+        if !record.body.coverage().covers(start, end) {
+            return Wanted::Unusable("the requested range is not stored");
+        }
+        Wanted::Range(resolved)
     }
 
     /// Find the stored variant whose selecting headers match this request.
@@ -255,14 +387,68 @@ impl Cache {
         Ok(None)
     }
 
+    /// Read `[start, end)` out of an entry, whether it is stored whole or in
+    /// runs. The caller has already established that the entry covers it.
+    fn read_span(&self, record: &EntryRecord, start: u64, end: u64) -> Result<Vec<u8>> {
+        match &record.body {
+            StoredBody::Complete { content, .. } => {
+                let body = self.blobs.get(ContentId(*content))?;
+                let to = (end as usize).min(body.len());
+                let from = (start as usize).min(to);
+                Ok(body[from..to].to_vec())
+            }
+            StoredBody::Partial { segments, .. } => {
+                let mut out = Vec::with_capacity((end - start) as usize);
+                let mut cursor = start;
+                for segment in segments {
+                    if segment.end <= cursor {
+                        continue;
+                    }
+                    if segment.start > cursor || segment.start >= end {
+                        break;
+                    }
+                    let bytes = self.blobs.get(segment.content_id())?;
+                    let stop = end.min(segment.end);
+                    let from = (cursor - segment.start) as usize;
+                    let to = ((stop - segment.start) as usize).min(bytes.len());
+                    out.extend_from_slice(&bytes[from.min(to)..to]);
+                    cursor = stop;
+                    if cursor >= end {
+                        break;
+                    }
+                }
+                if cursor < end {
+                    return Err(CacheError::MissingBlob(format!(
+                        "bytes {start}..{end} of {}",
+                        record.url
+                    )));
+                }
+                Ok(out)
+            }
+        }
+    }
+
     fn materialize(
         &self,
         key: String,
         record: &EntryRecord,
         meta: &StoredMeta,
         age: u64,
+        want: &Want,
     ) -> Result<StoredResponse> {
-        let body = self.blobs.get(record.content_id())?;
+        let body = match (want.omit_body, want.range) {
+            // A HEAD gets the headers and nothing else, by definition.
+            (true, _) => Vec::new(),
+            (false, Some(resolved)) => {
+                let (start, end) = resolved.half_open();
+                self.read_span(record, start, end)?
+            }
+            (false, None) => {
+                let len = record.body.complete_len().unwrap_or(0);
+                self.read_span(record, 0, len)?
+            }
+        };
+
         let mut headers = meta.headers.clone();
         // A qualified `no-cache="field"` means that field may not be reused.
         for field in policy::suppressed_fields(meta) {
@@ -274,15 +460,31 @@ impl Cache {
         if let Ok(value) = age.to_string().parse() {
             headers.insert(http::header::AGE, value);
         }
+
+        let status = match want.range {
+            Some(resolved) => {
+                if let Ok(value) = resolved.content_range().parse() {
+                    headers.insert(http::header::CONTENT_RANGE, value);
+                }
+                if let Ok(value) = resolved.len().to_string().parse() {
+                    headers.insert(http::header::CONTENT_LENGTH, value);
+                }
+                206
+            }
+            None => record.status,
+        };
+
         Ok(StoredResponse {
             key,
-            status: record.status,
+            status,
             headers,
             body,
             content: record.content_id(),
             provenance: record.provenance,
             age,
             meta: meta.clone(),
+            range: want.range,
+            body_omitted: want.omit_body,
         })
     }
 
@@ -379,6 +581,21 @@ impl Cache {
 
         let fields = vary::vary_fields(response_headers);
         let vkey = vary::vary_key(&fields, request_headers);
+
+        if status == 206 {
+            return self.store_partial(
+                method,
+                &url,
+                response_headers,
+                body,
+                request_time,
+                response_time,
+                provenance,
+                fields,
+                vkey,
+            );
+        }
+
         let receipt = self.blobs.put(body)?;
         if !receipt.newly_written {
             self.index.bump(counters::BYTES_DEDUPED, receipt.len)?;
@@ -386,14 +603,16 @@ impl Cache {
 
         let now = self.now();
         let record = EntryRecord {
-            url,
+            url: url.clone(),
             method: method.to_ascii_uppercase(),
             status,
             headers: sanitize(response_headers),
             vary_fields: fields,
             vary_key: vkey,
-            content: receipt.id.0,
-            body_len: receipt.len,
+            body: StoredBody::Complete {
+                content: receipt.id.0,
+                len: receipt.len,
+            },
             request_time,
             response_time,
             stored_at: now,
@@ -408,14 +627,241 @@ impl Cache {
             refcount: 0,
             created: now,
         };
-        self.index.put_entry(&record, blob)?;
+        let orphaned = self.index.put_entry(&record, &[(receipt.id, blob)])?;
+        self.drop_blobs(&orphaned)?;
         self.index.index_sri(&sri_digests(body, receipt.id))?;
         self.index.bump(counters::STORES, 1)?;
+
+        // RFC 9111 §4.3.5: a HEAD response says something about the stored GET,
+        // and the point of storing it is to act on that rather than to sit
+        // beside a GET it may have just contradicted.
+        if method.eq_ignore_ascii_case("HEAD") {
+            self.reconcile_head(&url, request_headers, response_headers)?;
+        }
+
+        self.enforce_budget()?;
 
         Ok(StoreOutcome::Stored {
             content: receipt.id,
             deduped: !receipt.newly_written,
         })
+    }
+
+    /// A 206, folded into whatever partial representation is already stored.
+    ///
+    /// The rule that keeps this honest is RFC 9111 §3.3: ranges may only be
+    /// combined when a strong validator says they come from the same
+    /// representation. Without one, the new range replaces what was there rather
+    /// than being stitched onto bytes that may be from a different file.
+    #[allow(clippy::too_many_arguments)]
+    fn store_partial(
+        &self,
+        method: &str,
+        url: &str,
+        response_headers: &HeaderMap,
+        body: &[u8],
+        request_time: u64,
+        response_time: u64,
+        provenance: Provenance,
+        fields: Vec<String>,
+        vkey: String,
+    ) -> Result<StoreOutcome> {
+        if !method.eq_ignore_ascii_case("GET") {
+            self.index.bump(counters::REJECTS, 1)?;
+            return Ok(StoreOutcome::NotStored("only a GET is stored as partial content"));
+        }
+        if range::is_multipart(response_headers) {
+            self.index.bump(counters::REJECTS, 1)?;
+            return Ok(StoreOutcome::NotStored("multipart ranges are passed through"));
+        }
+        let parsed = response_headers
+            .get(http::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(range::parse_content_range);
+        let Some(content_range) = parsed else {
+            self.index.bump(counters::REJECTS, 1)?;
+            return Ok(StoreOutcome::NotStored("206 without a usable Content-Range"));
+        };
+        if content_range.len() != body.len() as u64 {
+            self.index.bump(counters::REJECTS, 1)?;
+            return Ok(StoreOutcome::NotStored("206 body does not match its Content-Range"));
+        }
+
+        let key = entry_key("GET", url, &vkey);
+        let existing = self.index.get_entry(&key)?;
+
+        // Is what we already hold the same representation as this range?
+        let combinable = match &existing {
+            Some(record) => {
+                same_representation(&to_header_map(&record.headers), response_headers)
+            }
+            None => false,
+        };
+        if existing.is_some() && !combinable {
+            let orphaned = self.index.remove_entry(&key)?;
+            self.drop_blobs(&orphaned)?;
+        }
+        let existing = if combinable { existing } else { None };
+
+        if let Some(record) = &existing {
+            if record.body.is_complete() {
+                return Ok(StoreOutcome::NotStored("the whole body is already stored"));
+            }
+        }
+
+        let mut segments: Vec<Segment> = match existing.as_ref().map(|r| &r.body) {
+            Some(StoredBody::Partial { segments, .. }) => segments.clone(),
+            _ => Vec::new(),
+        };
+        let complete_len = content_range
+            .complete_len
+            .or_else(|| existing.as_ref().and_then(|r| r.body.complete_len()));
+
+        // Only the bytes we do not already hold get written. That is what makes
+        // a re-fetched range add to the entry rather than replace it.
+        let coverage = Coverage::from_sorted(segments.iter().map(|s| (s.start, s.end)).collect());
+        let (start, end) = content_range.half_open();
+        let mut new_blobs: Vec<(ContentId, BlobRecord)> = Vec::new();
+        let now = self.now();
+        for (from, to) in coverage.missing(start, end) {
+            let slice = &body[(from - start) as usize..(to - start) as usize];
+            let receipt = self.blobs.put(slice)?;
+            if !receipt.newly_written {
+                self.index.bump(counters::BYTES_DEDUPED, receipt.len)?;
+            }
+            segments.push(Segment {
+                start: from,
+                end: to,
+                content: receipt.id.0,
+            });
+            new_blobs.push((
+                receipt.id,
+                BlobRecord {
+                    len: receipt.len,
+                    stored_len: receipt.stored_len,
+                    compression: receipt.compression,
+                    refcount: 0,
+                    created: now,
+                },
+            ));
+        }
+        segments.sort_by_key(|s| s.start);
+
+        // The headers describe the whole representation, not this range of it.
+        let mut stored_headers = response_headers.clone();
+        stored_headers.remove(http::header::CONTENT_RANGE);
+        match complete_len {
+            Some(total) => {
+                if let Ok(value) = total.to_string().parse() {
+                    stored_headers.insert(http::header::CONTENT_LENGTH, value);
+                }
+            }
+            None => {
+                stored_headers.remove(http::header::CONTENT_LENGTH);
+            }
+        }
+
+        let mut record = EntryRecord {
+            url: url.to_string(),
+            method: "GET".to_string(),
+            // A stored partial is a stored *representation*; the 206 status
+            // belongs to the exchange, and we synthesise it again on serve.
+            status: 200,
+            headers: sanitize(&stored_headers),
+            vary_fields: fields,
+            vary_key: vkey,
+            body: StoredBody::Partial {
+                complete_len,
+                segments: segments.clone(),
+            },
+            request_time,
+            response_time,
+            stored_at: existing.as_ref().map(|r| r.stored_at).unwrap_or(now),
+            last_used: now,
+            hits: existing.as_ref().map(|r| r.hits).unwrap_or(0),
+            provenance,
+        };
+
+        // The runs met: the entry becomes an ordinary complete one, and the
+        // segment blobs fall away with their last reference.
+        let mut completed: Option<ContentId> = None;
+        if let Some(total) = complete_len {
+            let filled = Coverage::from_sorted(segments.iter().map(|s| (s.start, s.end)).collect());
+            if filled.covers(0, total) {
+                let whole = self.read_span(&record, 0, total)?;
+                let receipt = self.blobs.put(&whole)?;
+                record.body = StoredBody::Complete {
+                    content: receipt.id.0,
+                    len: receipt.len,
+                };
+                new_blobs.push((
+                    receipt.id,
+                    BlobRecord {
+                        len: receipt.len,
+                        stored_len: receipt.stored_len,
+                        compression: receipt.compression,
+                        refcount: 0,
+                        created: now,
+                    },
+                ));
+                self.index.index_sri(&sri_digests(&whole, receipt.id))?;
+                completed = Some(receipt.id);
+            }
+        }
+
+        let orphaned = self.index.put_entry(&record, &new_blobs)?;
+        self.drop_blobs(&orphaned)?;
+        self.index.bump(counters::STORES, 1)?;
+        if completed.is_none() {
+            self.index.bump(counters::PARTIAL_STORES, 1)?;
+        }
+        self.enforce_budget()?;
+
+        match completed {
+            Some(content) => Ok(StoreOutcome::Stored {
+                content,
+                deduped: false,
+            }),
+            None => Ok(StoreOutcome::StoredPartial {
+                held: record.body.held_len(),
+                complete_len,
+            }),
+        }
+    }
+
+    /// RFC 9111 §4.3.5. A HEAD's headers are the same headers a GET would carry,
+    /// so they either refresh the stored GET or prove it is out of date.
+    fn reconcile_head(
+        &self,
+        url: &str,
+        request_headers: &HeaderMap,
+        head_headers: &HeaderMap,
+    ) -> Result<()> {
+        let Some((key, mut record)) = self.select_variant("GET", url, request_headers)? else {
+            return Ok(());
+        };
+        let mut stored = to_header_map(&record.headers);
+
+        if !same_representation(&stored, head_headers) {
+            let orphaned = self.index.remove_entry(&key)?;
+            self.drop_blobs(&orphaned)?;
+            tracing::debug!(url, "a HEAD contradicted the stored GET; invalidated it");
+            return Ok(());
+        }
+
+        policy::apply_304(&mut stored, head_headers);
+        record.headers = sanitize(&stored);
+        self.index.refresh_entry(&record)?;
+        Ok(())
+    }
+
+    /// Delete blobs whose last reference has gone, and forget their records.
+    fn drop_blobs(&self, orphaned: &[ContentId]) -> Result<()> {
+        for id in orphaned {
+            self.blobs.remove(*id)?;
+            self.index.forget_blob(*id)?;
+        }
+        Ok(())
     }
 
     /// Fold a 304 into the stored entry so it becomes fresh again.
@@ -444,7 +890,11 @@ impl Cache {
             response_time,
         };
         let age = policy::current_age(&meta, self.now());
-        let response = self.materialize(key.to_string(), &record, &meta, age)?;
+        let want = Want {
+            range: None,
+            omit_body: false,
+        };
+        let response = self.materialize(key.to_string(), &record, &meta, age, &want)?;
         self.index
             .bump(counters::BYTES_FROM_CACHE, response.body.len() as u64)?;
         self.index.bump(counters::HITS, 1)?;
@@ -484,32 +934,79 @@ impl Cache {
         let url = Self::normalize_url(url);
         let mut removed = 0;
         for m in ["GET", "HEAD"] {
-            for orphan in self.index.invalidate(m, &url)? {
-                self.blobs.remove(orphan)?;
-                self.index.forget_blob(orphan)?;
-                removed += 1;
-            }
+            let orphaned = self.index.invalidate(m, &url)?;
+            removed += orphaned.len();
+            self.drop_blobs(&orphaned)?;
         }
         Ok(removed)
     }
 
     pub fn purge(&self, method: &str, url: &str) -> Result<()> {
         let url = Self::normalize_url(url);
-        for orphan in self.index.invalidate(method, &url)? {
-            self.blobs.remove(orphan)?;
-            self.index.forget_blob(orphan)?;
-        }
-        Ok(())
+        let orphaned = self.index.invalidate(method, &url)?;
+        self.drop_blobs(&orphaned)
     }
 
-    /// Delete blobs nothing points at any more.
+    /// Delete blobs nothing points at any more, and the integrity rows that
+    /// pointed at them.
+    ///
+    /// This is garbage collection, not eviction: it only removes what is already
+    /// unreferenced. Keeping the cache inside its budget is [`enforce_budget`],
+    /// which runs on every store.
+    ///
+    /// [`enforce_budget`]: Cache::enforce_budget
     pub fn collect_garbage(&self) -> Result<usize> {
         let orphans = self.index.orphaned_blobs()?;
         for id in &orphans {
             self.blobs.remove(*id)?;
             self.index.forget_blob(*id)?;
         }
+        let pruned = self.index.prune_sri()?;
+        if pruned > 0 {
+            tracing::debug!(pruned, "dropped integrity rows whose body is gone");
+        }
         Ok(orphans.len())
+    }
+
+    /// Bring the store back under its size budget by dropping entries.
+    ///
+    /// Entries, never blobs: two URLs that share a body each hold a reference to
+    /// it, and deleting the blob under one would take the other's storage with
+    /// it. So an entry is dropped, its references are released, and only a blob
+    /// whose last reference has gone is actually deleted — which is also why the
+    /// running total is only reduced when that happens.
+    pub fn enforce_budget(&self) -> Result<usize> {
+        let Some(capacity) = self.options.capacity_bytes else {
+            return Ok(0);
+        };
+        let (_, _, mut on_disk, _) = self.index.blob_totals()?;
+        if on_disk <= capacity {
+            return Ok(0);
+        }
+        let target = (capacity as f64 * self.options.evict_to_fraction.clamp(0.1, 1.0)) as u64;
+
+        let mut candidates = self.index.all_entries()?;
+        order_for_eviction(&mut candidates, self.options.eviction);
+
+        let mut evicted = 0;
+        for (key, _) in candidates {
+            if on_disk <= target {
+                break;
+            }
+            for id in self.index.remove_entry(&key)? {
+                if let Some(blob) = self.index.get_blob(id)? {
+                    on_disk = on_disk.saturating_sub(blob.stored_len);
+                }
+                self.blobs.remove(id)?;
+                self.index.forget_blob(id)?;
+            }
+            evicted += 1;
+        }
+        if evicted > 0 {
+            self.index.bump(counters::EVICTIONS, evicted as u64)?;
+            tracing::debug!(evicted, on_disk, capacity, "evicted to stay inside the budget");
+        }
+        Ok(evicted)
     }
 
     pub fn stats(&self) -> Result<Stats> {
@@ -522,6 +1019,7 @@ impl Cache {
             logical_bytes,
             ..Default::default()
         };
+        stats.sri_rows = self.index.sri_row_count()?;
         for (name, value) in self.index.counters()? {
             stats.apply_counter(&name, value);
         }
@@ -587,6 +1085,47 @@ fn sri_digests(body: &[u8], content: ContentId) -> Vec<(Vec<u8>, [u8; 32])> {
         .into_iter()
         .map(|algorithm| (sri_key(algorithm, &algorithm.digest(body)), content.0))
         .collect()
+}
+
+/// Whether two sets of headers describe the same representation.
+///
+/// Combining ranges from different representations produces a body that never
+/// existed, under a hash that says it did. RFC 9111 §3.3 wants a strong
+/// validator before that is allowed, so a weak `ETag`, a mismatch, or no
+/// validator at all all mean "not the same".
+fn same_representation(stored: &HeaderMap, fresh: &HeaderMap) -> bool {
+    let etag = |h: &HeaderMap| {
+        h.get(http::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.starts_with("W/"))
+    };
+    if let (Some(a), Some(b)) = (etag(stored), etag(fresh)) {
+        return a == b;
+    }
+    match (
+        crate::headers::header_date(stored, http::header::LAST_MODIFIED),
+        crate::headers::header_date(fresh, http::header::LAST_MODIFIED),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Sort entries worst-first for eviction, by the configured policy.
+fn order_for_eviction(entries: &mut [(String, EntryRecord)], policy: crate::policy::Eviction) {
+    use crate::policy::Eviction;
+    match policy {
+        Eviction::LeastRecentlyUsed => entries.sort_by_key(|(_, r)| r.last_used),
+        Eviction::LeastFrequentlyUsed => entries.sort_by_key(|(_, r)| (r.hits, r.last_used)),
+        Eviction::Cost => entries.sort_by(|(_, a), (_, b)| {
+            let value = |r: &EntryRecord| (r.hits + 1) as f64 / r.body.held_len().max(1) as f64;
+            value(a)
+                .partial_cmp(&value(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.last_used.cmp(&b.last_used))
+        }),
+    }
 }
 
 #[cfg(test)]

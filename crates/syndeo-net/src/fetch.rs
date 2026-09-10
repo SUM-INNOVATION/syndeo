@@ -263,7 +263,7 @@ impl Net {
                 stored.headers.clone(),
                 Bytes::from(stored.body.clone()),
                 Source::Cache,
-                Some(stored.content),
+                stored.content,
                 started,
             )),
 
@@ -280,7 +280,7 @@ impl Net {
                     response.headers.clone(),
                     Bytes::from(response.body.clone()),
                     Source::CacheStale,
-                    Some(response.content),
+                    response.content,
                     started,
                 ))
             }
@@ -301,7 +301,7 @@ impl Net {
                                 refreshed.headers.clone(),
                                 Bytes::from(refreshed.body.clone()),
                                 Source::Revalidated,
-                                Some(refreshed.content),
+                                refreshed.content,
                                 started,
                             )),
                             None => Ok(self.finish(
@@ -309,7 +309,7 @@ impl Net {
                                 response.headers.clone(),
                                 Bytes::from(response.body.clone()),
                                 Source::CacheStale,
-                                Some(response.content),
+                                response.content,
                                 started,
                             )),
                         }
@@ -328,7 +328,7 @@ impl Net {
                                 response.headers.clone(),
                                 Bytes::from(response.body.clone()),
                                 Source::StaleOnError,
-                                Some(response.content),
+                                response.content,
                                 started,
                             ))
                         } else {
@@ -370,6 +370,12 @@ impl Net {
             now,
         ) {
             Ok(StoreOutcome::Stored { content, .. }) => Some(content),
+            // A range landed in the store but the body is still incomplete, so
+            // there is no whole-body address to report yet.
+            Ok(StoreOutcome::StoredPartial { held, complete_len }) => {
+                tracing::debug!(url = %request.url, held, ?complete_len, "stored a partial body");
+                None
+            }
             Ok(StoreOutcome::NotStored(reason)) => {
                 tracing::debug!(url = %request.url, reason, "not cached");
                 None

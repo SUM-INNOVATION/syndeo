@@ -500,16 +500,482 @@ fn s4_4_unsafe_methods_invalidate_the_target() {
 // ------------------------------------------------- pass-through, not mishandled
 
 #[test]
-fn range_and_client_conditionals_are_passed_through() {
+fn client_conditionals_are_passed_through() {
     let meta = stored(200, &[("cache-control", "max-age=600")], 10);
-    assert!(matches!(
-        eval(&[("range", "bytes=0-99")], &meta, &private()),
-        Freshness::Unusable(_)
-    ));
     assert!(matches!(
         eval(&[("if-none-match", "\"v1\"")], &meta, &private()),
         Freshness::Unusable(_)
     ));
+    assert!(matches!(
+        eval(&[("if-modified-since", &date(NOW - 100))], &meta, &private()),
+        Freshness::Unusable(_)
+    ));
+}
+
+#[test]
+fn a_range_is_not_the_policy_layers_business() {
+    // Resolving a range needs the stored length, which this layer does not have.
+    // It answers "is the representation usable"; `Cache::lookup` answers "which
+    // bytes of it", and a range it cannot satisfy becomes a miss there.
+    let meta = stored(200, &[("cache-control", "max-age=600")], 10);
+    assert!(is_fresh(&eval(&[("range", "bytes=0-99")], &meta, &private())));
+    assert!(is_fresh(&eval(
+        &[("range", "bytes=0-99"), ("if-range", "\"v1\"")],
+        &meta,
+        &private()
+    )));
+}
+
+// --------------------------------------------------------------- §4 HEAD and GET
+
+/// A body long enough that a range of it is obviously not the whole thing.
+fn ranged_body() -> Vec<u8> {
+    (0..1000u32).map(|i| (i % 251) as u8).collect()
+}
+
+fn store_whole(cache: &Cache, url: &str, body: &[u8], extra: &[(&str, &str)]) {
+    let mut pairs = vec![
+        ("cache-control", "max-age=600"),
+        ("etag", "\"v1\""),
+    ];
+    pairs.extend_from_slice(extra);
+    let owned = date(NOW);
+    pairs.push(("date", owned.as_str()));
+    let len = body.len().to_string();
+    pairs.push(("content-length", len.as_str()));
+    let resp = headers(&pairs);
+    cache
+        .store("GET", url, &HeaderMap::new(), 200, &resp, body, NOW, NOW)
+        .unwrap();
+}
+
+#[test]
+fn s4_a_head_is_answered_from_the_stored_get_with_no_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/doc";
+    let body = ranged_body();
+    store_whole(&cache, url, &body, &[("content-type", "application/pdf")]);
+
+    match cache.lookup("HEAD", url, &HeaderMap::new()).unwrap() {
+        Lookup::Fresh(response) => {
+            assert_eq!(response.status, 200);
+            assert!(response.body.is_empty(), "a HEAD carries no body");
+            assert!(response.body_omitted);
+            assert_eq!(response.headers["content-length"], "1000");
+            assert_eq!(response.headers["content-type"], "application/pdf");
+        }
+        other => panic!("expected the stored GET to answer the HEAD, got {other:?}"),
+    }
+
+    // The reverse is not true: a GET is never answered from a HEAD.
+    let other = "https://example.test/head-only";
+    let resp = headers(&[
+        ("cache-control", "max-age=600"),
+        ("etag", "\"h1\""),
+        ("content-length", "1000"),
+        ("date", &date(NOW)),
+    ]);
+    cache
+        .store("HEAD", other, &HeaderMap::new(), 200, &resp, b"", NOW, NOW)
+        .unwrap();
+    assert!(matches!(
+        cache.lookup("HEAD", other, &HeaderMap::new()).unwrap(),
+        Lookup::Fresh(_)
+    ));
+    assert!(matches!(
+        cache.lookup("GET", other, &HeaderMap::new()).unwrap(),
+        Lookup::Miss(_)
+    ));
+}
+
+#[test]
+fn s4_3_5_a_head_refreshes_the_stored_get_or_invalidates_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/thing";
+    let body = ranged_body();
+    store_whole(&cache, url, &body, &[("x-origin", "old")]);
+
+    // Same validator: the HEAD's headers update the stored GET.
+    let head = headers(&[
+        ("cache-control", "max-age=600"),
+        ("etag", "\"v1\""),
+        ("content-length", "1000"),
+        ("x-origin", "new"),
+        ("date", &date(NOW)),
+    ]);
+    cache
+        .store("HEAD", url, &HeaderMap::new(), 200, &head, b"", NOW, NOW)
+        .unwrap();
+    match cache.lookup("GET", url, &HeaderMap::new()).unwrap() {
+        Lookup::Fresh(response) => {
+            assert_eq!(response.headers["x-origin"], "new");
+            assert_eq!(response.body, body, "the body is untouched");
+        }
+        other => panic!("expected the GET to survive the HEAD, got {other:?}"),
+    }
+
+    // A different validator says the representation changed: the GET goes.
+    let moved = headers(&[
+        ("cache-control", "max-age=600"),
+        ("etag", "\"v2\""),
+        ("content-length", "2000"),
+        ("date", &date(NOW)),
+    ]);
+    cache
+        .store("HEAD", url, &HeaderMap::new(), 200, &moved, b"", NOW, NOW)
+        .unwrap();
+    assert!(
+        matches!(cache.lookup("GET", url, &HeaderMap::new()).unwrap(), Lookup::Miss(_)),
+        "a HEAD that contradicts the stored GET invalidates it"
+    );
+}
+
+// ------------------------------------------------------------- §3.3, §14 ranges
+
+#[test]
+fn s14_a_stored_body_answers_a_range_without_touching_the_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/video.mp4";
+    let body = ranged_body();
+    store_whole(&cache, url, &body, &[]);
+
+    let request = headers(&[("range", "bytes=100-199")]);
+    match cache.lookup("GET", url, &request).unwrap() {
+        Lookup::Fresh(response) => {
+            assert_eq!(response.status, 206);
+            assert_eq!(response.body, body[100..=199]);
+            assert_eq!(response.headers["content-range"], "bytes 100-199/1000");
+            assert_eq!(response.headers["content-length"], "100");
+        }
+        other => panic!("expected a range out of the store, got {other:?}"),
+    }
+
+    // A suffix range, and one that runs past the end, both resolve.
+    let request = headers(&[("range", "bytes=-10")]);
+    match cache.lookup("GET", url, &request).unwrap() {
+        Lookup::Fresh(response) => {
+            assert_eq!(response.body, body[990..]);
+            assert_eq!(response.headers["content-range"], "bytes 990-999/1000");
+        }
+        other => panic!("expected a suffix range, got {other:?}"),
+    }
+
+    // Multipart is passed through rather than approximated.
+    let request = headers(&[("range", "bytes=0-9, 20-29")]);
+    assert!(matches!(
+        cache.lookup("GET", url, &request).unwrap(),
+        Lookup::Miss(_)
+    ));
+
+    // An unsatisfiable range is ignored, and the whole body is served.
+    let request = headers(&[("range", "bytes=5000-6000")]);
+    match cache.lookup("GET", url, &request).unwrap() {
+        Lookup::Fresh(response) => {
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, body);
+        }
+        other => panic!("expected the whole body, got {other:?}"),
+    }
+}
+
+#[test]
+fn s13_1_5_if_range_is_checked_against_the_stored_validator() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/big.iso";
+    let body = ranged_body();
+    store_whole(&cache, url, &body, &[]);
+
+    let matching = headers(&[("range", "bytes=0-9"), ("if-range", "\"v1\"")]);
+    match cache.lookup("GET", url, &matching).unwrap() {
+        Lookup::Fresh(response) => assert_eq!(response.status, 206),
+        other => panic!("expected the range to be served, got {other:?}"),
+    }
+
+    // The client holds a piece of a different representation: our copy is no
+    // use to it, so it goes to the origin for the whole thing.
+    let stale = headers(&[("range", "bytes=0-9"), ("if-range", "\"v0\"")]);
+    assert!(matches!(
+        cache.lookup("GET", url, &stale).unwrap(),
+        Lookup::Miss(_)
+    ));
+
+    // A weak tag may not be used for If-Range at all.
+    let weak = headers(&[("range", "bytes=0-9"), ("if-range", "W/\"v1\"")]);
+    assert!(matches!(
+        cache.lookup("GET", url, &weak).unwrap(),
+        Lookup::Miss(_)
+    ));
+}
+
+#[test]
+fn s3_3_partial_responses_are_stored_and_combined_rather_than_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/download.bin";
+    let body = ranged_body();
+
+    let partial = |first: usize, last: usize| {
+        headers(&[
+            ("cache-control", "max-age=600"),
+            ("etag", "\"v1\""),
+            ("content-range", &format!("bytes {first}-{last}/1000")),
+            ("date", &date(NOW)),
+        ])
+    };
+
+    // First half.
+    let outcome = cache
+        .store("GET", url, &HeaderMap::new(), 206, &partial(0, 499), &body[0..500], NOW, NOW)
+        .unwrap();
+    assert!(
+        matches!(outcome, StoreOutcome::StoredPartial { held: 500, complete_len: Some(1000) }),
+        "got {outcome:?}"
+    );
+
+    // A range inside what we hold is servable already.
+    let request = headers(&[("range", "bytes=10-19")]);
+    match cache.lookup("GET", url, &request).unwrap() {
+        Lookup::Fresh(response) => {
+            assert_eq!(response.status, 206);
+            assert_eq!(response.body, body[10..=19]);
+        }
+        other => panic!("expected the held range, got {other:?}"),
+    }
+
+    // One that is not is a miss, not a wrong answer.
+    let beyond = headers(&[("range", "bytes=600-699")]);
+    assert!(matches!(
+        cache.lookup("GET", url, &beyond).unwrap(),
+        Lookup::Miss(_)
+    ));
+    // And neither is the whole body, which we do not have.
+    assert!(matches!(
+        cache.lookup("GET", url, &HeaderMap::new()).unwrap(),
+        Lookup::Miss(_)
+    ));
+
+    // An overlapping range adds only what is new, and does not replace.
+    let outcome = cache
+        .store("GET", url, &HeaderMap::new(), 206, &partial(400, 799), &body[400..800], NOW, NOW)
+        .unwrap();
+    assert!(
+        matches!(outcome, StoreOutcome::StoredPartial { held: 800, .. }),
+        "got {outcome:?}"
+    );
+    let spanning = headers(&[("range", "bytes=450-550")]);
+    match cache.lookup("GET", url, &spanning).unwrap() {
+        Lookup::Fresh(response) => assert_eq!(response.body, body[450..=550]),
+        other => panic!("expected a range spanning two stored runs, got {other:?}"),
+    }
+
+    // The last gap closes and the entry becomes an ordinary complete one.
+    let outcome = cache
+        .store("GET", url, &HeaderMap::new(), 206, &partial(800, 999), &body[800..1000], NOW, NOW)
+        .unwrap();
+    assert!(matches!(outcome, StoreOutcome::Stored { .. }), "got {outcome:?}");
+    match cache.lookup("GET", url, &HeaderMap::new()).unwrap() {
+        Lookup::Fresh(response) => {
+            assert_eq!(response.status, 200);
+            assert_eq!(response.body, body, "the runs reassemble into the original bytes");
+        }
+        other => panic!("expected a complete body, got {other:?}"),
+    }
+}
+
+#[test]
+fn s3_3_ranges_from_a_different_representation_are_not_stitched_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/changing.bin";
+    let first = vec![b'a'; 1000];
+    let second = vec![b'b'; 1000];
+
+    let partial = |etag: &str, f: usize, l: usize| {
+        headers(&[
+            ("cache-control", "max-age=600"),
+            ("etag", etag),
+            ("content-range", &format!("bytes {f}-{l}/1000")),
+            ("date", &date(NOW)),
+        ])
+    };
+
+    cache
+        .store("GET", url, &HeaderMap::new(), 206, &partial("\"v1\"", 0, 499), &first[0..500], NOW, NOW)
+        .unwrap();
+    // The file changed underneath us. Combining these would produce a body that
+    // never existed, under a hash claiming it did.
+    let outcome = cache
+        .store("GET", url, &HeaderMap::new(), 206, &partial("\"v2\"", 500, 999), &second[500..1000], NOW, NOW)
+        .unwrap();
+    assert!(
+        matches!(outcome, StoreOutcome::StoredPartial { held: 500, .. }),
+        "the older representation is dropped rather than merged: {outcome:?}"
+    );
+
+    let early = headers(&[("range", "bytes=0-9")]);
+    assert!(
+        matches!(cache.lookup("GET", url, &early).unwrap(), Lookup::Miss(_)),
+        "the bytes from the old representation are gone"
+    );
+    let late = headers(&[("range", "bytes=500-509")]);
+    match cache.lookup("GET", url, &late).unwrap() {
+        Lookup::Fresh(response) => assert_eq!(response.body, &second[500..=509]),
+        other => panic!("expected the new representation's range, got {other:?}"),
+    }
+}
+
+#[test]
+fn s3_3_multipart_ranges_are_passed_through_not_stored_as_one_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let multipart = headers(&[
+        ("cache-control", "max-age=600"),
+        ("etag", "\"v1\""),
+        ("content-type", "multipart/byteranges; boundary=SEP"),
+        ("content-range", "bytes 0-9/1000"),
+        ("date", &date(NOW)),
+    ]);
+    let outcome = cache
+        .store("GET", "https://example.test/m", &HeaderMap::new(), 206, &multipart, b"--SEP...", NOW, NOW)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        StoreOutcome::NotStored("multipart ranges are passed through")
+    );
+
+    // And a 206 that will not say which bytes it is, is not stored either.
+    let vague = headers(&[
+        ("cache-control", "max-age=600"),
+        ("etag", "\"v1\""),
+        ("date", &date(NOW)),
+    ]);
+    let outcome = cache
+        .store("GET", "https://example.test/v", &HeaderMap::new(), 206, &vague, b"0123456789", NOW, NOW)
+        .unwrap();
+    assert_eq!(
+        outcome,
+        StoreOutcome::NotStored("206 without a usable Content-Range")
+    );
+}
+
+// -------------------------------------------------------- eviction and garbage
+
+#[test]
+fn filling_past_the_budget_evicts_by_the_configured_policy() {
+    use syndeo_cache::{CacheOptions, Eviction};
+
+    let dir = tempfile::tempdir().unwrap();
+    let options = CacheOptions {
+        // Small enough that a handful of bodies passes it.
+        capacity_bytes: Some(40_000),
+        evict_to_fraction: 0.5,
+        eviction: Eviction::LeastRecentlyUsed,
+        ..CacheOptions::default()
+    };
+    let cache = Cache::with_options(dir.path(), options)
+        .unwrap()
+        .with_clock(Arc::new(|| NOW));
+
+    // Incompressible, so the on-disk size is the body size.
+    let body = |seed: u8| -> Vec<u8> {
+        let mut state = seed as u64 + 1;
+        (0..10_000)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect()
+    };
+
+    for i in 0..8u8 {
+        let url = format!("https://example.test/{i}");
+        let resp = headers(&[("cache-control", "max-age=600"), ("date", &date(NOW))]);
+        cache
+            .store("GET", &url, &HeaderMap::new(), 200, &resp, &body(i), NOW, NOW)
+            .unwrap();
+    }
+
+    let stats = cache.stats().unwrap();
+    assert!(stats.evictions > 0, "nothing was evicted");
+    assert!(
+        stats.on_disk_bytes <= 40_000,
+        "still over budget at {} bytes",
+        stats.on_disk_bytes
+    );
+    assert!(stats.entries < 8, "every entry survived a budget it exceeded");
+}
+
+#[test]
+fn a_shared_body_survives_until_its_last_referring_entry_is_evicted() {
+    use syndeo_cache::CacheOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache = Cache::with_options(
+        dir.path(),
+        CacheOptions {
+            capacity_bytes: None,
+            ..CacheOptions::default()
+        },
+    )
+    .unwrap()
+    .with_clock(Arc::new(|| NOW));
+
+    let body = vec![b'z'; 4096];
+    let id = syndeo_cache::ContentId::of(&body);
+    for name in ["a", "b", "c"] {
+        let resp = headers(&[("cache-control", "max-age=600"), ("date", &date(NOW))]);
+        cache
+            .store(
+                "GET",
+                &format!("https://example.test/{name}"),
+                &HeaderMap::new(),
+                200,
+                &resp,
+                &body,
+                NOW,
+                NOW,
+            )
+            .unwrap();
+    }
+
+    cache.purge("GET", "https://example.test/a").unwrap();
+    assert!(cache.has_content(id));
+    cache.purge("GET", "https://example.test/b").unwrap();
+    assert!(cache.has_content(id), "one entry still refers to it");
+    cache.purge("GET", "https://example.test/c").unwrap();
+    assert!(!cache.has_content(id), "the last reference has gone");
+}
+
+#[test]
+fn the_integrity_index_does_not_grow_across_store_purge_and_collect() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/asset.js";
+
+    let cycle = |n: usize| {
+        let resp = headers(&[("cache-control", "max-age=600"), ("date", &date(NOW))]);
+        let body = format!("console.log({n});");
+        cache
+            .store("GET", url, &HeaderMap::new(), 200, &resp, body.as_bytes(), NOW, NOW)
+            .unwrap();
+        cache.purge("GET", url).unwrap();
+        cache.collect_garbage().unwrap();
+    };
+
+    cycle(0);
+    let after_one = cache.stats().unwrap().sri_rows;
+    for n in 1..6 {
+        cycle(n);
+    }
+    assert_eq!(
+        cache.stats().unwrap().sri_rows,
+        after_one,
+        "integrity rows accumulated for bodies that are no longer stored"
+    );
 }
 
 // ------------------------------------------------------------- end-to-end store

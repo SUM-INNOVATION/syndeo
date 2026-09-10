@@ -13,6 +13,23 @@ pub const HEURISTICALLY_CACHEABLE: &[u16] = &[
     200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501,
 ];
 
+/// Which entry to drop first when the store is over its budget.
+///
+/// Eviction works on *entries*, never on blobs: two URLs sharing one body each
+/// hold a reference to it, and dropping the blob under either would take the
+/// other's storage with it. Blobs go when their last reference goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Eviction {
+    /// Oldest `last_used` first. The default: cheap, predictable, and hard to
+    /// argue with when a user asks why something was dropped.
+    LeastRecentlyUsed,
+    /// Fewest hits first, ties broken by `last_used`.
+    LeastFrequentlyUsed,
+    /// Lowest `(hits + 1) / bytes` first, ties broken by `last_used`: a large
+    /// body has to earn its space, a small one barely has to.
+    Cost,
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheOptions {
     /// A shared cache honours `s-maxage`, refuses `private`, and is strict about
@@ -24,6 +41,15 @@ pub struct CacheOptions {
     pub max_heuristic_lifetime: u64,
     /// Largest body we are willing to store, in bytes.
     pub max_body_bytes: u64,
+    /// Ceiling on what the blob store may occupy on disk. `None` means the cache
+    /// grows without limit, which is only ever right for a test or a
+    /// measurement run.
+    pub capacity_bytes: Option<u64>,
+    /// Which entry goes first when the ceiling is passed.
+    pub eviction: Eviction,
+    /// How far under the ceiling one eviction pass takes us. Evicting back to
+    /// exactly the ceiling would mean evicting again on the very next store.
+    pub evict_to_fraction: f64,
 }
 
 impl Default for CacheOptions {
@@ -33,6 +59,9 @@ impl Default for CacheOptions {
             heuristic_fraction: 0.1,
             max_heuristic_lifetime: 24 * 60 * 60,
             max_body_bytes: 256 * 1024 * 1024,
+            capacity_bytes: Some(2 * 1024 * 1024 * 1024),
+            eviction: Eviction::LeastRecentlyUsed,
+            evict_to_fraction: 0.9,
         }
     }
 }
@@ -201,8 +230,23 @@ pub fn storability(
         return Storability::Reject("Vary: *");
     }
 
-    if meta.status == 206 || meta.status == 304 {
-        return Storability::Reject("partial or conditional response");
+    // A 304 carries no representation of its own; it updates one we hold.
+    if meta.status == 304 {
+        return Storability::Reject("a conditional response is folded in, not stored");
+    }
+    // A 206 is storable, but only when it says which bytes it is. Everything
+    // that decides whether it can be *combined* with what we already hold is in
+    // `Cache::store_partial`, which is the only place that can see the entry.
+    if meta.status == 206 {
+        let usable = meta
+            .headers
+            .get(http::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::range::parse_content_range)
+            .is_some();
+        if !usable {
+            return Storability::Reject("206 without a usable Content-Range");
+        }
     }
 
     let (lifetime, heuristic) = freshness_lifetime(meta, opts);
@@ -223,21 +267,24 @@ pub fn storability(
 }
 
 /// Can this stored entry answer this request, and under what conditions?
+///
+/// This answers "is the stored representation usable", not "which bytes of it".
+/// A `Range` is deliberately not consulted: resolving one needs the stored
+/// length, which this layer does not have and should not learn. `Cache::lookup`
+/// decides that separately, and a range it cannot satisfy becomes a miss.
 pub fn evaluate(
     request_headers: &HeaderMap,
     meta: &StoredMeta,
     now: u64,
     opts: &CacheOptions,
 ) -> Freshness {
-    // We do not serve ranges or forward client conditionals out of the store.
-    if request_headers.contains_key(http::header::RANGE) {
-        return Freshness::Unusable("range request");
-    }
+    // A client running its own validation wants the origin's answer, not ours.
+    // `If-Range` is not in this set: it qualifies a range rather than replacing
+    // it, and the cache checks it against the stored validator itself.
     if request_headers.contains_key(http::header::IF_NONE_MATCH)
         || request_headers.contains_key(http::header::IF_MODIFIED_SINCE)
         || request_headers.contains_key(http::header::IF_MATCH)
         || request_headers.contains_key(http::header::IF_UNMODIFIED_SINCE)
-        || request_headers.contains_key(http::header::IF_RANGE)
     {
         return Freshness::Unusable("client-supplied conditional");
     }

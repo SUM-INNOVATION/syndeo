@@ -45,6 +45,104 @@ pub enum Provenance {
     Import,
 }
 
+/// One contiguous run of bytes from a partial response, held as its own blob.
+///
+/// `[start, end)`. Segments in an entry are kept sorted and non-overlapping, so
+/// the set of them is exactly the coverage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Segment {
+    pub start: u64,
+    pub end: u64,
+    pub content: [u8; 32],
+}
+
+impl Segment {
+    pub fn len(&self) -> u64 {
+        self.end - self.start
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+
+    pub fn content_id(&self) -> ContentId {
+        ContentId(self.content)
+    }
+}
+
+/// What an entry actually holds.
+///
+/// A cache that only ever stores whole bodies misses video, large PDFs and every
+/// resumed download entirely. A partial entry is the alternative: it names the
+/// runs it has, so a later range either falls inside them or is fetched and
+/// merged, and the entry becomes complete when the runs meet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoredBody {
+    Complete {
+        content: [u8; 32],
+        len: u64,
+    },
+    Partial {
+        /// The length of the whole representation, when the origin said. A 206
+        /// carrying `bytes 0-99/*` does not, and such an entry can never be
+        /// promoted to complete because nothing knows when it would be done.
+        complete_len: Option<u64>,
+        segments: Vec<Segment>,
+    },
+}
+
+impl StoredBody {
+    pub fn is_complete(&self) -> bool {
+        matches!(self, StoredBody::Complete { .. })
+    }
+
+    /// The single content address of a complete body.
+    pub fn complete_content(&self) -> Option<ContentId> {
+        match self {
+            StoredBody::Complete { content, .. } => Some(ContentId(*content)),
+            StoredBody::Partial { .. } => None,
+        }
+    }
+
+    /// Length of the whole representation, when it is known.
+    pub fn complete_len(&self) -> Option<u64> {
+        match self {
+            StoredBody::Complete { len, .. } => Some(*len),
+            StoredBody::Partial { complete_len, .. } => *complete_len,
+        }
+    }
+
+    /// Bytes actually held, which is the whole body for a complete entry and the
+    /// sum of the segments for a partial one.
+    pub fn held_len(&self) -> u64 {
+        match self {
+            StoredBody::Complete { len, .. } => *len,
+            StoredBody::Partial { segments, .. } => segments.iter().map(|s| s.len()).sum(),
+        }
+    }
+
+    /// Which byte runs this entry holds.
+    pub fn coverage(&self) -> crate::range::Coverage {
+        match self {
+            StoredBody::Complete { len, .. } => crate::range::Coverage::from_sorted(vec![(0, *len)]),
+            StoredBody::Partial { segments, .. } => {
+                crate::range::Coverage::from_sorted(segments.iter().map(|s| (s.start, s.end)).collect())
+            }
+        }
+    }
+
+    /// Every distinct blob this entry refers to.
+    pub fn contents(&self) -> Vec<[u8; 32]> {
+        let mut out = match self {
+            StoredBody::Complete { content, .. } => vec![*content],
+            StoredBody::Partial { segments, .. } => segments.iter().map(|s| s.content).collect(),
+        };
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntryRecord {
     pub url: String,
@@ -53,8 +151,7 @@ pub struct EntryRecord {
     pub headers: Vec<(String, String)>,
     pub vary_fields: Vec<String>,
     pub vary_key: String,
-    pub content: [u8; 32],
-    pub body_len: u64,
+    pub body: StoredBody,
     pub request_time: u64,
     pub response_time: u64,
     pub stored_at: u64,
@@ -64,8 +161,14 @@ pub struct EntryRecord {
 }
 
 impl EntryRecord {
-    pub fn content_id(&self) -> ContentId {
-        ContentId(self.content)
+    /// The content address of a complete body. A partial entry has none, which
+    /// is why this is an `Option` rather than a lie.
+    pub fn content_id(&self) -> Option<ContentId> {
+        self.body.complete_content()
+    }
+
+    pub fn contents(&self) -> Vec<[u8; 32]> {
+        self.body.contents()
     }
 }
 
@@ -153,11 +256,22 @@ impl Index {
     }
 
     /// Insert an entry, register it as a variant of its URL, and take a reference
-    /// on the blob it names. All in one transaction so the refcount cannot drift.
-    pub fn put_entry(&self, record: &EntryRecord, blob: BlobRecord) -> Result<()> {
+    /// on every blob it names. All in one transaction so refcounts cannot drift.
+    ///
+    /// `blobs` supplies the metadata for content addresses that are not already
+    /// in the blob table; addresses already there keep the record they have.
+    /// Returns the blobs whose last reference this write released, which happens
+    /// when an entry is replaced by one naming different bytes.
+    pub fn put_entry(
+        &self,
+        record: &EntryRecord,
+        new_blobs: &[(ContentId, BlobRecord)],
+    ) -> Result<Vec<ContentId>> {
         let key = entry_key(&record.method, &record.url, &record.vary_key);
         let pkey = primary_key(&record.method, &record.url);
         let encoded = bincode::serialize(record)?;
+        let wanted = record.contents();
+        let mut orphaned = Vec::new();
 
         let tx = self.db.begin_write()?;
         {
@@ -165,36 +279,49 @@ impl Index {
             let mut blobs = tx.open_table(BLOBS)?;
             let mut variants = tx.open_table(VARIANTS)?;
 
-            // Replacing an entry releases the reference it used to hold.
-            let previous: Option<EntryRecord> = match entries.get(key.as_str())? {
-                Some(bytes) => Some(bincode::deserialize(bytes.value())?),
-                None => None,
+            // Replacing an entry releases the references it used to hold, but
+            // only the ones the new entry does not hold too — a partial entry
+            // that grew a segment still refers to all its old ones.
+            let held: Vec<[u8; 32]> = match entries.get(key.as_str())? {
+                Some(bytes) => {
+                    let previous: EntryRecord = bincode::deserialize(bytes.value())?;
+                    previous.contents()
+                }
+                None => Vec::new(),
             };
-            if let Some(prev) = &previous {
-                if prev.content != record.content {
-                    release(&mut blobs, &prev.content)?;
+            for content in &held {
+                if !wanted.contains(content) && release(&mut blobs, content)? {
+                    orphaned.push(ContentId(*content));
                 }
             }
 
-            let existing: Option<BlobRecord> = match blobs.get(record.content.as_slice())? {
-                Some(bytes) => Some(bincode::deserialize(bytes.value())?),
-                None => None,
-            };
-            let updated = match existing {
-                Some(mut b) => {
-                    // Only count a new reference when this key did not already hold one.
-                    let already = previous.map(|p| p.content == record.content).unwrap_or(false);
-                    if !already {
-                        b.refcount = b.refcount.saturating_add(1);
-                    }
-                    b
+            for content in &wanted {
+                if held.contains(content) {
+                    continue;
                 }
-                None => BlobRecord {
-                    refcount: 1,
-                    ..blob
-                },
-            };
-            blobs.insert(record.content.as_slice(), bincode::serialize(&updated)?.as_slice())?;
+                let existing: Option<BlobRecord> = match blobs.get(content.as_slice())? {
+                    Some(bytes) => Some(bincode::deserialize(bytes.value())?),
+                    None => None,
+                };
+                let updated = match existing {
+                    Some(mut b) => {
+                        b.refcount = b.refcount.saturating_add(1);
+                        b
+                    }
+                    None => {
+                        let Some((_, blob)) = new_blobs.iter().find(|(id, _)| id.0 == *content)
+                        else {
+                            return Err(CacheError::MissingBlob(ContentId(*content).to_hex()));
+                        };
+                        BlobRecord {
+                            refcount: 1,
+                            ..blob.clone()
+                        }
+                    }
+                };
+                blobs.insert(content.as_slice(), bincode::serialize(&updated)?.as_slice())?;
+            }
+
             entries.insert(key.as_str(), encoded.as_slice())?;
 
             let mut keys: Vec<String> = match variants.get(pkey.as_str())? {
@@ -207,7 +334,7 @@ impl Index {
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(orphaned)
     }
 
     /// Overwrite an entry in place without touching refcounts — used after a 304
@@ -256,8 +383,10 @@ impl Index {
                     None => None,
                 };
                 if let Some(record) = removed {
-                    if release(&mut blobs, &record.content)? {
-                        orphaned.push(ContentId(record.content));
+                    for content in record.contents() {
+                        if release(&mut blobs, &content)? {
+                            orphaned.push(ContentId(content));
+                        }
                     }
                 }
             }
@@ -267,8 +396,9 @@ impl Index {
         Ok(orphaned)
     }
 
-    pub fn remove_entry(&self, key: &str) -> Result<Option<ContentId>> {
-        let mut orphan = None;
+    /// Drop one entry. Returns the blobs whose last reference it held.
+    pub fn remove_entry(&self, key: &str) -> Result<Vec<ContentId>> {
+        let mut orphan = Vec::new();
         let tx = self.db.begin_write()?;
         {
             let mut entries = tx.open_table(ENTRIES)?;
@@ -278,8 +408,10 @@ impl Index {
                 None => None,
             };
             if let Some(record) = removed {
-                if release(&mut blobs, &record.content)? {
-                    orphan = Some(ContentId(record.content));
+                for content in record.contents() {
+                    if release(&mut blobs, &content)? {
+                        orphan.push(ContentId(content));
+                    }
                 }
                 let pkey = primary_key(&record.method, &record.url);
                 let mut variants = tx.open_table(VARIANTS)?;
@@ -407,6 +539,44 @@ impl Index {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Drop integrity rows pointing at content that is no longer stored.
+    ///
+    /// Nothing else removes them, so without this they accumulate for the life
+    /// of the cache: a lookup succeeds, `body_by_content` then fails, and the
+    /// peer answers `Missing` — correct, but the row is still there.
+    pub fn prune_sri(&self) -> Result<usize> {
+        let stale: Vec<Vec<u8>> = {
+            let tx = self.db.begin_read()?;
+            let sri = tx.open_table(SRI)?;
+            let blobs = tx.open_table(BLOBS)?;
+            let mut out = Vec::new();
+            for row in sri.iter()? {
+                let (key, value) = row?;
+                if blobs.get(value.value())?.is_none() {
+                    out.push(key.value().to_vec());
+                }
+            }
+            out
+        };
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.db.begin_write()?;
+        {
+            let mut sri = tx.open_table(SRI)?;
+            for key in &stale {
+                sri.remove(key.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(stale.len())
+    }
+
+    pub fn sri_row_count(&self) -> Result<u64> {
+        let tx = self.db.begin_read()?;
+        Ok(tx.open_table(SRI)?.len()?)
     }
 
     pub fn content_for_sri(&self, key: &[u8]) -> Result<Option<ContentId>> {
