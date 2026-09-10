@@ -9,6 +9,7 @@ pub mod config;
 pub mod dns;
 pub mod error;
 pub mod fetch;
+pub mod h3;
 pub mod service;
 pub mod tls;
 

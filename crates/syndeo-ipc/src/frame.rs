@@ -82,13 +82,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
         use crate::protocol::NetResponse;
 
         self.send(request).await?;
-        let (status, headers, source, elapsed_ms) = match self.recv::<NetResponse>().await? {
+        let (status, headers, source, protocol, elapsed_ms) = match self.recv::<NetResponse>().await? {
             NetResponse::FetchBegin {
                 status,
                 headers,
                 source,
+                protocol,
                 elapsed_ms,
-            } => (status, headers, source, elapsed_ms),
+            } => (status, headers, source, protocol, elapsed_ms),
             NetResponse::Error(e) => return Err(FrameError::Refused(e)),
             other => return Err(FrameError::Unexpected(format!("{other:?}"))),
         };
@@ -103,6 +104,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
                         headers,
                         body,
                         source,
+                        protocol,
                         elapsed_ms,
                         content,
                     })

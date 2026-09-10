@@ -42,6 +42,9 @@ pub enum NetResponse {
         status: u16,
         headers: Vec<(String, String)>,
         source: String,
+        /// Which protocol carried it: `http/1.1`, `h2`, `h3`, or `-` when
+        /// nothing did because it came out of the store.
+        protocol: String,
         elapsed_ms: u64,
     },
     FetchChunk {
@@ -212,6 +215,7 @@ pub struct Fetched {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub source: String,
+    pub protocol: String,
     pub elapsed_ms: u64,
     pub content: Option<String>,
 }

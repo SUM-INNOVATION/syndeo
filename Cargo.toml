@@ -82,6 +82,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 url = "2"
 httpdate = "1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "ring", "logging"] }
 hickory-resolver = { version = "0.24", features = ["dns-over-rustls", "dns-over-https-rustls", "tokio-runtime"] }
 tower-service = "0.3"

@@ -29,6 +29,9 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-platform-verifier.workspace = true
 hickory-resolver.workspace = true
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
 tower-service.workspace = true
 
 serde.workspace = true

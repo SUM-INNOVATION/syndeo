@@ -207,6 +207,7 @@ async fn browse(
         headers,
         body,
         source,
+        protocol,
         elapsed_ms,
         content,
     } = first;
@@ -218,6 +219,7 @@ async fn browse(
             "url": url,
             "status": status,
             "source": source,
+            "protocol": protocol,
             "elapsed_ms": elapsed_ms,
             "content": content,
             "bytes": body.len(),
@@ -234,7 +236,7 @@ async fn browse(
 
     println!("{url}");
     println!(
-        "  {status}  {source}  {elapsed_ms}ms  {}",
+        "  {status}  {source}  {protocol}  {elapsed_ms}ms  {}",
         syndeo_cache::stats::human(body.len() as u64)
     );
     if let Some(content) = &content {
@@ -247,7 +249,10 @@ async fn browse(
         println!("  type    {}", ct.1);
     }
     if let Some(second) = second {
-        println!("  again   {}  {}ms", second.source, second.elapsed_ms);
+        println!(
+            "  again   {}  {}  {}ms",
+            second.source, second.protocol, second.elapsed_ms
+        );
     }
     println!();
 

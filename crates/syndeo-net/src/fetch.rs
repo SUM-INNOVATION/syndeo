@@ -8,12 +8,13 @@
 use crate::body::{FetchBody, Tee};
 use crate::config::NetConfig;
 use crate::dns::Dns;
+use crate::h3::{AltSvc, QuicClient};
 use crate::error::{NetError, Result};
 use crate::tls;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri};
 use futures::stream::StreamExt;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -42,6 +43,40 @@ pub enum Source {
     Peer,
     /// Not cacheable; passed straight through.
     PassThrough,
+}
+
+/// Which protocol carried a response.
+///
+/// Reporting, not control. `Source` says whether the bytes had to cross the
+/// network at all, which is the question the cache exists to answer; this says
+/// how they crossed it when they did, which is a different question and belongs
+/// in a different field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Protocol {
+    /// Served from the store; nothing carried it.
+    None,
+    Http1,
+    Http2,
+    Http3,
+}
+
+impl Protocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::None => "-",
+            Protocol::Http1 => "http/1.1",
+            Protocol::Http2 => "h2",
+            Protocol::Http3 => "h3",
+        }
+    }
+
+    fn from_version(version: http::Version) -> Self {
+        match version {
+            http::Version::HTTP_2 => Protocol::Http2,
+            http::Version::HTTP_3 => Protocol::Http3,
+            _ => Protocol::Http1,
+        }
+    }
 }
 
 impl Source {
@@ -117,6 +152,8 @@ pub struct FetchResponse {
     pub final_url: String,
     /// How many redirects were followed to get here.
     pub redirects: u8,
+    /// Which protocol carried it, when one did.
+    pub protocol: Protocol,
 }
 
 type HttpsClient = Client<
@@ -130,6 +167,11 @@ pub struct Net {
     client: HttpsClient,
     config: NetConfig,
     peers: Option<syndeo_peer::PeerHandle>,
+    /// The QUIC endpoint, when one could be opened. A machine with no usable
+    /// UDP socket is not a broken browser; it is a browser that speaks TCP.
+    quic: Option<Arc<QuicClient>>,
+    /// Which origins have said they speak HTTP/3, and which have disappointed us.
+    alt_svc: Arc<AltSvc>,
     /// Entry keys with a background revalidation already in flight.
     ///
     /// A popular entry going stale is exactly when many requests arrive at once,
@@ -181,11 +223,21 @@ impl Net {
             None => None,
         };
 
+        let quic = match QuicClient::new(Dns::new(&config.dns)?, tls::client_config()?) {
+            Ok(client) => Some(Arc::new(client)),
+            Err(err) => {
+                tracing::info!(%err, "no QUIC endpoint; HTTP/3 is unavailable on this host");
+                None
+            }
+        };
+
         Ok(Net {
             cache,
             client,
             config,
             peers,
+            quic,
+            alt_svc: Arc::new(AltSvc::default()),
             refreshing: Arc::new(Mutex::new(HashSet::new())),
         })
     }
@@ -381,8 +433,7 @@ impl Net {
         extra: &[(HeaderName, String)],
         started: Instant,
     ) -> Result<FetchResponse> {
-        let (status, headers, incoming) =
-            origin_headers(&self.client, &self.config, request, extra).await?;
+        let (status, headers, incoming, protocol) = self.origin_any(request, extra).await?;
 
         if request.integrity.is_some() {
             let body = collect_body(incoming, self.config.max_body_bytes).await?;
@@ -395,7 +446,9 @@ impl Net {
             } else {
                 Source::PassThrough
             };
-            return Ok(self.finish(status, headers, body, source, content, started));
+            return Ok(self.finish_with(
+                status, headers, body, source, content, started, protocol,
+            ));
         }
 
         let body = stream_body(
@@ -409,7 +462,66 @@ impl Net {
         );
         // The address is not known yet — a body is not addressable until its
         // last byte — so `content` is None and the entry appears when it lands.
-        Ok(self.finish(status, headers, body, Source::Origin, None, started))
+        Ok(self.finish_with(
+            status,
+            headers,
+            body,
+            Source::Origin,
+            None,
+            started,
+            protocol,
+        ))
+    }
+
+    /// One origin request over whichever protocol applies.
+    ///
+    /// HTTP/3 only where the origin has said it speaks it, and never at the cost
+    /// of the fetch: a QUIC attempt that fails falls back to TCP, because UDP is
+    /// blocked on a great many networks and a browser that could not load a page
+    /// because of that would be broken.
+    async fn origin_any(
+        &self,
+        request: &FetchRequest,
+        extra: &[(HeaderName, String)],
+    ) -> Result<(u16, HeaderMap, OriginBody, Protocol)> {
+        let uri: Uri = request
+            .url
+            .parse()
+            .map_err(|_| NetError::InvalidUrl(request.url.clone()))?;
+        let authority = uri.authority().map(|a| a.to_string()).unwrap_or_default();
+
+        if uri.scheme() == Some(&http::uri::Scheme::HTTPS) && self.alt_svc.should_try(&authority) {
+            if let Some(quic) = &self.quic {
+                let headers = crate::h3::with_extra(&request.headers, extra);
+                match quic
+                    .request(&uri, &request.method, &headers, request.body.clone())
+                    .await
+                {
+                    Ok((status, response_headers, body)) => {
+                        return Ok((
+                            status,
+                            response_headers,
+                            OriginBody::Quic(body),
+                            Protocol::Http3,
+                        ));
+                    }
+                    Err(err) => {
+                        tracing::debug!(url = %request.url, %err, "HTTP/3 attempt failed; falling back to TCP");
+                        self.alt_svc.failed(&authority);
+                        quic.forget(&authority).await;
+                    }
+                }
+            }
+        }
+
+        let (status, headers, incoming, protocol) =
+            origin_headers(&self.client, &self.config, request, extra).await?;
+        // An origin advertises HTTP/3 on a response that came over TCP, which is
+        // the only way it could: this is where the next request learns.
+        if !authority.is_empty() {
+            self.alt_svc.observe(&authority, &headers);
+        }
+        Ok((status, headers, OriginBody::Tcp(incoming), protocol))
     }
 
     /// Tell the swarm we hold a body someone else could ask for.
@@ -578,6 +690,20 @@ impl Net {
         content: Option<syndeo_cache::ContentId>,
         started: Instant,
     ) -> FetchResponse {
+        self.finish_with(status, headers, body, source, content, started, Protocol::None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_with(
+        &self,
+        status: u16,
+        headers: HeaderMap,
+        body: impl Into<FetchBody>,
+        source: Source,
+        content: Option<syndeo_cache::ContentId>,
+        started: Instant,
+        protocol: Protocol,
+    ) -> FetchResponse {
         FetchResponse {
             status,
             headers,
@@ -587,6 +713,7 @@ impl Net {
             content,
             final_url: String::new(),
             redirects: 0,
+            protocol,
         }
     }
 
@@ -598,6 +725,32 @@ impl Net {
         extra: &[(HeaderName, String)],
     ) -> Result<(u16, HeaderMap, Bytes)> {
         origin_request(&self.client, &self.config, request, extra).await
+    }
+}
+
+/// A body from the origin, whichever protocol brought it.
+///
+/// The point of the enum is that nothing downstream branches on transport: the
+/// tee, the buffered path and the caller all see one stream of chunks.
+pub enum OriginBody {
+    Tcp(hyper::body::Incoming),
+    Quic(futures::stream::BoxStream<'static, Result<Bytes>>),
+}
+
+impl OriginBody {
+    fn into_stream(self) -> futures::stream::BoxStream<'static, Result<Bytes>> {
+        match self {
+            OriginBody::Tcp(incoming) => http_body_util::BodyStream::new(incoming)
+                .filter_map(|frame| async move {
+                    match frame {
+                        // Trailers carry no representation bytes.
+                        Ok(frame) => frame.into_data().ok().map(Ok),
+                        Err(err) => Some(Err(crate::body::truncated(err))),
+                    }
+                })
+                .boxed(),
+            OriginBody::Quic(stream) => stream,
+        }
     }
 }
 
@@ -613,7 +766,7 @@ async fn origin_headers(
     config: &NetConfig,
     request: &FetchRequest,
     extra: &[(HeaderName, String)],
-) -> Result<(u16, HeaderMap, hyper::body::Incoming)> {
+) -> Result<(u16, HeaderMap, hyper::body::Incoming, Protocol)> {
     let uri: Uri = request
         .url
         .parse()
@@ -658,7 +811,8 @@ async fn origin_headers(
 
     let status = response.status().as_u16();
     let headers = response.headers().clone();
-    Ok((status, headers, response.into_body()))
+    let protocol = Protocol::from_version(response.version());
+    Ok((status, headers, response.into_body(), protocol))
 }
 
 /// Read a whole body into memory, refusing one past the ceiling.
@@ -666,16 +820,17 @@ async fn origin_headers(
 /// The ceiling is real here, because this is the path that holds the body: it is
 /// taken when the caller declared an integrity hash, and a hash cannot be
 /// checked against bytes that have already been handed out.
-async fn collect_body(incoming: hyper::body::Incoming, limit: u64) -> Result<Bytes> {
-    let collected = incoming
-        .collect()
-        .await
-        .map_err(|e| NetError::Transport(e.to_string()))?;
-    let body = collected.to_bytes();
-    if body.len() as u64 > limit {
-        return Err(NetError::BodyTooLarge { limit });
+async fn collect_body(body: OriginBody, limit: u64) -> Result<Bytes> {
+    let mut stream = body.into_stream();
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if out.len() as u64 + chunk.len() as u64 > limit {
+            return Err(NetError::BodyTooLarge { limit });
+        }
+        out.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(Bytes::from(out))
 }
 
 /// One request to the origin, buffered. Kept for the paths that need the whole
@@ -686,14 +841,14 @@ async fn origin_request(
     request: &FetchRequest,
     extra: &[(HeaderName, String)],
 ) -> Result<(u16, HeaderMap, Bytes)> {
-    let (status, headers, incoming) = origin_headers(client, config, request, extra).await?;
-    let body = collect_body(incoming, config.max_body_bytes).await?;
+    let (status, headers, incoming, _) = origin_headers(client, config, request, extra).await?;
+    let body = collect_body(OriginBody::Tcp(incoming), config.max_body_bytes).await?;
     Ok((status, headers, body))
 }
 
 /// The state a teed body carries between chunks.
 struct Teed {
-    frames: http_body_util::BodyStream<hyper::body::Incoming>,
+    frames: futures::stream::BoxStream<'static, Result<Bytes>>,
     tee: Tee,
     cache: Arc<Cache>,
     request: FetchRequest,
@@ -720,28 +875,19 @@ fn stream_body(
     request: FetchRequest,
     status: u16,
     headers: HeaderMap,
-    incoming: hyper::body::Incoming,
+    incoming: OriginBody,
     limit: u64,
 ) -> FetchBody {
     let writer = match cache.begin_streamed() {
         Ok(writer) => writer,
         Err(err) => {
             tracing::warn!(%err, "could not open a cache writer; streaming without caching");
-            return FetchBody::Stream(
-                http_body_util::BodyStream::new(incoming)
-                    .filter_map(|frame| async move {
-                        match frame {
-                            Ok(frame) => frame.into_data().ok().map(Ok),
-                            Err(e) => Some(Err(NetError::Transport(e.to_string()))),
-                        }
-                    })
-                    .boxed(),
-            );
+            return FetchBody::Stream(incoming.into_stream());
         }
     };
 
     let state = Teed {
-        frames: http_body_util::BodyStream::new(incoming),
+        frames: incoming.into_stream(),
         tee: Tee::new(writer, limit),
         cache,
         request,
@@ -757,26 +903,20 @@ fn stream_body(
             if state.done {
                 return None;
             }
-            loop {
-                match state.frames.next().await {
-                    Some(Ok(frame)) => match frame.into_data() {
-                        Ok(chunk) => {
-                            state.tee.observe(&chunk);
-                            return Some((Ok(chunk), state));
-                        }
-                        // Trailers carry no body bytes; keep reading.
-                        Err(_) => continue,
-                    },
-                    Some(Err(err)) => {
-                        state.tee.discard();
-                        state.done = true;
-                        return Some((Err(crate::body::truncated(err)), state));
-                    }
-                    None => {
-                        // The last byte. This is where the entry appears.
-                        finish_streamed(&mut state);
-                        return None;
-                    }
+            match state.frames.next().await {
+                Some(Ok(chunk)) => {
+                    state.tee.observe(&chunk);
+                    Some((Ok(chunk), state))
+                }
+                Some(Err(err)) => {
+                    state.tee.discard();
+                    state.done = true;
+                    Some((Err(err), state))
+                }
+                None => {
+                    // The last byte. This is where the entry appears.
+                    finish_streamed(&mut state);
+                    None
                 }
             }
         })

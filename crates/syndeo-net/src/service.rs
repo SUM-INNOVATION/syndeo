@@ -141,6 +141,7 @@ where
                 status: response.status,
                 headers: header_pairs(&response.headers),
                 source: response.source.as_str().to_string(),
+                protocol: response.protocol.as_str().to_string(),
                 elapsed_ms: response.elapsed_ms,
             })
             .await?;
@@ -163,6 +164,7 @@ where
             status: response.status,
             headers: header_pairs(&response.headers),
             source: response.source.as_str().to_string(),
+            protocol: response.protocol.as_str().to_string(),
             elapsed_ms: response.elapsed_ms,
         })
         .await?;

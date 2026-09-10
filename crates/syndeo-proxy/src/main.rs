@@ -329,8 +329,9 @@ async fn forward(proxy: Arc<Proxy>, req: Request<Incoming>, origin: Option<Strin
         Ok(response) => {
             if proxy.trace {
                 tracing::info!(
-                    "{:>13}  {:>4}  {:>5}ms  {:>9}  {}",
+                    "{:>13}  {:>8}  {:>4}  {:>5}ms  {:>9}  {}",
                     response.source.as_str(),
+                    response.protocol.as_str(),
                     response.status,
                     response.elapsed_ms,
                     match response.body.known_len() {
@@ -356,6 +357,12 @@ async fn forward(proxy: Arc<Proxy>, req: Request<Incoming>, origin: Option<Strin
                 out.insert(
                     "x-syndeo-source",
                     http::HeaderValue::from_static(response.source.as_str()),
+                );
+                // Provenance and transport are different questions, so they are
+                // different headers.
+                out.insert(
+                    "x-syndeo-protocol",
+                    http::HeaderValue::from_static(response.protocol.as_str()),
                 );
             }
             builder
