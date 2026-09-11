@@ -91,12 +91,26 @@ jobs:
              # it, having no x86 intrinsics to compile.` \
             clang-15 libclang-15-dev
 
+      # Setting CC and CXX is not enough on its own: mozangle's build reaches
+      # for an unversioned `clang` on PATH, which on 22.04 is 14, and then
+      # fails on its own SSE intrinsics headers. The alternatives entry is what
+      # actually redirects that, and the target-suffixed variables cover the
+      # `cc` crate's own lookup order, which prefers them over plain CC when
+      # cargo is passed an explicit --target.
       - name: Point the C toolchain at clang 15
         if: runner.os == 'Linux'
         run: |
-          echo "CC=clang-15" >> "$GITHUB_ENV"
-          echo "CXX=clang++-15" >> "$GITHUB_ENV"
-          echo "LIBCLANG_PATH=/usr/lib/llvm-15/lib" >> "$GITHUB_ENV"
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 100
+          target=$(echo "${{ matrix.target }}" | tr '-' '_')
+          {
+            echo "CC=clang-15"
+            echo "CXX=clang++-15"
+            echo "CC_${target}=clang-15"
+            echo "CXX_${target}=clang++-15"
+            echo "LIBCLANG_PATH=/usr/lib/llvm-15/lib"
+          } >> "$GITHUB_ENV"
+          clang --version | head -1
 
       - uses: dtolnay/rust-toolchain@stable
         with:
