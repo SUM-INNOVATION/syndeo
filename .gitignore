@@ -24,3 +24,6 @@ TestResults.xml
 ### Rust ###
 /target
 **/*.rs.bk
+
+# Python shim for the Servo build; see the README.
+.python/

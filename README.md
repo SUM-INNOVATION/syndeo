@@ -93,11 +93,23 @@ Servo's `ProtocolRegistry` refuses `http` and `https` by design. Resource-load
 interception is the supported way in front of them, and it streams.
 
 **Building it is the expensive part.** The feature is off by default because
-Servo brings SpiderMonkey, Stylo and WebRender: about 1,200 crates, a 450 MB
-debug binary, and a Python ≥3.11 on `PATH` for Servo's WebIDL codegen — the
-system Python on macOS is 3.9 and the build fails on a `match` statement with a
-syntax error that does not name the cause. Everything in `syndeo-servo` that
-could be written and tested without Servo is outside the gate, in `bridge.rs`.
+Servo brings SpiderMonkey, Stylo and WebRender: about 1,200 crates and a 450 MB
+debug binary. Everything in `syndeo-servo` that could be written and tested
+without Servo is outside the gate, in `bridge.rs`.
+
+It also needs a Python ≥3.11 as `python3` on `PATH`, for Servo's WebIDL codegen.
+The system Python on macOS is 3.9, and the failure does not name the cause — it
+is a `SyntaxError` on a `match` statement, hundreds of crates in. On macOS:
+
+```sh
+brew install python@3.12
+mkdir -p .python && ln -sf "$(brew --prefix python@3.12)/bin/python3.12" .python/python3
+PATH="$PWD/.python:$PATH" cargo build -p syndeo-servo --features renderer
+```
+
+Servo's build script looks for `uv` first, which does not help here: the
+published crate ships no `uv.lock`, so `uv run --frozen` has no project to run
+in and the fallback to `python3` is what actually decides the version.
 
 ### The window
 
