@@ -65,6 +65,31 @@ deny = [
 version = 2
 yanked = "deny"
 
+# Every entry here is a decision, not a silencing. A vulnerability advisory is
+# never ignored — the whole point of running this weekly is that one arriving
+# against a dependency breaks the build the following Monday. These four are
+# `unmaintained`, which is a statement about a crate's future rather than about
+# a defect in it, and each says what would clear it.
+ignore = [
+    # bincode 1.3. Direct, and the encoding of two things that outlive the
+    # process: the redb index records and the peer wire format. Bincode 2 is a
+    # different encoding, so moving costs an index schema version and a protocol
+    # version, and buys nothing until there is a defect to fix. Cleared by that
+    # migration, deliberately and on its own.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3 encodes the cache index and the peer protocol; moving to 2 is a format migration" },
+
+    # rustls-pemfile. Reads the proxy's own authority certificate off disk, a
+    # file we wrote ourselves, at startup. rustls 0.23 has since absorbed this
+    # into rustls-pki-types; cleared by reading the PEM through that instead.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile parses the proxy's own CA file; superseded by rustls-pki-types" },
+
+    # instant and paste, both under libp2p 0.44 and neither reachable from
+    # anything we call directly. Cleared by the libp2p bump, whenever the
+    # sub-crate set moves.
+    { id = "RUSTSEC-2024-0384", reason = "instant, transitively under libp2p 0.44" },
+    { id = "RUSTSEC-2024-0436", reason = "paste, transitively under libp2p 0.44" },
+]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

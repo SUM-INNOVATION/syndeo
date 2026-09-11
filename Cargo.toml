@@ -89,7 +89,13 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "ring", "logging"] }
-hickory-resolver = { version = "0.24", features = ["dns-over-rustls", "dns-over-https-rustls", "tokio-runtime"] }
+# 0.24 is where every advisory in this tree came from: it pins rustls 0.21 and
+# with it rustls-webpki 0.101, which has three certificate-verification
+# advisories against it, plus hyper 0.14's h2 0.3 and hickory-proto's own name
+# compression one. 0.26 is on rustls 0.23, the same one everything else here
+# uses. Verification is the platform verifier rather than a bundled root list,
+# so DNS over TLS trusts what the rest of the tree trusts.
+hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio", "tls-ring", "https-ring", "rustls-platform-verifier"] }
 tower-service = "0.3"
 directories = "5"
 

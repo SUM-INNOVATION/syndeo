@@ -4,8 +4,11 @@
 //! alone an address.
 
 use crate::error::{NetError, Result};
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{
+    ResolveHosts, ResolverConfig, ServerGroup, CLOUDFLARE, GOOGLE, QUAD9,
+};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::TokioResolver;
 use hyper_util::client::legacy::connect::dns::Name;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,19 +33,14 @@ pub enum Resolver {
 }
 
 impl Resolver {
-    fn tls_group(self) -> NameServerConfigGroup {
+    /// The addresses and the name its certificate has to carry. One group per
+    /// provider, and the transport is chosen from it: the same servers answer
+    /// over TLS and over HTTPS.
+    fn group(self) -> ServerGroup<'static> {
         match self {
-            Resolver::Cloudflare => NameServerConfigGroup::cloudflare_tls(),
-            Resolver::Google => NameServerConfigGroup::google_tls(),
-            Resolver::Quad9 => NameServerConfigGroup::quad9_tls(),
-        }
-    }
-
-    fn https_group(self) -> NameServerConfigGroup {
-        match self {
-            Resolver::Cloudflare => NameServerConfigGroup::cloudflare_https(),
-            Resolver::Google => NameServerConfigGroup::google_https(),
-            Resolver::Quad9 => NameServerConfigGroup::quad9_https(),
+            Resolver::Cloudflare => CLOUDFLARE,
+            Resolver::Google => GOOGLE,
+            Resolver::Quad9 => QUAD9,
         }
     }
 }
@@ -73,28 +71,39 @@ impl std::str::FromStr for DnsMode {
 /// A hickory resolver dressed up as the resolver hyper's connector expects.
 #[derive(Clone)]
 pub struct Dns {
-    inner: Arc<TokioAsyncResolver>,
+    inner: Arc<TokioResolver>,
 }
 
 impl Dns {
     pub fn new(mode: &DnsMode) -> Result<Self> {
-        let mut opts = ResolverOpts::default();
-        opts.cache_size = 256;
-        opts.use_hosts_file = true;
-
-        let resolver = match mode {
-            DnsMode::System => TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|_| {
-                TokioAsyncResolver::tokio(ResolverConfig::default(), opts.clone())
+        // The system configuration is read where there is one to read, and a
+        // machine whose resolv.conf is missing or unparseable still resolves,
+        // through hickory's defaults, rather than failing to start the network
+        // process at all.
+        let mut builder = match mode {
+            DnsMode::System => TokioResolver::builder_tokio().unwrap_or_else(|_| {
+                TokioResolver::builder_with_config(
+                    ResolverConfig::default(),
+                    TokioRuntimeProvider::default(),
+                )
             }),
-            DnsMode::Tls(r) => TokioAsyncResolver::tokio(
-                ResolverConfig::from_parts(None, vec![], r.tls_group()),
-                opts.clone(),
+            DnsMode::Tls(r) => TokioResolver::builder_with_config(
+                ResolverConfig::from_name_servers(r.group().tls().collect()),
+                TokioRuntimeProvider::default(),
             ),
-            DnsMode::Https(r) => TokioAsyncResolver::tokio(
-                ResolverConfig::from_parts(None, vec![], r.https_group()),
-                opts.clone(),
+            DnsMode::Https(r) => TokioResolver::builder_with_config(
+                ResolverConfig::from_name_servers(r.group().https().collect()),
+                TokioRuntimeProvider::default(),
             ),
         };
+
+        let options = builder.options_mut();
+        options.cache_size = 256;
+        options.use_hosts_file = ResolveHosts::Auto;
+
+        let resolver = builder
+            .build()
+            .map_err(|e| NetError::Dns(format!("configuring the resolver: {e}")))?;
         Ok(Dns {
             inner: Arc::new(resolver),
         })
