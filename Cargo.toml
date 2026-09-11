@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore", "crates/syndeo-dom", "crates/syndeo-agent", "crates/syndeo-shell", "crates/syndeo-peer", "crates/syndeo-ui", "crates/syndeo-servo"]
+members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore", "crates/syndeo-dom", "crates/syndeo-agent", "crates/syndeo-shell", "crates/syndeo-peer", "crates/syndeo-ui", "crates/syndeo-servo", "crates/syndeo-webkit"]
 
 [workspace.package]
 version = "0.1.0"
