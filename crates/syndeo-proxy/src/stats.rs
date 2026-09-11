@@ -40,7 +40,11 @@ pub fn intercept(net: &Net, url: &str) -> Option<Response<Body>> {
             "text/plain; charset=utf-8",
             format!("{}\n", stats.render()),
         )),
-        _ => Some(reply(StatusCode::NOT_FOUND, "text/plain", "no such endpoint\n".into())),
+        _ => Some(reply(
+            StatusCode::NOT_FOUND,
+            "text/plain",
+            "no such endpoint\n".into(),
+        )),
     }
 }
 
@@ -49,6 +53,10 @@ fn reply(status: StatusCode, content_type: &str, body: String) -> Response<Body>
         .status(status)
         .header(http::header::CONTENT_TYPE, content_type)
         .header(http::header::CACHE_CONTROL, "no-store")
-        .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed_unsync())
+        .body(
+            Full::new(Bytes::from(body))
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+        )
         .expect("static response")
 }

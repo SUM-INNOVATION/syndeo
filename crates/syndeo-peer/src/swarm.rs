@@ -411,13 +411,17 @@ fn handle_command(
             };
 
             for peer in state.by_standing() {
-                let outbound = swarm.behaviour_mut().blobs.send_request(&peer, request.clone());
+                let outbound = swarm
+                    .behaviour_mut()
+                    .blobs
+                    .send_request(&peer, request.clone());
                 state.pending.insert(outbound, id);
                 entry.asked.insert(peer);
                 entry.outstanding += 1;
             }
 
-            if entry.outstanding == 0 && !start_provider_query(swarm, config, &mut entry, id, state) {
+            if entry.outstanding == 0 && !start_provider_query(swarm, config, &mut entry, id, state)
+            {
                 entry.finish(Err(PeerError::NotFound));
                 return;
             }
@@ -756,7 +760,12 @@ fn answer(
     channel: ResponseChannel<BlobResponse>,
     response: BlobResponse,
 ) {
-    if swarm.behaviour_mut().blobs.send_response(channel, response).is_err() {
+    if swarm
+        .behaviour_mut()
+        .blobs
+        .send_response(channel, response)
+        .is_err()
+    {
         tracing::debug!("the peer went away before we could answer");
     }
 }

@@ -19,7 +19,11 @@ use syndeo_ipc::protocol::{NetRequest, ShellRequest, ShellResponse, SignaturePur
 use syndeo_ipc::transport::{Channel, Endpoint};
 
 #[derive(Parser)]
-#[command(name = "syndeo-agent", version, about = "Reads pages; asks the shell for anything a human must approve")]
+#[command(
+    name = "syndeo-agent",
+    version,
+    about = "Reads pages; asks the shell for anything a human must approve"
+)]
 struct Cli {
     #[arg(long)]
     net_socket: PathBuf,
@@ -90,7 +94,13 @@ async fn main() -> Result<()> {
             let Some((name, rest)) = rest.split_first() else {
                 bail!("tool needs a name and a url");
             };
-            run_tool(&net, &tool_directory, name, rest.first().copied().unwrap_or_default()).await
+            run_tool(
+                &net,
+                &tool_directory,
+                name,
+                rest.first().copied().unwrap_or_default(),
+            )
+            .await
         }
         other => bail!("unknown task {other}; try read, crawl, identity, sign, tools or tool"),
     }
@@ -163,7 +173,10 @@ async fn run_tool(
 
     let started = std::time::Instant::now();
     let output = tool.run(input.as_bytes())?;
-    println!("{name}  {source} in {elapsed}ms, tool in {}ms", started.elapsed().as_millis());
+    println!(
+        "{name}  {source} in {elapsed}ms, tool in {}ms",
+        started.elapsed().as_millis()
+    );
     println!();
     match std::str::from_utf8(&output) {
         Ok(text) => println!("{text}"),
@@ -184,7 +197,8 @@ async fn read(net: &Endpoint, url: &str) -> Result<()> {
     println!("  {source} in {elapsed}ms, {} bytes", body.len());
 
     let blocks = document.blocks();
-    println!("  {} text blocks, {} links, {} subresources",
+    println!(
+        "  {} text blocks, {} links, {} subresources",
         blocks.len(),
         document.links().len(),
         document.subresources().len()
@@ -254,12 +268,19 @@ async fn crawl(net: &Endpoint, url: &str) -> Result<()> {
     if let Some(target) = targets.first() {
         let (_, source, elapsed) = fetch(net, target, None).await?;
         println!();
-        println!("refetch of {} → {source} in {elapsed}ms", truncate(target, 60));
+        println!(
+            "refetch of {} → {source} in {elapsed}ms",
+            truncate(target, 60)
+        );
     }
     Ok(())
 }
 
-async fn fetch(net: &Endpoint, url: &str, integrity: Option<String>) -> Result<(Vec<u8>, String, u64)> {
+async fn fetch(
+    net: &Endpoint,
+    url: &str,
+    integrity: Option<String>,
+) -> Result<(Vec<u8>, String, u64)> {
     let mut channel = Channel::connect(net).await?;
     // The agent summarises whole pages, so it waits for the whole body. The
     // frames it arrives in are what stop the transport from capping how large a
@@ -311,9 +332,7 @@ async fn request_signature(shell: &Endpoint, origin: &str, message: &str) -> Res
         .await?;
     match response {
         ShellResponse::Signed {
-            signature,
-            address,
-            ..
+            signature, address, ..
         } => {
             println!("signed by {address}");
             println!("{signature}");

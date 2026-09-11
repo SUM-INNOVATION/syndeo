@@ -25,7 +25,6 @@ pub enum TransportError {
 #[derive(Debug, Clone)]
 pub struct Endpoint(PathBuf);
 
-
 impl Endpoint {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Endpoint(path.into())

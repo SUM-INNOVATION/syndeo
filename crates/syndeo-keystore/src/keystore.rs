@@ -340,9 +340,14 @@ mod tests {
         let origin_identity = first.public_identity("https://wallet.test").unwrap();
 
         let (_b, second, _) = keystore();
-        let restored = second.restore(&mnemonic, Some("a different passphrase")).unwrap();
+        let restored = second
+            .restore(&mnemonic, Some("a different passphrase"))
+            .unwrap();
         assert_eq!(restored, address);
-        assert_eq!(second.public_identity("https://wallet.test").unwrap(), origin_identity);
+        assert_eq!(
+            second.public_identity("https://wallet.test").unwrap(),
+            origin_identity
+        );
     }
 
     #[test]
@@ -380,16 +385,20 @@ mod tests {
             "Send 10 SUM to alice",
             payload,
         );
-        let signed = keystore.sign_confirmed(&keystore_side, &confirmation, payload).unwrap();
+        let signed = keystore
+            .sign_confirmed(&keystore_side, &confirmation, payload)
+            .unwrap();
 
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-        let public = VerifyingKey::from_bytes(
-            &hex::decode(&signed.public_key).unwrap().try_into().unwrap(),
-        )
-        .unwrap();
+        let public =
+            VerifyingKey::from_bytes(&hex::decode(&signed.public_key).unwrap().try_into().unwrap())
+                .unwrap();
         let signature = Signature::from_slice(&hex::decode(&signed.signature).unwrap()).unwrap();
         assert!(public.verify(payload, &signature).is_ok());
-        assert_eq!(signed.address, keystore.public_identity("https://wallet.test").unwrap().1);
+        assert_eq!(
+            signed.address,
+            keystore.public_identity("https://wallet.test").unwrap().1
+        );
     }
 
     #[test]
@@ -423,11 +432,18 @@ mod tests {
         let side = Confirmer::new(secret);
 
         let shown = b"send 10 SUM";
-        let confirmation = shell.issue("https://wallet.test", SignaturePurpose::ChainTransaction, "Send 10 SUM", shown);
+        let confirmation = shell.issue(
+            "https://wallet.test",
+            SignaturePurpose::ChainTransaction,
+            "Send 10 SUM",
+            shown,
+        );
 
         assert!(matches!(
             keystore.sign_confirmed(&side, &confirmation, b"send 10000 SUM"),
-            Err(KeystoreError::Confirmation(ConfirmationError::PayloadMismatch))
+            Err(KeystoreError::Confirmation(
+                ConfirmationError::PayloadMismatch
+            ))
         ));
         assert!(keystore.sign_confirmed(&side, &confirmation, shown).is_ok());
         assert!(matches!(
@@ -445,11 +461,24 @@ mod tests {
         let side = Confirmer::new(secret);
 
         let payload = b"log me in";
-        let confirmation = shell.issue("https://a.test", SignaturePurpose::OriginLogin, "Log in to a.test", payload);
-        let signed = keystore.sign_confirmed(&side, &confirmation, payload).unwrap();
+        let confirmation = shell.issue(
+            "https://a.test",
+            SignaturePurpose::OriginLogin,
+            "Log in to a.test",
+            payload,
+        );
+        let signed = keystore
+            .sign_confirmed(&side, &confirmation, payload)
+            .unwrap();
 
-        assert_eq!(signed.address, keystore.public_identity("https://a.test").unwrap().1);
-        assert_ne!(signed.address, keystore.public_identity("https://b.test").unwrap().1);
+        assert_eq!(
+            signed.address,
+            keystore.public_identity("https://a.test").unwrap().1
+        );
+        assert_ne!(
+            signed.address,
+            keystore.public_identity("https://b.test").unwrap().1
+        );
     }
 
     #[test]
@@ -461,7 +490,12 @@ mod tests {
         let secret = SessionSecret::generate();
         let shell = Confirmer::new(secret.clone());
         let side = Confirmer::new(secret);
-        let confirmation = shell.issue("https://a.test", SignaturePurpose::OriginLogin, "Log in", b"payload");
+        let confirmation = shell.issue(
+            "https://a.test",
+            SignaturePurpose::OriginLogin,
+            "Log in",
+            b"payload",
+        );
         assert!(matches!(
             keystore.sign_confirmed(&side, &confirmation, b"payload"),
             Err(KeystoreError::Locked)
@@ -493,7 +527,11 @@ mod tests {
     /// A keystore whose clocks the test moves by hand.
     fn keystore_with_clock(
         timeout: Option<Duration>,
-    ) -> (tempfile::TempDir, Keystore, Arc<std::sync::atomic::AtomicU64>) {
+    ) -> (
+        tempfile::TempDir,
+        Keystore,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
         use std::sync::atomic::{AtomicU64, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let wrapping = Arc::new(InMemoryKeyStore::default());
@@ -547,7 +585,10 @@ mod tests {
             ticks.store(step * 240, Ordering::SeqCst);
             keystore.public_identity("https://a.test").unwrap();
         }
-        assert!(keystore.status().unsealed, "use did not keep the session alive");
+        assert!(
+            keystore.status().unsealed,
+            "use did not keep the session alive"
+        );
 
         // Then the machine is left alone.
         let secret = SessionSecret::generate();

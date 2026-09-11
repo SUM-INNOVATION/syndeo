@@ -8,7 +8,11 @@ use syndeo_ipc::transport::{Endpoint, Server};
 use syndeo_net::{DnsMode, Net, NetConfig};
 
 #[derive(Parser)]
-#[command(name = "syndeo-net", version, about = "The only process that opens a socket")]
+#[command(
+    name = "syndeo-net",
+    version,
+    about = "The only process that opens a socket"
+)]
 struct Cli {
     #[arg(long)]
     socket: Option<PathBuf>,

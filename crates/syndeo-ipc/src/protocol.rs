@@ -83,9 +83,14 @@ pub enum ShellRequest {
     },
     /// Ask for the public identity the shell would use for an origin. Public
     /// keys are not secret, but the agent still has to go through the shell.
-    IdentityFor { origin: String },
+    IdentityFor {
+        origin: String,
+    },
     /// Ask a yes/no question of the user.
-    Confirm { title: String, detail: String },
+    Confirm {
+        title: String,
+        detail: String,
+    },
     Ping,
 }
 
@@ -242,8 +247,7 @@ mod base64_bytes {
         decode(&text).map_err(serde::de::Error::custom)
     }
 
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     pub fn encode(bytes: &[u8]) -> String {
         let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -298,7 +302,11 @@ mod tests {
         for len in 0..64 {
             let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
             let encoded = super::base64_bytes::encode(&bytes);
-            assert_eq!(super::base64_bytes::decode(&encoded).unwrap(), bytes, "len {len}");
+            assert_eq!(
+                super::base64_bytes::decode(&encoded).unwrap(),
+                bytes,
+                "len {len}"
+            );
         }
     }
 

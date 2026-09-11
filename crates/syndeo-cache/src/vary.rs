@@ -82,13 +82,19 @@ mod tests {
         let gzip = vary_key(&fields, &headers(&[("accept-encoding", "gzip")]));
         let br = vary_key(&fields, &headers(&[("accept-encoding", "br")]));
         assert_ne!(gzip, br);
-        assert_eq!(gzip, vary_key(&fields, &headers(&[("accept-encoding", "gzip")])));
+        assert_eq!(
+            gzip,
+            vary_key(&fields, &headers(&[("accept-encoding", "gzip")]))
+        );
     }
 
     #[test]
     fn missing_header_matches_missing_header() {
         let fields = vary_fields(&headers(&[("vary", "accept-language")]));
-        assert_eq!(vary_key(&fields, &HeaderMap::new()), vary_key(&fields, &HeaderMap::new()));
+        assert_eq!(
+            vary_key(&fields, &HeaderMap::new()),
+            vary_key(&fields, &HeaderMap::new())
+        );
         assert_ne!(
             vary_key(&fields, &HeaderMap::new()),
             vary_key(&fields, &headers(&[("accept-language", "en")]))
@@ -97,7 +103,9 @@ mod tests {
 
     #[test]
     fn star_is_detected() {
-        assert!(varies_on_everything(&vary_fields(&headers(&[("vary", "*")]))));
+        assert!(varies_on_everything(&vary_fields(&headers(&[(
+            "vary", "*"
+        )]))));
         assert!(varies_on_everything(&vary_fields(&headers(&[(
             "vary",
             "accept, *"

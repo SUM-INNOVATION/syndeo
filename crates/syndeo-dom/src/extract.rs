@@ -68,11 +68,13 @@ pub fn subresources(root: &Handle, base: Option<&url::Url>) -> Vec<Subresource> 
             "img" => (attribute(handle, "src"), "image".to_string()),
             "iframe" => (attribute(handle, "src"), "iframe".to_string()),
             "link" => {
-                let rel = attribute(handle, "rel").unwrap_or_default().to_ascii_lowercase();
+                let rel = attribute(handle, "rel")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
                 let kind = match rel.as_str() {
                     "stylesheet" => "stylesheet".to_string(),
                     "preload" | "modulepreload" | "prefetch" => rel.clone(),
-                    other if other.is_empty() => return,
+                    "" => return,
                     other => other.to_string(),
                 };
                 (attribute(handle, "href"), kind)

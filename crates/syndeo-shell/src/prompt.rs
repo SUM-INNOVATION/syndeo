@@ -179,7 +179,11 @@ pub fn ask_to_sign(
 pub fn render_payload(payload: &[u8]) -> Vec<String> {
     const LIMIT: usize = 512;
     match std::str::from_utf8(payload) {
-        Ok(text) if text.chars().all(|c| !c.is_control() || c == '\n' || c == '\t') => {
+        Ok(text)
+            if text
+                .chars()
+                .all(|c| !c.is_control() || c == '\n' || c == '\t') =>
+        {
             let mut lines: Vec<String> = text
                 .lines()
                 .take(16)

@@ -8,12 +8,12 @@
 use crate::body::{FetchBody, Tee};
 use crate::config::NetConfig;
 use crate::dns::Dns;
-use crate::h3::{AltSvc, QuicClient};
 use crate::error::{NetError, Result};
+use crate::h3::{AltSvc, QuicClient};
 use crate::tls;
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri};
 use futures::stream::StreamExt;
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri};
 use http_body_util::Full;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -128,7 +128,10 @@ impl FetchRequest {
     }
 
     pub fn header(mut self, name: &str, value: &str) -> Self {
-        if let (Ok(n), Ok(v)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
             self.headers.append(n, v);
         }
         self
@@ -156,10 +159,7 @@ pub struct FetchResponse {
     pub protocol: Protocol,
 }
 
-type HttpsClient = Client<
-    hyper_rustls::HttpsConnector<HttpConnector<Dns>>,
-    Full<Bytes>,
->;
+type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector<Dns>>, Full<Bytes>>;
 
 /// The network process, as a library. The binary is a thin wrapper around this.
 pub struct Net {
@@ -210,16 +210,18 @@ impl Net {
             .build(https);
 
         let peers = match &config.peers {
-            Some(peer_config) => match syndeo_peer::PeerNode::start(cache.clone(), peer_config.clone()) {
-                Ok(handle) => {
-                    tracing::info!(peer = %handle.peer_id(), "joined the peer swarm");
-                    Some(handle)
+            Some(peer_config) => {
+                match syndeo_peer::PeerNode::start(cache.clone(), peer_config.clone()) {
+                    Ok(handle) => {
+                        tracing::info!(peer = %handle.peer_id(), "joined the peer swarm");
+                        Some(handle)
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "could not join the peer swarm; continuing without it");
+                        None
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!(%err, "could not join the peer swarm; continuing without it");
-                    None
-                }
-            },
+            }
             None => None,
         };
 
@@ -306,7 +308,11 @@ impl Net {
                 },
                 url: next.to_string(),
                 headers: forwardable_headers(&current.headers, &current.url, next.as_str()),
-                body: if preserve { current.body.clone() } else { Bytes::new() },
+                body: if preserve {
+                    current.body.clone()
+                } else {
+                    Bytes::new()
+                },
                 // Integrity was declared for the resource, not for a redirect
                 // hop, and it still describes whatever finally answers.
                 integrity: current.integrity.clone(),
@@ -323,7 +329,14 @@ impl Net {
         if syndeo_cache::policy::invalidates(&method) {
             let _ = self.cache.invalidate(&method, &request.url);
             let response = self.origin(&request, &[]).await?;
-            return Ok(self.finish(response.0, response.1, response.2, Source::PassThrough, None, started));
+            return Ok(self.finish(
+                response.0,
+                response.1,
+                response.2,
+                Source::PassThrough,
+                None,
+                started,
+            ));
         }
 
         match self.cache.lookup(&method, &request.url, &request.headers)? {
@@ -368,7 +381,10 @@ impl Net {
                 match attempt {
                     Ok((304, headers, _)) => {
                         let now = now_secs();
-                        match self.cache.record_not_modified(&response.key, &headers, now, now)? {
+                        match self
+                            .cache
+                            .record_not_modified(&response.key, &headers, now, now)?
+                        {
                             Some(refreshed) => Ok(self.finish(
                                 refreshed.status,
                                 refreshed.headers.clone(),
@@ -415,7 +431,7 @@ impl Net {
                 if let Some(response) = self.try_peers(&request, started).await {
                     return Ok(response);
                 }
-                self.from_origin(&request, &[], started).await
+                self.fetch_from_origin(&request, &[], started).await
             }
         }
     }
@@ -427,7 +443,7 @@ impl Net {
     /// caller cannot be taken back — so a resource with declared integrity is
     /// buffered, checked, and only then returned. Those are subresources named
     /// in markup, which is a bounded set; everything else streams.
-    async fn from_origin(
+    async fn fetch_from_origin(
         &self,
         request: &FetchRequest,
         extra: &[(HeaderName, String)],
@@ -446,9 +462,7 @@ impl Net {
             } else {
                 Source::PassThrough
             };
-            return Ok(self.finish_with(
-                status, headers, body, source, content, started, protocol,
-            ));
+            return Ok(self.finish_with(status, headers, body, source, content, started, protocol));
         }
 
         let body = stream_body(
@@ -612,10 +626,10 @@ impl Net {
                 return None;
             }
         };
-        if let Err(err) = self
-            .cache
-            .accept_peer_body(&syndeo_cache::PeerProof::Integrity(integrity.clone()), &body)
-        {
+        if let Err(err) = self.cache.accept_peer_body(
+            &syndeo_cache::PeerProof::Integrity(integrity.clone()),
+            &body,
+        ) {
             tracing::warn!(url = %request.url, %err, "a peer body failed its own declared hash");
             return None;
         }
@@ -671,13 +685,19 @@ impl Net {
         let inflight = self.refreshing.clone();
 
         tokio::spawn(async move {
-            let outcome = refresh_entry(&client, &config, &cache, &request, &key, &conditional).await;
+            let outcome =
+                refresh_entry(&client, &config, &cache, &request, &key, &conditional).await;
             match outcome {
                 Ok(true) => tracing::debug!(url = %request.url, "refreshed a stale entry"),
                 Ok(false) => tracing::debug!(url = %request.url, "the refresh was not storable"),
-                Err(err) => tracing::debug!(url = %request.url, %err, "background refresh failed; the stored entry stands"),
+                Err(err) => {
+                    tracing::debug!(url = %request.url, %err, "background refresh failed; the stored entry stands")
+                }
             }
-            inflight.lock().expect("refresh set is not poisoned").remove(&key);
+            inflight
+                .lock()
+                .expect("refresh set is not poisoned")
+                .remove(&key);
         });
     }
 
@@ -690,7 +710,15 @@ impl Net {
         content: Option<syndeo_cache::ContentId>,
         started: Instant,
     ) -> FetchResponse {
-        self.finish_with(status, headers, body, source, content, started, Protocol::None)
+        self.finish_with(
+            status,
+            headers,
+            body,
+            source,
+            content,
+            started,
+            Protocol::None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -939,7 +967,7 @@ fn finish_streamed(state: &mut Teed) {
         writer,
         state.request_time,
         now,
-    Provenance::Origin,
+        Provenance::Origin,
     );
     match outcome {
         Ok(StoreOutcome::Stored { .. }) => {

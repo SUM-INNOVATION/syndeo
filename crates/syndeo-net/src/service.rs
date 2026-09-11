@@ -47,7 +47,11 @@ pub async fn serve(net: Arc<Net>, server: Server) {
 /// because the alternative is a hard ceiling on how large a resource the browser
 /// can load — a ceiling imposed by our own transport rather than by the web.
 /// Everything else is a single reply.
-pub async fn respond<S>(net: &Net, request: NetRequest, framed: &mut Framed<S>) -> Result<(), FrameError>
+pub async fn respond<S>(
+    net: &Net,
+    request: NetRequest,
+    framed: &mut Framed<S>,
+) -> Result<(), FrameError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {

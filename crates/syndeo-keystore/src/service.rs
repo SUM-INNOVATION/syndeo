@@ -17,7 +17,10 @@ const TICK: Duration = Duration::from_secs(5);
 pub async fn serve(keystore: Arc<Keystore>, confirmer: Arc<Confirmer>, server: Server) {
     tracing::info!(socket = %server.endpoint().path().display(), "keystore listening");
     if let Some(timeout) = keystore.status().idle_timeout_secs {
-        tracing::info!(timeout, "the seed is forgotten after this many idle seconds");
+        tracing::info!(
+            timeout,
+            "the seed is forgotten after this many idle seconds"
+        );
     }
     // Nothing was calling `lock`, so an unsealed session lasted as long as the
     // process. This is what ends one.

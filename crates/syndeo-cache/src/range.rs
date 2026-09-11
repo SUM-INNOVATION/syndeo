@@ -50,7 +50,11 @@ impl Resolved {
 /// Parse a `Range` field value. Only `bytes` is a unit we understand; anything
 /// else, and anything malformed, yields `None` and the range is ignored.
 pub fn parse_range(value: &str) -> Option<Vec<RangeSpec>> {
-    let rest = value.trim().strip_prefix("bytes")?.trim_start().strip_prefix('=')?;
+    let rest = value
+        .trim()
+        .strip_prefix("bytes")?
+        .trim_start()
+        .strip_prefix('=')?;
     let mut out = Vec::new();
     for part in rest.split(',') {
         let part = part.trim();
@@ -190,7 +194,11 @@ pub fn is_multipart(headers: &HeaderMap) -> bool {
     headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().to_ascii_lowercase().starts_with("multipart/byteranges"))
+        .map(|v| {
+            v.trim()
+                .to_ascii_lowercase()
+                .starts_with("multipart/byteranges")
+        })
         .unwrap_or(false)
 }
 
@@ -254,9 +262,7 @@ impl Coverage {
         if end <= start {
             return true;
         }
-        self.0
-            .iter()
-            .any(|(s, e)| *s <= start && *e >= end)
+        self.0.iter().any(|(s, e)| *s <= start && *e >= end)
     }
 
     /// The parts of `[start, end)` we do not hold. This is what a newly received
@@ -322,21 +328,38 @@ mod tests {
             parse_range("bytes=0-9, 20-29"),
             Some(vec![
                 RangeSpec::FromTo { first: 0, last: 9 },
-                RangeSpec::FromTo { first: 20, last: 29 },
+                RangeSpec::FromTo {
+                    first: 20,
+                    last: 29
+                },
             ])
         );
     }
 
     #[test]
     fn malformed_ranges_are_ignored_rather_than_guessed_at() {
-        for bad in ["items=0-9", "bytes=9-0", "bytes=-", "bytes=x-y", "bytes=", "bytes=-0"] {
+        for bad in [
+            "items=0-9",
+            "bytes=9-0",
+            "bytes=-",
+            "bytes=x-y",
+            "bytes=",
+            "bytes=-0",
+        ] {
             assert_eq!(parse_range(bad), None, "{bad}");
         }
     }
 
     #[test]
     fn resolution_clamps_to_the_representation() {
-        let r = resolve(RangeSpec::FromTo { first: 0, last: 4_000 }, 100).unwrap();
+        let r = resolve(
+            RangeSpec::FromTo {
+                first: 0,
+                last: 4_000,
+            },
+            100,
+        )
+        .unwrap();
         assert_eq!((r.first, r.last), (0, 99));
         assert_eq!(r.content_range(), "bytes 0-99/100");
 
@@ -344,9 +367,20 @@ mod tests {
         assert_eq!((r.first, r.last), (90, 99));
 
         let r = resolve(RangeSpec::Suffix { length: 400 }, 100).unwrap();
-        assert_eq!((r.first, r.last), (0, 99), "a suffix longer than the body is the body");
+        assert_eq!(
+            (r.first, r.last),
+            (0, 99),
+            "a suffix longer than the body is the body"
+        );
 
-        assert!(resolve(RangeSpec::FromTo { first: 100, last: 200 }, 100).is_none());
+        assert!(resolve(
+            RangeSpec::FromTo {
+                first: 100,
+                last: 200
+            },
+            100
+        )
+        .is_none());
         assert!(resolve(RangeSpec::From { first: 100 }, 100).is_none());
     }
 
@@ -354,14 +388,26 @@ mod tests {
     fn parses_content_range_including_the_unknown_length_form() {
         assert_eq!(
             parse_content_range("bytes 0-99/1000"),
-            Some(ContentRange { first: 0, last: 99, complete_len: Some(1000) })
+            Some(ContentRange {
+                first: 0,
+                last: 99,
+                complete_len: Some(1000)
+            })
         );
         assert_eq!(
             parse_content_range("bytes 0-99/*"),
-            Some(ContentRange { first: 0, last: 99, complete_len: None })
+            Some(ContentRange {
+                first: 0,
+                last: 99,
+                complete_len: None
+            })
         );
         assert_eq!(parse_content_range("bytes */1000"), None);
-        assert_eq!(parse_content_range("bytes 990-1099/1000"), None, "past the end");
+        assert_eq!(
+            parse_content_range("bytes 990-1099/1000"),
+            None,
+            "past the end"
+        );
     }
 
     #[test]

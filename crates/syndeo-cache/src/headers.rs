@@ -45,7 +45,9 @@ impl CacheControl {
         if !seen {
             for value in headers.get_all(http::header::PRAGMA) {
                 if let Ok(s) = value.to_str() {
-                    if s.split(',').any(|d| d.trim().eq_ignore_ascii_case("no-cache")) {
+                    if s.split(',')
+                        .any(|d| d.trim().eq_ignore_ascii_case("no-cache"))
+                    {
                         cc.no_cache = true;
                     }
                 }
@@ -198,7 +200,7 @@ pub const HOP_BY_HOP: &[&str] = &[
 
 pub fn is_hop_by_hop(name: &str, connection_tokens: &[String]) -> bool {
     let lname = name.to_ascii_lowercase();
-    HOP_BY_HOP.contains(&lname.as_str()) || connection_tokens.iter().any(|t| *t == lname)
+    HOP_BY_HOP.contains(&lname.as_str()) || connection_tokens.contains(&lname)
 }
 
 pub fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
@@ -253,7 +255,10 @@ mod tests {
     #[test]
     fn max_stale_without_value_means_unbounded() {
         assert_eq!(CacheControl::parse("max-stale").max_stale, Some(None));
-        assert_eq!(CacheControl::parse("max-stale=10").max_stale, Some(Some(10)));
+        assert_eq!(
+            CacheControl::parse("max-stale=10").max_stale,
+            Some(Some(10))
+        );
     }
 
     #[test]
@@ -276,7 +281,10 @@ mod tests {
     #[test]
     fn connection_named_headers_are_hop_by_hop() {
         let mut h = HeaderMap::new();
-        h.insert(http::header::CONNECTION, "X-Custom, keep-alive".parse().unwrap());
+        h.insert(
+            http::header::CONNECTION,
+            "X-Custom, keep-alive".parse().unwrap(),
+        );
         h.insert("x-custom", "1".parse().unwrap());
         h.insert("x-kept", "1".parse().unwrap());
         let kept = sanitize(&h);

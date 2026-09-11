@@ -282,7 +282,14 @@ mod tests {
     #[test]
     fn a_sealed_seed_round_trips_with_both_factors() {
         let wrapping = generate_wrapping_key();
-        let sealed = seal(SEED, &wrapping, Some("correct horse"), fast(), "addr".into()).unwrap();
+        let sealed = seal(
+            SEED,
+            &wrapping,
+            Some("correct horse"),
+            fast(),
+            "addr".into(),
+        )
+        .unwrap();
         let opened = unseal(&sealed, &wrapping, Some("correct horse")).unwrap();
         assert_eq!(&opened[..], SEED);
     }
@@ -363,7 +370,10 @@ mod tests {
         let wrapping = generate_wrapping_key();
         let sealed = seal(SEED, &wrapping, Some("pass"), fast(), "addr".into()).unwrap();
         let reloaded = SealedSeed::from_bytes(&sealed.to_bytes()).unwrap();
-        assert_eq!(&unseal(&reloaded, &wrapping, Some("pass")).unwrap()[..], SEED);
+        assert_eq!(
+            &unseal(&reloaded, &wrapping, Some("pass")).unwrap()[..],
+            SEED
+        );
     }
 
     #[test]

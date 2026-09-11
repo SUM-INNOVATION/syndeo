@@ -9,9 +9,8 @@ use http::HeaderMap;
 
 /// Statuses a cache may store without explicit origin permission (RFC 9110 §15,
 /// "heuristically cacheable").
-pub const HEURISTICALLY_CACHEABLE: &[u16] = &[
-    200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501,
-];
+pub const HEURISTICALLY_CACHEABLE: &[u16] =
+    &[200, 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501];
 
 /// Which entry to drop first when the store is over its budget.
 ///
@@ -218,10 +217,7 @@ pub fn storability(
     {
         return Storability::Reject("authorized request without shared-cache permission");
     }
-    if opts.shared
-        && meta.headers.contains_key(http::header::SET_COOKIE)
-        && !cc.public
-    {
+    if opts.shared && meta.headers.contains_key(http::header::SET_COOKIE) && !cc.public {
         return Storability::Reject("set-cookie in a shared cache");
     }
 
@@ -380,7 +376,11 @@ pub fn evaluate(
 /// Headers to add to an outbound request so the origin can answer 304.
 pub fn conditional_headers(meta: &StoredMeta) -> Vec<(http::HeaderName, String)> {
     let mut out = Vec::new();
-    if let Some(etag) = meta.headers.get(http::header::ETAG).and_then(|v| v.to_str().ok()) {
+    if let Some(etag) = meta
+        .headers
+        .get(http::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+    {
         out.push((http::header::IF_NONE_MATCH, etag.to_string()));
     }
     if let Some(lm) = meta

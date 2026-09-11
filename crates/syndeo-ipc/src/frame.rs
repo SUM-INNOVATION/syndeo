@@ -46,7 +46,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
         if body.len() as u64 > MAX_FRAME as u64 {
             return Err(FrameError::TooLarge(body.len() as u32));
         }
-        self.stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
+        self.stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .await?;
         self.stream.write_all(&body).await?;
         self.stream.flush().await?;
         Ok(())
@@ -82,17 +84,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
         use crate::protocol::NetResponse;
 
         self.send(request).await?;
-        let (status, headers, source, protocol, elapsed_ms) = match self.recv::<NetResponse>().await? {
-            NetResponse::FetchBegin {
-                status,
-                headers,
-                source,
-                protocol,
-                elapsed_ms,
-            } => (status, headers, source, protocol, elapsed_ms),
-            NetResponse::Error(e) => return Err(FrameError::Refused(e)),
-            other => return Err(FrameError::Unexpected(format!("{other:?}"))),
-        };
+        let (status, headers, source, protocol, elapsed_ms) =
+            match self.recv::<NetResponse>().await? {
+                NetResponse::FetchBegin {
+                    status,
+                    headers,
+                    source,
+                    protocol,
+                    elapsed_ms,
+                } => (status, headers, source, protocol, elapsed_ms),
+                NetResponse::Error(e) => return Err(FrameError::Refused(e)),
+                other => return Err(FrameError::Unexpected(format!("{other:?}"))),
+            };
 
         let mut body = Vec::new();
         loop {

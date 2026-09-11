@@ -22,9 +22,7 @@ pub struct Page {
 
 impl Page {
     pub fn title(&self) -> String {
-        self.document
-            .title()
-            .unwrap_or_else(|| self.url.clone())
+        self.document.title().unwrap_or_else(|| self.url.clone())
     }
 }
 
@@ -188,6 +186,11 @@ pub fn truncate(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         text
     } else {
-        format!("{}…", text.chars().take(width.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            text.chars()
+                .take(width.saturating_sub(1))
+                .collect::<String>()
+        )
     }
 }

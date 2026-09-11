@@ -41,7 +41,11 @@ async fn a_served_stale_entry_is_refreshed_without_a_second_client_request() {
         // The revalidation arrives conditionally, and the origin confirms the
         // body it already sent — with a lifetime this time.
         if n > 0 && request.headers().contains_key("if-none-match") {
-            return respond(304, &[("cache-control", "max-age=600"), ("etag", "\"v1\"")], b"");
+            return respond(
+                304,
+                &[("cache-control", "max-age=600"), ("etag", "\"v1\"")],
+                b"",
+            );
         }
         respond(200, STALE, b"one")
     }))
@@ -81,7 +85,11 @@ async fn concurrent_requests_for_a_stale_entry_collapse_onto_one_refresh() {
             // Slow enough that the other requests are all in flight while the
             // first refresh is still running.
             std::thread::sleep(Duration::from_millis(150));
-            return respond(304, &[("cache-control", "max-age=600"), ("etag", "\"v1\"")], b"");
+            return respond(
+                304,
+                &[("cache-control", "max-age=600"), ("etag", "\"v1\"")],
+                b"",
+            );
         }
         respond(200, STALE, b"one")
     }))
@@ -124,7 +132,10 @@ async fn a_failed_refresh_leaves_the_stored_entry_exactly_as_it_was() {
         respond(
             200,
             &[
-                ("cache-control", "max-age=0, stale-while-revalidate=600, stale-if-error=600"),
+                (
+                    "cache-control",
+                    "max-age=0, stale-while-revalidate=600, stale-if-error=600",
+                ),
                 ("etag", "\"v1\""),
             ],
             b"one",

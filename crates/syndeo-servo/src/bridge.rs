@@ -175,8 +175,17 @@ mod tests {
             unreachable!()
         };
         let names: Vec<&str> = headers.iter().map(|(n, _)| n.as_str()).collect();
-        for refused in ["host", "connection", "upgrade", "transfer-encoding", "content-length"] {
-            assert!(!names.contains(&refused), "{refused} reached the net process");
+        for refused in [
+            "host",
+            "connection",
+            "upgrade",
+            "transfer-encoding",
+            "content-length",
+        ] {
+            assert!(
+                !names.contains(&refused),
+                "{refused} reached the net process"
+            );
         }
         // Cookies are the site's own business and do travel.
         assert!(names.contains(&"cookie"));

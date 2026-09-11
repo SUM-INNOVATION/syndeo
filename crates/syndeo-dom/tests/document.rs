@@ -43,7 +43,10 @@ fn text_is_prose_only_with_whitespace_collapsed() {
     assert!(text.contains("You hold 120 SUM."));
     assert!(text.contains("Pending: 3 transfers."));
     assert!(!text.contains("console.log"), "script bodies are not prose");
-    assert!(!text.contains("display: none"), "style bodies are not prose");
+    assert!(
+        !text.contains("display: none"),
+        "style bodies are not prose"
+    );
 }
 
 #[test]
@@ -52,7 +55,9 @@ fn blocks_carry_their_element_and_heading_depth() {
     let heading = blocks.iter().find(|b| b.text == "Balance").unwrap();
     assert_eq!(heading.element, "h1");
     assert_eq!(heading.heading_level, Some(1));
-    assert!(blocks.iter().any(|b| b.element == "p" && b.text.contains("120 SUM")));
+    assert!(blocks
+        .iter()
+        .any(|b| b.element == "p" && b.text.contains("120 SUM")));
 }
 
 #[test]
@@ -61,7 +66,10 @@ fn relative_links_resolve_against_the_base_and_fragments_are_dropped() {
     let urls: Vec<&str> = links.iter().map(|l| l.url.as_str()).collect();
     assert!(urls.contains(&"https://ledger.test/home"));
     assert!(urls.contains(&"https://other.test/docs"));
-    assert!(!urls.iter().any(|u| u.contains('#')), "same-page anchors are not navigation");
+    assert!(
+        !urls.iter().any(|u| u.contains('#')),
+        "same-page anchors are not navigation"
+    );
 }
 
 #[test]
@@ -76,7 +84,10 @@ fn subresources_are_found_with_their_kind() {
     };
     assert_eq!(by_kind("stylesheet"), vec!["https://ledger.test/style.css"]);
     assert_eq!(by_kind("script"), vec!["https://cdn.test/app.js"]);
-    assert_eq!(by_kind("image"), vec!["https://ledger.test/account/chart.png"]);
+    assert_eq!(
+        by_kind("image"),
+        vec!["https://ledger.test/account/chart.png"]
+    );
 }
 
 #[test]

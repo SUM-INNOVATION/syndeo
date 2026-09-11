@@ -81,7 +81,10 @@ impl Shell {
             } => self.sign(origin, purpose, description, payload).await,
 
             ShellRequest::IdentityFor { origin } => {
-                match self.keystore_call(KeystoreRequest::PublicIdentity { origin }).await {
+                match self
+                    .keystore_call(KeystoreRequest::PublicIdentity { origin })
+                    .await
+                {
                     Ok(KeystoreResponse::Identity {
                         public_key,
                         address,
@@ -259,7 +262,10 @@ impl Shell {
             None
         };
 
-        match self.call_once(&KeystoreRequest::Unseal { passphrase }).await? {
+        match self
+            .call_once(&KeystoreRequest::Unseal { passphrase })
+            .await?
+        {
             KeystoreResponse::Ok => Ok(()),
             KeystoreResponse::Error(e) => anyhow::bail!(e),
             _ => anyhow::bail!("unexpected reply from the keystore"),

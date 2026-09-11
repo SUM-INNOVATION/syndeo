@@ -171,8 +171,9 @@ impl QuicClient {
         config.transport_config(Arc::new(transport));
 
         // An unspecified local address, so the operating system picks the port.
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().expect("a valid address"))
-            .map_err(|e| NetError::Transport(format!("could not open a QUIC endpoint: {e}")))?;
+        let mut endpoint =
+            quinn::Endpoint::client("0.0.0.0:0".parse().expect("a valid address"))
+                .map_err(|e| NetError::Transport(format!("could not open a QUIC endpoint: {e}")))?;
         endpoint.set_default_client_config(config);
 
         Ok(QuicClient {
@@ -247,10 +248,7 @@ impl QuicClient {
                     Some((Ok(bytes), Some(stream)))
                 }
                 Ok(None) => None,
-                Err(err) => Some((
-                    Err(crate::body::truncated(format!("h3: {err}"))),
-                    None,
-                )),
+                Err(err) => Some((Err(crate::body::truncated(format!("h3: {err}"))), None)),
             }
         })
         .boxed();
@@ -268,7 +266,9 @@ impl QuicClient {
         }
 
         let address = self.resolve(uri).await?;
-        let host = uri.host().ok_or_else(|| NetError::InvalidUrl(uri.to_string()))?;
+        let host = uri
+            .host()
+            .ok_or_else(|| NetError::InvalidUrl(uri.to_string()))?;
         let connecting = self
             .endpoint
             .connect(address, host)
@@ -301,7 +301,9 @@ impl QuicClient {
     }
 
     async fn resolve(&self, uri: &Uri) -> Result<SocketAddr> {
-        let host = uri.host().ok_or_else(|| NetError::InvalidUrl(uri.to_string()))?;
+        let host = uri
+            .host()
+            .ok_or_else(|| NetError::InvalidUrl(uri.to_string()))?;
         let port = uri.port_u16().unwrap_or(443);
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             return Ok(SocketAddr::new(ip, port));

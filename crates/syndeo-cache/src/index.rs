@@ -124,10 +124,12 @@ impl StoredBody {
     /// Which byte runs this entry holds.
     pub fn coverage(&self) -> crate::range::Coverage {
         match self {
-            StoredBody::Complete { len, .. } => crate::range::Coverage::from_sorted(vec![(0, *len)]),
-            StoredBody::Partial { segments, .. } => {
-                crate::range::Coverage::from_sorted(segments.iter().map(|s| (s.start, s.end)).collect())
+            StoredBody::Complete { len, .. } => {
+                crate::range::Coverage::from_sorted(vec![(0, *len)])
             }
+            StoredBody::Partial { segments, .. } => crate::range::Coverage::from_sorted(
+                segments.iter().map(|s| (s.start, s.end)).collect(),
+            ),
         }
     }
 
@@ -211,7 +213,9 @@ impl Index {
         let path = path.as_ref();
         // A path that does not exist yet, or exists and is empty, is ours to
         // stamp. Anything else has to say which layout it was written under.
-        let fresh = std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+        let fresh = std::fs::metadata(path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true);
         let db = Database::create(path)?;
 
         if !fresh {

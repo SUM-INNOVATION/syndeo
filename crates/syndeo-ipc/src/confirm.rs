@@ -151,9 +151,7 @@ impl Confirmer {
     ) -> Result<(), ConfirmationError> {
         let expected = self.mac(&confirmation.signing_input());
         let presented = hex::decode(&confirmation.mac).unwrap_or_default();
-        if presented.len() != expected.len()
-            || !bool::from(presented.ct_eq(&expected))
-        {
+        if presented.len() != expected.len() || !bool::from(presented.ct_eq(&expected)) {
             return Err(ConfirmationError::BadMac);
         }
 
@@ -217,7 +215,12 @@ mod tests {
     fn a_confirmation_the_shell_issued_verifies_once() {
         let c = confirmer();
         let payload = b"transfer 10 SUM to alice";
-        let token = c.issue("https://wallet.test", SignaturePurpose::ChainTransaction, "Send 10 SUM", payload);
+        let token = c.issue(
+            "https://wallet.test",
+            SignaturePurpose::ChainTransaction,
+            "Send 10 SUM",
+            payload,
+        );
         assert_eq!(c.verify(&token, payload), Ok(()));
         assert_eq!(c.verify(&token, payload), Err(ConfirmationError::Replayed));
     }
@@ -225,7 +228,12 @@ mod tests {
     #[test]
     fn a_confirmation_does_not_transfer_to_a_different_payload() {
         let c = confirmer();
-        let token = c.issue("https://wallet.test", SignaturePurpose::ChainTransaction, "Send 10 SUM", b"send 10");
+        let token = c.issue(
+            "https://wallet.test",
+            SignaturePurpose::ChainTransaction,
+            "Send 10 SUM",
+            b"send 10",
+        );
         assert_eq!(
             c.verify(&token, b"send 10000"),
             Err(ConfirmationError::PayloadMismatch)
@@ -236,7 +244,12 @@ mod tests {
     fn tampering_with_any_bound_field_breaks_the_mac() {
         let c = confirmer();
         let payload = b"payload";
-        let original = c.issue("https://a.test", SignaturePurpose::OriginLogin, "Log in to a.test", payload);
+        let original = c.issue(
+            "https://a.test",
+            SignaturePurpose::OriginLogin,
+            "Log in to a.test",
+            payload,
+        );
 
         for mutate in [
             (|t: &mut Confirmation| t.origin = "https://evil.test".into()) as fn(&mut Confirmation),
@@ -255,15 +268,28 @@ mod tests {
         let shell = confirmer();
         let keystore = confirmer(); // a different secret
         let payload = b"payload";
-        let token = shell.issue("https://a.test", SignaturePurpose::OriginLogin, "Log in", payload);
-        assert_eq!(keystore.verify(&token, payload), Err(ConfirmationError::BadMac));
+        let token = shell.issue(
+            "https://a.test",
+            SignaturePurpose::OriginLogin,
+            "Log in",
+            payload,
+        );
+        assert_eq!(
+            keystore.verify(&token, payload),
+            Err(ConfirmationError::BadMac)
+        );
     }
 
     #[test]
     fn an_expired_confirmation_is_refused() {
         let c = confirmer();
         let payload = b"payload";
-        let mut token = c.issue("https://a.test", SignaturePurpose::OriginLogin, "Log in", payload);
+        let mut token = c.issue(
+            "https://a.test",
+            SignaturePurpose::OriginLogin,
+            "Log in",
+            payload,
+        );
         token.expires_at = now() - 1;
         token.mac = hex::encode(c.mac(&token.signing_input()));
         assert_eq!(c.verify(&token, payload), Err(ConfirmationError::Expired));

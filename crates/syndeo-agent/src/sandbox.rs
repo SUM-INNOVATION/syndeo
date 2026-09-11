@@ -137,7 +137,9 @@ mod platform {
 
     /// Seatbelt profiles are s-expressions; a path goes in a quoted string.
     fn escape(path: &Path) -> String {
-        path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"")
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
     }
 
     /// The path the kernel will see, symlinks and all.
@@ -238,12 +240,11 @@ mod platform {
         }
         for path in grant.sockets.iter().chain(grant.readable.iter()) {
             if let Ok(fd) = PathFd::new(path) {
-                ruleset = match ruleset
-                    .add_rule(PathBeneath::new(fd, read_only | AccessFs::WriteFile))
-                {
-                    Ok(r) => r,
-                    Err(err) => return Confinement::Unavailable(format!("landlock: {err}")),
-                };
+                ruleset =
+                    match ruleset.add_rule(PathBeneath::new(fd, read_only | AccessFs::WriteFile)) {
+                        Ok(r) => r,
+                        Err(err) => return Confinement::Unavailable(format!("landlock: {err}")),
+                    };
             }
         }
 
@@ -364,11 +365,23 @@ mod tests {
             .expect("the confined fixture runs");
         let report = String::from_utf8_lossy(&output.stdout);
 
-        assert!(report.contains("confined 0"), "the profile was refused: {report}");
-        assert!(report.contains("tcp false"), "it opened a TCP socket: {report}");
-        assert!(report.contains("udp false"), "it sent a UDP packet: {report}");
+        assert!(
+            report.contains("confined 0"),
+            "the profile was refused: {report}"
+        );
+        assert!(
+            report.contains("tcp false"),
+            "it opened a TCP socket: {report}"
+        );
+        assert!(
+            report.contains("udp false"),
+            "it sent a UDP packet: {report}"
+        );
         assert!(report.contains("write false"), "it wrote a file: {report}");
-        assert!(report.contains("exec false"), "it ran another program: {report}");
+        assert!(
+            report.contains("exec false"),
+            "it ran another program: {report}"
+        );
         assert!(
             !dir.path().join("written").exists(),
             "the write it reported as failing actually happened"

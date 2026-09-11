@@ -13,8 +13,8 @@ pub mod h3;
 pub mod service;
 pub mod tls;
 
+pub use body::FetchBody;
 pub use config::NetConfig;
 pub use dns::{DnsMode, Resolver};
 pub use error::{NetError, Result};
-pub use body::FetchBody;
 pub use fetch::{FetchRequest, FetchResponse, Net, Source};

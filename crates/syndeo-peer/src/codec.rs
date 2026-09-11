@@ -74,7 +74,8 @@ where
     }
     let mut body = vec![0u8; length];
     io.read_exact(&mut body).await?;
-    bincode::deserialize(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    bincode::deserialize(&body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
 async fn write_frame<T, V>(io: &mut T, value: &V) -> io::Result<()>

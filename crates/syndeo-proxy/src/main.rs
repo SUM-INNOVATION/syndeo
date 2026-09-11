@@ -90,15 +90,18 @@ fn home() -> PathBuf {
 }
 
 fn cache_root(override_path: &Option<PathBuf>) -> PathBuf {
-    override_path.clone().unwrap_or_else(|| home().join("cache"))
+    override_path
+        .clone()
+        .unwrap_or_else(|| home().join("cache"))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("syndeo_proxy=info,syndeo_net=info")),
+            tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG").unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("syndeo_proxy=info,syndeo_net=info")
+            }),
         )
         .with_target(false)
         .init();
@@ -122,13 +125,20 @@ async fn main() -> Result<()> {
             println!();
             println!("Trust it for the duration of the measurement, then remove it:");
             println!("  macOS   sudo security add-trusted-cert -d -r trustRoot \\");
-            println!("            -k /Library/Keychains/System.keychain {}", path.display());
-            println!("  remove  sudo security delete-certificate -c 'Syndeo Local Measurement CA' \\");
+            println!(
+                "            -k /Library/Keychains/System.keychain {}",
+                path.display()
+            );
+            println!(
+                "  remove  sudo security delete-certificate -c 'Syndeo Local Measurement CA' \\"
+            );
             println!("            /Library/Keychains/System.keychain");
             println!();
             println!("Then point a browser at the proxy, for example:");
             println!("  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\");
-            println!("    --proxy-server=http://127.0.0.1:8899 --user-data-dir=/tmp/syndeo-measure");
+            println!(
+                "    --proxy-server=http://127.0.0.1:8899 --user-data-dir=/tmp/syndeo-measure"
+            );
             Ok(())
         }
         Command::Stats(args) => {
@@ -179,7 +189,9 @@ async fn run(args: RunArgs) -> Result<()> {
 
     tracing::info!(listen = %args.listen, cache = %proxy.net.config().cache_root.display(), "proxy up");
     tracing::info!(certificate = %cert_path.display(), "trust this to intercept https");
-    tracing::info!("statistics at http://syndeo.local/stats through the proxy, or `syndeo-proxy stats`");
+    tracing::info!(
+        "statistics at http://syndeo.local/stats through the proxy, or `syndeo-proxy stats`"
+    );
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -221,7 +233,9 @@ type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
 
 fn whole(bytes: Bytes) -> Body {
     use http_body_util::BodyExt;
-    Full::new(bytes).map_err(|never| match never {}).boxed_unsync()
+    Full::new(bytes)
+        .map_err(|never| match never {})
+        .boxed_unsync()
 }
 
 fn streaming(body: syndeo_net::FetchBody) -> Body {
@@ -275,7 +289,14 @@ fn connect(proxy: Arc<Proxy>, req: Request<Incoming>) -> Response<Body> {
             }
         };
 
-        let origin = Arc::new(format!("https://{host}{}", if port == 443 { String::new() } else { format!(":{port}") }));
+        let origin = Arc::new(format!(
+            "https://{host}{}",
+            if port == 443 {
+                String::new()
+            } else {
+                format!(":{port}")
+            }
+        ));
         let service = service_fn(move |req| {
             let proxy = proxy.clone();
             let origin = origin.clone();
@@ -297,11 +318,20 @@ fn connect(proxy: Arc<Proxy>, req: Request<Incoming>) -> Response<Body> {
 }
 
 /// Turn one proxied request into a fetch, and the fetch back into a response.
-async fn forward(proxy: Arc<Proxy>, req: Request<Incoming>, origin: Option<String>) -> Response<Body> {
+async fn forward(
+    proxy: Arc<Proxy>,
+    req: Request<Incoming>,
+    origin: Option<String>,
+) -> Response<Body> {
     let method = req.method().clone();
     let url = match absolute_url(&req, origin.as_deref()) {
         Some(u) => u,
-        None => return text(StatusCode::BAD_REQUEST, "could not determine the target url"),
+        None => {
+            return text(
+                StatusCode::BAD_REQUEST,
+                "could not determine the target url",
+            )
+        }
     };
 
     if let Some(response) = stats::intercept(&proxy.net, &url) {
@@ -311,7 +341,12 @@ async fn forward(proxy: Arc<Proxy>, req: Request<Incoming>, origin: Option<Strin
     let headers = req.headers().clone();
     let body = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(err) => return text(StatusCode::BAD_REQUEST, &format!("reading the request body: {err}")),
+        Err(err) => {
+            return text(
+                StatusCode::BAD_REQUEST,
+                &format!("reading the request body: {err}"),
+            )
+        }
     };
 
     let fetch = FetchRequest {

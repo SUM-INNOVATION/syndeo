@@ -4,7 +4,7 @@ use crate::blob::{BlobStore, ContentId};
 use crate::error::{CacheError, Result};
 use crate::headers::{now_secs, sanitize};
 use crate::index::{entry_key, BlobRecord, EntryRecord, Index, Provenance, Segment, StoredBody};
-use crate::policy::{self, CacheOptions, Freshness, StoredMeta, Storability};
+use crate::policy::{self, CacheOptions, Freshness, Storability, StoredMeta};
 use crate::range::{self, Coverage, Resolved};
 use crate::sri::Integrity;
 use crate::stats::Stats;
@@ -77,7 +77,10 @@ pub enum Lookup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreOutcome {
     /// Written. `deduped` means the bytes were already on disk under this hash.
-    Stored { content: ContentId, deduped: bool },
+    Stored {
+        content: ContentId,
+        deduped: bool,
+    },
     /// A range was written into an entry that is still missing bytes. There is
     /// no content address yet, because there is no whole body to address.
     StoredPartial {
@@ -183,9 +186,10 @@ impl Cache {
         match url::Url::parse(raw) {
             Ok(mut u) => {
                 u.set_fragment(None);
-                let _ = u.set_port(u.port_or_known_default().filter(|p| {
-                    !matches!((u.scheme(), *p), ("http", 80) | ("https", 443))
-                }));
+                let _ = u.set_port(
+                    u.port_or_known_default()
+                        .filter(|p| !matches!((u.scheme(), *p), ("http", 80) | ("https", 443))),
+                );
                 u.to_string()
             }
             Err(_) => raw.to_string(),
@@ -289,7 +293,9 @@ impl Cache {
                 // succeeds and nothing to fall back on if it does not. Refetch.
                 if !record.body.is_complete() {
                     self.index.bump(counters::MISSES, 1)?;
-                    return Ok(Lookup::Miss("a stale partial entry is refetched, not revalidated"));
+                    return Ok(Lookup::Miss(
+                        "a stale partial entry is refetched, not revalidated",
+                    ));
                 }
                 let response = self.materialize(key.clone(), &record, &meta, age, &want)?;
                 self.index.bump(counters::REVALIDATIONS, 1)?;
@@ -494,7 +500,8 @@ impl Cache {
     /// before: the page names a sha384, a peer is asked for that sha384, and the
     /// bytes that come back either hash to it or are discarded.
     pub fn content_for_integrity(&self, hash: &crate::sri::Hash) -> Result<Option<ContentId>> {
-        self.index.content_for_sri(&sri_key(hash.algorithm, &hash.digest))
+        self.index
+            .content_for_sri(&sri_key(hash.algorithm, &hash.digest))
     }
 
     /// Record that an SRI digest names a stored body.
@@ -572,9 +579,13 @@ impl Cache {
             response_time,
         };
 
-        if let Storability::Reject(reason) =
-            policy::storability(method, request_headers, &meta, body.len() as u64, &self.options)
-        {
+        if let Storability::Reject(reason) = policy::storability(
+            method,
+            request_headers,
+            &meta,
+            body.len() as u64,
+            &self.options,
+        ) {
             self.index.bump(counters::REJECTS, 1)?;
             return Ok(StoreOutcome::NotStored(reason));
         }
@@ -783,11 +794,15 @@ impl Cache {
     ) -> Result<StoreOutcome> {
         if !method.eq_ignore_ascii_case("GET") {
             self.index.bump(counters::REJECTS, 1)?;
-            return Ok(StoreOutcome::NotStored("only a GET is stored as partial content"));
+            return Ok(StoreOutcome::NotStored(
+                "only a GET is stored as partial content",
+            ));
         }
         if range::is_multipart(response_headers) {
             self.index.bump(counters::REJECTS, 1)?;
-            return Ok(StoreOutcome::NotStored("multipart ranges are passed through"));
+            return Ok(StoreOutcome::NotStored(
+                "multipart ranges are passed through",
+            ));
         }
         let parsed = response_headers
             .get(http::header::CONTENT_RANGE)
@@ -795,11 +810,15 @@ impl Cache {
             .and_then(range::parse_content_range);
         let Some(content_range) = parsed else {
             self.index.bump(counters::REJECTS, 1)?;
-            return Ok(StoreOutcome::NotStored("206 without a usable Content-Range"));
+            return Ok(StoreOutcome::NotStored(
+                "206 without a usable Content-Range",
+            ));
         };
         if content_range.len() != body.len() as u64 {
             self.index.bump(counters::REJECTS, 1)?;
-            return Ok(StoreOutcome::NotStored("206 body does not match its Content-Range"));
+            return Ok(StoreOutcome::NotStored(
+                "206 body does not match its Content-Range",
+            ));
         }
 
         let key = entry_key("GET", url, &vkey);
@@ -807,9 +826,7 @@ impl Cache {
 
         // Is what we already hold the same representation as this range?
         let combinable = match &existing {
-            Some(record) => {
-                same_representation(&to_header_map(&record.headers), response_headers)
-            }
+            Some(record) => same_representation(&to_header_map(&record.headers), response_headers),
             None => false,
         };
         if existing.is_some() && !combinable {
@@ -1119,7 +1136,12 @@ impl Cache {
         }
         if evicted > 0 {
             self.index.bump(counters::EVICTIONS, evicted as u64)?;
-            tracing::debug!(evicted, on_disk, capacity, "evicted to stay inside the budget");
+            tracing::debug!(
+                evicted,
+                on_disk,
+                capacity,
+                "evicted to stay inside the budget"
+            );
         }
         Ok(evicted)
     }

@@ -105,7 +105,11 @@ async fn a_streamed_body_is_in_the_cache_once_it_has_all_arrived() {
 
     // Reading the stream to the end is what commits the entry.
     let second = net.fetch(FetchRequest::get(&url)).await.unwrap();
-    assert_eq!(second.source, Source::Cache, "the streamed body was not stored");
+    assert_eq!(
+        second.source,
+        Source::Cache,
+        "the streamed body was not stored"
+    );
     assert_eq!(second.body.collect().await.unwrap(), body);
     assert_eq!(origin.hits(), 1);
 }

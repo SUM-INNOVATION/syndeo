@@ -6,7 +6,6 @@ use syndeo_cache::sri::{Algorithm, Hash};
 use syndeo_cache::{Cache, ContentId};
 use syndeo_peer::{BlobRequest, PeerConfig, PeerHandle, PeerNode};
 
-
 fn cache(dir: &std::path::Path) -> Arc<Cache> {
     Arc::new(Cache::open(dir).unwrap())
 }
@@ -117,7 +116,10 @@ async fn a_peer_serves_a_body_by_the_integrity_a_page_declared() {
     // The client has never fetched this. All it has is the hash from the markup,
     // which is exactly the case peer fetch exists for.
     let declared = Hash::compute(Algorithm::Sha384, &body);
-    assert!(client_cache.content_for_integrity(&declared).unwrap().is_none());
+    assert!(client_cache
+        .content_for_integrity(&declared)
+        .unwrap()
+        .is_none());
 
     let fetched = client.fetch_integrity(&declared).await.unwrap();
     assert_eq!(fetched, body);
@@ -275,9 +277,15 @@ async fn what_a_peer_gave_and_took_is_recorded() {
         .iter()
         .find(|report| report.peer == server.peer_id())
         .expect("the server is connected");
-    assert_eq!(server_side.ledger.received, 1, "the client did not record the gift");
+    assert_eq!(
+        server_side.ledger.received, 1,
+        "the client did not record the gift"
+    );
     assert_eq!(server_side.ledger.bytes_received, body.len() as u64);
-    assert!(server_side.ledger.standing() > 0, "a giver should stand well");
+    assert!(
+        server_side.ledger.standing() > 0,
+        "a giver should stand well"
+    );
 
     let server_view = server.status().await.unwrap();
     let client_side = server_view
@@ -285,7 +293,10 @@ async fn what_a_peer_gave_and_took_is_recorded() {
         .iter()
         .find(|report| report.peer == client.peer_id())
         .expect("the client is connected");
-    assert_eq!(client_side.ledger.served, 1, "the server did not record the gift");
+    assert_eq!(
+        client_side.ledger.served, 1,
+        "the server did not record the gift"
+    );
     assert_eq!(client_side.ledger.debt, 1);
     assert!(
         client_side.ledger.standing() < 0,

@@ -8,8 +8,8 @@
 //! process for bytes and the shell for signatures, which is the same boundary
 //! the terminal front end sits behind.
 
-use crate::prompt::Ask;
 use crate::page::{self, Page};
+use crate::prompt::Ask;
 use egui::{Align, Color32, Layout, RichText};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
@@ -33,7 +33,10 @@ pub enum Done {
         url: String,
         fetched: Box<syndeo_ipc::protocol::Fetched>,
     },
-    Failed { url: String, error: String },
+    Failed {
+        url: String,
+        error: String,
+    },
     Stats(syndeo_cache::Stats),
     Peers(serde_json::Value),
     PeersUnavailable(String),
@@ -410,7 +413,10 @@ impl App {
                         row("misses", stats.misses.to_string());
                         row("revalidations", stats.revalidations.to_string());
                         row("hit rate", format!("{:.1}%", stats.hit_rate() * 100.0));
-                        row("byte hit rate", format!("{:.1}%", stats.byte_hit_rate() * 100.0));
+                        row(
+                            "byte hit rate",
+                            format!("{:.1}%", stats.byte_hit_rate() * 100.0),
+                        );
                         row("entries", stats.entries.to_string());
                         row("blobs", stats.blobs.to_string());
                         row("dedupe", format!("{:.2}x", stats.dedupe_ratio()));
@@ -485,7 +491,11 @@ impl App {
 
                 let connected = peers["connected"].as_array().cloned().unwrap_or_default();
                 if connected.is_empty() {
-                    ui.label(RichText::new("No peers connected.").color(Color32::GRAY).size(12.0));
+                    ui.label(
+                        RichText::new("No peers connected.")
+                            .color(Color32::GRAY)
+                            .size(12.0),
+                    );
                     return;
                 }
                 egui::Grid::new("peer-ledger")
@@ -498,10 +508,8 @@ impl App {
                         ui.end_row();
                         for report in &connected {
                             let id = report["peer"].as_str().unwrap_or_default();
-                            ui.label(
-                                RichText::new(page::truncate(id, 22)).monospace().size(11.0),
-                            )
-                            .on_hover_text(id);
+                            ui.label(RichText::new(page::truncate(id, 22)).monospace().size(11.0))
+                                .on_hover_text(id);
                             ui.label(RichText::new(report["received"].to_string()).size(11.0));
                             ui.label(RichText::new(report["served"].to_string()).size(11.0));
                             ui.end_row();
@@ -573,11 +581,7 @@ impl App {
 
                     ui.add_space(6.0);
                     ui.label(RichText::new("digest").size(12.0).color(Color32::GRAY));
-                    ui.label(
-                        RichText::new(request.digest())
-                            .monospace()
-                            .size(11.0),
-                    );
+                    ui.label(RichText::new(request.digest()).monospace().size(11.0));
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
@@ -666,7 +670,8 @@ impl App {
                             .desired_width(f32::INFINITY),
                     );
                     field.request_focus();
-                    let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let entered =
+                        field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {

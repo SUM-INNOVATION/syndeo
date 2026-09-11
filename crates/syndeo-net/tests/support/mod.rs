@@ -81,9 +81,8 @@ impl Origin {
 }
 
 /// An origin whose replies carry a body that is still being produced.
-pub type StreamHandler = Arc<
-    dyn Fn(&Request<hyper::body::Incoming>, usize) -> Response<StreamedBody> + Send + Sync,
->;
+pub type StreamHandler =
+    Arc<dyn Fn(&Request<hyper::body::Incoming>, usize) -> Response<StreamedBody> + Send + Sync>;
 
 pub type StreamedBody = http_body_util::StreamBody<
     futures::stream::BoxStream<'static, Result<hyper::body::Frame<Bytes>, std::io::Error>>,
@@ -124,7 +123,11 @@ impl Origin {
     }
 }
 
-pub fn respond(status: u16, headers: &[(&str, &str)], body: &'static [u8]) -> Response<Full<Bytes>> {
+pub fn respond(
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &'static [u8],
+) -> Response<Full<Bytes>> {
     let mut builder = Response::builder().status(status);
     for (name, value) in headers {
         builder = builder.header(*name, *value);

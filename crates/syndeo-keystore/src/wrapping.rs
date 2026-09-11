@@ -78,7 +78,6 @@ impl OsKeyring {
     fn enrolled_in_enclave(&self) -> bool {
         false
     }
-
 }
 
 impl WrappingKeyStore for OsKeyring {

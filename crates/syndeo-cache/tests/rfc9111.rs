@@ -5,9 +5,9 @@
 //! drive the real index and blob store.
 
 use http::HeaderMap;
+use std::sync::Arc;
 use syndeo_cache::policy::{self, CacheOptions, Freshness, Storability, StoredMeta};
 use syndeo_cache::{Cache, Lookup, StoreOutcome};
-use std::sync::Arc;
 
 /// A cache pinned to the suite's fixed clock.
 fn cache_at(dir: &std::path::Path, now: u64) -> Cache {
@@ -97,8 +97,14 @@ fn s4_2_1_max_age_beats_expires() {
 #[test]
 fn s4_2_1_s_maxage_applies_only_to_shared_caches() {
     let meta = stored(200, &[("cache-control", "max-age=10, s-maxage=1000")], 100);
-    assert!(is_revalidate(&eval(&[], &meta, &private())), "private honours max-age");
-    assert!(is_fresh(&eval(&[], &meta, &shared())), "shared honours s-maxage");
+    assert!(
+        is_revalidate(&eval(&[], &meta, &private())),
+        "private honours max-age"
+    );
+    assert!(
+        is_fresh(&eval(&[], &meta, &shared())),
+        "shared honours s-maxage"
+    );
 }
 
 #[test]
@@ -184,9 +190,17 @@ fn s4_2_3_apparent_age_covers_a_lying_upstream_age() {
 
 #[test]
 fn s4_2_4_must_revalidate_forbids_serving_stale() {
-    let meta = stored(200, &[("cache-control", "max-age=10, must-revalidate")], 100);
+    let meta = stored(
+        200,
+        &[("cache-control", "max-age=10, must-revalidate")],
+        100,
+    );
     // Even when the client explicitly accepts staleness.
-    assert!(is_revalidate(&eval(&[("cache-control", "max-stale")], &meta, &private())));
+    assert!(is_revalidate(&eval(
+        &[("cache-control", "max-stale")],
+        &meta,
+        &private()
+    )));
 }
 
 #[test]
@@ -217,7 +231,14 @@ fn s4_2_4_stale_while_revalidate_window_is_bounded() {
 
 #[test]
 fn stale_if_error_is_reported_to_the_caller() {
-    let meta = stored(200, &[("cache-control", "max-age=10, stale-if-error=600"), ("etag", "\"v1\"")], 100);
+    let meta = stored(
+        200,
+        &[
+            ("cache-control", "max-age=10, stale-if-error=600"),
+            ("etag", "\"v1\""),
+        ],
+        100,
+    );
     match eval(&[], &meta, &private()) {
         Freshness::Revalidate { stale_if_error, .. } => assert_eq!(stale_if_error, Some(600)),
         other => panic!("expected revalidate, got {other:?}"),
@@ -238,10 +259,28 @@ fn s4_1_vary_selects_the_matching_variant() {
     ]);
 
     cache
-        .store("GET", url, &headers(&[("accept-encoding", "gzip")]), 200, &resp, b"gzip body", NOW, NOW)
+        .store(
+            "GET",
+            url,
+            &headers(&[("accept-encoding", "gzip")]),
+            200,
+            &resp,
+            b"gzip body",
+            NOW,
+            NOW,
+        )
         .unwrap();
     cache
-        .store("GET", url, &headers(&[("accept-encoding", "br")]), 200, &resp, b"br body", NOW, NOW)
+        .store(
+            "GET",
+            url,
+            &headers(&[("accept-encoding", "br")]),
+            200,
+            &resp,
+            b"br body",
+            NOW,
+            NOW,
+        )
         .unwrap();
 
     for (encoding, expected) in [("gzip", &b"gzip body"[..]), ("br", &b"br body"[..])] {
@@ -284,7 +323,13 @@ fn s3_no_store_is_honoured_on_both_sides() {
 
     let ok = stored(200, &[("cache-control", "max-age=600")], 0);
     assert!(matches!(
-        policy::storability("GET", &headers(&[("cache-control", "no-store")]), &ok, 10, &private()),
+        policy::storability(
+            "GET",
+            &headers(&[("cache-control", "no-store")]),
+            &ok,
+            10,
+            &private()
+        ),
         Storability::Reject(_)
     ));
 }
@@ -363,7 +408,11 @@ fn s3_heuristically_cacheable_statuses_are_stored_without_directives() {
 
 #[test]
 fn s5_2_2_3_must_understand_overrides_no_store() {
-    let meta = stored(200, &[("cache-control", "no-store, must-understand, max-age=60")], 0);
+    let meta = stored(
+        200,
+        &[("cache-control", "no-store, must-understand, max-age=60")],
+        0,
+    );
     assert_eq!(
         policy::storability("GET", &HeaderMap::new(), &meta, 10, &private()),
         Storability::Store
@@ -383,22 +432,50 @@ fn a_response_with_neither_freshness_nor_a_validator_is_pointless_to_store() {
 
 #[test]
 fn s5_2_1_request_no_cache_forces_revalidation() {
-    let meta = stored(200, &[("cache-control", "max-age=600"), ("etag", "\"v1\"")], 10);
-    assert!(is_revalidate(&eval(&[("cache-control", "no-cache")], &meta, &private())));
+    let meta = stored(
+        200,
+        &[("cache-control", "max-age=600"), ("etag", "\"v1\"")],
+        10,
+    );
+    assert!(is_revalidate(&eval(
+        &[("cache-control", "no-cache")],
+        &meta,
+        &private()
+    )));
 }
 
 #[test]
 fn s5_2_1_request_max_age_can_be_stricter_than_the_response() {
-    let meta = stored(200, &[("cache-control", "max-age=600"), ("etag", "\"v1\"")], 100);
+    let meta = stored(
+        200,
+        &[("cache-control", "max-age=600"), ("etag", "\"v1\"")],
+        100,
+    );
     assert!(is_fresh(&eval(&[], &meta, &private())));
-    assert!(is_revalidate(&eval(&[("cache-control", "max-age=50")], &meta, &private())));
+    assert!(is_revalidate(&eval(
+        &[("cache-control", "max-age=50")],
+        &meta,
+        &private()
+    )));
 }
 
 #[test]
 fn s5_2_1_min_fresh_requires_remaining_lifetime() {
-    let meta = stored(200, &[("cache-control", "max-age=100"), ("etag", "\"v1\"")], 80);
-    assert!(is_fresh(&eval(&[("cache-control", "min-fresh=10")], &meta, &private())));
-    assert!(is_revalidate(&eval(&[("cache-control", "min-fresh=50")], &meta, &private())));
+    let meta = stored(
+        200,
+        &[("cache-control", "max-age=100"), ("etag", "\"v1\"")],
+        80,
+    );
+    assert!(is_fresh(&eval(
+        &[("cache-control", "min-fresh=10")],
+        &meta,
+        &private()
+    )));
+    assert!(is_revalidate(&eval(
+        &[("cache-control", "min-fresh=50")],
+        &meta,
+        &private()
+    )));
 }
 
 #[test]
@@ -408,14 +485,25 @@ fn s5_2_1_max_stale_accepts_bounded_staleness() {
         eval(&[("cache-control", "max-stale=100")], &meta, &private()),
         Freshness::ServeStale { .. }
     ));
-    assert!(is_revalidate(&eval(&[("cache-control", "max-stale=5")], &meta, &private())));
+    assert!(is_revalidate(&eval(
+        &[("cache-control", "max-stale=5")],
+        &meta,
+        &private()
+    )));
 }
 
 // ------------------------------------------------------------ §5.2.2 no-cache
 
 #[test]
 fn s5_2_2_response_no_cache_forces_revalidation_every_time() {
-    let meta = stored(200, &[("cache-control", "no-cache, max-age=600"), ("etag", "\"v1\"")], 1);
+    let meta = stored(
+        200,
+        &[
+            ("cache-control", "no-cache, max-age=600"),
+            ("etag", "\"v1\""),
+        ],
+        1,
+    );
     assert!(is_revalidate(&eval(&[], &meta, &private())));
 }
 
@@ -470,8 +558,14 @@ fn s4_3_4_a_304_updates_headers_but_not_content_metadata() {
 
     assert_eq!(stored_headers["cache-control"], "max-age=600");
     assert_eq!(stored_headers["x-origin"], "new");
-    assert_eq!(stored_headers["content-length"], "1234", "must not be overwritten");
-    assert!(!stored_headers.contains_key("connection"), "hop-by-hop dropped");
+    assert_eq!(
+        stored_headers["content-length"], "1234",
+        "must not be overwritten"
+    );
+    assert!(
+        !stored_headers.contains_key("connection"),
+        "hop-by-hop dropped"
+    );
     assert_eq!(stored_headers["etag"], "\"v1\"", "untouched fields survive");
 }
 
@@ -491,10 +585,16 @@ fn s4_4_unsafe_methods_invalidate_the_target() {
     cache
         .store("GET", url, &HeaderMap::new(), 200, &resp, b"v1", NOW, NOW)
         .unwrap();
-    assert!(matches!(cache.lookup("GET", url, &HeaderMap::new()).unwrap(), Lookup::Fresh(_)));
+    assert!(matches!(
+        cache.lookup("GET", url, &HeaderMap::new()).unwrap(),
+        Lookup::Fresh(_)
+    ));
 
     cache.invalidate("POST", url).unwrap();
-    assert!(matches!(cache.lookup("GET", url, &HeaderMap::new()).unwrap(), Lookup::Miss(_)));
+    assert!(matches!(
+        cache.lookup("GET", url, &HeaderMap::new()).unwrap(),
+        Lookup::Miss(_)
+    ));
 }
 
 // ------------------------------------------------- pass-through, not mishandled
@@ -507,7 +607,11 @@ fn client_conditionals_are_passed_through() {
         Freshness::Unusable(_)
     ));
     assert!(matches!(
-        eval(&[("if-modified-since", &date(NOW - 100))], &meta, &private()),
+        eval(
+            &[("if-modified-since", &date(NOW - 100))],
+            &meta,
+            &private()
+        ),
         Freshness::Unusable(_)
     ));
 }
@@ -518,7 +622,11 @@ fn a_range_is_not_the_policy_layers_business() {
     // It answers "is the representation usable"; `Cache::lookup` answers "which
     // bytes of it", and a range it cannot satisfy becomes a miss there.
     let meta = stored(200, &[("cache-control", "max-age=600")], 10);
-    assert!(is_fresh(&eval(&[("range", "bytes=0-99")], &meta, &private())));
+    assert!(is_fresh(&eval(
+        &[("range", "bytes=0-99")],
+        &meta,
+        &private()
+    )));
     assert!(is_fresh(&eval(
         &[("range", "bytes=0-99"), ("if-range", "\"v1\"")],
         &meta,
@@ -534,10 +642,7 @@ fn ranged_body() -> Vec<u8> {
 }
 
 fn store_whole(cache: &Cache, url: &str, body: &[u8], extra: &[(&str, &str)]) {
-    let mut pairs = vec![
-        ("cache-control", "max-age=600"),
-        ("etag", "\"v1\""),
-    ];
+    let mut pairs = vec![("cache-control", "max-age=600"), ("etag", "\"v1\"")];
     pairs.extend_from_slice(extra);
     let owned = date(NOW);
     pairs.push(("date", owned.as_str()));
@@ -627,7 +732,10 @@ fn s4_3_5_a_head_refreshes_the_stored_get_or_invalidates_it() {
         .store("HEAD", url, &HeaderMap::new(), 200, &moved, b"", NOW, NOW)
         .unwrap();
     assert!(
-        matches!(cache.lookup("GET", url, &HeaderMap::new()).unwrap(), Lookup::Miss(_)),
+        matches!(
+            cache.lookup("GET", url, &HeaderMap::new()).unwrap(),
+            Lookup::Miss(_)
+        ),
         "a HEAD that contradicts the stored GET invalidates it"
     );
 }
@@ -729,10 +837,25 @@ fn s3_3_partial_responses_are_stored_and_combined_rather_than_replaced() {
 
     // First half.
     let outcome = cache
-        .store("GET", url, &HeaderMap::new(), 206, &partial(0, 499), &body[0..500], NOW, NOW)
+        .store(
+            "GET",
+            url,
+            &HeaderMap::new(),
+            206,
+            &partial(0, 499),
+            &body[0..500],
+            NOW,
+            NOW,
+        )
         .unwrap();
     assert!(
-        matches!(outcome, StoreOutcome::StoredPartial { held: 500, complete_len: Some(1000) }),
+        matches!(
+            outcome,
+            StoreOutcome::StoredPartial {
+                held: 500,
+                complete_len: Some(1000)
+            }
+        ),
         "got {outcome:?}"
     );
 
@@ -760,7 +883,16 @@ fn s3_3_partial_responses_are_stored_and_combined_rather_than_replaced() {
 
     // An overlapping range adds only what is new, and does not replace.
     let outcome = cache
-        .store("GET", url, &HeaderMap::new(), 206, &partial(400, 799), &body[400..800], NOW, NOW)
+        .store(
+            "GET",
+            url,
+            &HeaderMap::new(),
+            206,
+            &partial(400, 799),
+            &body[400..800],
+            NOW,
+            NOW,
+        )
         .unwrap();
     assert!(
         matches!(outcome, StoreOutcome::StoredPartial { held: 800, .. }),
@@ -774,13 +906,28 @@ fn s3_3_partial_responses_are_stored_and_combined_rather_than_replaced() {
 
     // The last gap closes and the entry becomes an ordinary complete one.
     let outcome = cache
-        .store("GET", url, &HeaderMap::new(), 206, &partial(800, 999), &body[800..1000], NOW, NOW)
+        .store(
+            "GET",
+            url,
+            &HeaderMap::new(),
+            206,
+            &partial(800, 999),
+            &body[800..1000],
+            NOW,
+            NOW,
+        )
         .unwrap();
-    assert!(matches!(outcome, StoreOutcome::Stored { .. }), "got {outcome:?}");
+    assert!(
+        matches!(outcome, StoreOutcome::Stored { .. }),
+        "got {outcome:?}"
+    );
     match cache.lookup("GET", url, &HeaderMap::new()).unwrap() {
         Lookup::Fresh(response) => {
             assert_eq!(response.status, 200);
-            assert_eq!(response.body, body, "the runs reassemble into the original bytes");
+            assert_eq!(
+                response.body, body,
+                "the runs reassemble into the original bytes"
+            );
         }
         other => panic!("expected a complete body, got {other:?}"),
     }
@@ -804,12 +951,30 @@ fn s3_3_ranges_from_a_different_representation_are_not_stitched_together() {
     };
 
     cache
-        .store("GET", url, &HeaderMap::new(), 206, &partial("\"v1\"", 0, 499), &first[0..500], NOW, NOW)
+        .store(
+            "GET",
+            url,
+            &HeaderMap::new(),
+            206,
+            &partial("\"v1\"", 0, 499),
+            &first[0..500],
+            NOW,
+            NOW,
+        )
         .unwrap();
     // The file changed underneath us. Combining these would produce a body that
     // never existed, under a hash claiming it did.
     let outcome = cache
-        .store("GET", url, &HeaderMap::new(), 206, &partial("\"v2\"", 500, 999), &second[500..1000], NOW, NOW)
+        .store(
+            "GET",
+            url,
+            &HeaderMap::new(),
+            206,
+            &partial("\"v2\"", 500, 999),
+            &second[500..1000],
+            NOW,
+            NOW,
+        )
         .unwrap();
     assert!(
         matches!(outcome, StoreOutcome::StoredPartial { held: 500, .. }),
@@ -840,7 +1005,16 @@ fn s3_3_multipart_ranges_are_passed_through_not_stored_as_one_body() {
         ("date", &date(NOW)),
     ]);
     let outcome = cache
-        .store("GET", "https://example.test/m", &HeaderMap::new(), 206, &multipart, b"--SEP...", NOW, NOW)
+        .store(
+            "GET",
+            "https://example.test/m",
+            &HeaderMap::new(),
+            206,
+            &multipart,
+            b"--SEP...",
+            NOW,
+            NOW,
+        )
         .unwrap();
     assert_eq!(
         outcome,
@@ -854,7 +1028,16 @@ fn s3_3_multipart_ranges_are_passed_through_not_stored_as_one_body() {
         ("date", &date(NOW)),
     ]);
     let outcome = cache
-        .store("GET", "https://example.test/v", &HeaderMap::new(), 206, &vague, b"0123456789", NOW, NOW)
+        .store(
+            "GET",
+            "https://example.test/v",
+            &HeaderMap::new(),
+            206,
+            &vague,
+            b"0123456789",
+            NOW,
+            NOW,
+        )
         .unwrap();
     assert_eq!(
         outcome,
@@ -885,7 +1068,9 @@ fn filling_past_the_budget_evicts_by_the_configured_policy() {
         let mut state = seed as u64 + 1;
         (0..10_000)
             .map(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 (state >> 33) as u8
             })
             .collect()
@@ -895,7 +1080,16 @@ fn filling_past_the_budget_evicts_by_the_configured_policy() {
         let url = format!("https://example.test/{i}");
         let resp = headers(&[("cache-control", "max-age=600"), ("date", &date(NOW))]);
         cache
-            .store("GET", &url, &HeaderMap::new(), 200, &resp, &body(i), NOW, NOW)
+            .store(
+                "GET",
+                &url,
+                &HeaderMap::new(),
+                200,
+                &resp,
+                &body(i),
+                NOW,
+                NOW,
+            )
             .unwrap();
     }
 
@@ -906,7 +1100,10 @@ fn filling_past_the_budget_evicts_by_the_configured_policy() {
         "still over budget at {} bytes",
         stats.on_disk_bytes
     );
-    assert!(stats.entries < 8, "every entry survived a budget it exceeded");
+    assert!(
+        stats.entries < 8,
+        "every entry survived a budget it exceeded"
+    );
 }
 
 #[test]
@@ -960,7 +1157,16 @@ fn the_integrity_index_does_not_grow_across_store_purge_and_collect() {
         let resp = headers(&[("cache-control", "max-age=600"), ("date", &date(NOW))]);
         let body = format!("console.log({n});");
         cache
-            .store("GET", url, &HeaderMap::new(), 200, &resp, body.as_bytes(), NOW, NOW)
+            .store(
+                "GET",
+                url,
+                &HeaderMap::new(),
+                200,
+                &resp,
+                body.as_bytes(),
+                NOW,
+                NOW,
+            )
             .unwrap();
         cache.purge("GET", url).unwrap();
         cache.collect_garbage().unwrap();
@@ -1012,7 +1218,16 @@ fn end_to_end_store_hit_revalidate_and_dedupe() {
         ("date", &date(NOW)),
     ]);
     cache
-        .store("GET", url, &HeaderMap::new(), 200, &resp, b"old", NOW - 500, NOW - 500)
+        .store(
+            "GET",
+            url,
+            &HeaderMap::new(),
+            200,
+            &resp,
+            b"old",
+            NOW - 500,
+            NOW - 500,
+        )
         .unwrap();
 
     let key = match cache.lookup("GET", url, &HeaderMap::new()).unwrap() {
@@ -1092,10 +1307,28 @@ fn dropping_the_last_reference_frees_the_blob() {
     let body = vec![b'q'; 8192];
 
     cache
-        .store("GET", "https://example.test/a", &HeaderMap::new(), 200, &resp, &body, NOW, NOW)
+        .store(
+            "GET",
+            "https://example.test/a",
+            &HeaderMap::new(),
+            200,
+            &resp,
+            &body,
+            NOW,
+            NOW,
+        )
         .unwrap();
     cache
-        .store("GET", "https://example.test/b", &HeaderMap::new(), 200, &resp, &body, NOW, NOW)
+        .store(
+            "GET",
+            "https://example.test/b",
+            &HeaderMap::new(),
+            200,
+            &resp,
+            &body,
+            NOW,
+            NOW,
+        )
         .unwrap();
 
     let id = syndeo_cache::ContentId::of(&body);

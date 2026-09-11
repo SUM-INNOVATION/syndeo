@@ -17,7 +17,11 @@ use syndeo_keystore::{Keystore, OsKeyring};
 const SECRET_VAR: &str = "SYNDEO_SESSION_SECRET";
 
 #[derive(Parser)]
-#[command(name = "syndeo-keystore", version, about = "Holds keys; signs only what the shell confirms")]
+#[command(
+    name = "syndeo-keystore",
+    version,
+    about = "Holds keys; signs only what the shell confirms"
+)]
 struct Cli {
     /// Where `.keystore` lives.
     #[arg(long, global = true)]
@@ -90,10 +94,14 @@ async fn main() -> Result<()> {
 
             let endpoint = match socket {
                 Some(path) => Endpoint::new(path),
-                None => Endpoint::in_runtime_dir(syndeo_ipc::transport::runtime_dir_for(&home), "keystore")?,
+                None => Endpoint::in_runtime_dir(
+                    syndeo_ipc::transport::runtime_dir_for(&home),
+                    "keystore",
+                )?,
             };
             let server = Server::bind(endpoint)?;
-            syndeo_keystore::service::serve(keystore, Arc::new(Confirmer::new(secret)), server).await;
+            syndeo_keystore::service::serve(keystore, Arc::new(Confirmer::new(secret)), server)
+                .await;
             Ok(())
         }
 
@@ -186,7 +194,10 @@ async fn main() -> Result<()> {
             let passphrase = syndeo_keystore::passphrase::read("Passphrase: ")?;
             keystore.unseal(Some(&passphrase))?;
             let (public_key, address) = keystore.public_identity(&origin)?;
-            println!("origin      {}", syndeo_keystore::derive::canonical_origin(&origin));
+            println!(
+                "origin      {}",
+                syndeo_keystore::derive::canonical_origin(&origin)
+            );
             println!("public key  {public_key}");
             println!("address     {address}");
             keystore.lock();

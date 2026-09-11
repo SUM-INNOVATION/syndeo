@@ -142,7 +142,10 @@ pub fn canonical_origin(origin: &str) -> String {
         .next()
         .unwrap_or(rest)
         .to_ascii_lowercase();
-    let authority = authority.rsplit_once('@').map(|(_, a)| a).unwrap_or(&authority);
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, a)| a)
+        .unwrap_or(&authority);
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
             (h.to_string(), Some(p.to_string()))
@@ -231,8 +234,14 @@ mod tests {
         assert_eq!(SUM_CHAIN_ID, 1, "the chain id is not the coin type");
 
         let identity = master.derive_path(&[PURPOSE, SUM_COIN_TYPE, 0]);
-        assert_eq!(identity.address().to_base58(), "6d3w7V1x5bVHK7xf6s75JpHQWd9Ed6Xsg");
-        assert_eq!(hex::encode(identity.public_key()), "35a597be28cd361d3f33143093ca0f120276b75ea701c47e7c45a49a76b9fc5d");
+        assert_eq!(
+            identity.address().to_base58(),
+            "6d3w7V1x5bVHK7xf6s75JpHQWd9Ed6Xsg"
+        );
+        assert_eq!(
+            hex::encode(identity.public_key()),
+            "35a597be28cd361d3f33143093ca0f120276b75ea701c47e7c45a49a76b9fc5d"
+        );
 
         for (origin, address) in [
             ("https://wallet.test", "8rNvk67chDLXGE4pgD6Ns49b6StyrARNd"),

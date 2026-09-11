@@ -142,8 +142,7 @@ impl ApplicationHandler<Woken> for App {
         else {
             return;
         };
-        let (waker, net, runtime, url) =
-            (waker.clone(), net.clone(), runtime.clone(), url.clone());
+        let (waker, net, runtime, url) = (waker.clone(), net.clone(), runtime.clone(), url.clone());
         // Servo gets one, the delegate gets another: a finished fetch has to be
         // able to turn the loop just as much as a finished frame does.
         let waker_for_loads = waker.clone();

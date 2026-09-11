@@ -119,7 +119,10 @@ impl Tool {
     /// outside its own memory, or returning more than [`MAX_BUFFER`].
     pub fn run(&self, input: &[u8]) -> Result<Vec<u8>> {
         if input.len() > MAX_BUFFER {
-            bail!("the input is {} bytes, past the {MAX_BUFFER} ceiling", input.len());
+            bail!(
+                "the input is {} bytes, past the {MAX_BUFFER} ceiling",
+                input.len()
+            );
         }
 
         let host = Host {
@@ -137,8 +140,8 @@ impl Tool {
         // An empty linker. This is the whole security argument: there is nothing
         // in it, so there is nothing for the tool to call.
         let linker: Linker<Host> = Linker::new(&self.engine);
-        let instance = wasm(linker.instantiate(&mut store, &self.module))
-            .context("instantiating the tool")?;
+        let instance =
+            wasm(linker.instantiate(&mut store, &self.module)).context("instantiating the tool")?;
 
         let memory = instance
             .get_memory(&mut store, "memory")
@@ -162,7 +165,6 @@ impl Tool {
         }
         read_from(&store, &memory, out_pointer, out_len)
     }
-
 }
 
 fn write_into(
@@ -207,7 +209,10 @@ pub fn discover(directory: &Path) -> Vec<(PathBuf, Result<Tool>)> {
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
         if EXTENSIONS.contains(&extension) {
             out.push((path.clone(), Tool::load(&path)));
         }

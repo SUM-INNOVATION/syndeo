@@ -165,6 +165,9 @@ mod tests {
             algorithm: algorithm_tag(Algorithm::Sha256),
             digest: full.digest[..16].to_vec(),
         };
-        assert!(!request.is_satisfied_by(BODY), "a short digest is not a weaker digest");
+        assert!(
+            !request.is_satisfied_by(BODY),
+            "a short digest is not a weaker digest"
+        );
     }
 }

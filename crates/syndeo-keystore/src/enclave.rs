@@ -209,8 +209,10 @@ impl EnclaveItem {
 /// An OSStatus, with the ones that actually happen named.
 fn describe(status: i32) -> String {
     let meaning = match status {
-        -34018 => " (missing entitlement: this binary is not signed with a keychain access group, \
-                    so the data protection keychain is not available to it)",
+        -34018 => {
+            " (missing entitlement: this binary is not signed with a keychain access group, \
+                    so the data protection keychain is not available to it)"
+        }
         -25291 => " (no keychain is available)",
         -25300 => " (no such item)",
         -128 => " (the user cancelled the authentication)",

@@ -341,11 +341,7 @@ impl BlobWriter {
             file.sync_all()?;
         }
         let id = ContentId(*self.hasher.finalize().as_bytes());
-        let digests = self
-            .digests
-            .take()
-            .map(|d| d.finish())
-            .unwrap_or_default();
+        let digests = self.digests.take().map(|d| d.finish()).unwrap_or_default();
         Ok(FinishedWrite {
             id,
             // Taking the path also disarms `Drop`, which would otherwise delete
@@ -449,7 +445,9 @@ mod tests {
     #[test]
     fn incompressible_bodies_are_stored_raw() {
         let (_dir, store) = store();
-        let body: Vec<u8> = (0..40_000u32).map(|i| blake3::hash(&i.to_le_bytes()).as_bytes()[0]).collect();
+        let body: Vec<u8> = (0..40_000u32)
+            .map(|i| blake3::hash(&i.to_le_bytes()).as_bytes()[0])
+            .collect();
         let receipt = store.put(&body).unwrap();
         assert_eq!(receipt.compression, Compression::None);
         assert_eq!(store.get(receipt.id).unwrap(), body);

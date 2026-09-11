@@ -83,8 +83,9 @@ impl Dns {
         opts.use_hosts_file = true;
 
         let resolver = match mode {
-            DnsMode::System => TokioAsyncResolver::tokio_from_system_conf()
-                .unwrap_or_else(|_| TokioAsyncResolver::tokio(ResolverConfig::default(), opts.clone())),
+            DnsMode::System => TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|_| {
+                TokioAsyncResolver::tokio(ResolverConfig::default(), opts.clone())
+            }),
             DnsMode::Tls(r) => TokioAsyncResolver::tokio(
                 ResolverConfig::from_parts(None, vec![], r.tls_group()),
                 opts.clone(),
@@ -122,9 +123,8 @@ impl Iterator for Addrs {
 impl tower_service::Service<Name> for Dns {
     type Response = Addrs;
     type Error = NetError;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Addrs>> + Send + 'static>,
-    >;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Addrs>> + Send + 'static>>;
 
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<()>> {
         Poll::Ready(Ok(()))
@@ -137,10 +137,7 @@ impl tower_service::Service<Name> for Dns {
                 .lookup_ip(name.as_str())
                 .await
                 .map_err(|e| NetError::Dns(e.to_string()))?;
-            let addrs: Vec<SocketAddr> = response
-                .iter()
-                .map(|ip| SocketAddr::new(ip, 0))
-                .collect();
+            let addrs: Vec<SocketAddr> = response.iter().map(|ip| SocketAddr::new(ip, 0)).collect();
             Ok(Addrs(addrs.into_iter()))
         })
     }

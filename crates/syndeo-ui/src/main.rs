@@ -213,7 +213,10 @@ async fn unseal(keystore: &Endpoint, prompter: &dyn Prompter) -> Result<()> {
     } else {
         None
     };
-    match channel.call(&KeystoreRequest::Unseal { passphrase }).await? {
+    match channel
+        .call(&KeystoreRequest::Unseal { passphrase })
+        .await?
+    {
         KeystoreResponse::Ok => Ok(()),
         KeystoreResponse::Error(e) => bail!(e),
         _ => bail!("unexpected reply from the keystore"),
