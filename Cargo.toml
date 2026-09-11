@@ -115,3 +115,24 @@ egui_extras = { version = "0.36" }
 servo = { version = "0.5" }
 winit = { version = "0.30" }
 euclid = { version = "0.22" }
+
+# Cargo's defaults leave a release build with sixteen codegen units and no
+# link-time optimisation, which for a browser is measurable in two places: the
+# binary, and how much of it is resident. Only about 37 MB of the renderer's
+# 143 MB is ever paged in, so this is aimed at the code that actually runs
+# rather than at the file size — though both move.
+#
+# Thin LTO rather than fat: fat LTO across Servo's twelve hundred crates costs
+# far more build time than the difference is worth, and thin gets most of it.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# Panics still unwind. Servo catches them, and abort would turn a recoverable
+# script failure into a lost window.
+panic = "unwind"
+strip = "debuginfo"
+
+# The renderer's dependencies are most of the build, and they are the ones worth
+# optimising hardest; our own crates are small enough that it costs nothing.
+[profile.release.package."*"]
+codegen-units = 1

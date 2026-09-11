@@ -305,6 +305,30 @@ mod base64_bytes {
     }
 }
 
+/// The cache partition for a document: its origin, and nothing more of it.
+///
+/// Scheme, host and port — so `https://example.test/a` and
+/// `https://example.test/b` share a partition, and `http://` and `https://` do
+/// not. Chrome partitions on the registrable domain instead, which needs a
+/// public suffix list to work out that `bbc.co.uk` is a site and `co.uk` is
+/// not; the origin is stricter than that, needs no list, and errs towards more
+/// partitions rather than fewer. Subdomains of one site therefore do not share
+/// a cache, which costs some hit rate and gives nothing away.
+pub fn partition_for(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    let url = &url;
+    match url.host_str() {
+        Some(host) => Some(match url.port() {
+            Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+            None => format!("{}://{}", url.scheme(), host),
+        }),
+        // `about:blank` and friends have no host and so no site to be
+        // partitioned under. They get their own partition rather than sharing
+        // the unpartitioned one with everything else.
+        None => Some(format!("{}:", url.scheme())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -327,29 +351,5 @@ mod tests {
         // serialized form changes and this fails.
         let variants = serde_json::to_string(&super::ShellRequest::Ping).unwrap();
         assert_eq!(variants, "\"Ping\"");
-    }
-}
-
-/// The cache partition for a document: its origin, and nothing more of it.
-///
-/// Scheme, host and port — so `https://example.test/a` and
-/// `https://example.test/b` share a partition, and `http://` and `https://` do
-/// not. Chrome partitions on the registrable domain instead, which needs a
-/// public suffix list to work out that `bbc.co.uk` is a site and `co.uk` is
-/// not; the origin is stricter than that, needs no list, and errs towards more
-/// partitions rather than fewer. Subdomains of one site therefore do not share
-/// a cache, which costs some hit rate and gives nothing away.
-pub fn partition_for(url: &str) -> Option<String> {
-    let url = url::Url::parse(url).ok()?;
-    let url = &url;
-    match url.host_str() {
-        Some(host) => Some(match url.port() {
-            Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
-            None => format!("{}://{}", url.scheme(), host),
-        }),
-        // `about:blank` and friends have no host and so no site to be
-        // partitioned under. They get their own partition rather than sharing
-        // the unpartitioned one with everything else.
-        None => Some(format!("{}:", url.scheme())),
     }
 }
