@@ -48,6 +48,24 @@ struct Cli {
     /// system | dot:cloudflare | doh:cloudflare | doh:google | doh:quad9
     #[arg(long, default_value = "system")]
     dns: String,
+    /// Scroll this many times on its own, report how long each frame took, and
+    /// exit.
+    ///
+    /// Driving a window from a test script means synthetic input, which means
+    /// depending on which window the operating system thinks is focused — and
+    /// that is decided by whoever is using the machine at the time. This drives
+    /// the same code path a wheel event does, from inside, so the measurement
+    /// is the renderer's rather than the window server's.
+    #[arg(long, value_name = "COUNT")]
+    scroll_bench: Option<usize>,
+    /// Window size, as WIDTHxHEIGHT. Compositing cost is per pixel, so a
+    /// measurement at the default size says nothing about a maximised window.
+    #[arg(long, value_name = "WxH")]
+    window_size: Option<String>,
+    /// Milliseconds between synthetic scrolls in `--scroll-bench`. A trackpad
+    /// is about 8; anything under one frame is what coalescing exists for.
+    #[arg(long, default_value_t = 8, value_name = "MS")]
+    scroll_rate_ms: u64,
 }
 
 fn main() -> Result<()> {
@@ -89,11 +107,35 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::with_user_event()
         .build()
         .context("creating the event loop")?;
+    let proxy = event_loop.create_proxy();
+    // The benchmark is paced from a thread rather than from a timer inside the
+    // loop, so that a slow frame delays the next scroll exactly as a finger
+    // would not: the input keeps coming at a steady rate whatever the renderer
+    // is doing, which is the situation being measured.
+    if let Some(count) = cli.scroll_bench {
+        let proxy = proxy.clone();
+        let rate = cli.scroll_rate_ms;
+        std::thread::spawn(move || {
+            // Long enough for the page to have loaded and settled.
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            for _ in 0..count {
+                if proxy.send_event(Woken).is_err() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(rate));
+            }
+        });
+    }
     let mut app = App::Initial {
-        waker: Waker(event_loop.create_proxy()),
+        waker: Waker(proxy),
         net,
         runtime: runtime.handle().clone(),
         url,
+        bench: cli.scroll_bench.unwrap_or(0),
+        size: cli.window_size.as_deref().and_then(|s| {
+            let (w, h) = s.split_once(['x', 'X'])?;
+            Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+        }),
     };
     let outcome = event_loop.run_app(&mut app);
 
@@ -115,6 +157,22 @@ struct Running {
     cursor: Cell<(f32, f32)>,
     /// Which modifiers are held, so a shortcut can be told from a keystroke.
     modifiers: Cell<Modifiers>,
+    /// Wheel deltas that have arrived but have not been handed to Servo yet.
+    ///
+    /// A trackpad produces around a hundred and twenty of these a second, and
+    /// one composite costs about eight milliseconds — so notifying per event
+    /// asks for roughly a full core just to scroll, and every hiccup then shows
+    /// as the page falling behind the finger. They are summed here and handed
+    /// over once per turn of the loop instead, which is what every other
+    /// browser does: the cost becomes one per *frame* rather than one per
+    /// *event*, and is bounded by the display rather than by the input.
+    pending_scroll: Cell<(f32, f32)>,
+    /// Scrolls still to perform in `--scroll-bench`, and how long each frame
+    /// took while it ran.
+    bench: Cell<usize>,
+    fed: Cell<usize>,
+    frames: RefCell<Vec<u128>>,
+    last_paint: Cell<Option<std::time::Instant>>,
     /// Horizontal scroll accumulated since the last navigation.
     ///
     /// A swipe is not an event, it is a few dozen small deltas, so the decision
@@ -141,6 +199,42 @@ impl Running {
         }
     }
 
+    /// Hand Servo everything the wheel has produced since the last turn.
+    fn flush_scroll(&self) {
+        let (dx, dy) = self.pending_scroll.replace((0.0, 0.0));
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        let point = self.cursor_point();
+        self.with_webview(|webview| {
+            // Two notifications, and both are needed. The wheel event is what a
+            // page listening for `wheel` sees and may cancel; the scroll is what
+            // actually moves the viewport, for the overwhelming majority of
+            // pages that listen for nothing. Sending only the first is a page
+            // that reports scrolling and never moves.
+            webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
+                WheelDelta {
+                    x: dx as f64,
+                    y: dy as f64,
+                    z: 0.0,
+                    mode: WheelMode::DeltaPixel,
+                },
+                point,
+            )));
+            // Negated, because the two conventions are opposites: a positive
+            // wheel delta reveals content *above*, and a positive scroll delta
+            // reveals content *below*.
+            webview.notify_scroll_event(
+                Scroll::Delta(WebViewVector::Page(euclid::Vector2D::new(-dx, -dy))),
+                point,
+            );
+        });
+    }
+
+    fn benching(&self) -> bool {
+        self.fed.get() > 0
+    }
+
     /// Back and forward, however they were asked for.
     ///
     /// There is no button to press, and there cannot be one yet: drawing chrome
@@ -161,6 +255,26 @@ impl Running {
             }
         });
         self.window.request_redraw();
+    }
+}
+
+impl App {
+    /// One frame's work, timed: pump, composite, present.
+    ///
+    /// Called directly rather than through `RedrawRequested`, because macOS
+    /// does not ask an occluded window to redraw — and a benchmark that waited
+    /// to be asked measured nothing whenever another window was in front, which
+    /// is most of the time on a machine somebody is using.
+    fn compose(state: &Rc<Running>) {
+        let started = std::time::Instant::now();
+        state.network.deliver();
+        state._servo.spin_event_loop();
+        state.with_webview(|webview| webview.paint());
+        state.rendering_context.present();
+        state
+            .frames
+            .borrow_mut()
+            .push(started.elapsed().as_millis());
     }
 }
 
@@ -190,6 +304,8 @@ enum App {
         net: Endpoint,
         runtime: tokio::runtime::Handle,
         url: Url,
+        bench: usize,
+        size: Option<(u32, u32)>,
     },
     Running(Rc<Running>),
 }
@@ -201,10 +317,14 @@ impl ApplicationHandler<Woken> for App {
             net,
             runtime,
             url,
+            bench,
+            size,
         } = self
         else {
             return;
         };
+        let bench = *bench;
+        let size = *size;
         let (waker, net, runtime, url) = (waker.clone(), net.clone(), runtime.clone(), url.clone());
         // Servo gets one, the delegate gets another: a finished fetch has to be
         // able to turn the loop just as much as a finished frame does.
@@ -213,9 +333,11 @@ impl ApplicationHandler<Woken> for App {
         let display_handle = event_loop
             .display_handle()
             .expect("a display handle for the window");
-        let window = event_loop
-            .create_window(Window::default_attributes().with_title("Syndeo — renderer"))
-            .expect("a window");
+        let mut attributes = Window::default_attributes().with_title("Syndeo — renderer");
+        if let Some((w, h)) = size {
+            attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(w, h));
+        }
+        let window = event_loop.create_window(attributes).expect("a window");
         let window_handle = window.window_handle().expect("a handle for the window");
 
         let rendering_context = Rc::new(
@@ -241,6 +363,11 @@ impl ApplicationHandler<Woken> for App {
             cursor: Cell::new((0.0, 0.0)),
             modifiers: Cell::new(Modifiers::empty()),
             swipe: Cell::new(0.0),
+            pending_scroll: Cell::new((0.0, 0.0)),
+            bench: Cell::new(bench),
+            fed: Cell::new(0),
+            frames: RefCell::new(Vec::new()),
+            last_paint: Cell::new(None),
         });
 
         let webview = WebViewBuilder::new(&state._servo, state.rendering_context.clone())
@@ -259,7 +386,46 @@ impl ApplicationHandler<Woken> for App {
     /// it has drained everything that was pending, and that is where the work
     /// happens. Pumping here as well would pump once per wake-up instead of
     /// once per batch.
-    fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _event: Woken) {}
+    fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, _event: Woken) {
+        let App::Running(state) = self else { return };
+        let remaining = state.bench.get();
+        if remaining == 0 {
+            return;
+        }
+
+        // Fed into the same accumulator a real wheel event goes into, so the
+        // benchmark exercises the coalescing rather than stepping around it.
+        let (px, py) = state.pending_scroll.get();
+        state.pending_scroll.set((px, py - 10.0));
+        state.fed.set(state.fed.get() + 1);
+        state.bench.set(remaining - 1);
+
+        if remaining == 1 {
+            // One last turn, so the deltas fed above are not left unflushed.
+            state.flush_scroll();
+            Self::compose(state);
+            let mut sorted: Vec<u128> = state.frames.borrow().clone();
+            sorted.sort_unstable();
+            if sorted.is_empty() {
+                println!("scroll-bench: no frames were painted");
+            } else {
+                let at = |q: f64| sorted[((sorted.len() - 1) as f64 * q) as usize];
+                let over = sorted.iter().filter(|ms| **ms > 16).count();
+                println!(
+                    "scroll-bench: {} wheel events -> {} composites  \
+                     median {}ms  p90 {}ms  max {}ms  over 16ms: {} ({:.0}%)",
+                    state.fed.get(),
+                    sorted.len(),
+                    at(0.5),
+                    at(0.9),
+                    sorted[sorted.len() - 1],
+                    over,
+                    100.0 * over as f64 / sorted.len() as f64,
+                );
+            }
+            event_loop.exit();
+        }
+    }
 
     /// One pump per batch of events, rather than one per event.
     ///
@@ -273,6 +439,12 @@ impl ApplicationHandler<Woken> for App {
     /// forty scroll deltas now costs one pump instead of forty.
     fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
         if let App::Running(state) = self {
+            let scrolled = state.pending_scroll.get() != (0.0, 0.0);
+            state.flush_scroll();
+            if scrolled && state.benching() {
+                Self::compose(state);
+            }
+
             // Answers first: a load that has come back should be applied before
             // Servo is asked what to do next.
             let started = std::time::Instant::now();
@@ -344,6 +516,14 @@ impl ApplicationHandler<Woken> for App {
                     let painted = started.elapsed();
                     if painted > std::time::Duration::from_millis(16) {
                         tracing::debug!(ms = painted.as_millis(), "slow paint");
+                    }
+                    // The interval between frames, which is what smoothness
+                    // actually is: how long the previous frame stayed on screen.
+                    if let Some(previous) = state.last_paint.replace(Some(started)) {
+                        state
+                            .frames
+                            .borrow_mut()
+                            .push(previous.elapsed().as_millis());
                     }
                 }
             }
@@ -478,32 +658,9 @@ impl ApplicationHandler<Woken> for App {
                         state.swipe.set(0.0);
                     }
 
-                    let point = state.cursor_point();
-                    tracing::debug!(dx, dy, ?point, "input: wheel");
-                    state.with_webview(|webview| {
-                        // Two notifications, and both are needed. The wheel
-                        // event is what a page listening for `wheel` sees and
-                        // may cancel; the scroll is what actually moves the
-                        // viewport, for the overwhelming majority of pages that
-                        // listen for nothing. Sending only the first is a page
-                        // that reports scrolling and never moves.
-                        webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
-                            WheelDelta {
-                                x: dx as f64,
-                                y: dy as f64,
-                                z: 0.0,
-                                mode: WheelMode::DeltaPixel,
-                            },
-                            point,
-                        )));
-                        // Negated, because the two conventions are opposites: a
-                        // positive wheel delta reveals content *above*, and a
-                        // positive scroll delta reveals content *below*.
-                        webview.notify_scroll_event(
-                            Scroll::Delta(WebViewVector::Page(euclid::Vector2D::new(-dx, -dy))),
-                            point,
-                        );
-                    });
+                    tracing::trace!(dx, dy, "input: wheel");
+                    let (px, py) = state.pending_scroll.get();
+                    state.pending_scroll.set((px + dx, py + dy));
                     state.window.request_redraw();
                 }
             }
