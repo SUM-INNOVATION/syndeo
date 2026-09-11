@@ -80,10 +80,23 @@ jobs:
             libgl1-mesa-dev libegl1-mesa-dev \
             `# Servo's own, on top of ours: fonts, text shaping, unwinding` \
             libfontconfig1-dev libfreetype6-dev libharfbuzz-dev libunwind-dev \
-            libssl-dev ccache clang cmake gperf libgles2-mesa-dev \
+            libssl-dev ccache cmake gperf libgles2-mesa-dev \
             `# GStreamer, for media` \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev
+            libgstreamer-plugins-bad1.0-dev \
+            `# clang 15: Servo's mozangle (ANGLE) does not compile with the
+             # clang 14 that 22.04 ships — its headers reject the SSE builtins
+             # ANGLE uses, and the failure is a wall of
+             # "undeclared identifier __builtin_ia32_paddsb128". arm64 never hit
+             # it, having no x86 intrinsics to compile.` \
+            clang-15 libclang-15-dev
+
+      - name: Point the C toolchain at clang 15
+        if: runner.os == 'Linux'
+        run: |
+          echo "CC=clang-15" >> "$GITHUB_ENV"
+          echo "CXX=clang++-15" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=/usr/lib/llvm-15/lib" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
