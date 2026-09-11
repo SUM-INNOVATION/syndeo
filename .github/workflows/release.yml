@@ -100,8 +100,13 @@ jobs:
       - name: Point the C toolchain at clang 15
         if: runner.os == 'Linux'
         run: |
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 100
+          # A symlink, not an alternatives entry: /usr/bin/clang on these
+          # runners is a real file, and `update-alternatives --install` does
+          # nothing at all when the path it is asked to manage already exists
+          # as one. That is why the previous two attempts changed nothing and
+          # `clang --version` kept answering 14.
+          sudo ln -sf /usr/bin/clang-15 /usr/bin/clang
+          sudo ln -sf /usr/bin/clang++-15 /usr/bin/clang++
           target=$(echo "${{ matrix.target }}" | tr '-' '_')
           {
             echo "CC=clang-15"
@@ -110,7 +115,11 @@ jobs:
             echo "CXX_${target}=clang++-15"
             echo "LIBCLANG_PATH=/usr/lib/llvm-15/lib"
           } >> "$GITHUB_ENV"
+          # Printed, and checked, so a compiler that did not change fails here
+          # rather than forty minutes into Servo.
           clang --version | head -1
+          clang --version | grep -q 'version 15' \
+            || { echo "::error::clang is still $(clang --version | head -1)"; exit 1; }
 
       - uses: dtolnay/rust-toolchain@stable
         with:
