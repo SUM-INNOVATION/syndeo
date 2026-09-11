@@ -96,6 +96,21 @@ pub fn provenance(fetched: &Fetched) -> String {
     }
 }
 
+/// Whether a URL's bytes are already in the renderer's hands.
+///
+/// `data:` is the payload itself, `about:` is Servo's own pages, `blob:` and
+/// `filesystem:` are memory it is already holding. None of them is reachable
+/// over a socket, so none of them is the network process's business — and
+/// handing them to it produces a cancelled load and a missing image.
+///
+/// Compared on the parsed scheme rather than on a prefix of the text: the URL
+/// parser has already lowercased it and stripped the whitespace that a prefix
+/// match would have to guess at.
+pub fn is_self_contained_scheme(url: &url::Url) -> bool {
+    const SELF_CONTAINED: &[&str] = &["data", "about", "blob", "filesystem", "javascript"];
+    SELF_CONTAINED.contains(&url.scheme())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +238,31 @@ mod tests {
 
         let from_store = fetched(&[], b"x");
         assert_eq!(provenance(&from_store), "cache");
+    }
+
+    #[test]
+    fn bytes_the_renderer_already_has_are_not_the_network_process_business() {
+        let parse = |s: &str| url::Url::parse(s).unwrap();
+
+        // The exact shape that was cancelling every inline icon on rust-lang.org.
+        assert!(is_self_contained_scheme(&parse(
+            "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>"
+        )));
+        assert!(is_self_contained_scheme(&parse(
+            "DATA:text/plain;base64,aGk="
+        )));
+        assert!(is_self_contained_scheme(&parse("about:blank")));
+        assert!(is_self_contained_scheme(&parse(
+            "blob:https://example.test/abc"
+        )));
+
+        // Everything that can reach a socket goes to the network process, and a
+        // scheme nobody has thought about is on that side of the line too.
+        assert!(!is_self_contained_scheme(&parse("https://example.test/")));
+        assert!(!is_self_contained_scheme(&parse("http://example.test/")));
+        assert!(!is_self_contained_scheme(&parse(
+            "wss://example.test/socket"
+        )));
+        assert!(!is_self_contained_scheme(&parse("ftp://example.test/file")));
     }
 }

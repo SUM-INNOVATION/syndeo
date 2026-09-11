@@ -82,6 +82,22 @@ impl NetworkDelegate {
     /// Returns immediately. The load is parked until the network process
     /// answers.
     pub fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+        // Schemes that carry their own bytes are left to Servo, and that is not
+        // a hole in the boundary: `data:` is base64 in the markup, `about:` and
+        // `blob:` are memory the renderer already holds, and none of the three
+        // can reach a socket however Servo chooses to handle them. Sending them
+        // to the network process instead is what produced `invalid url
+        // data:image/svg+xml,...` for every inline icon on a page, and an icon
+        // that silently did not draw.
+        //
+        // An allowlist rather than a denylist, deliberately: a scheme nobody
+        // here has thought about goes to the network process, which is the side
+        // to be wrong on. `ws:` and `wss:` are exactly that case.
+        if bridge::is_self_contained_scheme(&load.request().url) {
+            tracing::trace!(url = %load.request().url, "left to the renderer; no network in it");
+            return;
+        }
+
         let request = bridge::to_net_request(
             &load.request().method,
             &load.request().url,
