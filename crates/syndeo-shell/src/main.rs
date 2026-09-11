@@ -8,8 +8,6 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use syndeo_shell::prompt::{self, NonInteractive, Prompter, TerminalPrompter};
-use syndeo_shell::{Shell, Supervisor};
 use syndeo_dom::Document;
 use syndeo_ipc::confirm::{Confirmer, SessionSecret};
 use syndeo_ipc::protocol::{
@@ -17,6 +15,8 @@ use syndeo_ipc::protocol::{
     SignaturePurpose,
 };
 use syndeo_ipc::transport::{Channel, Endpoint, Server};
+use syndeo_shell::prompt::{self, NonInteractive, Prompter, TerminalPrompter};
+use syndeo_shell::{Shell, Supervisor};
 
 #[derive(Parser)]
 #[command(
@@ -56,9 +56,7 @@ enum Command {
         twice: bool,
     },
     /// Run the agent against a task, with the full process model up.
-    Agent {
-        task: String,
-    },
+    Agent { task: String },
     /// Ask for a signature over a message, the way a site would.
     Sign {
         #[arg(long)]
@@ -74,9 +72,7 @@ enum Command {
         yes: bool,
     },
     /// Show the identity used for an origin.
-    Identity {
-        origin: String,
-    },
+    Identity { origin: String },
     /// Cache statistics.
     Stats {
         #[arg(long)]
@@ -129,8 +125,9 @@ fn home(override_path: Option<PathBuf>) -> PathBuf {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("syndeo=warn,syndeo_shell=info")),
+            tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG").unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("syndeo=warn,syndeo_shell=info")
+            }),
         )
         .with_target(false)
         .with_writer(std::io::stderr)
@@ -270,7 +267,11 @@ async fn browse(
             println!();
             println!("links ({})", links.len());
             for link in links.iter().take(20) {
-                println!("  {:<60} {}", truncate(&link.url, 60), truncate(&link.text, 40));
+                println!(
+                    "  {:<60} {}",
+                    truncate(&link.url, 60),
+                    truncate(&link.text, 40)
+                );
             }
         }
         let resources = document.subresources();
@@ -479,7 +480,10 @@ async fn unseal(keystore: &Endpoint) -> Result<()> {
         None
     };
 
-    match channel.call(&KeystoreRequest::Unseal { passphrase }).await? {
+    match channel
+        .call(&KeystoreRequest::Unseal { passphrase })
+        .await?
+    {
         KeystoreResponse::Ok => Ok(()),
         KeystoreResponse::Error(e) => bail!(e),
         _ => bail!("unexpected reply from the keystore"),
@@ -542,7 +546,10 @@ async fn peer_status(
         return Ok(());
     }
 
-    println!("peer          {}", status["peer_id"].as_str().unwrap_or("?"));
+    println!(
+        "peer          {}",
+        status["peer_id"].as_str().unwrap_or("?")
+    );
     println!("serving       {}", status["serving"]);
     println!("routing table {} peers", status["routing_table"]);
     println!("announced     {} bodies", status["announced"]);
@@ -550,7 +557,10 @@ async fn peer_status(
     println!("connected     {}", connected.len());
     if !connected.is_empty() {
         println!();
-        println!("  {:<54} {:>6} {:>6} {:>9}", "peer", "gave", "took", "standing");
+        println!(
+            "  {:<54} {:>6} {:>6} {:>9}",
+            "peer", "gave", "took", "standing"
+        );
         for report in &connected {
             println!(
                 "  {:<54} {:>6} {:>6} {:>9}",
@@ -591,15 +601,41 @@ fn stats(home: &std::path::Path, json: bool) -> Result<()> {
 // ------------------------------------------------------------------- doctor
 
 async fn doctor(home: &std::path::Path) -> Result<()> {
-    println!("home        {}", home.display());
+    println!("version         {}", env!("CARGO_PKG_VERSION"));
+    println!("home            {}", home.display());
+
+    // The first thing to go wrong in an install is a half-copied one, and the
+    // symptom is a timeout somewhere much later. Say it here instead.
+    let mut missing = Vec::new();
+    for name in ["syndeo-net", "syndeo-keystore", "syndeo-agent"] {
+        match Supervisor::locate(name) {
+            Ok(path) => println!("{name:<16}{}", path.display()),
+            Err(_) => {
+                println!("{name:<16}NOT FOUND");
+                missing.push(name);
+            }
+        }
+    }
+    if !missing.is_empty() {
+        println!();
+        println!(
+            "            {} is missing. Every Syndeo binary has to be",
+            missing.join(", ")
+        );
+        println!("                installed into one directory; re-run install.sh.");
+        return Ok(());
+    }
 
     let cache_root = home.join("cache");
     match syndeo_cache::Cache::open(&cache_root) {
         Ok(cache) => {
             let stats = cache.stats()?;
-            println!("cache       {} entries, {} blobs", stats.entries, stats.blobs);
+            println!(
+                "cache           {} entries, {} blobs",
+                stats.entries, stats.blobs
+            );
         }
-        Err(err) => println!("cache       unavailable: {err}"),
+        Err(err) => println!("cache           unavailable: {err}"),
     }
 
     let secret = SessionSecret::generate();
@@ -616,16 +652,16 @@ async fn doctor(home: &std::path::Path) -> Result<()> {
                 ..
             } = channel.call(&KeystoreRequest::Status).await?
             {
-                println!("keystore    initialized {initialized}, unsealed {unsealed}");
-                println!("            passphrase required {passphrase_required}");
-                println!("            platform presence enforced {presence_enforced}");
+                println!("keystore        initialized {initialized}, unsealed {unsealed}");
+                println!("                passphrase required {passphrase_required}");
+                println!("                platform presence enforced {presence_enforced}");
                 match idle_timeout_secs {
-                    Some(secs) => println!("            idle auto-lock after {secs}s"),
-                    None => println!("            idle auto-lock off"),
+                    Some(secs) => println!("                idle auto-lock after {secs}s"),
+                    None => println!("                idle auto-lock off"),
                 }
             }
         }
-        Err(err) => println!("keystore    not reachable: {err}"),
+        Err(err) => println!("keystore        not reachable: {err}"),
     }
     supervisor.shutdown().await;
 

@@ -31,14 +31,40 @@ impl Supervisor {
     }
 
     /// Sibling binaries, so a build tree and an install both work.
-    fn binary(name: &str) -> Result<PathBuf> {
+    ///
+    /// The invocation path is resolved before its directory is taken, because a
+    /// packaged install is commonly a symlink on `PATH` pointing into a private
+    /// directory, and on macOS `current_exe` hands back the symlink rather than
+    /// its target. `PATH` is the last resort rather than the first: a sibling is
+    /// the binary that shipped with this one, and preferring it means a build
+    /// tree never picks up an installed copy of a different version.
+    pub fn locate(name: &str) -> Result<PathBuf> {
         let exe = std::env::current_exe().context("locating the running binary")?;
-        let candidate = exe
-            .parent()
-            .map(|d| d.join(name))
-            .filter(|p| p.exists())
-            .with_context(|| format!("{name} is not next to {}", exe.display()))?;
-        Ok(candidate)
+        let resolved = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+
+        let mut tried = Vec::new();
+        for directory in [resolved.parent(), exe.parent()].into_iter().flatten() {
+            let candidate = directory.join(name);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+            tried.push(candidate);
+        }
+
+        if let Some(found) = search_path(name) {
+            return Ok(found);
+        }
+
+        bail!(
+            "cannot find {name}. Looked beside {} and on PATH. \
+             Every Syndeo binary has to be installed into the same directory; \
+             see the install instructions in the README.",
+            tried
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        )
     }
 
     /// The network process. Every other process reaches the outside world
@@ -46,7 +72,7 @@ impl Supervisor {
     pub async fn start_net(&mut self, dns: &str, peers: &[String]) -> Result<Endpoint> {
         let endpoint = Endpoint::new(self.runtime_dir().join("net.sock"));
         clear_stale(endpoint.path());
-        let mut command = Command::new(Self::binary("syndeo-net")?);
+        let mut command = Command::new(Self::locate("syndeo-net")?);
         command
             .arg("--socket")
             .arg(endpoint.path())
@@ -83,7 +109,7 @@ impl Supervisor {
     ) -> Result<Endpoint> {
         let endpoint = Endpoint::new(self.runtime_dir().join("net.sock"));
         clear_stale(endpoint.path());
-        let mut command = Command::new(Self::binary("syndeo-net")?);
+        let mut command = Command::new(Self::locate("syndeo-net")?);
         command
             .arg("--socket")
             .arg(endpoint.path())
@@ -118,7 +144,7 @@ impl Supervisor {
     pub async fn start_keystore(&mut self, secret: &SessionSecret) -> Result<Endpoint> {
         let endpoint = Endpoint::new(self.runtime_dir().join("keystore.sock"));
         clear_stale(endpoint.path());
-        let child = Command::new(Self::binary("syndeo-keystore")?)
+        let child = Command::new(Self::locate("syndeo-keystore")?)
             .arg("serve")
             .arg("--socket")
             .arg(endpoint.path())
@@ -136,7 +162,7 @@ impl Supervisor {
 
     /// The agent. Note precisely what it is given, and what it is not.
     pub fn start_agent(&mut self, net: &Endpoint, shell: &Endpoint, task: &str) -> Result<()> {
-        let child = Command::new(Self::binary("syndeo-agent")?)
+        let child = Command::new(Self::locate("syndeo-agent")?)
             .arg("--net-socket")
             .arg(net.path())
             .arg("--shell-socket")
@@ -213,4 +239,21 @@ fn clear_stale(path: &Path) {
         return;
     }
     let _ = std::fs::remove_file(path);
+}
+
+/// The last resort when the sibling lookup finds nothing.
+///
+/// Only entries that are actually executable count, so a directory of the same
+/// name on `PATH` is not mistaken for the binary.
+fn search_path(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
 }
