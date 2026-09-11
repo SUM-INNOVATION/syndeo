@@ -1,0 +1,100 @@
+# What every commit has to survive. The release workflow builds the same
+# binaries from the same lock file, so a green run here is what makes a tag
+# worth cutting.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # The renderer job only. Servo is an hour of compilation, so it is checked on
+  # a cadence rather than on every commit; bit-rot there is found in a week
+  # instead of at the next release.
+  schedule:
+    - cron: "0 4 * * 1"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A build that differs from the lock file is a build nobody reviewed.
+  CARGO_NET_RETRY: 3
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+          - name: macos-aarch64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config libdbus-1-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # Warnings are errors here and nowhere else: a developer's own build stays
+      # usable while a half-finished thought is on screen.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources advisories
+
+  renderer:
+    name: renderer (Servo)
+    # Weekly and on demand. Everything in syndeo-servo that could be written
+    # without Servo is outside the feature gate and is covered by `test` above;
+    # this job is what keeps the gated half compiling.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Servo's WebIDL codegen needs Python >= 3.11 as `python3`. The system
+      # Python is older, and the failure is a SyntaxError hundreds of crates in
+      # that names nothing.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: cargo check -p syndeo-servo --features renderer --locked
