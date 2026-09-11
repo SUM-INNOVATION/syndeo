@@ -6,6 +6,61 @@ separate processes.
 The cache is the product. Everything else is arranged so the cache can be
 swapped, shared, or fed from a peer without anything above it noticing.
 
+## Install
+
+macOS on Apple Silicon, or Linux on x86_64 or arm64:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/SUM-INNOVATION/syndeo/main/install.sh | sh
+```
+
+It downloads the release built for your machine, checks it against the published
+`SHA256SUMS`, and puts the binaries in `~/.local/bin`. No `sudo`, and nothing
+written outside your home directory. `SYNDEO_INSTALL_DIR` moves them;
+`SYNDEO_VERSION` pins a version.
+
+They all have to live in the same directory. The shell starts the network
+process and the keystore by looking beside itself, which is what keeps a build
+tree and an install both working without either being told where the other is.
+
+Then:
+
+```sh
+syndeo browse https://www.rust-lang.org/ --twice   # the second fetch says cache
+syndeo doctor                                      # what is set up, and where
+```
+
+Piping a script into a shell is worth being unhappy about. The script is
+[`install.sh`](install.sh) — read it first, or skip it: the tarballs and the
+`SHA256SUMS` covering them are on the
+[releases page](https://github.com/SUM-INNOVATION/syndeo/releases), and
+unpacking one yourself does the same thing.
+
+### What it needs
+
+- **macOS 13 or later, Apple Silicon.** Intel Macs have no prebuilt release;
+  they build from source.
+- **Linux with glibc 2.35 or later** — Ubuntu 22.04, Debian 12, Fedora 36, and
+  anything since. `syndeo-ui` additionally wants a Wayland or X11 session and a
+  GPU that Vulkan or GL can reach.
+- **A Secret Service implementation on Linux** — gnome-keyring or KWallet —
+  before `syndeo-keystore init` will work, because the wrapping key is never a
+  file we wrote. Everything that is not the keystore runs headless.
+- **Windows and ChromeOS**: not yet, and tracked at
+  [#17](https://github.com/SUM-INNOVATION/syndeo/issues/17).
+
+macOS releases are signed and notarized, so a browser download is not
+quarantined. `syndeo-keystore status` reports whether that build reaches the
+data protection keychain, which is what decides whether Touch ID is enforced by
+the Secure Enclave or the passphrase is mandatory instead.
+
+### Verifying a download yourself
+
+```sh
+curl -fsSLO https://github.com/SUM-INNOVATION/syndeo/releases/latest/download/SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+```
+
 ## The three boundaries
 
 These are load-bearing. Get them right at the start and everything else is
@@ -62,12 +117,28 @@ of hours.
 The agent-first alternative to step four — a headless DOM rather than pixels — is
 `syndeo-dom`, and it is what the agent reads today.
 
-## Running it
+## Build from source
+
+A stable Rust toolchain and, on Linux, the development packages for D-Bus and
+the window system:
+
+```sh
+sudo apt-get install -y pkg-config libdbus-1-dev libxkbcommon-dev libwayland-dev \
+  libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev \
+  libgl1-mesa-dev libegl1-mesa-dev
+```
+
+Then:
 
 ```sh
 cargo build --release
 export PATH="$PWD/target/release:$PATH"
 ```
+
+`syndeo-servo` is not in that build, or in any release tarball; see below for
+what it costs.
+
+## Running it
 
 ### A page, rendered
 
@@ -281,6 +352,26 @@ change is caught by the suite rather than discovered by a user whose funds went
 somewhere else. SUM Chain's network id, 1, is recorded beside it and marked as
 not the coin type.
 
+## Releasing
+
+`.github/workflows/ci.yml` is what every commit has to survive: rustfmt, clippy
+as errors, the test suite and `cargo-deny`, on Linux and macOS. Servo is checked
+weekly rather than per-commit, because it is an hour of compilation.
+
+A release is a tag:
+
+```sh
+# bump [workspace.package] version, add a CHANGELOG.md section, then
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` refuses a tag that disagrees with the workspace
+version, builds the three targets, signs and notarizes the macOS binaries when
+the signing secrets are present, and publishes the tarballs with a `SHA256SUMS`
+covering them. The secrets it reads are named and explained at the top of
+[`ci/sign-macos.sh`](ci/sign-macos.sh); without them the build still produces
+working tarballs and says in the log that it did not sign them.
+
 ## Licensing
 
 `cargo-deny` runs with an allowlist from the first commit, because the failure
@@ -302,10 +393,9 @@ cargo deny check licenses bans sources
 ## Known gaps
 
 Everything that is missing or deferred is filed rather than left in a comment.
-What is worth knowing before you rely on any of this:
-
-Everything filed is closed. What remains is a set of honest limits rather than
-open work:
+One thing is open — Windows and ChromeOS support,
+[#17](https://github.com/SUM-INNOVATION/syndeo/issues/17) — and the rest of this
+is a set of honest limits rather than work waiting to be done:
 
 - `syndeo-ui` shows the headless DOM rather than a rendered page; `syndeo-servo`
   is where pixels are. Putting the renderer inside the shell's window means one
@@ -331,7 +421,7 @@ both say so where you would meet them:
 cargo test --workspace
 ```
 
-197 of them. Thirty-seven cite the RFC 9111 section they cover.
+198 of them. Thirty-seven cite the RFC 9111 section they cover.
 
 ```sh
 cargo test --workspace                  # does not build Servo

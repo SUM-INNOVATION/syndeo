@@ -27,3 +27,6 @@ TestResults.xml
 
 # Python shim for the Servo build; see the README.
 .python/
+
+# Release tarballs, built by ci/package.sh.
+/dist

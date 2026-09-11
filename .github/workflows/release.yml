@@ -1,0 +1,163 @@
+# Cutting a release.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Produces one tarball per platform, a SHA256SUMS file covering all of them, and
+# a GitHub release holding the lot. install.sh reads exactly those names.
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the leading v (a dry run; nothing is published)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 3
+
+jobs:
+  # A tag that disagrees with the workspace version produces binaries whose
+  # `--version` lies about which release they came from. Cheapest possible
+  # place to catch that.
+  verify:
+    name: version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          set -euo pipefail
+          manifest=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            wanted="${{ inputs.version }}"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            wanted="${GITHUB_REF_NAME#v}"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$manifest" != "$wanted" ]; then
+            echo "::error::Cargo.toml says $manifest, the tag says $wanted. Bump [workspace.package] version first."
+            exit 1
+          fi
+          echo "version=$wanted" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # Built on 22.04 rather than the newest image on purpose: the glibc a
+      # binary is linked against is the oldest one it will run on.
+      - name: System libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config libdbus-1-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p syndeo-shell -p syndeo-net -p syndeo-keystore \
+            -p syndeo-agent -p syndeo-proxy -p syndeo-ui
+
+      # A no-op when the signing secrets are not set, so a fork and a first
+      # release both still produce usable tarballs. ci/sign-macos.sh says which
+      # it did.
+      - name: Sign and notarize
+        if: runner.os == 'macOS'
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: ./ci/sign-macos.sh "target/${{ matrix.target }}/release"
+
+      - name: Package
+        id: package
+        shell: bash
+        run: ./ci/package.sh "${{ needs.verify.outputs.version }}" "${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: syndeo-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: [verify, build]
+    if: needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One file covering every tarball, so install.sh fetches one checksum
+      # list and not one per platform.
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz | tee SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.verify.outputs.version }}"
+          notes=$(mktemp)
+          {
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/v${version}/install.sh | sh"
+            echo '```'
+            echo
+            echo "macOS on Apple Silicon, and Linux on x86_64 or arm64."
+            echo "Verify a download against \`SHA256SUMS\` before running it."
+            echo
+            if [ -f CHANGELOG.md ]; then
+              awk "/^## ${version}\$/{f=1;next} /^## /{f=0} f" CHANGELOG.md
+            fi
+          } > "$notes"
+          gh release create "v${version}" dist/*.tar.gz dist/SHA256SUMS \
+            --title "v${version}" --notes-file "$notes" --verify-tag
