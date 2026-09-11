@@ -112,6 +112,10 @@ where
         _ => None,
     };
 
+    // Timed so that "the browser feels slow" can be attributed rather than
+    // argued about: this is the network process's own share, with the IPC round
+    // trip and the renderer's work outside it.
+    let started = std::time::Instant::now();
     let response = match net
         .fetch(FetchRequest {
             method: parsed,
@@ -125,6 +129,12 @@ where
         Ok(response) => response,
         Err(err) => return framed.send(&NetResponse::Error(err.to_string())).await,
     };
+    tracing::debug!(
+        %url,
+        source = ?response.source,
+        served_ms = started.elapsed().as_millis(),
+        "served"
+    );
 
     // A caller that declared what the bytes must hash to gets bytes that hash to
     // it, whatever produced them. `Net::fetch` buffers such a response for

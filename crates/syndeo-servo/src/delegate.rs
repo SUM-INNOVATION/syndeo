@@ -44,7 +44,7 @@ pub struct NetworkDelegate {
     next: Cell<u64>,
     /// Loads waiting on the network process. Not `Send`, and never leaves this
     /// thread.
-    pending: RefCell<HashMap<u64, WebResourceLoad>>,
+    pending: RefCell<HashMap<u64, (WebResourceLoad, std::time::Instant)>>,
     answers: Receiver<(u64, Answer)>,
     answered: Sender<(u64, Answer)>,
     /// Counted so the claim this crate makes can be checked rather than asserted.
@@ -108,7 +108,12 @@ impl NetworkDelegate {
         let id = self.next.get();
         self.next.set(id + 1);
         self.intercepted.set(self.intercepted.get() + 1);
-        self.pending.borrow_mut().insert(id, load);
+        let in_flight = {
+            let mut pending = self.pending.borrow_mut();
+            pending.insert(id, (load, std::time::Instant::now()));
+            pending.len()
+        };
+        tracing::debug!(%url, in_flight, "requested a renderer load");
 
         let net = self.net.clone();
         let answered = self.answered.clone();
@@ -127,13 +132,19 @@ impl NetworkDelegate {
     }
 
     /// Apply every answer that has arrived. Called from the event loop.
-    pub fn deliver(&self) {
+    ///
+    /// Returns how many were applied, because the caller needs to know whether
+    /// handing these to Servo might have produced more work — a stylesheet
+    /// arriving is how the fonts it references are discovered.
+    pub fn deliver(&self) -> usize {
         // Collected first so the borrow is not held across `intercept`.
         let ready: Vec<(u64, Answer)> = self.answers.try_iter().collect();
+        let applied = ready.len();
         for (id, answer) in ready {
-            let Some(load) = self.pending.borrow_mut().remove(&id) else {
+            let Some((load, requested)) = self.pending.borrow_mut().remove(&id) else {
                 continue;
             };
+            let waited = requested.elapsed();
             let url = load.request().url.clone();
 
             match answer {
@@ -146,6 +157,7 @@ impl NetworkDelegate {
                         %url,
                         provenance = bridge::provenance(&fetched),
                         bytes = fetched.body.len(),
+                        waited_ms = waited.as_millis(),
                         "answered a renderer load"
                     );
 
@@ -164,6 +176,7 @@ impl NetworkDelegate {
                 }
             }
         }
+        applied
     }
 }
 
