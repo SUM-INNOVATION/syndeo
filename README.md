@@ -407,6 +407,20 @@ A release is a tag:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
+Before handing a release to anyone, check the thing that was published rather
+than the thing that was built:
+
+```sh
+ci/verify-release.sh 0.1.1
+```
+
+It installs from the release with the same one-liner the README gives, into a
+throwaway directory, and then asks the installed binaries to demonstrate what
+has broken before — a cache hit that is served and then forgotten, a proxy that
+turns every Google host into a 502, binaries that cannot find each other. Every
+check in it exists because something it covers once shipped broken. It exits
+non-zero, so it can gate a release rather than decorate one.
+
 `.github/workflows/release.yml` refuses a tag that disagrees with the workspace
 version, builds the three targets, signs and notarizes the macOS binaries when
 the signing secrets are present, and publishes the tarballs with a `SHA256SUMS`
