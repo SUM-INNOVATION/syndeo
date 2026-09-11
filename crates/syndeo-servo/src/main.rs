@@ -113,6 +113,14 @@ struct Running {
     /// A click and a wheel turn both have to say *where*, and winit only puts a
     /// position on the move event. Remembering the last one is the whole of it.
     cursor: Cell<(f32, f32)>,
+    /// Which modifiers are held, so a shortcut can be told from a keystroke.
+    modifiers: Cell<Modifiers>,
+    /// Horizontal scroll accumulated since the last navigation.
+    ///
+    /// A swipe is not an event, it is a few dozen small deltas, so the decision
+    /// is a running total against a threshold rather than a test on any one of
+    /// them.
+    swipe: Cell<f32>,
 }
 
 impl Running {
@@ -132,6 +140,34 @@ impl Running {
             act(webview);
         }
     }
+
+    /// Back and forward, however they were asked for.
+    ///
+    /// There is no button to press, and there cannot be one yet: drawing chrome
+    /// over the page means one surface shared between our own renderer and
+    /// WebRender, which is a piece of work in its own right. Until then this
+    /// window is reached by gesture, by keyboard and by the two side buttons on
+    /// a mouse — which is how most people navigate anyway, and none of which
+    /// needs a pixel of chrome.
+    fn navigate(&self, direction: Direction) {
+        tracing::debug!(?direction, "navigating");
+        self.swipe.set(0.0);
+        self.with_webview(|webview| match direction {
+            Direction::Back => {
+                webview.go_back(1);
+            }
+            Direction::Forward => {
+                webview.go_forward(1);
+            }
+        });
+        self.window.request_redraw();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Direction {
+    Back,
+    Forward,
 }
 
 /// The delegate Servo talks to.
@@ -203,6 +239,8 @@ impl ApplicationHandler<Woken> for App {
             webviews: Default::default(),
             network: NetworkDelegate::new(net, runtime, Box::new(waker_for_loads)),
             cursor: Cell::new((0.0, 0.0)),
+            modifiers: Cell::new(Modifiers::empty()),
+            swipe: Cell::new(0.0),
         });
 
         let webview = WebViewBuilder::new(&state._servo, state.rendering_context.clone())
@@ -215,12 +253,65 @@ impl ApplicationHandler<Woken> for App {
         *self = App::Running(state);
     }
 
-    fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _event: Woken) {
+    /// Something woke the loop — a finished fetch, or a frame Servo wants.
+    ///
+    /// Deliberately empty. Waking is enough: winit calls `about_to_wait` once
+    /// it has drained everything that was pending, and that is where the work
+    /// happens. Pumping here as well would pump once per wake-up instead of
+    /// once per batch.
+    fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _event: Woken) {}
+
+    /// One pump per batch of events, rather than one per event.
+    ///
+    /// `spin_event_loop` drives the whole of Servo — script, layout, the
+    /// compositor. Calling it from the top of `window_event` meant doing all of
+    /// that again for every single mouse move, and a trackpad produces those by
+    /// the hundred per second. The work was quadratic in how much the user
+    /// moved, which is exactly the shape of "it gets laggy when I scroll".
+    ///
+    /// winit calls this once it has nothing left to deliver, so a burst of
+    /// forty scroll deltas now costs one pump instead of forty.
+    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
         if let App::Running(state) = self {
             // Answers first: a load that has come back should be applied before
             // Servo is asked what to do next.
-            state.network.deliver();
-            state._servo.spin_event_loop();
+            let started = std::time::Instant::now();
+
+            // Loaded resources arrive in waves, not all at once: the document
+            // names the stylesheets, the stylesheets name the fonts, and each
+            // wave is only discovered once the previous one has been handed to
+            // Servo and acted on. Doing one wave per turn of the event loop put
+            // a frame between every wave — and on a page with seventy-eight
+            // subresources that is most of two seconds, on a *warm cache*, with
+            // no network involved at all. Measured, not guessed.
+            //
+            // So: keep going while answers are still landing, rather than
+            // waiting to be woken again for each wave. Bounded, because a page
+            // that keeps producing loads must not be allowed to hold the event
+            // loop and with it every click and keystroke.
+            const BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+            let mut delivered = std::time::Duration::ZERO;
+            loop {
+                let applied = state.network.deliver();
+                delivered = started.elapsed();
+                state._servo.spin_event_loop();
+                if applied == 0 || started.elapsed() > BUDGET {
+                    break;
+                }
+            }
+            let total = started.elapsed();
+
+            // A frame is 16ms at sixty a second. Anything past that is a frame
+            // the user did not get, so it is worth being able to see which half
+            // took it — applying fetched bytes, or Servo's own script, layout
+            // and compositing.
+            if total > std::time::Duration::from_millis(16) {
+                tracing::debug!(
+                    total_ms = total.as_millis(),
+                    deliver_ms = delivered.as_millis(),
+                    "slow pump"
+                );
+            }
         }
     }
 
@@ -230,10 +321,6 @@ impl ApplicationHandler<Woken> for App {
         _window: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        if let App::Running(state) = self {
-            state.network.deliver();
-            state._servo.spin_event_loop();
-        }
         match event {
             WindowEvent::CloseRequested => {
                 if let App::Running(state) = self {
@@ -249,10 +336,15 @@ impl ApplicationHandler<Woken> for App {
             }
             WindowEvent::RedrawRequested => {
                 if let App::Running(state) = self {
+                    let started = std::time::Instant::now();
                     if let Some(webview) = state.webviews.borrow().last() {
                         webview.paint();
                     }
                     state.rendering_context.present();
+                    let painted = started.elapsed();
+                    if painted > std::time::Duration::from_millis(16) {
+                        tracing::debug!(ms = painted.as_millis(), "slow paint");
+                    }
                 }
             }
             WindowEvent::Resized(size) => {
@@ -273,6 +365,18 @@ impl ApplicationHandler<Woken> for App {
                         webview
                             .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
                     });
+                }
+            }
+
+            WindowEvent::ModifiersChanged(changed) => {
+                if let App::Running(state) = self {
+                    let winit = changed.state();
+                    let mut modifiers = Modifiers::empty();
+                    modifiers.set(Modifiers::SHIFT, winit.shift_key());
+                    modifiers.set(Modifiers::CONTROL, winit.control_key());
+                    modifiers.set(Modifiers::ALT, winit.alt_key());
+                    modifiers.set(Modifiers::META, winit.super_key());
+                    state.modifiers.set(modifiers);
                 }
             }
 
@@ -306,6 +410,23 @@ impl ApplicationHandler<Woken> for App {
                         winit::event::MouseButton::Forward => servo::MouseButton::Forward,
                         winit::event::MouseButton::Other(other) => servo::MouseButton::Other(other),
                     };
+                    // The two side buttons on a mouse are navigation
+                    // everywhere else; making them a page click here would be
+                    // the surprising choice.
+                    if action == MouseButtonAction::Down {
+                        match button {
+                            servo::MouseButton::Back => {
+                                state.navigate(Direction::Back);
+                                return;
+                            }
+                            servo::MouseButton::Forward => {
+                                state.navigate(Direction::Forward);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     let point = state.cursor_point();
                     // Logged, because "clicking does nothing" and "the click
                     // never reached the page" look identical from outside and
@@ -331,6 +452,31 @@ impl ApplicationHandler<Woken> for App {
                             (position.x as f32, position.y as f32)
                         }
                     };
+
+                    // A decisive sideways gesture is navigation, the way it is
+                    // in every other browser. "Decisive" is doing real work
+                    // here: a vertical scroll with a little sideways drift in it
+                    // is not a swipe, and treating it as one would send someone
+                    // back a page while they were reading.
+                    if dx.abs() > dy.abs() * 2.0 {
+                        let swiped = state.swipe.get() + dx;
+                        state.swipe.set(swiped);
+                        if swiped.abs() >= SWIPE_THRESHOLD {
+                            // Swiping right reveals what was to the left of the
+                            // page, which is where you came from.
+                            state.navigate(if swiped > 0.0 {
+                                Direction::Back
+                            } else {
+                                Direction::Forward
+                            });
+                            return;
+                        }
+                    } else if dy != 0.0 {
+                        // Scrolling vertically ends whatever sideways gesture
+                        // was half-finished, rather than leaving it to be
+                        // completed minutes later by an unrelated nudge.
+                        state.swipe.set(0.0);
+                    }
 
                     let point = state.cursor_point();
                     tracing::debug!(dx, dy, ?point, "input: wheel");
@@ -364,7 +510,11 @@ impl ApplicationHandler<Woken> for App {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if let App::Running(state) = self {
-                    if let Some(keyboard) = keyboard_event(&event) {
+                    if let Some(direction) = shortcut(&event, state.modifiers.get()) {
+                        state.navigate(direction);
+                        return;
+                    }
+                    if let Some(keyboard) = keyboard_event(&event, state.modifiers.get()) {
                         state.with_webview(|webview| {
                             webview.notify_input_event(InputEvent::Keyboard(keyboard.clone()));
                         });
@@ -402,7 +552,7 @@ impl servo::EventLoopWaker for Waker {
 /// what typing into a field and scrolling with the keyboard need — and the rest
 /// arrives as `Unidentified` rather than as nothing, so a page that inspects
 /// `key` sees an event it can ignore instead of never being told.
-fn keyboard_event(event: &winit::event::KeyEvent) -> Option<KeyboardEvent> {
+fn keyboard_event(event: &winit::event::KeyEvent, modifiers: Modifiers) -> Option<KeyboardEvent> {
     use winit::keyboard::{Key as WinitKey, NamedKey as WinitNamed};
 
     let state = match event.state {
@@ -447,8 +597,43 @@ fn keyboard_event(event: &winit::event::KeyEvent) -> Option<KeyboardEvent> {
         key,
         Code::Unidentified,
         Location::Standard,
-        Modifiers::empty(),
+        modifiers,
         event.repeat,
         false,
     ))
+}
+
+/// How far sideways a gesture has to travel before it means "go back".
+///
+/// Low enough that a deliberate swipe reaches it in one motion, high enough
+/// that the sideways drift in an ordinary vertical scroll never does.
+const SWIPE_THRESHOLD: f32 = 220.0;
+
+/// The keyboard shortcuts that navigate, on the modifier each platform uses.
+///
+/// Command-arrow on macOS, Alt-arrow elsewhere — matching every browser on the
+/// respective platform rather than picking one and making both wrong.
+fn shortcut(event: &winit::event::KeyEvent, modifiers: Modifiers) -> Option<Direction> {
+    use winit::keyboard::{Key as WinitKey, NamedKey as WinitNamed};
+
+    if event.state != ElementState::Pressed {
+        return None;
+    }
+
+    let navigating = if cfg!(target_os = "macos") {
+        modifiers.contains(Modifiers::META)
+    } else {
+        modifiers.contains(Modifiers::ALT)
+    };
+    if !navigating {
+        return None;
+    }
+
+    match &event.logical_key {
+        WinitKey::Named(WinitNamed::ArrowLeft) => Some(Direction::Back),
+        WinitKey::Named(WinitNamed::ArrowRight) => Some(Direction::Forward),
+        WinitKey::Character(text) if text == "[" => Some(Direction::Back),
+        WinitKey::Character(text) if text == "]" => Some(Direction::Forward),
+        _ => None,
+    }
 }
