@@ -12,6 +12,7 @@
 //! building with it.
 
 mod app;
+mod fonts;
 mod page;
 mod prompt;
 
@@ -122,6 +123,9 @@ fn main() -> Result<()> {
             // prompter the same handle is what lets a signing request wake the
             // window rather than wait for the next frame.
             prompter.attach(context.egui_ctx.clone());
+            // Before the first frame: a page in a script the bundled fonts do
+            // not cover otherwise draws as boxes.
+            fonts::install_fallback(&context.egui_ctx);
             Ok(Box::new(app::App::new(
                 &context.egui_ctx,
                 work_sender,
