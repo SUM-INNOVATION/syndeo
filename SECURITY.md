@@ -44,6 +44,14 @@ welcome as a second opinion; they are not treated as new.
 - **The Landlock confinement is compiled but not yet exercised on a running
   Linux kernel.** The macOS Seatbelt path is tested, including a fixture that
   holds TCP, UDP, file writes and `exec` to failing.
+- **The renderer's dependency tree carries advisories, and is not in any
+  release.** `syndeo-servo` is behind an off-by-default `renderer` feature and
+  is in no tarball, because it is about 1,200 crates. Building it yourself
+  brings in Servo's own dependencies, and today that includes an RSA timing
+  side channel (RUSTSEC-2023-0071) and six unmaintained crates. CI reports that
+  tree weekly rather than gating merges on it; what ships is checked on every
+  commit and is clean. If you build the renderer, you are taking on Servo's
+  dependency graph as well as ours.
 - **Losing both the passphrase and the recovery phrase is unrecoverable.** That
   is what the recovery phrase is for.
 

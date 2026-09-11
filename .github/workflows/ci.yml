@@ -73,9 +73,25 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      # Licences over everything, renderer included. That allowlist exists
+      # precisely so Servo's tree is covered: MPL-2.0 and CDLA-Permissive-2.0
+      # are in it for no other reason, and a copyleft dependency arriving under
+      # the renderer is exactly the thing it was written to catch.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check licenses bans sources advisories
+          command: check licenses bans sources
+          arguments: --locked --all-features
+
+      # Advisories over what ships, which is the renderer's opposite: Servo is
+      # behind an off-by-default feature and is in no release tarball, and its
+      # dependency tree carries advisories nobody here can act on. Gating every
+      # merge on those would train people to ignore this check. It is looked at
+      # weekly instead, at the end of the renderer job.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+          arguments: --locked
 
   renderer:
     name: renderer (Servo)
@@ -98,3 +114,11 @@ jobs:
           python-version: "3.12"
 
       - run: cargo check -p syndeo-servo --features renderer --locked
+
+      # What the renderer's own dependency tree is carrying. Weekly, and here
+      # rather than in `deny`, because it is a report on a tree we do not
+      # control and do not ship — worth knowing, not worth blocking a merge on.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+          arguments: --locked --all-features
