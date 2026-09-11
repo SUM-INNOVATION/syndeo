@@ -77,7 +77,13 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             pkg-config libdbus-1-dev libxkbcommon-dev libwayland-dev \
             libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev \
-            libgl1-mesa-dev libegl1-mesa-dev
+            libgl1-mesa-dev libegl1-mesa-dev \
+            `# Servo's own, on top of ours: fonts, text shaping, unwinding` \
+            libfontconfig1-dev libfreetype6-dev libharfbuzz-dev libunwind-dev \
+            libssl-dev ccache clang cmake gperf libgles2-mesa-dev \
+            `# GStreamer, for media` \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -86,11 +92,26 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
+      # Servo's WebIDL codegen runs `python3` at build time — Mozilla's build
+      # tooling, not a runtime dependency; nothing Python ships in the binary.
+      # It needs 3.11 or newer, and the failure without it is a SyntaxError
+      # hundreds of crates in that names nothing.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Build
         run: |
           cargo build --release --locked --target ${{ matrix.target }} \
             -p syndeo-shell -p syndeo-net -p syndeo-keystore \
             -p syndeo-agent -p syndeo-proxy -p syndeo-ui
+
+      # Separately, and with a timeout of its own: this is about 1,200 crates.
+      - name: Build the renderer
+        timeout-minutes: 150
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p syndeo-servo --features renderer
 
       # A no-op when the signing secrets are not set, so a fork and a first
       # release both still produce usable tarballs. ci/sign-macos.sh says which

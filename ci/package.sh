@@ -18,7 +18,7 @@ stage="${root}/dist/${name}"
 rm -rf "$stage"
 mkdir -p "$stage/tools"
 
-binaries=(syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-ui)
+binaries=(syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-ui syndeo-servo)
 for binary in "${binaries[@]}"; do
   if [ ! -x "${release}/${binary}" ]; then
     echo "missing ${release}/${binary}" >&2
@@ -27,10 +27,10 @@ for binary in "${binaries[@]}"; do
   cp "${release}/${binary}" "${stage}/${binary}"
 done
 
-# syndeo-servo is deliberately not here. It needs the `renderer` feature, which
-# is Servo, Stylo and SpiderMonkey: about 1,200 crates and a binary two orders
-# of magnitude larger than everything above put together. Built from source by
-# whoever wants it.
+# syndeo-servo is in that list and is most of the weight: Servo, Stylo and
+# SpiderMonkey come to about 140 MB on their own, against four for everything
+# else put together. It is here because a browser that cannot draw a page is
+# not a browser, and leaving it out made every download a reader.
 
 cp "${root}/README.md" "${root}/LICENSE" "$stage/"
 cp "${root}/crates/syndeo-agent/tools/wordcount.wat" "${stage}/tools/"
