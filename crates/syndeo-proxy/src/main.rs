@@ -338,7 +338,8 @@ async fn forward(
         return response;
     }
 
-    let headers = req.headers().clone();
+    let headers = forwardable(req.headers());
+
     let body = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(err) => {
@@ -438,4 +439,77 @@ fn text(status: StatusCode, message: &str) -> Response<Body> {
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(whole(Bytes::from(message.to_string())))
         .expect("static response")
+}
+
+/// The headers that may be sent on to an origin.
+///
+/// Hop-by-hop headers belong to the connection the client made to *us*, and
+/// forwarding them is a bug in any proxy. Over HTTP/2 it is not merely untidy:
+/// RFC 9113 section 8.2.2 makes `Connection`, `Keep-Alive`, `Proxy-Connection`,
+/// `Transfer-Encoding` and `Upgrade` illegal in a request, and a strict server
+/// answers with a stream error instead of a page. Google does; GitHub does not,
+/// which is why this presented for a long time as "Google is special" rather
+/// than as a bug on this side.
+///
+/// `Host` goes too. HTTP/2 carries the authority in `:authority` and hyper sets
+/// it from the URI, so a forwarded `Host` is a second copy of the same fact and
+/// one more thing that can disagree with the first. The renderer bridge has
+/// always stripped these; this path never did.
+fn forwardable(incoming: &http::HeaderMap) -> http::HeaderMap {
+    let tokens = syndeo_cache::headers::connection_tokens(incoming);
+    let mut out = http::HeaderMap::new();
+    for (name, value) in incoming.iter() {
+        if name == http::header::HOST
+            || syndeo_cache::headers::is_hop_by_hop(name.as_str(), &tokens)
+        {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_headers_do_not_reach_the_origin() {
+        // The exact shape that made every Google-operated host answer 502: a
+        // proxied request carrying the client's connection headers into HTTP/2,
+        // where they are a protocol error rather than an untidiness.
+        let mut incoming = http::HeaderMap::new();
+        for (name, value) in [
+            ("host", "www.google.com"),
+            ("proxy-connection", "keep-alive"),
+            ("connection", "keep-alive, x-custom"),
+            ("keep-alive", "timeout=5"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "websocket"),
+            ("x-custom", "named by connection, so hop-by-hop too"),
+            ("accept", "text/html"),
+            ("user-agent", "syndeo-test"),
+        ] {
+            incoming.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+
+        let out = forwardable(&incoming);
+
+        for gone in [
+            "host",
+            "proxy-connection",
+            "connection",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+            "x-custom",
+        ] {
+            assert!(!out.contains_key(gone), "{gone} must not be forwarded");
+        }
+        assert_eq!(out.get("accept").unwrap(), "text/html");
+        assert_eq!(out.get("user-agent").unwrap(), "syndeo-test");
+    }
 }

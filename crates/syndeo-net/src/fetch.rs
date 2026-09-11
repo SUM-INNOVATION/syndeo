@@ -847,10 +847,20 @@ async fn origin_headers(
         .body(Full::new(request.body.clone()))
         .map_err(NetError::Http)?;
 
-    let response = client
-        .request(req)
-        .await
-        .map_err(|e| NetError::Transport(e.to_string()))?;
+    let response = client.request(req).await.map_err(|e| {
+        // hyper's own Display stops at "client error (SendRequest)", which names
+        // the call that failed and nothing about why. The cause is one or more
+        // links further down, and without it every transport failure looks the
+        // same.
+        let mut chain = e.to_string();
+        let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            chain.push_str(": ");
+            chain.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        NetError::Transport(chain)
+    })?;
 
     let status = response.status().as_u16();
     let headers = response.headers().clone();
