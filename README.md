@@ -36,6 +36,7 @@ refactorable; get them wrong and no amount of later work recovers it.
 | `syndeo-agent` | the agent process, sandboxed by what it is given |
 | `syndeo-shell` | the process model and the prompt, as a library, plus the `syndeo` command |
 | `syndeo-ui` | the windowed shell: winit, wgpu, egui, accesskit |
+| `syndeo-servo` | Servo embedded, with its resource loading replaced by the net process |
 | `syndeo-proxy` | a local intercepting proxy, to measure the cache on real traffic |
 
 ## Build order
@@ -50,8 +51,8 @@ of hours.
    hit rate and dedupe ratio on real traffic. This is the go/no-go. — *done*
 3. **Net process**: hyper, rustls, the cache behind a fetch API. Still no
    browser. — *done, including HTTP/3 over QUIC behind `Alt-Svc`*
-4. **Embed Servo**, replace its net crate with this one, run servoshell's UI
-   as-is. — *not started (#4)*
+4. **Embed Servo**, replace its net crate with this one. — *done, behind the
+   `renderer` feature; see below for what that costs to build*
 5. **Split the process model out properly.** Keystore, then agent. — *done, ahead
    of step four, because the boundaries are cheaper to draw before there is a
    renderer to draw them around*
@@ -67,6 +68,36 @@ The agent-first alternative to step four — a headless DOM rather than pixels �
 cargo build --release
 export PATH="$PWD/target/release:$PATH"
 ```
+
+### A page, rendered
+
+```sh
+cargo build -p syndeo-servo --features renderer     # long; see below
+syndeo-servo https://www.rust-lang.org/
+```
+
+A real renderer — SpiderMonkey, Stylo, WebRender — that opens no socket. Servo
+asks the embedder about every HTTP load through `load_web_resource`, and every
+one of them is answered from the network process instead. Nothing is ever handed
+back, because a declined load is one Servo would perform itself.
+
+What that is worth, measured rather than asserted: loading `rust-lang.org` makes
+78 resource loads, all 78 go through the net process, and on the second visit all
+78 come back marked `cache`. While it runs, `lsof` on the renderer shows no
+network sockets at all and `lsof` on the net process shows the TCP connections
+and the QUIC socket. The renderer inherits the cache, the peer fetch and the DNS
+policy without knowing any of them exist.
+
+Registering a protocol handler would have looked tidier and does not work:
+Servo's `ProtocolRegistry` refuses `http` and `https` by design. Resource-load
+interception is the supported way in front of them, and it streams.
+
+**Building it is the expensive part.** The feature is off by default because
+Servo brings SpiderMonkey, Stylo and WebRender: about 1,200 crates, a 450 MB
+debug binary, and a Python ≥3.11 on `PATH` for Servo's WebIDL codegen — the
+system Python on macOS is 3.9 and the build fails on a `match` statement with a
+syntax error that does not name the cause. Everything in `syndeo-servo` that
+could be written and tested without Servo is outside the gate, in `bridge.rs`.
 
 ### The window
 
@@ -261,9 +292,16 @@ cargo deny check licenses bans sources
 Everything that is missing or deferred is filed rather than left in a comment.
 What is worth knowing before you rely on any of this:
 
-| | |
-| --- | --- |
-| #4 | Servo is not embedded, so nothing draws a page — the window shows the headless DOM |
+Everything filed is closed. What remains is a set of honest limits rather than
+open work:
+
+- `syndeo-ui` shows the headless DOM rather than a rendered page; `syndeo-servo`
+  is where pixels are. Putting the renderer inside the shell's window means one
+  surface shared between egui and WebRender, which is a piece of work in its own
+  right and is not this one.
+- Servo does not tell the embedder what a page declared as a subresource's
+  integrity, so nothing loaded through the renderer is eligible for peer fetch
+  yet. It reaches the cache; it just never asks a peer.
 
 Two things are done but not *demonstrated* on an ordinary developer machine, and
 both say so where you would meet them:
@@ -281,4 +319,9 @@ both say so where you would meet them:
 cargo test --workspace
 ```
 
-192 of them. Thirty-seven cite the RFC 9111 section they cover.
+197 of them. Thirty-seven cite the RFC 9111 section they cover.
+
+```sh
+cargo test --workspace                  # does not build Servo
+cargo build -p syndeo-servo --features renderer
+```

@@ -37,6 +37,12 @@ allow = [
     # to remember if that ever changes.
     "OFL-1.1",
     "Ubuntu-font-1.0",
+    # The Mozilla CA root bundle, reached only with the `renderer` feature on:
+    # it comes in under Servo's own net crate. A data licence rather than a code
+    # one, and permissive. Worth noting that those roots are never consulted —
+    # every one of Servo's loads is answered by the network process, which
+    # verifies with the platform verifier instead.
+    "CDLA-Permissive-2.0",
 ]
 
 # libzstd is dual BSD-3-Clause / GPL-2.0. We take the BSD side.

@@ -1,0 +1,38 @@
+[package]
+name = "syndeo-servo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Servo embedded with its resource loading replaced by the network process"
+
+[features]
+# Off by default, and deliberately. Servo brings SpiderMonkey, Stylo and
+# WebRender with it, which is an hour of compilation and a toolchain that not
+# every machine has. Everything that can be written and tested without it, is.
+default = []
+renderer = ["dep:servo", "dep:winit", "dep:euclid"]
+
+[lib]
+name = "syndeo_servo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "syndeo-servo"
+path = "src/main.rs"
+required-features = ["renderer"]
+
+[dependencies]
+syndeo-ipc.workspace = true
+syndeo-shell.workspace = true
+
+http.workspace = true
+url.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+
+servo = { workspace = true, optional = true }
+winit = { workspace = true, optional = true }
+euclid = { workspace = true, optional = true }

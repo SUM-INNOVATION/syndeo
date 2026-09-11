@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore", "crates/syndeo-dom", "crates/syndeo-agent", "crates/syndeo-shell", "crates/syndeo-peer", "crates/syndeo-ui"]
+members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore", "crates/syndeo-dom", "crates/syndeo-agent", "crates/syndeo-shell", "crates/syndeo-peer", "crates/syndeo-ui", "crates/syndeo-servo"]
 
 [workspace.package]
 version = "0.1.0"
@@ -100,3 +100,12 @@ directories = "5"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "accesskit", "default_fonts", "wayland", "x11"] }
 egui = { version = "0.36" }
 egui_extras = { version = "0.36" }
+
+# Step four. Optional everywhere it appears: Servo brings SpiderMonkey, Stylo and
+# WebRender, which is an hour of compilation and a toolchain not every machine
+# has, so it is behind a feature that is off by default.
+# Default features are what an embedder wants: baked-in resources, so it can
+# find its own without a resource directory, and the JIT.
+servo = { version = "0.5" }
+winit = { version = "0.30" }
+euclid = { version = "0.22" }
