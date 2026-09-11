@@ -68,7 +68,9 @@ impl Vault {
         if path.exists() {
             audit(&path)?;
         }
-        let tmp = self.dir.join(format!("seed.sealed.new.{}", std::process::id()));
+        let tmp = self
+            .dir
+            .join(format!("seed.sealed.new.{}", std::process::id()));
         fs::write(&tmp, bytes)?;
         restrict(&tmp, 0o600)?;
         fs::rename(&tmp, &path)?;
@@ -120,12 +122,12 @@ fn restrict(path: &Path, mode: u32) -> Result<()> {
 /// Best effort; failure here is cosmetic, not a security property.
 fn hide(path: &Path) {
     #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("/usr/bin/chflags")
-            .arg("hidden")
-            .arg(path)
-            .status();
-    }
+    run_briefly(
+        "/usr/bin/chflags",
+        "hidden",
+        path,
+        "the keystore directory is visible in Finder",
+    );
     #[cfg(not(target_os = "macos"))]
     let _ = path;
 }
@@ -133,14 +135,68 @@ fn hide(path: &Path) {
 /// Keep the sealed seed out of Time Machine and any backup that walks it.
 fn exclude_from_backups(path: &Path) {
     #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("/usr/bin/tmutil")
-            .arg("addexclusion")
-            .arg(path)
-            .status();
-    }
+    run_briefly(
+        "/usr/bin/tmutil",
+        "addexclusion",
+        path,
+        "the sealed seed is not excluded from Time Machine",
+    );
     #[cfg(not(target_os = "macos"))]
     let _ = path;
+}
+
+/// Run one of the two posture commands, and do not wait forever for it.
+///
+/// Both of these sit on the keystore's startup path, and `tmutil addexclusion`
+/// reaches `backupd` over XPC: on a machine where that daemon is busy, or where
+/// this binary has not been granted Full Disk Access, or inside an application
+/// sandbox, the call blocks rather than failing. Unbounded, that is a keystore
+/// that never binds its socket and a shell reporting a ten-second timeout with
+/// nothing to say about the cause — on a user's very first run, which is the
+/// only run where `Vault::open` calls either of these.
+///
+/// Both were already best-effort. Giving up is not a new failure mode, it is
+/// the existing one made bounded and made audible.
+#[cfg(target_os = "macos")]
+fn run_briefly(program: &str, verb: &str, path: &Path, cost: &str) {
+    use std::time::{Duration, Instant};
+
+    const LIMIT: Duration = Duration::from_secs(3);
+
+    let mut child = match std::process::Command::new(program)
+        .arg(verb)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            tracing::warn!(program, %err, "could not run it; {cost}");
+            return;
+        }
+    };
+
+    let deadline = Instant::now() + LIMIT;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(err) => {
+                tracing::warn!(program, %err, "could not wait for it; {cost}");
+                return;
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    tracing::warn!(
+        program,
+        path = %path.display(),
+        "did not finish within three seconds; {cost}"
+    );
 }
 
 #[cfg(unix)]
@@ -177,7 +233,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(vault.sealed_path()).unwrap().permissions().mode() & 0o777;
+            let mode = fs::metadata(vault.sealed_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600);
         }
     }
@@ -208,6 +268,28 @@ mod tests {
             fs::write(&elsewhere, b"attacker controlled").unwrap();
             std::os::unix::fs::symlink(&elsewhere, vault.sealed_path()).unwrap();
             assert!(matches!(vault.read_sealed(), Err(CustodyError::Symlink(_))));
+        }
+    }
+
+    /// Opening a fresh vault is the first thing a first run does, and it shells
+    /// out to set the filesystem posture. `tmutil addexclusion` blocks instead
+    /// of failing wherever it cannot reach `backupd` — a sandbox, or a binary
+    /// without Full Disk Access — and an unbounded wait there is a keystore
+    /// that never binds its socket.
+    ///
+    /// Asserted from another thread, because the failure this guards against is
+    /// a hang: a test that merely measured elapsed time would hang with it.
+    #[test]
+    fn opening_a_fresh_vault_does_not_wait_forever() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let home = tempfile::tempdir().unwrap();
+            let opened = Vault::open(home.path()).is_ok();
+            let _ = tx.send(opened);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(opened) => assert!(opened, "the vault did not open"),
+            Err(_) => panic!("Vault::open did not return; a posture command is unbounded"),
         }
     }
 }
