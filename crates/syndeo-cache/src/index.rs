@@ -435,6 +435,56 @@ impl Index {
         Ok(orphan)
     }
 
+    /// Everything one served request changes, in a single transaction.
+    ///
+    /// The hit path used to be four separate write transactions — the request
+    /// counter, the entry's last-used stamp, the hit counter, the byte counter
+    /// — each one committing, and each commit an fsync. redb allows one writer
+    /// at a time, so on a page with seventy-eight subresources that is three
+    /// hundred serialised fsyncs before the page can paint, and the measurement
+    /// was unambiguous: a *cache hit*, with no network in it at all, took a
+    /// median of 488ms to answer.
+    ///
+    /// One transaction now, and `Durability::None` on it. These are statistics
+    /// and an eviction timestamp: losing the last few seconds of them to a
+    /// crash costs a slightly wrong hit rate and a slightly wrong eviction
+    /// order. Paying an fsync each to avoid that made the cache slower than the
+    /// network it exists to replace, which is the only way this component can
+    /// truly fail.
+    ///
+    /// Stored bytes are not written here. Those go through `put`, which commits
+    /// durably, because losing *those* loses the body itself.
+    pub fn record_access(
+        &self,
+        key: Option<&str>,
+        now: u64,
+        counters: &[(&str, u64)],
+    ) -> Result<()> {
+        let mut tx = self.db.begin_write()?;
+        tx.set_durability(redb::Durability::None);
+        {
+            if let Some(key) = key {
+                let mut entries = tx.open_table(ENTRIES)?;
+                let existing: Option<EntryRecord> = match entries.get(key)? {
+                    Some(bytes) => Some(bincode::deserialize(bytes.value())?),
+                    None => None,
+                };
+                if let Some(mut record) = existing {
+                    record.last_used = now;
+                    record.hits += 1;
+                    entries.insert(key, bincode::serialize(&record)?.as_slice())?;
+                }
+            }
+            let mut table = tx.open_table(COUNTERS)?;
+            for (name, by) in counters {
+                let current = { table.get(*name)?.map(|v| v.value()).unwrap_or(0) };
+                table.insert(*name, current.saturating_add(*by))?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Record a hit against an entry.
     pub fn touch(&self, key: &str, now: u64) -> Result<()> {
         let tx = self.db.begin_write()?;

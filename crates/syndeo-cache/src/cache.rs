@@ -199,11 +199,16 @@ impl Cache {
     // ---- read path ---------------------------------------------------------
 
     pub fn lookup(&self, method: &str, url: &str, request_headers: &HeaderMap) -> Result<Lookup> {
-        self.index.bump(counters::REQUESTS, 1)?;
+        // Counted in memory and written once, at the end, in a single
+        // transaction. Writing each of these as it happened cost an fsync
+        // apiece against redb's one writer, and made a cache hit slower than
+        // the origin fetch it replaced. See `Index::record_access`.
+        let mut tally: Vec<(&str, u64)> = vec![(counters::REQUESTS, 1)];
         let url = Self::normalize_url(url);
 
         if !policy::is_cacheable_method(method) {
-            self.index.bump(counters::MISSES, 1)?;
+            tally.push((counters::MISSES, 1));
+            self.index.record_access(None, 0, &tally)?;
             return Ok(Lookup::Miss("method is not cacheable"));
         }
 
@@ -217,7 +222,8 @@ impl Cache {
             None => None,
         };
         let Some((key, record)) = selected else {
-            self.index.bump(counters::MISSES, 1)?;
+            tally.push((counters::MISSES, 1));
+            self.index.record_access(None, 0, &tally)?;
             return Ok(Lookup::Miss("no stored variant"));
         };
 
@@ -234,7 +240,8 @@ impl Cache {
         // stored length, which the policy layer deliberately does not know.
         let want = match self.wanted_bytes(request_headers, &record, &meta) {
             Wanted::Unusable(reason) => {
-                self.index.bump(counters::MISSES, 1)?;
+                tally.push((counters::MISSES, 1));
+                self.index.record_access(None, 0, &tally)?;
                 return Ok(Lookup::Miss(reason));
             }
             Wanted::Range(resolved) => Want {
@@ -250,13 +257,12 @@ impl Cache {
         match policy::evaluate(request_headers, &meta, now, &self.options) {
             Freshness::Fresh { age, .. } => {
                 let response = self.materialize(key.clone(), &record, &meta, age, &want)?;
-                self.index.touch(&key, now)?;
-                self.index.bump(counters::HITS, 1)?;
+                tally.push((counters::HITS, 1));
                 if want.range.is_some() {
-                    self.index.bump(counters::RANGE_HITS, 1)?;
+                    tally.push((counters::RANGE_HITS, 1));
                 }
-                self.index
-                    .bump(counters::BYTES_FROM_CACHE, response.body.len() as u64)?;
+                tally.push((counters::BYTES_FROM_CACHE, response.body.len() as u64));
+                self.index.record_access(Some(&key), now, &tally)?;
                 Ok(Lookup::Fresh(Box::new(response)))
             }
             Freshness::ServeStale {
@@ -266,13 +272,12 @@ impl Cache {
                 ..
             } => {
                 let response = self.materialize(key.clone(), &record, &meta, age, &want)?;
-                self.index.touch(&key, now)?;
-                self.index.bump(counters::STALE_HITS, 1)?;
+                tally.push((counters::STALE_HITS, 1));
                 if want.range.is_some() {
-                    self.index.bump(counters::RANGE_HITS, 1)?;
+                    tally.push((counters::RANGE_HITS, 1));
                 }
-                self.index
-                    .bump(counters::BYTES_FROM_CACHE, response.body.len() as u64)?;
+                tally.push((counters::BYTES_FROM_CACHE, response.body.len() as u64));
+                self.index.record_access(Some(&key), now, &tally)?;
                 Ok(Lookup::Stale {
                     response: Box::new(response),
                     refresh_in_background,
@@ -286,19 +291,22 @@ impl Cache {
                 ..
             } => {
                 if !policy::has_validator(&meta) {
-                    self.index.bump(counters::MISSES, 1)?;
+                    tally.push((counters::MISSES, 1));
+                    self.index.record_access(None, 0, &tally)?;
                     return Ok(Lookup::Miss("stale with no validator"));
                 }
                 // A stale partial has no whole body to serve if revalidation
                 // succeeds and nothing to fall back on if it does not. Refetch.
                 if !record.body.is_complete() {
-                    self.index.bump(counters::MISSES, 1)?;
+                    tally.push((counters::MISSES, 1));
+                    self.index.record_access(None, 0, &tally)?;
                     return Ok(Lookup::Miss(
                         "a stale partial entry is refetched, not revalidated",
                     ));
                 }
                 let response = self.materialize(key.clone(), &record, &meta, age, &want)?;
-                self.index.bump(counters::REVALIDATIONS, 1)?;
+                tally.push((counters::REVALIDATIONS, 1));
+                self.index.record_access(None, 0, &tally)?;
                 Ok(Lookup::Revalidate {
                     conditional: policy::conditional_headers(&meta),
                     response: Box::new(response),
@@ -307,7 +315,8 @@ impl Cache {
                 })
             }
             Freshness::Unusable(reason) => {
-                self.index.bump(counters::MISSES, 1)?;
+                tally.push((counters::MISSES, 1));
+                self.index.record_access(None, 0, &tally)?;
                 Ok(Lookup::Miss(reason))
             }
         }
