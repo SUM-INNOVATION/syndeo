@@ -19,6 +19,17 @@ syndeo-shell.workspace = true
 wry = { version = "0.57", default-features = false, features = ["mac-proxy", "os-webview"] }
 winit.workspace = true
 
+# Matching wry's own versions exactly, because the pinning delegate is set on
+# the web view wry built: a different objc2 is a different `Retained<T>` and the
+# types will not meet.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-web-kit = "0.3"
+block2 = "0.6"
+security-framework.workspace = true
+core-foundation.workspace = true
+base64.workspace = true
+
 tokio.workspace = true
 anyhow.workspace = true
 clap.workspace = true

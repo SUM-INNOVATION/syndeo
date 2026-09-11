@@ -67,6 +67,17 @@ struct CaArgs {
     /// Write the certificate to stdout instead of describing it.
     #[arg(long)]
     print: bool,
+    /// Trust this authority for TLS, for this user only.
+    ///
+    /// Goes into the login keychain rather than the System one, so it needs no
+    /// `sudo` and applies to nobody else who uses the machine. macOS will ask
+    /// you to authorise the change; that prompt is the consent, and there is
+    /// deliberately no way to skip it from here.
+    #[arg(long)]
+    trust: bool,
+    /// Remove the trust this added, and the certificate with it.
+    #[arg(long)]
+    untrust: bool,
 }
 
 #[derive(Parser)]
@@ -121,24 +132,27 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             let path = authority.certificate_path();
+
+            if args.trust || args.untrust {
+                return trust_in_login_keychain(&path, args.trust);
+            }
+
             println!("authority certificate: {}", path.display());
             println!();
-            println!("Trust it for the duration of the measurement, then remove it:");
-            println!("  macOS   sudo security add-trusted-cert -d -r trustRoot \\");
-            println!(
-                "            -k /Library/Keychains/System.keychain {}",
-                path.display()
-            );
-            println!(
-                "  remove  sudo security delete-certificate -c 'Syndeo Local Measurement CA' \\"
-            );
-            println!("            /Library/Keychains/System.keychain");
             println!();
-            println!("Then point a browser at the proxy, for example:");
-            println!("  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\");
-            println!(
-                "    --proxy-server=http://127.0.0.1:8899 --user-data-dir=/tmp/syndeo-measure"
-            );
+            println!("Why this exists: caching HTTPS means terminating it, so the proxy");
+            println!("presents a certificate it issued. A browser that does not know this");
+            println!("issuer refuses every page.");
+            println!();
+            println!("Trust it for this user only — no sudo, nobody else on the machine:");
+            println!("  syndeo-proxy ca --trust");
+            println!("  syndeo-proxy ca --untrust      # and to undo it");
+            println!();
+            println!("What that costs, plainly: your user account will trust one more");
+            println!("authority for TLS. It was generated on this machine and its key is at");
+            println!("{}.", authority.key_path().display());
+            println!("Anyone who takes that key can impersonate any site to you. Remove the");
+            println!("trust when you are done, and keep the key as private as any other.");
             Ok(())
         }
         Command::Stats(args) => {
@@ -439,6 +453,91 @@ fn text(status: StatusCode, message: &str) -> Response<Body> {
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(whole(Bytes::from(message.to_string())))
         .expect("static response")
+}
+
+/// Trust, or stop trusting, the proxy's authority for this user.
+///
+/// The login keychain rather than the System one: no `sudo`, and no effect on
+/// anyone else who uses the machine. Trust is set for the SSL policy only, so
+/// this authority can vouch for a TLS server and for nothing else — not code
+/// signing, not S/MIME, not a timestamp.
+///
+/// macOS puts up its own authorisation dialog for a trust-setting change, and
+/// that is the consent. There is no flag here to bypass it, because a browser
+/// that can silently add a root to your machine is a browser you should not run.
+fn trust_in_login_keychain(certificate: &std::path::Path, trust: bool) -> anyhow::Result<()> {
+    use std::process::Command as Exec;
+
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    let keychain = format!("{home}/Library/Keychains/login.keychain-db");
+
+    if trust {
+        // Asked here, because macOS does not ask. A trust setting in the user's
+        // own login keychain goes in without a prompt, so a browser that ran
+        // this silently would be adding a root to someone's machine without
+        // telling them. The prompt is ours to put up.
+        println!("This will add one certificate authority to your login keychain,");
+        println!("trusted for TLS only, for your user only — no sudo, nobody else");
+        println!("on this machine. It was generated here and its key is at");
+        println!("{}.", certificate.with_extension("key").display());
+        println!();
+        println!("Anyone who takes that key can impersonate any website to you.");
+        println!("Remove it with `syndeo-proxy ca --untrust` when you are done.");
+        print!("Type 'yes' to continue: ");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if answer.trim() != "yes" {
+            println!("Nothing was trusted.");
+            return Ok(());
+        }
+        let status = Exec::new("/usr/bin/security")
+            .args([
+                "add-trusted-cert",
+                // User trust, not admin: the login keychain.
+                "-r",
+                // A self-signed authority is a root. `trustAsRoot` is for a
+                // certificate that is not one, and macOS answers it with
+                // "one or more parameters passed to a function were not valid".
+                "trustRoot",
+                // SSL and nothing else.
+                "-p",
+                "ssl",
+                "-k",
+                &keychain,
+            ])
+            .arg(certificate)
+            .status()
+            .context("running security add-trusted-cert")?;
+        if !status.success() {
+            anyhow::bail!("macOS declined or the authorisation was cancelled; nothing was trusted");
+        }
+        println!();
+        println!("Trusted. Remove it with `syndeo-proxy ca --untrust` when you are done.");
+    } else {
+        let status = Exec::new("/usr/bin/security")
+            .args(["remove-trusted-cert", "-d"])
+            .arg(certificate)
+            .status();
+        // `remove-trusted-cert` fails when there was no trust setting to
+        // remove, which is the state the caller asked for, so it is not an
+        // error worth stopping on.
+        match status {
+            Ok(s) if s.success() => println!("Trust removed."),
+            _ => println!("No trust setting to remove."),
+        }
+        let _ = Exec::new("/usr/bin/security")
+            .args([
+                "delete-certificate",
+                "-c",
+                "Syndeo Local Measurement CA",
+                &keychain,
+            ])
+            .status();
+        println!("The certificate is out of the login keychain.");
+    }
+    Ok(())
 }
 
 /// The headers that may be sent on to an origin.

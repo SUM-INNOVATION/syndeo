@@ -110,6 +110,16 @@ impl CertificateAuthority {
         self.dir.join("syndeo-ca.pem")
     }
 
+    /// Where the authority's private key lives.
+    ///
+    /// Worth being able to name, because anyone who takes this key can
+    /// impersonate any site to a machine that trusts the certificate — so the
+    /// command that asks a user to trust it says out loud which file they are
+    /// now responsible for.
+    pub fn key_path(&self) -> PathBuf {
+        self.dir.join("syndeo-ca.key")
+    }
+
     pub fn certificate_pem(&self) -> &str {
         &self.ca_pem
     }
