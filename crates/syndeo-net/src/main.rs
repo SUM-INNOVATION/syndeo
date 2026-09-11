@@ -144,6 +144,18 @@ async fn main() -> Result<()> {
         Some(path) => Endpoint::new(path),
         None => Endpoint::in_runtime_dir(syndeo_ipc::transport::runtime_dir_for(&home), "net")?,
     };
-    syndeo_net::service::serve(net, Server::bind(endpoint)?).await;
+    // Stop on SIGTERM rather than only on SIGKILL, so the cache gets to close.
+    // Its index commits statistics and eviction stamps with relaxed durability
+    // and flushes them on the way out; a process that is killed outright takes
+    // the record of everything it served with it.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    tokio::select! {
+        _ = syndeo_net::service::serve(net.clone(), Server::bind(endpoint)?) => {}
+        _ = terminate.recv() => tracing::debug!("asked to stop"),
+        _ = interrupt.recv() => tracing::debug!("interrupted"),
+    }
+    // Everything the cache is holding, on disk, before this returns.
+    drop(net);
     Ok(())
 }

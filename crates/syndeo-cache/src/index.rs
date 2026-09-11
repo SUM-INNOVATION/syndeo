@@ -10,6 +10,7 @@ use crate::error::{CacheError, Result};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bumped whenever the layout of anything `bincode` writes into this file
 /// changes. `bincode` has no field names and no tolerance for change: a record
@@ -230,6 +231,29 @@ pub fn entry_key(partition: Option<&str>, method: &str, url: &str, vary_key: &st
 
 pub struct Index {
     db: Database,
+    /// Accesses recorded since the last durable commit.
+    since_flush: AtomicU64,
+}
+
+impl Drop for Index {
+    /// Carry the relaxed commits to disk before the process goes.
+    ///
+    /// The periodic flush bounds what a *crash* costs. This is what makes a
+    /// short run correct: a process that fetched two pages and exited would
+    /// otherwise take both of its counter updates with it, and `syndeo stats`
+    /// in the next process would report a cache that had served nothing.
+    ///
+    /// Best effort by necessity — a destructor has nowhere to report an error
+    /// to — and an empty durable commit is enough, because redb persists
+    /// everything committed before it.
+    fn drop(&mut self) {
+        if self.since_flush.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        if let Ok(tx) = self.db.begin_write() {
+            let _ = tx.commit();
+        }
+    }
 }
 
 impl std::fmt::Debug for Index {
@@ -275,7 +299,10 @@ impl Index {
             tx.open_table(SRI)?;
         }
         tx.commit()?;
-        Ok(Index { db })
+        Ok(Index {
+            db,
+            since_flush: AtomicU64::new(0),
+        })
     }
 
     /// The layout this index was written under.
@@ -515,8 +542,27 @@ impl Index {
         now: u64,
         counters: &[(&str, u64)],
     ) -> Result<()> {
+        // Not durable, most of the time — but *some* of the time it has to be,
+        // or this is not persistence with a relaxed deadline, it is a write
+        // that never lands. redb keeps a `Durability::None` commit in memory,
+        // visible to later readers in this process, and drops it when the
+        // process goes. What that looks like from outside is a browser that
+        // fetched two pages, served the second from cache, and then reported
+        // "requests 2, hits 0" — which is exactly the regression that shipping
+        // the relaxed commit without a flush produced, and what the pre-release
+        // check caught.
+        //
+        // So every so many accesses one commit pays the fsync and carries
+        // everything before it to disk. What a crash costs is bounded by that
+        // interval, which for statistics and an eviction stamp is the right
+        // trade, and the common case still does no synchronous I/O at all.
+        const FLUSH_EVERY: u64 = 32;
+
+        let since = self.since_flush.fetch_add(1, Ordering::Relaxed) + 1;
         let mut tx = self.db.begin_write()?;
-        tx.set_durability(redb::Durability::None);
+        if !since.is_multiple_of(FLUSH_EVERY) {
+            tx.set_durability(redb::Durability::None);
+        }
         {
             if let Some(key) = key {
                 let mut entries = tx.open_table(ENTRIES)?;

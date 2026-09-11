@@ -212,13 +212,46 @@ impl Supervisor {
         Ok(child.wait().await?)
     }
 
+    /// Ask the children to stop, then insist.
+    ///
+    /// `start_kill` is SIGKILL, which runs no destructor in the target. That is
+    /// fine for a process holding nothing, and wrong for the network process,
+    /// which holds the cache: its index commits statistics and eviction stamps
+    /// with relaxed durability and flushes them when it closes, so killing it
+    /// outright threw away the record of everything it had just served. The
+    /// symptom was `syndeo browse --twice` reporting a cache hit and
+    /// `syndeo stats` then reporting none.
+    ///
+    /// So: SIGTERM, a moment to act on it, and SIGKILL for anything that did
+    /// not. The grace period is short because nothing here has much to do — a
+    /// commit and a close — and a shell that hangs on exit is its own bug.
     pub async fn shutdown(&mut self) {
+        const GRACE: Duration = Duration::from_millis(500);
+
         for (name, child) in self.children.iter_mut() {
-            let _ = child.start_kill();
-            tracing::debug!(process = %name, "stopped");
+            match child.id() {
+                Some(pid) => {
+                    // SAFETY: `pid` came from a child this process spawned and
+                    // has not been reaped, so it names that child or nothing.
+                    unsafe { libc_kill(pid as i32, SIGTERM) };
+                    tracing::debug!(process = %name, "asked to stop");
+                }
+                // Already gone.
+                None => continue,
+            }
         }
-        for (_, child) in self.children.iter_mut() {
-            let _ = child.wait().await;
+
+        let deadline = Instant::now() + GRACE;
+        for (name, child) in self.children.iter_mut() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(left, child.wait()).await {
+                Ok(_) => tracing::debug!(process = %name, "stopped"),
+                Err(_) => {
+                    tracing::debug!(process = %name, "did not stop in time; killing it");
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+            }
         }
         self.children.clear();
     }
@@ -259,6 +292,15 @@ fn clear_stale(path: &Path) {
         return;
     }
     let _ = std::fs::remove_file(path);
+}
+
+const SIGTERM: i32 = 15;
+
+unsafe fn libc_kill(pid: i32, signal: i32) {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    kill(pid, signal);
 }
 
 /// The last resort when the sibling lookup finds nothing.

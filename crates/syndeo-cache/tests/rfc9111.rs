@@ -1515,3 +1515,47 @@ fn two_partitions_holding_the_same_bytes_hold_one_copy_of_them() {
     assert_eq!(stats.entries, 2, "one entry per partition");
     assert_eq!(stats.blobs, 1, "and one copy of the bytes");
 }
+
+/// A cache hit that nobody can see afterwards is a cache hit nobody can trust.
+///
+/// The hit path commits its counters with relaxed durability, because paying an
+/// fsync per served request made the cache slower than the network. Relaxed is
+/// not the same as absent: a process that serves a page from cache and exits
+/// has to leave that fact on disk, or `syndeo stats` in the next process
+/// reports a cache that has served nothing — which is what shipping the relaxed
+/// commit without a flush actually did.
+#[test]
+fn counters_survive_the_process_that_recorded_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = "https://example.test/counted.css";
+
+    {
+        let cache = cache_at(dir.path(), NOW);
+        cache
+            .store(
+                None,
+                "GET",
+                url,
+                &HeaderMap::new(),
+                200,
+                &headers(&[("cache-control", "max-age=3600")]),
+                b"body{}",
+                NOW,
+                NOW,
+            )
+            .unwrap();
+        assert!(matches!(
+            cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap(),
+            Lookup::Fresh(_)
+        ));
+        // and the cache is dropped here, as a short-lived process would
+    }
+
+    let reopened = cache_at(dir.path(), NOW);
+    let stats = reopened.stats().unwrap();
+    assert_eq!(
+        stats.hits, 1,
+        "the hit must outlive the process that served it"
+    );
+    assert!(stats.requests >= 1, "so must the request that produced it");
+}
