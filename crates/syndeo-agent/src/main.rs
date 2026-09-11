@@ -51,6 +51,10 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // A shell that was force-quit runs no destructors, so `kill_on_drop` never
+    // fires and this process would outlive it holding a socket.
+    syndeo_ipc::exit_when_parent_does();
+
     // Proof, at startup, that the boundary holds. If the shell ever leaked the
     // session secret into this process's environment, this is where we would
     // find out rather than in an incident report.

@@ -51,6 +51,10 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // A shell that was force-quit runs no destructors, so `kill_on_drop` never
+    // fires and this process would outlive it holding a socket.
+    syndeo_ipc::exit_when_parent_does();
     let home = cli.home.unwrap_or_else(|| {
         std::env::var_os("SYNDEO_HOME")
             .map(PathBuf::from)

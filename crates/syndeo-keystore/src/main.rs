@@ -82,6 +82,10 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Status) {
         Command::Serve { socket } => {
+            // Only when serving: the subcommands are run by a person at a
+            // terminal, where stdin is theirs and closing it means nothing.
+            syndeo_ipc::exit_when_parent_does();
+
             let secret = std::env::var(SECRET_VAR)
                 .ok()
                 .and_then(|s| {

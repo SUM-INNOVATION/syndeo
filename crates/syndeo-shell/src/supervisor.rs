@@ -16,6 +16,14 @@ use tokio::process::{Child, Command};
 pub struct Supervisor {
     home: PathBuf,
     children: Vec<(String, Child)>,
+    /// The writing ends of each child's parent-watch pipe.
+    ///
+    /// Never written to, and that is the point: they stay open for exactly as
+    /// long as this process lives, and the kernel closes them however it ends.
+    /// A child reading end-of-file on its stdin knows the shell is gone and
+    /// exits, which `kill_on_drop` alone cannot arrange for a shell that was
+    /// force-quit.
+    watches: Vec<tokio::process::ChildStdin>,
 }
 
 impl Supervisor {
@@ -23,6 +31,14 @@ impl Supervisor {
         Supervisor {
             home: home.into(),
             children: Vec::new(),
+            watches: Vec::new(),
+        }
+    }
+
+    /// Hold the writing end of this child's parent-watch pipe.
+    fn watch(&mut self, child: &mut Child) {
+        if let Some(pipe) = child.stdin.take() {
+            self.watches.push(pipe);
         }
     }
 
@@ -88,11 +104,12 @@ impl Supervisor {
                 }
             }
         }
-        let child = command
-            .stdin(Stdio::null())
+        let mut child = command
+            .stdin(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("spawning the network process")?;
+        self.watch(&mut child);
         self.children.push(("net".into(), child));
         wait_for(endpoint.path()).await?;
         Ok(endpoint)
@@ -129,11 +146,12 @@ impl Supervisor {
                 command.arg("--bootstrap").arg(address);
             }
         }
-        let child = command
-            .stdin(Stdio::null())
+        let mut child = command
+            .stdin(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("spawning the network process")?;
+        self.watch(&mut child);
         self.children.push(("net".into(), child));
         wait_for(endpoint.path()).await?;
         Ok(endpoint)
@@ -144,17 +162,18 @@ impl Supervisor {
     pub async fn start_keystore(&mut self, secret: &SessionSecret) -> Result<Endpoint> {
         let endpoint = Endpoint::new(self.runtime_dir().join("keystore.sock"));
         clear_stale(endpoint.path());
-        let child = Command::new(Self::locate("syndeo-keystore")?)
+        let mut child = Command::new(Self::locate("syndeo-keystore")?)
             .arg("serve")
             .arg("--socket")
             .arg(endpoint.path())
             .arg("--home")
             .arg(&self.home)
             .env("SYNDEO_SESSION_SECRET", secret.to_hex())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("spawning the keystore process")?;
+        self.watch(&mut child);
         self.children.push(("keystore".into(), child));
         wait_for(endpoint.path()).await?;
         Ok(endpoint)
@@ -162,7 +181,7 @@ impl Supervisor {
 
     /// The agent. Note precisely what it is given, and what it is not.
     pub fn start_agent(&mut self, net: &Endpoint, shell: &Endpoint, task: &str) -> Result<()> {
-        let child = Command::new(Self::locate("syndeo-agent")?)
+        let mut child = Command::new(Self::locate("syndeo-agent")?)
             .arg("--net-socket")
             .arg(net.path())
             .arg("--shell-socket")
@@ -175,10 +194,11 @@ impl Supervisor {
             // environment that would let the agent reach a key.
             .env_remove("SYNDEO_SESSION_SECRET")
             .env_remove("SYNDEO_PASSPHRASE")
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("spawning the agent process")?;
+        self.watch(&mut child);
         self.children.push(("agent".into(), child));
         Ok(())
     }
