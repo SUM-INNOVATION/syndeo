@@ -66,6 +66,7 @@ async fn a_peer_serves_a_body_by_its_content_address() {
     let now = syndeo_cache::headers::now_secs();
     server_cache
         .store(
+            None,
             "GET",
             "https://origin.test/asset.js",
             &http::HeaderMap::new(),
@@ -97,6 +98,7 @@ async fn a_peer_serves_a_body_by_the_integrity_a_page_declared() {
     let now = syndeo_cache::headers::now_secs();
     server_cache
         .store(
+            None,
             "GET",
             "https://cdn.test/lib.js",
             &http::HeaderMap::new(),
@@ -140,6 +142,7 @@ async fn bytes_that_do_not_hash_to_the_request_are_refused() {
     let now = syndeo_cache::headers::now_secs();
     server_cache
         .store(
+            None,
             "GET",
             "https://cdn.test/lib.js",
             &http::HeaderMap::new(),
@@ -202,6 +205,7 @@ fn seed(cache: &Arc<Cache>, body: &[u8]) -> Hash {
     let now = cache.now();
     cache
         .store(
+            None,
             "GET",
             "https://example.test/lib.js",
             &http::HeaderMap::new(),
@@ -322,6 +326,7 @@ async fn a_peer_that_only_takes_is_eventually_asked_to_wait() {
             let now = server_cache.now();
             server_cache
                 .store(
+                    None,
                     "GET",
                     &format!("https://example.test/{i}.js"),
                     &http::HeaderMap::new(),

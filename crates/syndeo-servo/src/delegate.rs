@@ -81,7 +81,7 @@ impl NetworkDelegate {
     ///
     /// Returns immediately. The load is parked until the network process
     /// answers.
-    pub fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+    pub fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
         // Schemes that carry their own bytes are left to Servo, and that is not
         // a hole in the boundary: `data:` is base64 in the markup, `about:` and
         // `blob:` are memory the renderer already holds, and none of the three
@@ -98,10 +98,19 @@ impl NetworkDelegate {
             return;
         }
 
+        // The address in the URL bar, which is what the cache is partitioned
+        // on. Taken from the webview rather than from the load, because the
+        // load's own URL is the subresource's — and partitioning a third-party
+        // request under its own origin is the same as not partitioning it.
+        let partition = webview
+            .url()
+            .and_then(|url| syndeo_ipc::protocol::partition_for(url.as_str()));
+
         let request = bridge::to_net_request(
             &load.request().method,
             &load.request().url,
             &load.request().headers,
+            partition.as_deref(),
         );
         let url = load.request().url.clone();
 

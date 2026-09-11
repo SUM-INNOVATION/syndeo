@@ -19,7 +19,15 @@ struct Cli {
     #[arg(long)]
     cache: Option<PathBuf>,
     /// system | dot:cloudflare | doh:cloudflare | doh:google | doh:quad9
-    #[arg(long, default_value = "system")]
+    /// Serve one site's stored resources to another.
+    ///
+    /// Off by default: a cache keyed on the URL alone lets one site time a
+    /// fetch and learn where you have been. This raises the hit rate on
+    /// third-party resources and gives that away, and exists so the two can be
+    /// measured against each other.
+    #[arg(long)]
+    unpartitioned_cache: bool,
+    #[arg(long, default_value = "doh:cloudflare")]
     dns: String,
     #[arg(long)]
     home: Option<PathBuf>,
@@ -97,10 +105,39 @@ async fn main() -> Result<()> {
         cache_root: cli.cache.unwrap_or_else(|| home.join("cache")),
         dns,
         peers,
+        partition_cache: !cli.unpartitioned_cache,
         ..NetConfig::default()
     })?);
     if let Some(peer_id) = net.peer_id() {
         tracing::info!(%peer_id, "peer fetch is on");
+    }
+
+    // Blobs nothing points at any more.
+    //
+    // `enforce_budget` runs on every store and keeps the cache inside its size
+    // limit, but it only deletes a blob when the last entry referring to it is
+    // evicted. A blob can lose its last reference another way — a process
+    // killed between writing the body and committing the entry, an entry
+    // dropped by a schema migration — and nothing was collecting those: the
+    // sweep existed and had no caller outside its own test, so a long-lived
+    // cache accumulated bytes that no page could ever be served from.
+    //
+    // Once at startup, then hourly. Unreferenced blobs are not urgent, and the
+    // sweep walks the whole index, so doing it on a store would pay a linear
+    // cost for a rare event.
+    {
+        let net = net.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+            loop {
+                every.tick().await;
+                match net.cache().collect_garbage() {
+                    Ok(0) => tracing::debug!("no unreferenced blobs"),
+                    Ok(n) => tracing::info!(blobs = n, "collected unreferenced blobs"),
+                    Err(err) => tracing::warn!(%err, "collecting unreferenced blobs"),
+                }
+            }
+        });
     }
 
     let endpoint = match cli.socket {

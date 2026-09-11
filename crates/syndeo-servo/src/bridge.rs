@@ -31,8 +31,14 @@ const NOT_FORWARDED: &[&str] = &[
 /// it: a socket, an address, a certificate, a DNS answer, a proxy. A URL goes
 /// in, bytes come back. That is boundary one, and this function is where it is
 /// enforced against a renderer rather than asserted about one.
-pub fn to_net_request(method: &Method, url: &url::Url, headers: &HeaderMap) -> NetRequest {
+pub fn to_net_request(
+    method: &Method,
+    url: &url::Url,
+    headers: &HeaderMap,
+    partition: Option<&str>,
+) -> NetRequest {
     NetRequest::Fetch {
+        partition: partition.map(str::to_owned),
         method: method.as_str().to_string(),
         url: url.as_str().to_string(),
         headers: forwardable(headers),
@@ -148,6 +154,7 @@ mod tests {
             &Method::GET,
             &url,
             &headers(&[("accept", "*/*"), ("referer", "https://example.test/")]),
+            Some("https://example.test"),
         );
 
         let NetRequest::Fetch {
@@ -185,6 +192,7 @@ mod tests {
                 ("content-length", "9999"),
                 ("cookie", "session=abc"),
             ]),
+            Some("https://example.test"),
         );
         let NetRequest::Fetch { headers, .. } = request else {
             unreachable!()

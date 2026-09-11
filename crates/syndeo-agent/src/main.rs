@@ -291,6 +291,8 @@ async fn fetch(
     // page it can read.
     let response = channel
         .fetch(&NetRequest::Fetch {
+            // A page fetched at the top level is its own partition.
+            partition: syndeo_ipc::protocol::partition_for(url),
             method: "GET".into(),
             url: url.to_string(),
             headers: vec![("accept".into(), "text/html,*/*".into())],

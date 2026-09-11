@@ -46,7 +46,7 @@ struct Cli {
     #[arg(long)]
     home: Option<PathBuf>,
     /// system | dot:cloudflare | doh:cloudflare | doh:google | doh:quad9
-    #[arg(long, default_value = "system")]
+    #[arg(long, default_value = "doh:cloudflare")]
     dns: String,
     /// Scroll this many times on its own, report how long each frame took, and
     /// exit.

@@ -52,7 +52,7 @@ struct RunArgs {
     #[arg(long)]
     cache: Option<PathBuf>,
     /// system | dot:cloudflare | doh:cloudflare | doh:google | doh:quad9
-    #[arg(long, default_value = "system")]
+    #[arg(long, default_value = "doh:cloudflare")]
     dns: String,
     /// Run the cache with shared-cache semantics.
     #[arg(long, default_value_t = true)]
@@ -358,6 +358,13 @@ async fn forward(
         // so nothing here is ever eligible for peer fetch. The measurement is of
         // the cache, uncontaminated.
         integrity: None,
+        // Unpartitioned, deliberately. A proxied browser does not tell us which
+        // tab a request came from either, so there is no top-level site to
+        // partition under — and inventing one from the request's own host would
+        // be the same as not partitioning while looking like it was. Hit rates
+        // measured here are therefore an upper bound; the browser's own figures
+        // are the partitioned ones.
+        partition: None,
     };
 
     match proxy.net.fetch(fetch).await {

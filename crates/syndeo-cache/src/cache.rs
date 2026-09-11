@@ -198,7 +198,13 @@ impl Cache {
 
     // ---- read path ---------------------------------------------------------
 
-    pub fn lookup(&self, method: &str, url: &str, request_headers: &HeaderMap) -> Result<Lookup> {
+    pub fn lookup(
+        &self,
+        partition: Option<&str>,
+        method: &str,
+        url: &str,
+        request_headers: &HeaderMap,
+    ) -> Result<Lookup> {
         // Counted in memory and written once, at the end, in a single
         // transaction. Writing each of these as it happened cost an fsync
         // apiece against redb's one writer, and made a cache hit slower than
@@ -216,9 +222,9 @@ impl Cache {
         // are exactly what a HEAD response is. Its own stored variant is tried
         // first; the fallback is what saves the origin round trip.
         let head = method.eq_ignore_ascii_case("HEAD");
-        let selected = match self.select_variant(method, &url, request_headers)? {
+        let selected = match self.select_variant(partition, method, &url, request_headers)? {
             Some(found) => Some(found),
-            None if head => self.select_variant("GET", &url, request_headers)?,
+            None if head => self.select_variant(partition, "GET", &url, request_headers)?,
             None => None,
         };
         let Some((key, record)) = selected else {
@@ -385,12 +391,13 @@ impl Cache {
     /// Find the stored variant whose selecting headers match this request.
     fn select_variant(
         &self,
+        partition: Option<&str>,
         method: &str,
         url: &str,
         request_headers: &HeaderMap,
     ) -> Result<Option<(String, EntryRecord)>> {
-        for candidate in self.index.variant_keys(method, url)? {
-            let key = entry_key(method, url, &candidate);
+        for candidate in self.index.variant_keys(partition, method, url)? {
+            let key = entry_key(partition, method, url, &candidate);
             let Some(record) = self.index.get_entry(&key)? else {
                 continue;
             };
@@ -542,6 +549,7 @@ impl Cache {
     #[allow(clippy::too_many_arguments)]
     pub fn store(
         &self,
+        partition: Option<&str>,
         method: &str,
         url: &str,
         request_headers: &HeaderMap,
@@ -552,6 +560,7 @@ impl Cache {
         response_time: u64,
     ) -> Result<StoreOutcome> {
         self.store_with_provenance(
+            partition,
             method,
             url,
             request_headers,
@@ -567,6 +576,7 @@ impl Cache {
     #[allow(clippy::too_many_arguments)]
     pub fn store_with_provenance(
         &self,
+        partition: Option<&str>,
         method: &str,
         url: &str,
         request_headers: &HeaderMap,
@@ -604,6 +614,7 @@ impl Cache {
 
         if status == 206 {
             return self.store_partial(
+                partition,
                 method,
                 &url,
                 response_headers,
@@ -623,6 +634,7 @@ impl Cache {
 
         let now = self.now();
         let record = EntryRecord {
+            partition: partition.map(str::to_owned),
             url: url.clone(),
             method: method.to_ascii_uppercase(),
             status,
@@ -656,7 +668,7 @@ impl Cache {
         // and the point of storing it is to act on that rather than to sit
         // beside a GET it may have just contradicted.
         if method.eq_ignore_ascii_case("HEAD") {
-            self.reconcile_head(&url, request_headers, response_headers)?;
+            self.reconcile_head(partition, &url, request_headers, response_headers)?;
         }
 
         self.enforce_budget()?;
@@ -690,6 +702,7 @@ impl Cache {
     #[allow(clippy::too_many_arguments)]
     pub fn finish_streamed(
         &self,
+        partition: Option<&str>,
         method: &str,
         url: &str,
         request_headers: &HeaderMap,
@@ -736,6 +749,7 @@ impl Cache {
 
         let now = self.now();
         let record = EntryRecord {
+            partition: partition.map(str::to_owned),
             url: url.clone(),
             method: method.to_ascii_uppercase(),
             status,
@@ -772,7 +786,7 @@ impl Cache {
         self.index.bump(counters::STORES, 1)?;
 
         if method.eq_ignore_ascii_case("HEAD") {
-            self.reconcile_head(&url, request_headers, response_headers)?;
+            self.reconcile_head(partition, &url, request_headers, response_headers)?;
         }
         self.enforce_budget()?;
 
@@ -791,6 +805,7 @@ impl Cache {
     #[allow(clippy::too_many_arguments)]
     fn store_partial(
         &self,
+        partition: Option<&str>,
         method: &str,
         url: &str,
         response_headers: &HeaderMap,
@@ -830,7 +845,7 @@ impl Cache {
             ));
         }
 
-        let key = entry_key("GET", url, &vkey);
+        let key = entry_key(partition, "GET", url, &vkey);
         let existing = self.index.get_entry(&key)?;
 
         // Is what we already hold the same representation as this range?
@@ -903,6 +918,7 @@ impl Cache {
         }
 
         let mut record = EntryRecord {
+            partition: partition.map(str::to_owned),
             url: url.to_string(),
             method: "GET".to_string(),
             // A stored partial is a stored *representation*; the 206 status
@@ -974,11 +990,14 @@ impl Cache {
     /// so they either refresh the stored GET or prove it is out of date.
     fn reconcile_head(
         &self,
+        partition: Option<&str>,
         url: &str,
         request_headers: &HeaderMap,
         head_headers: &HeaderMap,
     ) -> Result<()> {
-        let Some((key, mut record)) = self.select_variant("GET", url, request_headers)? else {
+        let Some((key, mut record)) =
+            self.select_variant(partition, "GET", url, request_headers)?
+        else {
             return Ok(());
         };
         let mut stored = to_header_map(&record.headers);
@@ -1068,23 +1087,23 @@ impl Cache {
     }
 
     /// Unsafe methods invalidate the target URI (RFC 9111 §4.4).
-    pub fn invalidate(&self, method: &str, url: &str) -> Result<usize> {
+    pub fn invalidate(&self, partition: Option<&str>, method: &str, url: &str) -> Result<usize> {
         if !policy::invalidates(method) {
             return Ok(0);
         }
         let url = Self::normalize_url(url);
         let mut removed = 0;
         for m in ["GET", "HEAD"] {
-            let orphaned = self.index.invalidate(m, &url)?;
+            let orphaned = self.index.invalidate(partition, m, &url)?;
             removed += orphaned.len();
             self.drop_blobs(&orphaned)?;
         }
         Ok(removed)
     }
 
-    pub fn purge(&self, method: &str, url: &str) -> Result<()> {
+    pub fn purge(&self, partition: Option<&str>, method: &str, url: &str) -> Result<()> {
         let url = Self::normalize_url(url);
-        let orphaned = self.index.invalidate(method, &url)?;
+        let orphaned = self.index.invalidate(partition, method, &url)?;
         self.drop_blobs(&orphaned)
     }
 
@@ -1283,7 +1302,17 @@ mod tests {
         headers.insert(http::header::CACHE_CONTROL, "max-age=600".parse().unwrap());
         let now = cache.now();
         cache
-            .store("GET", url, &HeaderMap::new(), 200, &headers, body, now, now)
+            .store(
+                None,
+                "GET",
+                url,
+                &HeaderMap::new(),
+                200,
+                &headers,
+                body,
+                now,
+                now,
+            )
             .unwrap();
     }
 

@@ -19,6 +19,16 @@ pub enum NetRequest {
         /// Subresource Integrity from the markup, when the caller has it. This is
         /// what makes a peer-supplied body acceptable.
         integrity: Option<String>,
+        /// The top-level document's origin — the address in the URL bar, not
+        /// this resource's own.
+        ///
+        /// It is the cache partition. Without it a cache is shared across every
+        /// site, and that is a way to be tracked: an advertiser embedded in two
+        /// places can time a fetch and learn whether you have been somewhere it
+        /// was already loaded. `None` is unpartitioned, which is what the
+        /// measuring proxy sends and what `--shared-cache` restores.
+        #[serde(default)]
+        partition: Option<String>,
     },
     Stats,
     /// What the peer swarm looks like from the network process. Reports nothing
@@ -317,5 +327,29 @@ mod tests {
         // serialized form changes and this fails.
         let variants = serde_json::to_string(&super::ShellRequest::Ping).unwrap();
         assert_eq!(variants, "\"Ping\"");
+    }
+}
+
+/// The cache partition for a document: its origin, and nothing more of it.
+///
+/// Scheme, host and port — so `https://example.test/a` and
+/// `https://example.test/b` share a partition, and `http://` and `https://` do
+/// not. Chrome partitions on the registrable domain instead, which needs a
+/// public suffix list to work out that `bbc.co.uk` is a site and `co.uk` is
+/// not; the origin is stricter than that, needs no list, and errs towards more
+/// partitions rather than fewer. Subdomains of one site therefore do not share
+/// a cache, which costs some hit rate and gives nothing away.
+pub fn partition_for(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    let url = &url;
+    match url.host_str() {
+        Some(host) => Some(match url.port() {
+            Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+            None => format!("{}://{}", url.scheme(), host),
+        }),
+        // `about:blank` and friends have no host and so no site to be
+        // partitioned under. They get their own partition rather than sharing
+        // the unpartitioned one with everything else.
+        None => Some(format!("{}:", url.scheme())),
     }
 }

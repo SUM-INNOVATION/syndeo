@@ -260,6 +260,7 @@ fn s4_1_vary_selects_the_matching_variant() {
 
     cache
         .store(
+            None,
             "GET",
             url,
             &headers(&[("accept-encoding", "gzip")]),
@@ -272,6 +273,7 @@ fn s4_1_vary_selects_the_matching_variant() {
         .unwrap();
     cache
         .store(
+            None,
             "GET",
             url,
             &headers(&[("accept-encoding", "br")]),
@@ -285,7 +287,7 @@ fn s4_1_vary_selects_the_matching_variant() {
 
     for (encoding, expected) in [("gzip", &b"gzip body"[..]), ("br", &b"br body"[..])] {
         match cache
-            .lookup("GET", url, &headers(&[("accept-encoding", encoding)]))
+            .lookup(None, "GET", url, &headers(&[("accept-encoding", encoding)]))
             .unwrap()
         {
             Lookup::Fresh(r) => assert_eq!(r.body, expected),
@@ -296,7 +298,7 @@ fn s4_1_vary_selects_the_matching_variant() {
     // An encoding we never stored must miss rather than serve the wrong body.
     assert!(matches!(
         cache
-            .lookup("GET", url, &headers(&[("accept-encoding", "zstd")]))
+            .lookup(None, "GET", url, &headers(&[("accept-encoding", "zstd")]))
             .unwrap(),
         Lookup::Miss(_)
     ));
@@ -583,16 +585,26 @@ fn s4_4_unsafe_methods_invalidate_the_target() {
     let url = "https://example.test/thing";
     let resp = headers(&[("cache-control", "max-age=600"), ("date", &date(NOW))]);
     cache
-        .store("GET", url, &HeaderMap::new(), 200, &resp, b"v1", NOW, NOW)
+        .store(
+            None,
+            "GET",
+            url,
+            &HeaderMap::new(),
+            200,
+            &resp,
+            b"v1",
+            NOW,
+            NOW,
+        )
         .unwrap();
     assert!(matches!(
-        cache.lookup("GET", url, &HeaderMap::new()).unwrap(),
+        cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap(),
         Lookup::Fresh(_)
     ));
 
-    cache.invalidate("POST", url).unwrap();
+    cache.invalidate(None, "POST", url).unwrap();
     assert!(matches!(
-        cache.lookup("GET", url, &HeaderMap::new()).unwrap(),
+        cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap(),
         Lookup::Miss(_)
     ));
 }
@@ -650,7 +662,17 @@ fn store_whole(cache: &Cache, url: &str, body: &[u8], extra: &[(&str, &str)]) {
     pairs.push(("content-length", len.as_str()));
     let resp = headers(&pairs);
     cache
-        .store("GET", url, &HeaderMap::new(), 200, &resp, body, NOW, NOW)
+        .store(
+            None,
+            "GET",
+            url,
+            &HeaderMap::new(),
+            200,
+            &resp,
+            body,
+            NOW,
+            NOW,
+        )
         .unwrap();
 }
 
@@ -662,7 +684,7 @@ fn s4_a_head_is_answered_from_the_stored_get_with_no_body() {
     let body = ranged_body();
     store_whole(&cache, url, &body, &[("content-type", "application/pdf")]);
 
-    match cache.lookup("HEAD", url, &HeaderMap::new()).unwrap() {
+    match cache.lookup(None, "HEAD", url, &HeaderMap::new()).unwrap() {
         Lookup::Fresh(response) => {
             assert_eq!(response.status, 200);
             assert!(response.body.is_empty(), "a HEAD carries no body");
@@ -682,14 +704,26 @@ fn s4_a_head_is_answered_from_the_stored_get_with_no_body() {
         ("date", &date(NOW)),
     ]);
     cache
-        .store("HEAD", other, &HeaderMap::new(), 200, &resp, b"", NOW, NOW)
+        .store(
+            None,
+            "HEAD",
+            other,
+            &HeaderMap::new(),
+            200,
+            &resp,
+            b"",
+            NOW,
+            NOW,
+        )
         .unwrap();
     assert!(matches!(
-        cache.lookup("HEAD", other, &HeaderMap::new()).unwrap(),
+        cache
+            .lookup(None, "HEAD", other, &HeaderMap::new())
+            .unwrap(),
         Lookup::Fresh(_)
     ));
     assert!(matches!(
-        cache.lookup("GET", other, &HeaderMap::new()).unwrap(),
+        cache.lookup(None, "GET", other, &HeaderMap::new()).unwrap(),
         Lookup::Miss(_)
     ));
 }
@@ -711,9 +745,19 @@ fn s4_3_5_a_head_refreshes_the_stored_get_or_invalidates_it() {
         ("date", &date(NOW)),
     ]);
     cache
-        .store("HEAD", url, &HeaderMap::new(), 200, &head, b"", NOW, NOW)
+        .store(
+            None,
+            "HEAD",
+            url,
+            &HeaderMap::new(),
+            200,
+            &head,
+            b"",
+            NOW,
+            NOW,
+        )
         .unwrap();
-    match cache.lookup("GET", url, &HeaderMap::new()).unwrap() {
+    match cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap() {
         Lookup::Fresh(response) => {
             assert_eq!(response.headers["x-origin"], "new");
             assert_eq!(response.body, body, "the body is untouched");
@@ -729,11 +773,21 @@ fn s4_3_5_a_head_refreshes_the_stored_get_or_invalidates_it() {
         ("date", &date(NOW)),
     ]);
     cache
-        .store("HEAD", url, &HeaderMap::new(), 200, &moved, b"", NOW, NOW)
+        .store(
+            None,
+            "HEAD",
+            url,
+            &HeaderMap::new(),
+            200,
+            &moved,
+            b"",
+            NOW,
+            NOW,
+        )
         .unwrap();
     assert!(
         matches!(
-            cache.lookup("GET", url, &HeaderMap::new()).unwrap(),
+            cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap(),
             Lookup::Miss(_)
         ),
         "a HEAD that contradicts the stored GET invalidates it"
@@ -751,7 +805,7 @@ fn s14_a_stored_body_answers_a_range_without_touching_the_origin() {
     store_whole(&cache, url, &body, &[]);
 
     let request = headers(&[("range", "bytes=100-199")]);
-    match cache.lookup("GET", url, &request).unwrap() {
+    match cache.lookup(None, "GET", url, &request).unwrap() {
         Lookup::Fresh(response) => {
             assert_eq!(response.status, 206);
             assert_eq!(response.body, body[100..=199]);
@@ -763,7 +817,7 @@ fn s14_a_stored_body_answers_a_range_without_touching_the_origin() {
 
     // A suffix range, and one that runs past the end, both resolve.
     let request = headers(&[("range", "bytes=-10")]);
-    match cache.lookup("GET", url, &request).unwrap() {
+    match cache.lookup(None, "GET", url, &request).unwrap() {
         Lookup::Fresh(response) => {
             assert_eq!(response.body, body[990..]);
             assert_eq!(response.headers["content-range"], "bytes 990-999/1000");
@@ -774,13 +828,13 @@ fn s14_a_stored_body_answers_a_range_without_touching_the_origin() {
     // Multipart is passed through rather than approximated.
     let request = headers(&[("range", "bytes=0-9, 20-29")]);
     assert!(matches!(
-        cache.lookup("GET", url, &request).unwrap(),
+        cache.lookup(None, "GET", url, &request).unwrap(),
         Lookup::Miss(_)
     ));
 
     // An unsatisfiable range is ignored, and the whole body is served.
     let request = headers(&[("range", "bytes=5000-6000")]);
-    match cache.lookup("GET", url, &request).unwrap() {
+    match cache.lookup(None, "GET", url, &request).unwrap() {
         Lookup::Fresh(response) => {
             assert_eq!(response.status, 200);
             assert_eq!(response.body, body);
@@ -798,7 +852,7 @@ fn s13_1_5_if_range_is_checked_against_the_stored_validator() {
     store_whole(&cache, url, &body, &[]);
 
     let matching = headers(&[("range", "bytes=0-9"), ("if-range", "\"v1\"")]);
-    match cache.lookup("GET", url, &matching).unwrap() {
+    match cache.lookup(None, "GET", url, &matching).unwrap() {
         Lookup::Fresh(response) => assert_eq!(response.status, 206),
         other => panic!("expected the range to be served, got {other:?}"),
     }
@@ -807,14 +861,14 @@ fn s13_1_5_if_range_is_checked_against_the_stored_validator() {
     // use to it, so it goes to the origin for the whole thing.
     let stale = headers(&[("range", "bytes=0-9"), ("if-range", "\"v0\"")]);
     assert!(matches!(
-        cache.lookup("GET", url, &stale).unwrap(),
+        cache.lookup(None, "GET", url, &stale).unwrap(),
         Lookup::Miss(_)
     ));
 
     // A weak tag may not be used for If-Range at all.
     let weak = headers(&[("range", "bytes=0-9"), ("if-range", "W/\"v1\"")]);
     assert!(matches!(
-        cache.lookup("GET", url, &weak).unwrap(),
+        cache.lookup(None, "GET", url, &weak).unwrap(),
         Lookup::Miss(_)
     ));
 }
@@ -838,6 +892,7 @@ fn s3_3_partial_responses_are_stored_and_combined_rather_than_replaced() {
     // First half.
     let outcome = cache
         .store(
+            None,
             "GET",
             url,
             &HeaderMap::new(),
@@ -861,7 +916,7 @@ fn s3_3_partial_responses_are_stored_and_combined_rather_than_replaced() {
 
     // A range inside what we hold is servable already.
     let request = headers(&[("range", "bytes=10-19")]);
-    match cache.lookup("GET", url, &request).unwrap() {
+    match cache.lookup(None, "GET", url, &request).unwrap() {
         Lookup::Fresh(response) => {
             assert_eq!(response.status, 206);
             assert_eq!(response.body, body[10..=19]);
@@ -872,18 +927,19 @@ fn s3_3_partial_responses_are_stored_and_combined_rather_than_replaced() {
     // One that is not is a miss, not a wrong answer.
     let beyond = headers(&[("range", "bytes=600-699")]);
     assert!(matches!(
-        cache.lookup("GET", url, &beyond).unwrap(),
+        cache.lookup(None, "GET", url, &beyond).unwrap(),
         Lookup::Miss(_)
     ));
     // And neither is the whole body, which we do not have.
     assert!(matches!(
-        cache.lookup("GET", url, &HeaderMap::new()).unwrap(),
+        cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap(),
         Lookup::Miss(_)
     ));
 
     // An overlapping range adds only what is new, and does not replace.
     let outcome = cache
         .store(
+            None,
             "GET",
             url,
             &HeaderMap::new(),
@@ -899,7 +955,7 @@ fn s3_3_partial_responses_are_stored_and_combined_rather_than_replaced() {
         "got {outcome:?}"
     );
     let spanning = headers(&[("range", "bytes=450-550")]);
-    match cache.lookup("GET", url, &spanning).unwrap() {
+    match cache.lookup(None, "GET", url, &spanning).unwrap() {
         Lookup::Fresh(response) => assert_eq!(response.body, body[450..=550]),
         other => panic!("expected a range spanning two stored runs, got {other:?}"),
     }
@@ -907,6 +963,7 @@ fn s3_3_partial_responses_are_stored_and_combined_rather_than_replaced() {
     // The last gap closes and the entry becomes an ordinary complete one.
     let outcome = cache
         .store(
+            None,
             "GET",
             url,
             &HeaderMap::new(),
@@ -921,7 +978,7 @@ fn s3_3_partial_responses_are_stored_and_combined_rather_than_replaced() {
         matches!(outcome, StoreOutcome::Stored { .. }),
         "got {outcome:?}"
     );
-    match cache.lookup("GET", url, &HeaderMap::new()).unwrap() {
+    match cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap() {
         Lookup::Fresh(response) => {
             assert_eq!(response.status, 200);
             assert_eq!(
@@ -952,6 +1009,7 @@ fn s3_3_ranges_from_a_different_representation_are_not_stitched_together() {
 
     cache
         .store(
+            None,
             "GET",
             url,
             &HeaderMap::new(),
@@ -966,6 +1024,7 @@ fn s3_3_ranges_from_a_different_representation_are_not_stitched_together() {
     // never existed, under a hash claiming it did.
     let outcome = cache
         .store(
+            None,
             "GET",
             url,
             &HeaderMap::new(),
@@ -983,11 +1042,14 @@ fn s3_3_ranges_from_a_different_representation_are_not_stitched_together() {
 
     let early = headers(&[("range", "bytes=0-9")]);
     assert!(
-        matches!(cache.lookup("GET", url, &early).unwrap(), Lookup::Miss(_)),
+        matches!(
+            cache.lookup(None, "GET", url, &early).unwrap(),
+            Lookup::Miss(_)
+        ),
         "the bytes from the old representation are gone"
     );
     let late = headers(&[("range", "bytes=500-509")]);
-    match cache.lookup("GET", url, &late).unwrap() {
+    match cache.lookup(None, "GET", url, &late).unwrap() {
         Lookup::Fresh(response) => assert_eq!(response.body, &second[500..=509]),
         other => panic!("expected the new representation's range, got {other:?}"),
     }
@@ -1006,6 +1068,7 @@ fn s3_3_multipart_ranges_are_passed_through_not_stored_as_one_body() {
     ]);
     let outcome = cache
         .store(
+            None,
             "GET",
             "https://example.test/m",
             &HeaderMap::new(),
@@ -1029,6 +1092,7 @@ fn s3_3_multipart_ranges_are_passed_through_not_stored_as_one_body() {
     ]);
     let outcome = cache
         .store(
+            None,
             "GET",
             "https://example.test/v",
             &HeaderMap::new(),
@@ -1081,6 +1145,7 @@ fn filling_past_the_budget_evicts_by_the_configured_policy() {
         let resp = headers(&[("cache-control", "max-age=600"), ("date", &date(NOW))]);
         cache
             .store(
+                None,
                 "GET",
                 &url,
                 &HeaderMap::new(),
@@ -1127,6 +1192,7 @@ fn a_shared_body_survives_until_its_last_referring_entry_is_evicted() {
         let resp = headers(&[("cache-control", "max-age=600"), ("date", &date(NOW))]);
         cache
             .store(
+                None,
                 "GET",
                 &format!("https://example.test/{name}"),
                 &HeaderMap::new(),
@@ -1139,11 +1205,11 @@ fn a_shared_body_survives_until_its_last_referring_entry_is_evicted() {
             .unwrap();
     }
 
-    cache.purge("GET", "https://example.test/a").unwrap();
+    cache.purge(None, "GET", "https://example.test/a").unwrap();
     assert!(cache.has_content(id));
-    cache.purge("GET", "https://example.test/b").unwrap();
+    cache.purge(None, "GET", "https://example.test/b").unwrap();
     assert!(cache.has_content(id), "one entry still refers to it");
-    cache.purge("GET", "https://example.test/c").unwrap();
+    cache.purge(None, "GET", "https://example.test/c").unwrap();
     assert!(!cache.has_content(id), "the last reference has gone");
 }
 
@@ -1158,6 +1224,7 @@ fn the_integrity_index_does_not_grow_across_store_purge_and_collect() {
         let body = format!("console.log({n});");
         cache
             .store(
+                None,
                 "GET",
                 url,
                 &HeaderMap::new(),
@@ -1168,7 +1235,7 @@ fn the_integrity_index_does_not_grow_across_store_purge_and_collect() {
                 NOW,
             )
             .unwrap();
-        cache.purge("GET", url).unwrap();
+        cache.purge(None, "GET", url).unwrap();
         cache.collect_garbage().unwrap();
     };
 
@@ -1197,7 +1264,17 @@ fn end_to_end_store_hit_revalidate_and_dedupe() {
         let url = format!("https://example.test/copy{i}");
         let resp = headers(&[("cache-control", "max-age=600"), ("date", &date(NOW))]);
         let outcome = cache
-            .store("GET", &url, &HeaderMap::new(), 200, &resp, &body, NOW, NOW)
+            .store(
+                None,
+                "GET",
+                &url,
+                &HeaderMap::new(),
+                200,
+                &resp,
+                &body,
+                NOW,
+                NOW,
+            )
             .unwrap();
         match outcome {
             StoreOutcome::Stored { deduped, .. } => assert_eq!(deduped, i > 0),
@@ -1219,6 +1296,7 @@ fn end_to_end_store_hit_revalidate_and_dedupe() {
     ]);
     cache
         .store(
+            None,
             "GET",
             url,
             &HeaderMap::new(),
@@ -1230,7 +1308,7 @@ fn end_to_end_store_hit_revalidate_and_dedupe() {
         )
         .unwrap();
 
-    let key = match cache.lookup("GET", url, &HeaderMap::new()).unwrap() {
+    let key = match cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap() {
         Lookup::Revalidate {
             response,
             conditional,
@@ -1250,7 +1328,7 @@ fn end_to_end_store_hit_revalidate_and_dedupe() {
         .expect("entry still present");
     assert_eq!(refreshed.body, b"old");
     assert!(matches!(
-        cache.lookup("GET", url, &HeaderMap::new()).unwrap(),
+        cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap(),
         Lookup::Fresh(_)
     ));
 }
@@ -1308,6 +1386,7 @@ fn dropping_the_last_reference_frees_the_blob() {
 
     cache
         .store(
+            None,
             "GET",
             "https://example.test/a",
             &HeaderMap::new(),
@@ -1320,6 +1399,7 @@ fn dropping_the_last_reference_frees_the_blob() {
         .unwrap();
     cache
         .store(
+            None,
             "GET",
             "https://example.test/b",
             &HeaderMap::new(),
@@ -1332,9 +1412,106 @@ fn dropping_the_last_reference_frees_the_blob() {
         .unwrap();
 
     let id = syndeo_cache::ContentId::of(&body);
-    cache.purge("GET", "https://example.test/a").unwrap();
+    cache.purge(None, "GET", "https://example.test/a").unwrap();
     assert!(cache.has_content(id), "still referenced by /b");
 
-    cache.purge("GET", "https://example.test/b").unwrap();
+    cache.purge(None, "GET", "https://example.test/b").unwrap();
     assert!(!cache.has_content(id), "last reference gone");
+}
+
+// ---- cache partitioning ---------------------------------------------------
+
+/// One site's stored response is not served to another.
+///
+/// This is the cross-site cache-probing defence, and it is a property rather
+/// than a feature: without it an advertiser embedded in two places can time a
+/// fetch for a resource and learn whether you have been somewhere it was
+/// already loaded. No script and no cookie — just the difference between a hit
+/// and a miss.
+#[test]
+fn one_site_is_not_served_another_sites_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://cdn.test/tracker.js";
+    let body = b"console.log(1)";
+    let now = NOW;
+
+    cache
+        .store(
+            Some("https://news.test"),
+            "GET",
+            url,
+            &HeaderMap::new(),
+            200,
+            &headers(&[("cache-control", "max-age=3600")]),
+            body,
+            now,
+            now,
+        )
+        .unwrap();
+
+    // The site that stored it is served it.
+    assert!(
+        matches!(
+            cache
+                .lookup(Some("https://news.test"), "GET", url, &HeaderMap::new())
+                .unwrap(),
+            Lookup::Fresh(_)
+        ),
+        "the site that stored it should get a hit"
+    );
+
+    // Another site is not, and so cannot tell the first one ever visited it.
+    assert!(
+        matches!(
+            cache
+                .lookup(Some("https://attacker.test"), "GET", url, &HeaderMap::new())
+                .unwrap(),
+            Lookup::Miss(_)
+        ),
+        "a different site must not be served from another site's partition"
+    );
+
+    // Nor is the unpartitioned caller, which is what the measuring proxy is.
+    assert!(
+        matches!(
+            cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap(),
+            Lookup::Miss(_)
+        ),
+        "an unpartitioned lookup must not reach a partitioned entry"
+    );
+}
+
+/// Partitioning costs hit rate, not disk: the bytes are stored once.
+///
+/// This is what makes the trade acceptable here and would not be acceptable in
+/// a cache that stored bodies per key. Two sites loading the same framework
+/// hold two entries and one body.
+#[test]
+fn two_partitions_holding_the_same_bytes_hold_one_copy_of_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://cdn.test/framework.js";
+    let body = vec![b'x'; 64 * 1024];
+    let now = NOW;
+
+    for site in ["https://one.test", "https://two.test"] {
+        cache
+            .store(
+                Some(site),
+                "GET",
+                url,
+                &HeaderMap::new(),
+                200,
+                &headers(&[("cache-control", "max-age=3600")]),
+                &body,
+                now,
+                now,
+            )
+            .unwrap();
+    }
+
+    let stats = cache.stats().unwrap();
+    assert_eq!(stats.entries, 2, "one entry per partition");
+    assert_eq!(stats.blobs, 1, "and one copy of the bytes");
 }

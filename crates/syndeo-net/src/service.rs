@@ -62,7 +62,13 @@ where
             headers,
             body,
             integrity,
-        } => fetch(net, method, url, headers, body, integrity, framed).await,
+            partition,
+        } => {
+            fetch(
+                net, method, url, headers, body, integrity, partition, framed,
+            )
+            .await
+        }
         other => {
             let response = handle(net, other).await;
             framed.send(&response).await
@@ -82,6 +88,7 @@ async fn fetch<S>(
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     integrity: Option<String>,
+    partition: Option<String>,
     framed: &mut Framed<S>,
 ) -> Result<(), FrameError>
 where
@@ -123,6 +130,10 @@ where
             headers: map,
             body: bytes::Bytes::from(body),
             integrity: declared.clone(),
+            // Dropped here rather than at the caller, so that turning
+            // partitioning off is one decision in one place and cannot be
+            // half-applied.
+            partition: partition.filter(|_| net.config().partition_cache),
         })
         .await
     {

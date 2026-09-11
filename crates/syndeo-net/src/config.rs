@@ -5,7 +5,23 @@ use std::path::PathBuf;
 pub struct NetConfig {
     pub cache_root: PathBuf,
     /// A browser cache is private. The measuring proxy runs shared.
+    ///
+    /// This is RFC 9111's shared-versus-private, which decides what may be
+    /// stored at all. It is a different question from `partition_cache`, which
+    /// decides who may be served what is stored.
     pub shared_cache: bool,
+    /// Key stored entries by the top-level site that caused the fetch.
+    ///
+    /// On by default, and it should stay on. A cache keyed on the URL alone is
+    /// shared across every site, and that is a way to be tracked: an advertiser
+    /// embedded in two places can time a fetch for a resource and learn whether
+    /// you have been somewhere it was already loaded. No script, no cookie,
+    /// just the difference between eight milliseconds and eighty.
+    ///
+    /// Turning it off raises the hit rate on third-party resources and gives
+    /// that away. `--unpartitioned-cache` exists so the two can be measured
+    /// against each other on real traffic, not so the answer can be avoided.
+    pub partition_cache: bool,
     pub dns: DnsMode,
     /// Largest response body we are willing to *cache*.
     ///
@@ -32,6 +48,7 @@ impl Default for NetConfig {
         NetConfig {
             cache_root: default_cache_root(),
             shared_cache: false,
+            partition_cache: true,
             dns: DnsMode::System,
             max_body_bytes: 64 * 1024 * 1024,
             user_agent: concat!("Syndeo/", env!("CARGO_PKG_VERSION")).to_string(),

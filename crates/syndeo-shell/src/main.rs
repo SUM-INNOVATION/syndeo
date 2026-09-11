@@ -29,7 +29,7 @@ struct Cli {
     #[arg(long, global = true)]
     home: Option<PathBuf>,
     /// system | dot:cloudflare | doh:cloudflare | doh:google | doh:quad9
-    #[arg(long, global = true, default_value = "system")]
+    #[arg(long, global = true, default_value = "doh:cloudflare")]
     dns: String,
     /// Join the peer swarm. Repeat with a multiaddress to dial a bootstrap peer.
     /// A peer is only ever asked for a body the page already named by hash.
@@ -181,6 +181,8 @@ async fn browse(
         let mut channel = Channel::connect(&net).await?;
         let response = channel
             .fetch(&NetRequest::Fetch {
+                // A page fetched at the top level is its own partition.
+                partition: syndeo_ipc::protocol::partition_for(url),
                 method: "GET".into(),
                 url: url.to_string(),
                 headers: vec![("accept".into(), "text/html,*/*".into())],

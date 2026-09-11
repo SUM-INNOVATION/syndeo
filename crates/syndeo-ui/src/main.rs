@@ -42,7 +42,7 @@ struct Cli {
     #[arg(long)]
     home: Option<PathBuf>,
     /// system | dot:cloudflare | doh:cloudflare | doh:google | doh:quad9
-    #[arg(long, default_value = "system")]
+    #[arg(long, default_value = "doh:cloudflare")]
     dns: String,
     /// Join the peer swarm. Repeat with a multiaddress to dial a bootstrap peer.
     #[arg(long = "peer")]
@@ -277,6 +277,8 @@ async fn load(net: &Endpoint, url: &str) -> Result<syndeo_ipc::protocol::Fetched
     let mut channel = Channel::connect(net).await?;
     Ok(channel
         .fetch(&NetRequest::Fetch {
+            // A page fetched at the top level is its own partition.
+            partition: syndeo_ipc::protocol::partition_for(url),
             method: "GET".into(),
             url: url.to_string(),
             headers: vec![("accept".into(), "text/html,*/*".into())],

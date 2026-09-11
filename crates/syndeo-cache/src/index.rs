@@ -20,7 +20,12 @@ use std::path::Path;
 /// Version 1 is the first layout to carry a version at all. An index written by
 /// the unversioned build reads as `None` and is refused for the same reason a
 /// version we do not recognise is.
-pub const SCHEMA_VERSION: u64 = 1;
+// 2: cache keys carry the top-level site they were fetched under. A version 1
+// index holds unpartitioned keys, which would be served to the wrong partition
+// if read as version 2 — so it is discarded rather than migrated. Losing a
+// cache costs a few seconds of refetching; reading one wrong costs the property
+// the partition exists for.
+pub const SCHEMA_VERSION: u64 = 2;
 
 /// Index-wide scalars. Not `bincode`, so it stays readable across any change to
 /// the record layout — a version check that could itself mis-parse is no check.
@@ -147,6 +152,14 @@ impl StoredBody {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntryRecord {
+    /// The top-level site this was fetched under. `None` is unpartitioned.
+    ///
+    /// Stored on the record rather than parsed back out of the key, because
+    /// every place that rebuilds a key from a record has to rebuild the same
+    /// one, and a partition recovered by splitting a string is a partition that
+    /// can be recovered wrongly.
+    #[serde(default)]
+    pub partition: Option<String>,
     pub url: String,
     pub method: String,
     pub status: u16,
@@ -184,13 +197,35 @@ pub struct BlobRecord {
 }
 
 /// Primary key for a URL, before the `Vary` secondary key is applied.
-pub fn primary_key(method: &str, url: &str) -> String {
-    format!("{}\u{1}{}", method.to_ascii_uppercase(), url)
+/// The primary key, partitioned by the site that caused the fetch.
+///
+/// A cache keyed on the URL alone is shared across every site, and that is a
+/// way to be tracked: an advertiser embedded in two places can time a fetch for
+/// a resource and learn whether you have been somewhere it was already loaded.
+/// No script and no cookie, just the difference between eight milliseconds and
+/// eighty. Chrome partitioned its cache in 2020 and Safari before that.
+///
+/// `partition` is the top-level document's origin — the address in the URL bar,
+/// not the resource's own. `None` means unpartitioned, which is what the
+/// measuring proxy uses and what `--shared-cache` restores; everything the
+/// browser does passes a site.
+///
+/// What this costs is hit rate on third-party resources, and what saves it here
+/// is that the blob store is content-addressed: two partitions holding the same
+/// bytes hold one copy of them and two references. Partitioned for privacy,
+/// deduplicated for size, and the statistics report both.
+pub fn primary_key(partition: Option<&str>, method: &str, url: &str) -> String {
+    format!(
+        "{}\u{1}{}\u{1}{}",
+        partition.unwrap_or(""),
+        method.to_ascii_uppercase(),
+        url
+    )
 }
 
 /// Full cache key: primary key plus the secondary (`Vary`) key.
-pub fn entry_key(method: &str, url: &str, vary_key: &str) -> String {
-    format!("{}\u{1}{}", primary_key(method, url), vary_key)
+pub fn entry_key(partition: Option<&str>, method: &str, url: &str, vary_key: &str) -> String {
+    format!("{}\u{1}{}", primary_key(partition, method, url), vary_key)
 }
 
 pub struct Index {
@@ -271,8 +306,13 @@ impl Index {
         record: &EntryRecord,
         new_blobs: &[(ContentId, BlobRecord)],
     ) -> Result<Vec<ContentId>> {
-        let key = entry_key(&record.method, &record.url, &record.vary_key);
-        let pkey = primary_key(&record.method, &record.url);
+        let key = entry_key(
+            record.partition.as_deref(),
+            &record.method,
+            &record.url,
+            &record.vary_key,
+        );
+        let pkey = primary_key(record.partition.as_deref(), &record.method, &record.url);
         let encoded = bincode::serialize(record)?;
         let wanted = record.contents();
         let mut orphaned = Vec::new();
@@ -344,7 +384,12 @@ impl Index {
     /// Overwrite an entry in place without touching refcounts — used after a 304
     /// folds fresh headers into an unchanged body.
     pub fn refresh_entry(&self, record: &EntryRecord) -> Result<()> {
-        let key = entry_key(&record.method, &record.url, &record.vary_key);
+        let key = entry_key(
+            record.partition.as_deref(),
+            &record.method,
+            &record.url,
+            &record.vary_key,
+        );
         let encoded = bincode::serialize(record)?;
         let tx = self.db.begin_write()?;
         {
@@ -356,10 +401,15 @@ impl Index {
     }
 
     /// The `Vary` keys stored for a URL. An empty list means nothing is stored.
-    pub fn variant_keys(&self, method: &str, url: &str) -> Result<Vec<String>> {
+    pub fn variant_keys(
+        &self,
+        partition: Option<&str>,
+        method: &str,
+        url: &str,
+    ) -> Result<Vec<String>> {
         let tx = self.db.begin_read()?;
         let table = tx.open_table(VARIANTS)?;
-        match table.get(primary_key(method, url).as_str())? {
+        match table.get(primary_key(partition, method, url).as_str())? {
             Some(bytes) => Ok(bincode::deserialize(bytes.value())?),
             None => Ok(Vec::new()),
         }
@@ -367,8 +417,13 @@ impl Index {
 
     /// Drop every variant of a URL. Returns the content ids whose refcount hit
     /// zero, which the caller may then delete from the blob store.
-    pub fn invalidate(&self, method: &str, url: &str) -> Result<Vec<ContentId>> {
-        let pkey = primary_key(method, url);
+    pub fn invalidate(
+        &self,
+        partition: Option<&str>,
+        method: &str,
+        url: &str,
+    ) -> Result<Vec<ContentId>> {
+        let pkey = primary_key(partition, method, url);
         let mut orphaned = Vec::new();
         let tx = self.db.begin_write()?;
         {
@@ -417,7 +472,7 @@ impl Index {
                         orphan.push(ContentId(content));
                     }
                 }
-                let pkey = primary_key(&record.method, &record.url);
+                let pkey = primary_key(record.partition.as_deref(), &record.method, &record.url);
                 let mut variants = tx.open_table(VARIANTS)?;
                 let mut keys: Vec<String> = match variants.get(pkey.as_str())? {
                     Some(v) => bincode::deserialize(v.value())?,

@@ -114,6 +114,9 @@ pub struct FetchRequest {
     /// What the page says this resource's bytes must hash to. Without it, a peer
     /// is never asked, and the origin is the only source.
     pub integrity: Option<syndeo_cache::Integrity>,
+    /// The top-level document's origin, which is the cache partition. See
+    /// `syndeo_cache::index::primary_key` for what it buys and what it costs.
+    pub partition: Option<String>,
 }
 
 impl FetchRequest {
@@ -123,6 +126,7 @@ impl FetchRequest {
             url: url.into(),
             headers: HeaderMap::new(),
             body: Bytes::new(),
+            partition: None,
             integrity: None,
         }
     }
@@ -301,6 +305,9 @@ impl Net {
             // the body. 307 and 308 preserve both.
             let preserve = matches!(response.status, 307 | 308);
             current = FetchRequest {
+                // The partition follows the document that started the chain,
+                // not whatever host it was bounced through.
+                partition: current.partition.clone(),
                 method: if preserve {
                     current.method.clone()
                 } else {
@@ -327,7 +334,9 @@ impl Net {
 
         // An unsafe method invalidates whatever we hold for the target.
         if syndeo_cache::policy::invalidates(&method) {
-            let _ = self.cache.invalidate(&method, &request.url);
+            let _ = self
+                .cache
+                .invalidate(request.partition.as_deref(), &method, &request.url);
             let response = self.origin(&request, &[]).await?;
             return Ok(self.finish(
                 response.0,
@@ -339,7 +348,12 @@ impl Net {
             ));
         }
 
-        match self.cache.lookup(&method, &request.url, &request.headers)? {
+        match self.cache.lookup(
+            request.partition.as_deref(),
+            &method,
+            &request.url,
+            &request.headers,
+        )? {
             Lookup::Fresh(stored) => Ok(self.finish(
                 stored.status,
                 stored.headers.clone(),
@@ -579,6 +593,7 @@ impl Net {
     ) -> Option<syndeo_cache::ContentId> {
         let now = now_secs();
         match self.cache.store(
+            request.partition.as_deref(),
             request.method.as_str(),
             &request.url,
             &request.headers,
@@ -959,6 +974,7 @@ fn finish_streamed(state: &mut Teed) {
     };
     let now = now_secs();
     let outcome = state.cache.finish_streamed(
+        state.request.partition.as_deref(),
         state.request.method.as_str(),
         &state.request.url,
         &state.request.headers,
@@ -1010,6 +1026,7 @@ async fn refresh_entry(
     }
 
     let outcome = cache.store(
+        request.partition.as_deref(),
         request.method.as_str(),
         &request.url,
         &request.headers,

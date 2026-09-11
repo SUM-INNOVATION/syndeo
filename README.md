@@ -287,6 +287,48 @@ syndeo agent "tool wordcount https://example.test/"   # run one over a page
 `crates/syndeo-agent/tools/wordcount.wat` is an example, written as readable text
 rather than a binary on purpose.
 
+## What it does not tell anyone
+
+Privacy here is a set of defaults, not a setting. Each of these is on without
+being asked for, and each costs something that is named rather than hidden.
+
+**The cache is partitioned by the top-level site.** A cache keyed on the URL
+alone is shared across every site you visit, and that is a way to be tracked: an
+advertiser embedded in two places can time a fetch for a resource and learn
+whether you have been somewhere it was already loaded — no script, no cookie,
+just the difference between eight milliseconds and eighty. Chrome partitioned
+its cache in 2020 and Safari before it. The key here is the top-level
+document's *origin*, which is stricter than Chrome's registrable domain and
+needs no public suffix list to compute.
+
+What that costs is hit rate on third-party resources. What saves it is that the
+blob store is content-addressed: two sites loading the same framework hold two
+entries and **one copy of the bytes**. Partitioned for privacy, deduplicated
+for size — a test asserts exactly that, because it is the claim the trade rests
+on. `syndeo-net --unpartitioned-cache` turns it off, and exists so the two hit
+rates can be measured against each other rather than argued about.
+
+**DNS goes over HTTPS by default.** The system resolver sees every hostname you
+visit, in plaintext, and hands it to whoever runs it. The default is
+`doh:cloudflare`; `--dns doh:google`, `doh:quad9` and `dot:cloudflare` are
+there, and `--dns system` goes back to the resolver the machine is configured
+with. Two honest costs: it points your lookups at one operator instead of your
+ISP, which is a different trust rather than none; and it breaks captive portals
+and split-horizon corporate DNS until you pass `--dns system`.
+
+**Nothing is reported anywhere.** No telemetry, no analytics, no crash
+reporting, no update ping. There is no code in this tree that sends anything
+anywhere except the page you asked for.
+
+**Credentials do not follow a redirect across origins.** `Authorization`,
+`Cookie` and `Proxy-Authorization` are dropped when a redirect changes origin.
+
+**A peer is asked only for a body the page already named by hash**, and peer
+fetch is off unless you turn it on. What it does and does not buy is in
+`syndeo-peer`'s crate documentation: a peer never learns a URL from you, but it
+does learn which hashes you want and when, and that is not the same as
+anonymous.
+
 ## Root secret custody
 
 The seed is never a plaintext file. In order of what an attacker has to get past:
