@@ -287,6 +287,40 @@ syndeo agent "tool wordcount https://example.test/"   # run one over a page
 `crates/syndeo-agent/tools/wordcount.wat` is an example, written as readable text
 rather than a binary on purpose.
 
+## Memory, measured against Safari
+
+Same page, same interval, both sides sampled rather than snapshotted:
+
+| YouTube watch page | Syndeo | Safari |
+| --- | --- | --- |
+| main WebContent | 915 MB | 969 MB |
+| second WebContent (the page's iframe) | 36 MB | 46 MB |
+| host / browser process | 100 MB | 159 MB |
+| **one window, one page** | **~1051 MB** | **~1293 MB** |
+
+| rust-lang.org | Syndeo | Safari |
+| --- | --- | --- |
+| WebContent | 43.6 MB | 46.2 MB |
+
+The engine costs what Safari's engine costs, because it *is* Safari's engine;
+the difference is the host process, where ours is smaller. Safari's fixed
+overhead is amortised across its other tabs and ours is not, so past roughly a
+dozen tabs the comparison turns around.
+
+Getting this right took three attempts and produced two published numbers that
+were wrong, both in our favour, from two mistakes worth naming:
+
+- **Attribution.** WebKit's WebContent processes are XPC services parented to
+  `launchd`, so "the new process" is whichever appeared in the window — and with
+  Safari open, some of those are Safari's.
+- **Picking the wrong process.** A page with an iframe gets two WebContent
+  processes, a main frame and a small one for the embed. Reading the small one
+  gave "Safari uses 50 MB on YouTube" while its main frame was using 969 MB.
+
+[`ci/measure-memory.sh`](ci/measure-memory.sh) does it properly — every process
+printed, ours told from Safari's by container, both sides sampled over the same
+interval — so the next person does not repeat it.
+
 ## What it does not tell anyone
 
 Privacy here is a set of defaults, not a setting. Each of these is on without
