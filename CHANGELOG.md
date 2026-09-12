@@ -3,6 +3,52 @@
 The release workflow reads the section matching the tag and puts it in the
 release notes, so a heading here is `## <version>` and nothing else.
 
+## 0.1.2
+
+`syndeo-webkit`: a renderer that plays video, in tabs, with every byte still
+going through our own cache. macOS only, and in the tarball for the first time.
+
+Servo cannot play a video and was never going to — its script engine contains
+one mention of `MediaSource` and it is a `TODO` — so this embeds WebKit
+instead, and keeps boundary one by containment rather than by asking the engine
+nicely: the web view is pointed at `syndeo-proxy` and cannot route around it.
+Measured on a YouTube watch page, sequential DASH segments through our cache:
+
+    videoplayback?...&rn=15   200  1678ms
+    videoplayback?...&rn=16   200   360ms
+    videoplayback?...&rn=17   200   650ms
+    videoplayback?...&rn=18   200   159ms
+
+- **Tabs.** Command-T opens, Command-W closes, Command-[ and Command-] cycle,
+  Command-1 to 9 jump. Hidden rather than destroyed, so a tab keeps its scroll
+  position, its heap and its playing video — and all of them share one process,
+  where Servo paid a whole browser's fixed cost per page.
+- **One command.** It starts its own proxy and uses that proxy's authority, so
+  `syndeo-webkit <url>` is the whole of it after a one-time
+  `syndeo-proxy ca --trust`.
+- **The authority is per-user**, SSL-policy only, no `sudo`, and
+  `syndeo-proxy ca --untrust` removes it. `--trust` asks first, because macOS
+  does not prompt for a trust setting in your own login keychain — a browser
+  that added a root silently would be one you should not run. It is needed
+  because WebKit validates subresources in its networking process, which never
+  consults an in-process pinned anchor: without it a page loads its document
+  and silently drops the other seventy-odd resources.
+- **Memory, measured properly.** One window on a YouTube watch page costs about
+  1051 MB against Safari's 1293 MB, and rust-lang.org 43.6 MB of WebContent
+  against 46.2. Two Safari figures published earlier, 50 MB and 90 MB, were
+  wrong in our favour: one summed a Safari tab with ours, the other read a
+  page's small iframe process instead of its main frame.
+  `ci/measure-memory.sh` does it carefully now.
+- **CI is green**, which took admitting that setting `CC` did nothing because
+  mozangle calls unversioned `clang`, and that `update-alternatives --install`
+  also did nothing because `/usr/bin/clang` is a real file on those runners.
+  A symlink, and an assertion that fails in the first minute rather than forty
+  minutes into Servo.
+
+Unchanged and still true: Servo remains in the tree as the only configuration
+where a renderer provably opens no socket at all, and `syndeo-webkit` is the
+weaker claim — one socket, to loopback, with the sandbox making it the only one.
+
 ## 0.1.1
 
 Fixes found by running it against the web rather than against tests.

@@ -92,6 +92,7 @@ refactorable; get them wrong and no amount of later work recovers it.
 | `syndeo-shell` | the process model and the prompt, as a library, plus the `syndeo` command |
 | `syndeo-ui` | the windowed shell: winit, wgpu, egui, accesskit |
 | `syndeo-servo` | Servo embedded, with its resource loading replaced by the net process |
+| `syndeo-webkit` | WebKit embedded, confined to a proxy it cannot bypass — the one that plays video (macOS) |
 | `syndeo-proxy` | a local intercepting proxy, to measure the cache on real traffic |
 
 ## Build order
@@ -181,6 +182,40 @@ PATH="$PWD/.python:$PATH" cargo build -p syndeo-servo --features renderer
 Servo's build script looks for `uv` first, which does not help here: the
 published crate ships no `uv.lock`, so `uv run --frozen` has no project to run
 in and the fallback to `python3` is what actually decides the version.
+
+### A page that plays
+
+```sh
+syndeo-proxy ca --trust                  # once, and it asks first
+syndeo-webkit https://www.youtube.com/watch?v=wXtngLBkK4Q
+```
+
+macOS only. This is the one that plays video: WebKit for the engine, so Media
+Source Extensions and adaptive streaming work, with every byte — the DASH
+segments included — going through `syndeo-proxy` into our own cache. It starts
+that proxy itself.
+
+Tabs: `⌘T` opens, `⌘W` closes, `⌘[` and `⌘]` cycle, `⌘1`–`⌘9` jump. Hidden
+rather than destroyed, so a tab keeps its scroll position, its heap and its
+playing video, and all of them share one process.
+
+Boundary one holds differently here, and the difference is worth stating rather
+than glossing. With Servo the renderer opens no socket at all, because Servo
+asks the embedder about every load. WebKit will not do that — `WKURLSchemeHandler`
+refuses `http` and `https` — so instead the web view is pointed at a proxy it
+has no way to route around: one socket, to loopback, with the sandbox making it
+the only one. Weaker as a sentence, stronger as an enforcement, since the first
+is an engine agreeing to ask and the second is the kernel refusing to let it do
+otherwise.
+
+The trust step is not decoration. Caching HTTPS means terminating it, and
+WebKit validates subresources in its *networking* process, which never consults
+an anchor pinned inside ours — so without it a page loads its document and
+silently drops everything else. The authority is generated on your machine,
+goes in your login keychain for your user only, is trusted for TLS and nothing
+else, needs no `sudo`, and comes out again with `syndeo-proxy ca --untrust`.
+Anyone who takes its private key can impersonate any site to you, which is why
+`--trust` asks before it acts and tells you where that key is.
 
 ### The window
 

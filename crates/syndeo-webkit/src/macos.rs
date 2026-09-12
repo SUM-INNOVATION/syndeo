@@ -74,7 +74,7 @@ use winit::keyboard::Key;
 use winit::window::Window;
 use wry::{WebView, WebViewBuilder};
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     name = "syndeo-webkit",
     version,
@@ -83,12 +83,15 @@ use wry::{WebView, WebViewBuilder};
 struct Cli {
     /// The page to open.
     url: String,
-    /// The proxy's authority, trusted by this process and nowhere else.
+    /// The proxy's authority.
     ///
-    /// Required with `--proxy`, because caching HTTPS means terminating it and
-    /// a web view that does not know this issuer refuses every page.
+    /// Defaults to the one belonging to the proxy this starts, so it does not
+    /// normally need giving.
     #[arg(long, value_name = "PEM")]
     proxy_ca: Option<PathBuf>,
+    /// Where the cache, the keys and the authority live.
+    #[arg(long)]
+    home: Option<PathBuf>,
     /// Start any video on the page, muted.
     ///
     /// WebKit blocks autoplay with sound, which is correct behaviour and makes
@@ -117,6 +120,47 @@ pub fn run() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let home = cli.home.clone().unwrap_or_else(default_home);
+
+    let spec = cli
+        .proxy
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PROXY.to_string());
+    let authority = cli
+        .proxy_ca
+        .clone()
+        .unwrap_or_else(|| home.join("proxy").join("syndeo-ca.pem"));
+
+    // First, before anything is started: the failure without this is every page
+    // refusing to load with nothing said about why, because WebKit validates
+    // subresources in its networking process and that does not consult us.
+    if !authority_is_trusted() {
+        eprintln!(
+            "The proxy's authority is not trusted yet, so every https page would be\n\
+             refused with no error shown. It is a per-user certificate — no sudo, and\n\
+             nobody else on this machine:\n\
+             \n\
+             \x20   syndeo-proxy ca --trust\n\
+             \n\
+             It asks before it does anything, and `syndeo-proxy ca --untrust` undoes it."
+        );
+        std::process::exit(1);
+    }
+
+    // Start the proxy unless told to use one that is already running. Without
+    // this the browser is two commands and a path, which is two more than a
+    // browser should need.
+    let _proxy_process = if cli.proxy.is_none() {
+        Some(start_proxy(&home)?)
+    } else {
+        None
+    };
+
+    let cli = Cli {
+        proxy: Some(spec),
+        proxy_ca: Some(authority),
+        ..cli
+    };
     let proxy = match cli.proxy.as_deref() {
         Some(spec) => {
             let (host, port) = spec.rsplit_once(':').context("--proxy wants host:port")?;
@@ -446,4 +490,73 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+/// Where everything lives when nobody says otherwise.
+fn default_home() -> PathBuf {
+    std::env::var_os("SYNDEO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".syndeo")
+        })
+}
+
+const DEFAULT_PROXY: &str = "127.0.0.1:8899";
+
+/// Start the proxy this browser fetches through, and wait until it answers.
+///
+/// A sibling binary, found the way the shell finds its own, so a build tree and
+/// an install both work. Killed with this process, and the child watches for
+/// that too, so force-quitting the browser does not leave a proxy holding the
+/// cache.
+fn start_proxy(home: &std::path::Path) -> Result<std::process::Child> {
+    let exe = std::env::current_exe().context("locating the running binary")?;
+    let resolved = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+    let beside = resolved
+        .parent()
+        .map(|d| d.join("syndeo-proxy"))
+        .filter(|p| p.exists())
+        .context(
+            "cannot find syndeo-proxy next to this binary. Every Syndeo binary \
+             has to be installed into the same directory.",
+        )?;
+
+    let child = std::process::Command::new(beside)
+        .arg("run")
+        // On the environment rather than a flag, because that is where the
+        // proxy reads it from and inventing a flag it does not have is how the
+        // first attempt at this failed.
+        .env("SYNDEO_HOME", home)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .context("starting the proxy")?;
+
+    // It has to be listening before the first page is asked for.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(DEFAULT_PROXY).is_ok() {
+            tracing::info!(proxy = DEFAULT_PROXY, "the proxy is listening");
+            return Ok(child);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    anyhow::bail!("the proxy did not start listening on {DEFAULT_PROXY} within ten seconds")
+}
+
+/// Whether our authority is in a keychain WebKit's networking process consults.
+///
+/// Only a hint — it asks whether the certificate is present, not whether its
+/// trust settings are right — but it is the difference between a clear message
+/// and a window that renders nothing for no stated reason.
+fn authority_is_trusted() -> bool {
+    std::process::Command::new("/usr/bin/security")
+        .args(["find-certificate", "-c", "Syndeo Local Measurement CA"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }

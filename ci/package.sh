@@ -19,6 +19,12 @@ rm -rf "$stage"
 mkdir -p "$stage/tools"
 
 binaries=(syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-ui syndeo-servo)
+
+# syndeo-webkit embeds WKWebView, so it exists on macOS and nowhere else. It is
+# the only one of these that plays video.
+case "$target" in
+  *-apple-darwin) binaries+=(syndeo-webkit) ;;
+esac
 for binary in "${binaries[@]}"; do
   if [ ! -x "${release}/${binary}" ]; then
     echo "missing ${release}/${binary}" >&2
