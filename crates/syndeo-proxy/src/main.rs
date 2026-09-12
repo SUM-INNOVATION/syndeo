@@ -516,8 +516,12 @@ fn trust_in_login_keychain(certificate: &std::path::Path, trust: bool) -> anyhow
         println!();
         println!("Trusted. Remove it with `syndeo-proxy ca --untrust` when you are done.");
     } else {
+        // No `-d`: that is the admin domain, and `--trust` put this in the
+        // user's own. Asking the wrong domain answers "the specified item
+        // could not be found in the keychain" and leaves the trust setting
+        // exactly where it was.
         let status = Exec::new("/usr/bin/security")
-            .args(["remove-trusted-cert", "-d"])
+            .args(["remove-trusted-cert"])
             .arg(certificate)
             .status();
         // `remove-trusted-cert` fails when there was no trust setting to
