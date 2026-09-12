@@ -10,6 +10,11 @@ name = "syndeo-webkit"
 path = "src/main.rs"
 
 [dependencies]
+# Common to every platform, so the stub still builds a binary that explains
+# itself rather than failing to compile.
+anyhow.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
 syndeo-ipc.workspace = true
 syndeo-shell.workspace = true
 
@@ -31,7 +36,6 @@ core-foundation.workspace = true
 base64.workspace = true
 
 tokio.workspace = true
-anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

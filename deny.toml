@@ -87,6 +87,18 @@ ignore = [
     # anything we call directly. Cleared by the libp2p bump, whenever the
     # sub-crate set moves.
     { id = "RUSTSEC-2024-0384", reason = "instant, transitively under libp2p 0.44" },
+
+    # proc-macro-error, a build-time dependency of wry's macro crates. It runs
+    # during compilation and is in no shipped binary, so "unmaintained" here
+    # means a macro helper that will not gain features rather than code with a
+    # future. Cleared when wry's own dependencies move.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error, build-time only, under wry" },
+
+    # ttf-parser, reached through owned_ttf_parser and ab_glyph under
+    # sctk-adwaita — which is winit's Wayland client-side window decorations.
+    # It parses a font in order to draw a titlebar, on Linux, and nothing
+    # reaches it on macOS at all. Cleared when winit's decoration stack moves.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser, under winit's Wayland titlebar decorations" },
     { id = "RUSTSEC-2024-0436", reason = "paste, transitively under libp2p 0.44" },
 ]
 
