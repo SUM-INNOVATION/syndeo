@@ -142,6 +142,16 @@ jobs:
             -p syndeo-shell -p syndeo-net -p syndeo-keystore \
             -p syndeo-agent -p syndeo-proxy -p syndeo-ui
 
+      # macOS only, because it embeds WKWebView. Built separately for the same
+      # reason it is packaged separately: on Linux this crate is a stub that
+      # exists to explain itself, and building it there compiles nothing worth
+      # shipping.
+      - name: Build the WebKit renderer
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p syndeo-webkit
+
       # Separately, and with a timeout of its own: this is about 1,200 crates.
       - name: Build the renderer
         timeout-minutes: 150
