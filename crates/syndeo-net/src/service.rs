@@ -134,6 +134,10 @@ where
             // partitioning off is one decision in one place and cannot be
             // half-applied.
             partition: partition.filter(|_| net.config().partition_cache),
+            // Everything that reaches the network process over IPC wants the
+            // resource rather than the redirect, and the protocol has no way to
+            // ask for anything else.
+            redirect: crate::RedirectMode::Follow,
         })
         .await
     {

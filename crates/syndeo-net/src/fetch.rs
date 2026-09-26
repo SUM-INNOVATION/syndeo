@@ -117,6 +117,28 @@ pub struct FetchRequest {
     /// The top-level document's origin, which is the cache partition. See
     /// `syndeo_cache::index::primary_key` for what it buys and what it costs.
     pub partition: Option<String>,
+    /// Whether a redirect is followed here or handed back to the caller.
+    pub redirect: RedirectMode,
+}
+
+/// Who follows a redirect: this process, or whoever asked.
+///
+/// Following is right for a caller that only wants the resource — the shell,
+/// the agent, the renderers — and is the default. It is wrong for a proxy. A
+/// browser behind a proxy has to see the redirect itself: it is what moves the
+/// address bar, what decides which origin the final page runs as, and what
+/// carries any cookie the redirecting response set. A proxy that followed on
+/// the browser's behalf would hand back the destination's page as the answer
+/// to the first URL, so a script from the destination would run as the site
+/// that redirected to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RedirectMode {
+    /// Follow redirects here, up to `NetConfig::max_redirects`.
+    #[default]
+    Follow,
+    /// Return the first response as it is, redirect or not: status, every
+    /// header and the body.
+    Manual,
 }
 
 impl FetchRequest {
@@ -128,6 +150,7 @@ impl FetchRequest {
             body: Bytes::new(),
             partition: None,
             integrity: None,
+            redirect: RedirectMode::Follow,
         }
     }
 
@@ -274,6 +297,10 @@ impl Net {
             response.final_url = current.url.clone();
             response.redirects = redirects;
 
+            if current.redirect == RedirectMode::Manual {
+                return Ok(response);
+            }
+
             let Some(location) = redirect_target(&response) else {
                 return Ok(response);
             };
@@ -323,6 +350,7 @@ impl Net {
                 // Integrity was declared for the resource, not for a redirect
                 // hop, and it still describes whatever finally answers.
                 integrity: current.integrity.clone(),
+                redirect: current.redirect,
             };
             redirects += 1;
         }

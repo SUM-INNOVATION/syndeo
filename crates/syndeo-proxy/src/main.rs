@@ -19,7 +19,7 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use syndeo_net::{DnsMode, FetchRequest, Net, NetConfig};
+use syndeo_net::{DnsMode, FetchRequest, Net, NetConfig, RedirectMode};
 use tokio::net::TcpListener;
 
 #[derive(Parser)]
@@ -388,6 +388,11 @@ async fn forward(
         // measured here are therefore an upper bound; the browser's own figures
         // are the partitioned ones.
         partition: None,
+        // The browser follows its own redirects. Following them here would
+        // answer the first URL with the destination's page, so the page would
+        // run as the site that redirected to it, and any cookie the redirect
+        // set would never reach the browser.
+        redirect: RedirectMode::Manual,
     };
 
     match proxy.net.fetch(fetch).await {
@@ -583,6 +588,165 @@ fn forwardable(incoming: &http::HeaderMap) -> http::HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// One request as an origin saw it.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        path: String,
+    }
+
+    type Answer = Arc<dyn Fn(&str) -> Response<Full<Bytes>> + Send + Sync>;
+
+    /// A plain-HTTP origin on a free loopback port that remembers every request.
+    struct Origin {
+        address: SocketAddr,
+        seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    impl Origin {
+        async fn start(answer: Answer) -> Origin {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let log = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let answer = answer.clone();
+                    let log = log.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let answer = answer.clone();
+                            let log = log.clone();
+                            async move {
+                                log.lock().unwrap().push(Seen {
+                                    path: req.uri().path().to_string(),
+                                });
+                                Ok::<_, std::convert::Infallible>(answer(req.uri().path()))
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            });
+            Origin { address, seen }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("http://{}{path}", self.address)
+        }
+
+        fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    fn respond(
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &'static [u8],
+    ) -> Response<Full<Bytes>> {
+        let mut builder = Response::builder().status(status);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Full::new(Bytes::from_static(body))).unwrap()
+    }
+
+    /// A real proxy on a free port, resolving through the system resolver so
+    /// nothing here needs the internet.
+    async fn start_proxy(dir: &std::path::Path) -> SocketAddr {
+        let net = Net::new(NetConfig {
+            cache_root: dir.join("cache"),
+            shared_cache: true,
+            dns: DnsMode::System,
+            ..NetConfig::default()
+        })
+        .unwrap();
+        let authority = CertificateAuthority::load_or_create(dir.join("proxy")).unwrap();
+        let proxy = Arc::new(Proxy {
+            net,
+            authority,
+            trace: false,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, proxy));
+        address
+    }
+
+    /// What came back through the proxy.
+    struct Reply {
+        status: StatusCode,
+        headers: http::HeaderMap,
+        body: Bytes,
+    }
+
+    /// Send one request through the proxy the way a browser configured to use
+    /// it does: a connection to the proxy, with the full URL as the target.
+    async fn through(proxy: SocketAddr, url: &str, headers: &[(&str, &str)]) -> Reply {
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+        let uri: hyper::Uri = url.parse().unwrap();
+        let mut request = Request::builder()
+            .uri(&uri)
+            .header(http::header::HOST, uri.authority().unwrap().as_str());
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = sender
+            .send_request(request.body(Full::new(Bytes::new())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        Reply {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_reaches_the_browser_as_a_redirect() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|path| match path {
+            "/start" => respond(
+                302,
+                &[
+                    ("location", "/target"),
+                    ("set-cookie", "a=1; Path=/"),
+                    ("set-cookie", "b=2; Path=/"),
+                ],
+                b"moved",
+            ),
+            _ => respond(200, &[], b"the destination"),
+        }))
+        .await;
+        let proxy = start_proxy(dir.path()).await;
+
+        let reply = through(proxy, &origin.url("/start"), &[]).await;
+
+        assert_eq!(reply.status, StatusCode::FOUND);
+        assert_eq!(reply.headers.get("location").unwrap(), "/target");
+        let cookies: Vec<&str> = reply
+            .headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, ["a=1; Path=/", "b=2; Path=/"]);
+        assert_eq!(&reply.body[..], b"moved");
+        let paths: Vec<String> = origin.seen().into_iter().map(|s| s.path).collect();
+        assert_eq!(paths, ["/start"], "the destination must not be fetched");
+    }
 
     #[test]
     fn connection_headers_do_not_reach_the_origin() {

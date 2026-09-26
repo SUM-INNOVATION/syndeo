@@ -17,4 +17,4 @@ pub use body::FetchBody;
 pub use config::NetConfig;
 pub use dns::{DnsMode, Resolver};
 pub use error::{NetError, Result};
-pub use fetch::{FetchRequest, FetchResponse, Net, Source};
+pub use fetch::{FetchRequest, FetchResponse, Net, RedirectMode, Source};
