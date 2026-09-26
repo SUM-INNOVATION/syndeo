@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use syndeo_dom::Document;
-use syndeo_shell::prompt::{Decision, SignatureRequest};
+use syndeo_shell::prompt::{prompt_lines, Decision, SignatureRequest};
 
 /// What the worker thread has been asked to do.
 pub enum Work {
@@ -531,10 +531,13 @@ impl App {
 
     /// The dialog this window exists for.
     ///
-    /// Every field the terminal prompt shows is here: the origin whose key will
-    /// sign, the purpose, what the site says it wants, the exact bytes, and
-    /// their digest. Nothing is summarised, because a signature over bytes the
-    /// user did not see is not consent.
+    /// What it shows of the request is [`prompt_lines`], the same lines the
+    /// terminal prints: the canonical origin whose key will sign, the purpose,
+    /// what the site says it wants, every byte of the payload, and its digest.
+    /// Nothing is summarised, because a signature over bytes the user did not
+    /// see is not consent, and nothing is laid out differently from the
+    /// terminal, because two front ends that disagree about a request are two
+    /// chances to show it wrong.
     fn modal(&mut self, context: &egui::Context) {
         let Some(modal) = self.modal.take() else {
             return;
@@ -544,8 +547,11 @@ impl App {
         match modal {
             Modal::Sign { request, answer } => {
                 let mut decision = None;
+                // Wide enough for a wrapped payload line when the window is;
+                // anything narrower scrolls sideways rather than rewrapping.
+                let width = (context.content_rect().width() - 64.0).clamp(420.0, 800.0);
                 egui::Modal::new(egui::Id::new("signing")).show(context, |ui| {
-                    ui.set_width(560.0);
+                    ui.set_width(width);
                     ui.heading("Signature requested");
                     ui.add_space(4.0);
                     ui.label(
@@ -557,31 +563,21 @@ impl App {
                     );
                     ui.separator();
 
-                    egui::Grid::new("signing-fields")
-                        .num_columns(2)
-                        .spacing([12.0, 6.0])
-                        .show(ui, |ui| {
-                            field(ui, "origin", &request.origin);
-                            field(ui, "purpose", request.purpose.as_str());
-                            field(ui, "says", &request.description);
-                        });
-
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("payload").size(12.0).color(Color32::GRAY));
                     egui::Frame::group(ui.style()).show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(180.0)
+                        egui::ScrollArea::both()
+                            .max_height(420.0)
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                                for line in request.rendered_payload() {
-                                    ui.label(RichText::new(line).monospace().size(12.0));
+                                for line in prompt_lines(&request) {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(line).monospace().size(12.0),
+                                        )
+                                        .extend(),
+                                    );
                                 }
                             });
                     });
-
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("digest").size(12.0).color(Color32::GRAY));
-                    ui.label(RichText::new(request.digest()).monospace().size(11.0));
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
@@ -758,12 +754,6 @@ fn name(response: egui::Response, spoken: &str) -> egui::Response {
     response
 }
 
-fn field(ui: &mut egui::Ui, name: &str, value: &str) {
-    ui.label(RichText::new(name).size(12.0).color(Color32::GRAY));
-    ui.label(RichText::new(value).size(13.0));
-    ui.end_row();
-}
-
 fn badge(ui: &mut egui::Ui, text: &str, colour: Color32) -> egui::Response {
     egui::Frame::new()
         .fill(colour.gamma_multiply(0.25))
@@ -796,5 +786,131 @@ pub fn page_from(url: String, fetched: syndeo_ipc::protocol::Fetched) -> Page {
         bytes: fetched.body.len(),
         content: fetched.content,
         document,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::accesskit::{NodeId, Role, TreeUpdate};
+    use std::collections::HashMap;
+    use syndeo_ipc::protocol::SignaturePurpose;
+
+    /// Draw the real signing dialog for a request, with no window, and read
+    /// back the text of every label it drew from the accessibility tree, in
+    /// tree order.
+    ///
+    /// Read from what egui published rather than from what this module meant
+    /// to draw: it is what a screen reader announces, and it is built from the
+    /// widgets that were actually laid out.
+    fn labels_drawn_for(request: SignatureRequest) -> Vec<String> {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+
+        let (work, _work) = std::sync::mpsc::channel();
+        let (_done, done) = std::sync::mpsc::channel();
+        let (asks, asked) = std::sync::mpsc::sync_channel(1);
+        let (answer, _answer) = std::sync::mpsc::sync_channel(1);
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut app = App::new(&context, work, done, asked, closed, None);
+        asks.send(Ask::Sign {
+            request: Box::new(request),
+            answer,
+        })
+        .unwrap();
+
+        // A few frames, so the modal's first sizing pass is behind it.
+        let mut update = None;
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 760.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = context.run_ui(input, |ui| {
+                app.drain();
+                app.modal(ui.ctx());
+            });
+            update = output.platform_output.accesskit_update.take();
+            // There is no renderer to upload the font atlas to.
+            output.textures_delta.clear();
+        }
+        assert!(app.modal.is_some(), "the dialog closed without an answer");
+        labels_in_order(&update.expect("no accessibility tree was published"))
+    }
+
+    fn labels_in_order(update: &TreeUpdate) -> Vec<String> {
+        let nodes: HashMap<NodeId, &egui::accesskit::Node> =
+            update.nodes.iter().map(|(id, node)| (*id, node)).collect();
+        let mut labels = Vec::new();
+        let mut stack = vec![update.tree.as_ref().expect("a tree").root];
+        while let Some(id) = stack.pop() {
+            let Some(node) = nodes.get(&id) else {
+                continue;
+            };
+            if node.role() == Role::Label {
+                labels.push(node.value().unwrap_or_default().to_string());
+            }
+            stack.extend(node.children().iter().rev().copied());
+        }
+        labels
+    }
+
+    fn shows_exactly(request: SignatureRequest) {
+        let expected = prompt_lines(&request);
+        let drawn = labels_drawn_for(request);
+        assert!(
+            drawn
+                .windows(expected.len())
+                .any(|window| window == expected.as_slice()),
+            "the window drew\n{drawn:#?}\nand the shared prompt is\n{expected:#?}"
+        );
+    }
+
+    #[test]
+    fn the_window_draws_the_same_lines_as_the_terminal() {
+        shows_exactly(
+            SignatureRequest::new(
+                "https://Wallet.Test:443/",
+                SignaturePurpose::ChainTransaction,
+                "Send 10 SUM to alice",
+                b"transfer 10 SUM to alice\n\nmemo: rent\n".to_vec(),
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn the_window_draws_a_hex_payload_the_same_way_too() {
+        shows_exactly(
+            SignatureRequest::new(
+                "http://example.test:8080",
+                SignaturePurpose::Attestation,
+                "Attest",
+                "pay alice\u{202E}01 MUS".as_bytes().to_vec(),
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn the_window_draws_every_line_of_a_payload_at_the_limit() {
+        // 64 lines, most of them below the fold: all of them are drawn, not
+        // only the ones in view.
+        let payload = format!("{}\n{}", "é".repeat(1500), "line\n".repeat(48));
+        let request = SignatureRequest::new(
+            "https://wallet.test",
+            SignaturePurpose::Attestation,
+            "A long one",
+            payload.into_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            request.rendered_payload().len(),
+            syndeo_shell::prompt::MAX_TEXT_PAYLOAD_LINES
+        );
+        shows_exactly(request);
     }
 }

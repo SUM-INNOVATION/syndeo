@@ -28,3 +28,11 @@ clap.workspace = true
 hex.workspace = true
 blake3.workspace = true
 rpassword.workspace = true
+url.workspace = true
+unicode-general-category.workspace = true
+
+[dev-dependencies]
+# For its origin canonicalization, which the shell's has to agree with: the
+# tests hold the two together so that no accepted origin changes its key.
+syndeo-keystore.workspace = true
+tempfile = "3"

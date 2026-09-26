@@ -118,6 +118,10 @@ impl Shell {
     /// exact payload on a command line, which is consent to that payload by the
     /// same standard the dialog applies. It is deliberately not reachable from
     /// the agent boundary: an agent's payload was never typed by anyone.
+    ///
+    /// The same standard includes the checks. Nobody is shown this request, but
+    /// it is minted and signed over the same validated, canonical fields a
+    /// prompted one would be, so `--yes` is never a way around them.
     pub async fn sign_with_typed_consent(
         &self,
         origin: String,
@@ -125,29 +129,11 @@ impl Shell {
         description: String,
         payload: Vec<u8>,
     ) -> ShellResponse {
-        let confirmation = self
-            .confirmer
-            .issue(&origin, purpose, &description, &payload);
-        match self
-            .keystore_call(KeystoreRequest::SignConfirmed {
-                confirmation,
-                payload,
-            })
-            .await
-        {
-            Ok(KeystoreResponse::Signature {
-                signature,
-                public_key,
-                address,
-            }) => ShellResponse::Signed {
-                signature,
-                public_key,
-                address,
-            },
-            Ok(KeystoreResponse::Error(e)) => ShellResponse::Error(e),
-            Ok(_) => ShellResponse::Error("unexpected keystore reply".into()),
-            Err(e) => ShellResponse::Error(e.to_string()),
-        }
+        let request = match SignatureRequest::new(origin, purpose, description, payload) {
+            Ok(request) => request,
+            Err(refusal) => return ShellResponse::Declined(refusal.to_string()),
+        };
+        self.sign_confirmed(&request).await
     }
 
     /// The whole point of the boundary, in one function.
@@ -158,6 +144,14 @@ impl Shell {
         description: String,
         payload: Vec<u8>,
     ) -> ShellResponse {
+        // Checked first, before anything else happens. A request that could not
+        // be shown faithfully is refused here, and nobody is asked about it,
+        // nothing is minted for it, and the keystore never hears of it.
+        let request = match SignatureRequest::new(origin, purpose, description, payload) {
+            Ok(request) => request,
+            Err(refusal) => return ShellResponse::Declined(refusal.to_string()),
+        };
+
         if !self.prompter.is_interactive() {
             return ShellResponse::Declined(
                 "a signature needs a human, and this run is not interactive".into(),
@@ -166,26 +160,33 @@ impl Shell {
 
         // The user sees the origin, the purpose, the description and the exact
         // bytes. Nothing is signed that was not on screen.
-        let request = SignatureRequest {
-            origin: origin.clone(),
-            purpose,
-            description: description.clone(),
-            payload: payload.clone(),
-        };
         if self.prompter.ask_to_sign(&request) == Decision::No {
             return ShellResponse::Declined("the user declined".into());
         }
 
+        self.sign_confirmed(&request).await
+    }
+
+    /// Mint the confirmation and ask the keystore to honour it.
+    ///
+    /// Everything comes from the one validated request: the origin, purpose,
+    /// description and payload the confirmation covers are the ones that were
+    /// on screen, and the payload sent is the payload the confirmation names.
+    /// There are no separate copies to drift apart.
+    async fn sign_confirmed(&self, request: &SignatureRequest) -> ShellResponse {
         // The confirmation is minted here, in the shell, over exactly those
         // bytes. The agent never holds the secret that makes it valid.
-        let confirmation = self
-            .confirmer
-            .issue(&origin, purpose, &description, &payload);
+        let confirmation = self.confirmer.issue(
+            request.origin(),
+            request.purpose(),
+            request.description(),
+            request.payload(),
+        );
 
         match self
             .keystore_call(KeystoreRequest::SignConfirmed {
                 confirmation,
-                payload,
+                payload: request.payload().to_vec(),
             })
             .await
         {
@@ -270,5 +271,222 @@ impl Shell {
             KeystoreResponse::Error(e) => anyhow::bail!(e),
             _ => anyhow::bail!("unexpected reply from the keystore"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use syndeo_ipc::confirm::SessionSecret;
+
+    /// Counts how often it is asked, and gives the same answer every time.
+    struct CountingPrompter {
+        answer: Decision,
+        asked: AtomicUsize,
+    }
+
+    impl Prompter for CountingPrompter {
+        fn ask_to_sign(&self, _request: &SignatureRequest) -> Decision {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.answer
+        }
+
+        fn ask(&self, _title: &str, _detail: &str) -> Decision {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            self.answer
+        }
+
+        fn read_passphrase(&self, _label: &str) -> std::io::Result<String> {
+            Err(std::io::Error::other("no passphrase in this test"))
+        }
+    }
+
+    /// A shell whose keystore endpoint is a listener this test owns. It counts
+    /// connections, keeps what it was sent, and answers every request with an
+    /// error — enough for the shell's call to return cleanly without anything
+    /// being signed.
+    struct Harness {
+        connections: Arc<AtomicUsize>,
+        received: Arc<std::sync::Mutex<Vec<KeystoreRequest>>>,
+        confirmer: Arc<Confirmer>,
+        prompter: Arc<CountingPrompter>,
+        shell: Shell,
+        _serving: tokio::task::JoinHandle<()>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Harness {
+        fn start(answer: Decision) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let endpoint = Endpoint::new(dir.path().join("keystore.sock"));
+            let server = Server::bind(endpoint.clone()).unwrap();
+
+            let connections = Arc::new(AtomicUsize::new(0));
+            let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let serving = tokio::spawn({
+                let connections = connections.clone();
+                let received = received.clone();
+                async move {
+                    while let Ok(mut framed) = server.accept().await {
+                        connections.fetch_add(1, Ordering::SeqCst);
+                        if let Ok(request) = framed.recv::<KeystoreRequest>().await {
+                            received.lock().unwrap().push(request);
+                            let reply = KeystoreResponse::Error("the fake keystore".into());
+                            let _ = framed.send(&reply).await;
+                        }
+                    }
+                }
+            });
+
+            let confirmer = Arc::new(Confirmer::new(SessionSecret::generate()));
+            let prompter = Arc::new(CountingPrompter {
+                answer,
+                asked: AtomicUsize::new(0),
+            });
+            let shell = Shell::new(confirmer.clone(), endpoint, prompter.clone());
+            Harness {
+                connections,
+                received,
+                confirmer,
+                prompter,
+                shell,
+                _serving: serving,
+                _dir: dir,
+            }
+        }
+
+        fn prompts(&self) -> usize {
+            self.prompter.asked.load(Ordering::SeqCst)
+        }
+
+        /// Exact at the moment a call returns: a call that connected also
+        /// waited for the reply, which the listener sends after counting.
+        fn connections(&self) -> usize {
+            self.connections.load(Ordering::SeqCst)
+        }
+
+        async fn prompted(&self, origin: &str, description: &str, payload: &[u8]) -> ShellResponse {
+            self.shell
+                .handle(ShellRequest::RequestSignature {
+                    origin: origin.into(),
+                    purpose: SignaturePurpose::ChainTransaction,
+                    description: description.into(),
+                    payload: payload.to_vec(),
+                })
+                .await
+        }
+
+        async fn typed(&self, origin: &str, description: &str, payload: &[u8]) -> ShellResponse {
+            self.shell
+                .sign_with_typed_consent(
+                    origin.into(),
+                    SignaturePurpose::ChainTransaction,
+                    description.into(),
+                    payload.to_vec(),
+                )
+                .await
+        }
+    }
+
+    const ORIGIN: &str = "https://wallet.test";
+    const DESCRIPTION: &str = "Send 10 SUM to alice";
+    const PAYLOAD: &[u8] = b"transfer 10 SUM to alice";
+
+    #[tokio::test]
+    async fn an_unsafe_description_is_refused_before_anyone_is_asked_or_anything_is_signed() {
+        let harness = Harness::start(Decision::Yes);
+        for description in ["Send 10 SUM to \u{202E}ecila", "Send 10 SUM\nto alice"] {
+            let prompted = harness.prompted(ORIGIN, description, PAYLOAD).await;
+            assert!(
+                matches!(prompted, ShellResponse::Declined(_)),
+                "{prompted:?}"
+            );
+            let typed = harness.typed(ORIGIN, description, PAYLOAD).await;
+            assert!(matches!(typed, ShellResponse::Declined(_)), "{typed:?}");
+        }
+
+        assert_eq!(harness.prompts(), 0);
+        assert_eq!(harness.connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_payload_is_refused_before_anyone_is_asked_or_anything_is_signed() {
+        let harness = Harness::start(Decision::Yes);
+        for payload in [
+            vec![b'a'; crate::prompt::MAX_TEXT_PAYLOAD_BYTES + 1],
+            vec![0xff; crate::prompt::MAX_HEX_PAYLOAD_BYTES + 1],
+        ] {
+            let prompted = harness.prompted(ORIGIN, DESCRIPTION, &payload).await;
+            assert!(
+                matches!(prompted, ShellResponse::Declined(_)),
+                "{prompted:?}"
+            );
+            let typed = harness.typed(ORIGIN, DESCRIPTION, &payload).await;
+            assert!(matches!(typed, ShellResponse::Declined(_)), "{typed:?}");
+        }
+
+        assert_eq!(harness.prompts(), 0);
+        assert_eq!(harness.connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_valid_request_the_user_declines_never_reaches_the_keystore() {
+        let harness = Harness::start(Decision::No);
+        let response = harness.prompted(ORIGIN, DESCRIPTION, PAYLOAD).await;
+        assert!(
+            matches!(response, ShellResponse::Declined(_)),
+            "{response:?}"
+        );
+        assert_eq!(harness.prompts(), 1);
+        assert_eq!(harness.connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn typed_consent_sends_the_keystore_the_canonical_origin_once() {
+        let harness = Harness::start(Decision::No);
+        let response = harness
+            .typed("HTTPS://Wallet.Test:443/", DESCRIPTION, PAYLOAD)
+            .await;
+        assert!(
+            matches!(&response, ShellResponse::Error(e) if e == "the fake keystore"),
+            "{response:?}"
+        );
+        assert_eq!(harness.prompts(), 0);
+        assert_eq!(harness.connections(), 1);
+
+        let received = harness.received.lock().unwrap();
+        let [KeystoreRequest::SignConfirmed {
+            confirmation,
+            payload,
+        }] = received.as_slice()
+        else {
+            panic!("expected one SignConfirmed, got {received:?}");
+        };
+        assert_eq!(confirmation.origin, ORIGIN);
+        assert_eq!(payload.as_slice(), PAYLOAD);
+        assert_eq!(
+            confirmation.description_hash,
+            blake3::hash(DESCRIPTION.as_bytes()).to_hex().to_string()
+        );
+        // Minted by this shell's confirmer over exactly what was sent.
+        assert_eq!(harness.confirmer.verify(confirmation, payload), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn an_approved_request_is_signed_over_the_canonical_origin() {
+        let harness = Harness::start(Decision::Yes);
+        let response = harness
+            .prompted("https://WALLET.test/", DESCRIPTION, PAYLOAD)
+            .await;
+        assert!(matches!(response, ShellResponse::Error(_)), "{response:?}");
+        assert_eq!(harness.prompts(), 1);
+        assert_eq!(harness.connections(), 1);
+
+        let received = harness.received.lock().unwrap();
+        let [KeystoreRequest::SignConfirmed { confirmation, .. }] = received.as_slice() else {
+            panic!("expected one SignConfirmed, got {received:?}");
+        };
+        assert_eq!(confirmation.origin, ORIGIN);
     }
 }

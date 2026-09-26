@@ -167,12 +167,13 @@ mod tests {
     use syndeo_ipc::protocol::SignaturePurpose;
 
     fn request() -> SignatureRequest {
-        SignatureRequest {
-            origin: "https://wallet.test".into(),
-            purpose: SignaturePurpose::ChainTransaction,
-            description: "Send 10 SUM to alice".into(),
-            payload: b"transfer 10 SUM to alice".to_vec(),
-        }
+        SignatureRequest::new(
+            "https://wallet.test",
+            SignaturePurpose::ChainTransaction,
+            "Send 10 SUM to alice",
+            b"transfer 10 SUM to alice".to_vec(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -201,7 +202,7 @@ mod tests {
         std::thread::spawn(move || match receiver.recv().unwrap() {
             Ask::Sign { request, answer } => {
                 // What the window draws is what gets signed.
-                assert_eq!(request.payload, b"transfer 10 SUM to alice".to_vec());
+                assert_eq!(request.payload(), b"transfer 10 SUM to alice");
                 assert_eq!(request.rendered_payload()[0], "transfer 10 SUM to alice");
                 answer.send(Decision::Yes).unwrap();
             }

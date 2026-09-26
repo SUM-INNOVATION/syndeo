@@ -11358,9 +11358,13 @@ dependencies = [
  "syndeo-cache",
  "syndeo-dom",
  "syndeo-ipc",
+ "syndeo-keystore",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-general-category",
+ "url",
 ]
 
 [[package]]

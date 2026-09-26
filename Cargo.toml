@@ -84,6 +84,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 url = "2"
+# The General_Category table, so the signing prompt can refuse every Format
+# character rather than a hand-kept list of the ones known to reorder text.
+unicode-general-category = "1.1"
 httpdate = "1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 h3 = "0.0.8"
