@@ -33,6 +33,14 @@ use std::time::{Duration, Instant};
 /// How long an `Alt-Svc` advertisement is trusted when it carries no `ma`.
 const DEFAULT_ALT_SVC_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The longest an advertisement is believed, whatever `ma` says.
+///
+/// `ma` is whatever number the response carried. Unbounded, a value such as
+/// 18446744073709551615 made the deadline overflow, and the panic that caused
+/// happened with the map locked, which poisoned it for every HTTPS request
+/// after. Thirty days is longer than any real deployment asks for.
+const MAX_ALT_SVC_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// How long an authority is left alone after a QUIC attempt failed.
 ///
 /// Long enough that a network which blocks UDP costs one timeout rather than one
@@ -56,6 +64,15 @@ pub struct AltSvc {
 }
 
 impl AltSvc {
+    /// The map, even if something panicked while holding it. Every entry is a
+    /// hint that is written whole, so one left by a panic is still a hint, and
+    /// a poisoned lock must not take every later request down with it.
+    fn known(&self) -> std::sync::MutexGuard<'_, HashMap<String, Advertisement>> {
+        self.known
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Record what an `Alt-Svc` header said. Anything that does not name `h3` is
     /// ignored: this is not a general alternative-service implementation, and
     /// pretending otherwise would mean honouring advertisements we cannot use.
@@ -65,23 +82,24 @@ impl AltSvc {
         };
         // `clear` withdraws every advertisement for this origin.
         if value.trim().eq_ignore_ascii_case("clear") {
-            self.known.lock().expect("alt-svc map").remove(authority);
+            self.known().remove(authority);
             return;
         }
         let Some(lifetime) = parse_h3_advertisement(value) else {
             return;
         };
-        self.known.lock().expect("alt-svc map").insert(
-            authority.to_string(),
-            Advertisement::Available {
-                until: Instant::now() + lifetime,
-            },
-        );
+        // Computed before the lock is taken, and checked, so nothing that can
+        // go wrong here happens while the map is held.
+        let Some(until) = Instant::now().checked_add(lifetime) else {
+            return;
+        };
+        self.known()
+            .insert(authority.to_string(), Advertisement::Available { until });
     }
 
     /// Should this request go over QUIC?
     pub fn should_try(&self, authority: &str) -> bool {
-        let mut known = self.known.lock().expect("alt-svc map");
+        let mut known = self.known();
         match known.get(authority) {
             Some(Advertisement::Available { until }) if *until > Instant::now() => true,
             Some(Advertisement::Failed { until }) if *until > Instant::now() => false,
@@ -96,12 +114,10 @@ impl AltSvc {
 
     /// The attempt did not work. Stop trying for a while.
     pub fn failed(&self, authority: &str) {
-        self.known.lock().expect("alt-svc map").insert(
-            authority.to_string(),
-            Advertisement::Failed {
-                until: Instant::now() + FAILURE_COOLDOWN,
-            },
-        );
+        let now = Instant::now();
+        let until = now.checked_add(FAILURE_COOLDOWN).unwrap_or(now);
+        self.known()
+            .insert(authority.to_string(), Advertisement::Failed { until });
     }
 }
 
@@ -126,7 +142,7 @@ fn parse_h3_advertisement(value: &str) -> Option<Duration> {
             if let Some((name, seconds)) = parameter.trim().split_once('=') {
                 if name.trim() == "ma" {
                     if let Ok(secs) = seconds.trim().trim_matches('"').parse::<u64>() {
-                        lifetime = Duration::from_secs(secs);
+                        lifetime = Duration::from_secs(secs).min(MAX_ALT_SVC_LIFETIME);
                     }
                 }
             }
@@ -388,6 +404,55 @@ mod tests {
             !alt.should_try("blocked.test"),
             "a network that blocks UDP should cost one timeout, not one per request"
         );
+    }
+
+    fn advertise(alt: &AltSvc, authority: &str, value: &str) {
+        let mut headers = HeaderMap::new();
+        headers.insert("alt-svc", value.parse().unwrap());
+        alt.observe(authority, &headers);
+    }
+
+    #[test]
+    fn a_huge_max_age_is_clamped_rather_than_overflowing() {
+        assert_eq!(
+            parse_h3_advertisement("h3=\":443\"; ma=18446744073709551615"),
+            Some(MAX_ALT_SVC_LIFETIME)
+        );
+
+        let alt = AltSvc::default();
+        advertise(&alt, "huge.test", "h3=\":443\"; ma=18446744073709551615");
+        assert!(alt.should_try("huge.test"));
+
+        // The map is still whole: other origins, failures and `clear` all work.
+        advertise(&alt, "next.test", "h3=\":443\"; ma=60");
+        assert!(alt.should_try("next.test"));
+        assert!(!alt.should_try("never-advertised.test"));
+        alt.failed("next.test");
+        assert!(!alt.should_try("next.test"));
+        advertise(&alt, "huge.test", "clear");
+        assert!(!alt.should_try("huge.test"));
+    }
+
+    #[test]
+    fn a_panic_while_the_map_was_held_does_not_poison_every_request_after() {
+        let alt = Arc::new(AltSvc::default());
+        advertise(&alt, "before.test", "h3=\":443\"");
+        let holder = alt.clone();
+        let panicked = std::thread::spawn(move || {
+            let _held = holder.known.lock().unwrap();
+            panic!("something went wrong with the map held");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(alt.known.is_poisoned());
+
+        assert!(alt.should_try("before.test"));
+        advertise(&alt, "after.test", "h3=\":443\"; ma=60");
+        assert!(alt.should_try("after.test"));
+        alt.failed("after.test");
+        assert!(!alt.should_try("after.test"));
+        advertise(&alt, "before.test", "clear");
+        assert!(!alt.should_try("before.test"));
     }
 
     #[test]
