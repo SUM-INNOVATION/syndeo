@@ -314,23 +314,102 @@ mod tests {
         assert!(keystore.status().initialized);
         assert!(keystore.status().unsealed);
 
-        // The phrase is not on disk anywhere under the vault. The check is over
-        // the document's *values*: the field names are ours, and one of them
-        // (`m_cost`) contains a word that is also in the BIP-39 list, which
-        // would otherwise fail this test for about one phrase in eighty.
+        // The phrase is not on disk anywhere under the vault: not verbatim, and
+        // not one word of it as a word in anything the file holds.
         let raw = std::fs::read_to_string(keystore.vault.sealed_path()).unwrap();
+        assert!(
+            !raw.contains(mnemonic.as_str()),
+            "the recovery phrase is in the sealed file verbatim"
+        );
         let document: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let values: String = document
-            .as_object()
-            .expect("the sealed file is an object")
-            .values()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        for word in mnemonic.split_whitespace() {
-            assert!(!values.contains(word), "the recovery phrase leaked: {word}");
+        let leaked = leaked_words(&document, &mnemonic);
+        assert!(leaked.is_empty(), "the recovery phrase leaked: {leaked:?}");
+        assert_eq!(
+            document["identity_hint"].as_str(),
+            Some(address.to_base58().as_str())
+        );
+    }
+
+    /// The words of `mnemonic` that the document holds as words.
+    ///
+    /// Only string values are read, at any depth, and never a key: the keys
+    /// are our own field names, and `kdf` is an object whose `m_cost`, `t_cost`
+    /// and `p_cost` contain "cost", which is also a BIP-39 word. Reading keys
+    /// as text failed this test for every phrase that happened to include it,
+    /// about one in eighty-five. A word counts only as a whole
+    /// whitespace-delimited token, because a leaked phrase is words separated
+    /// by spaces, and a base64 ciphertext can contain any short word by chance.
+    fn leaked_words(document: &serde_json::Value, mnemonic: &str) -> Vec<String> {
+        fn strings<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+            match value {
+                serde_json::Value::String(s) => out.push(s),
+                serde_json::Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+                serde_json::Value::Object(fields) => fields.values().for_each(|v| strings(v, out)),
+                _ => {}
+            }
         }
-        assert!(values.contains(&address.to_base58()));
+        let mut leaves = Vec::new();
+        strings(document, &mut leaves);
+        let tokens: std::collections::HashSet<&str> =
+            leaves.iter().flat_map(|s| s.split_whitespace()).collect();
+        mnemonic
+            .split_whitespace()
+            .filter(|word| tokens.contains(word))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_field_name_is_not_leaked_text() {
+        let document = serde_json::json!({
+            "kdf": { "m_cost": 65536, "t_cost": 3, "p_cost": 1 },
+            "ciphertext": "c29tZXRoaW5n",
+        });
+        assert!(leaked_words(&document, "abandon cost zoo").is_empty());
+    }
+
+    #[test]
+    fn a_word_in_a_string_value_is_found_at_any_depth() {
+        let document = serde_json::json!({
+            "kdf": { "m_cost": 65536 },
+            "notes": [{ "text": "what it will cost" }],
+        });
+        assert_eq!(leaked_words(&document, "abandon cost zoo"), vec!["cost"]);
+    }
+
+    /// The case that failed at random, made certain: a real sealed file, from a
+    /// phrase whose first word is "cost".
+    #[test]
+    fn a_phrase_containing_cost_is_not_found_in_the_sealed_file() {
+        let index = Language::English.find_word("cost").unwrap();
+        let mut entropy = [0u8; 32];
+        entropy[0] = (index >> 3) as u8;
+        entropy[1] = ((index & 0b111) << 5) as u8;
+        let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
+            .unwrap()
+            .to_string();
+        assert_eq!(mnemonic.split_whitespace().next(), Some("cost"));
+
+        let (_dir, keystore, _) = keystore();
+        let address = keystore.restore(&mnemonic, Some(PASS)).unwrap();
+        let raw = std::fs::read_to_string(keystore.vault.sealed_path()).unwrap();
+        assert!(raw.contains("m_cost"), "the collision this guards against");
+        assert!(!raw.contains(mnemonic.as_str()));
+        let document: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(leaked_words(&document, &mnemonic).is_empty());
+        assert_eq!(
+            document["identity_hint"].as_str(),
+            Some(address.to_base58().as_str())
+        );
+    }
+
+    #[test]
+    fn a_word_inside_a_longer_token_is_not_the_word() {
+        let document = serde_json::json!({
+            "ciphertext": "xcostx",
+            "note": "costly",
+        });
+        assert!(leaked_words(&document, "abandon cost zoo").is_empty());
     }
 
     #[test]
