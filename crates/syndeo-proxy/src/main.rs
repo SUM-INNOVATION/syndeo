@@ -172,6 +172,10 @@ struct Proxy {
     net: Net,
     authority: CertificateAuthority,
     trace: bool,
+    /// Requests this proxy has been asked to handle, so a test can see that a
+    /// loop stopped rather than only that an answer came back.
+    #[cfg(test)]
+    handled: std::sync::atomic::AtomicUsize,
 }
 
 async fn run(args: RunArgs) -> Result<()> {
@@ -195,6 +199,8 @@ async fn run(args: RunArgs) -> Result<()> {
         net,
         authority,
         trace: args.trace_requests,
+        #[cfg(test)]
+        handled: Default::default(),
     });
 
     let listener = TcpListener::bind(args.listen)
@@ -223,11 +229,20 @@ async fn serve(listener: TcpListener, proxy: Arc<Proxy>) -> Result<()> {
                 continue;
             }
         };
+        // The address this connection reached, which is the one a request
+        // naming this proxy as its own target would name.
+        let local = match stream.local_addr() {
+            Ok(address) => address,
+            Err(err) => {
+                tracing::debug!(%peer, %err, "no local address");
+                continue;
+            }
+        };
         let proxy = proxy.clone();
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let proxy = proxy.clone();
-                async move { handle(proxy, req).await }
+                async move { handle(proxy, req, local).await }
             });
             if let Err(err) = hyper::server::conn::http1::Builder::new()
                 .preserve_header_case(true)
@@ -271,21 +286,32 @@ fn streaming(body: syndeo_net::FetchBody) -> Body {
     BodyExt::boxed_unsync(StreamBody::new(frames))
 }
 
-async fn handle(proxy: Arc<Proxy>, req: Request<Incoming>) -> Result<Response<Body>, hyper::Error> {
+async fn handle(
+    proxy: Arc<Proxy>,
+    req: Request<Incoming>,
+    local: SocketAddr,
+) -> Result<Response<Body>, hyper::Error> {
+    #[cfg(test)]
+    proxy
+        .handled
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if req.method() == hyper::Method::CONNECT {
-        return Ok(connect(proxy, req));
+        return Ok(connect(proxy, req, local));
     }
-    Ok(forward(proxy, req, None).await)
+    Ok(forward(proxy, req, None, local).await)
 }
 
 /// `CONNECT host:port` — answer 200, then take over the tunnel and terminate TLS
 /// with a leaf we mint for that host.
-fn connect(proxy: Arc<Proxy>, req: Request<Incoming>) -> Response<Body> {
+fn connect(proxy: Arc<Proxy>, req: Request<Incoming>, local: SocketAddr) -> Response<Body> {
     let Some(authority) = req.uri().authority().cloned() else {
         return text(StatusCode::BAD_REQUEST, "CONNECT needs an authority");
     };
     let host = authority.host().to_string();
     let port = authority.port_u16().unwrap_or(443);
+    if via_names_us(req.headers()) || targets_this_proxy(&host, port, local) {
+        return loop_detected();
+    }
 
     tokio::spawn(async move {
         let upgraded = match hyper::upgrade::on(req).await {
@@ -322,7 +348,9 @@ fn connect(proxy: Arc<Proxy>, req: Request<Incoming>) -> Response<Body> {
         let service = service_fn(move |req| {
             let proxy = proxy.clone();
             let origin = origin.clone();
-            async move { Ok::<_, hyper::Error>(forward(proxy, req, Some(origin.to_string())).await) }
+            async move {
+                Ok::<_, hyper::Error>(forward(proxy, req, Some(origin.to_string()), local).await)
+            }
         });
 
         if let Err(err) = ServerBuilder::new(TokioExecutor::new())
@@ -344,8 +372,21 @@ async fn forward(
     proxy: Arc<Proxy>,
     req: Request<Incoming>,
     origin: Option<String>,
+    local: SocketAddr,
 ) -> Response<Body> {
+    // A request that has already been through this proxy is a loop, whatever
+    // name it reached us by: `localtest.me`, `localhost`, or anything else
+    // that resolves back here. Answered before anything is fetched, so a loop
+    // costs one extra hop and not a machine's worth of sockets.
+    if via_names_us(req.headers()) {
+        return loop_detected();
+    }
+
     let method = req.method().clone();
+    // A request that is neither in proxy form nor inside a tunnel was sent to
+    // the proxy as though it were the website. Only the statistics page is
+    // meant to be reached that way.
+    let direct = origin.is_none() && req.uri().authority().is_none();
     let url = match absolute_url(&req, origin.as_deref()) {
         Some(u) => u,
         None => {
@@ -359,8 +400,18 @@ async fn forward(
     if let Some(response) = stats::intercept(&proxy.net, &url) {
         return response;
     }
+    if direct {
+        return text(
+            StatusCode::BAD_REQUEST,
+            "this is a proxy: configure it as one rather than requesting from it directly",
+        );
+    }
+    if url_targets_this_proxy(&url, local) {
+        return loop_detected();
+    }
 
-    let headers = forwardable(req.headers());
+    let mut headers = forwardable(req.headers());
+    append_our_via(&mut headers);
 
     let body = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -458,6 +509,108 @@ fn absolute_url(req: &Request<Incoming>, origin: Option<&str>) -> Option<String>
     }
     let host = req.headers().get(http::header::HOST)?.to_str().ok()?;
     Some(format!("http://{host}{}", uri.path_and_query()?.as_str()))
+}
+
+/// The name this proxy gives itself in `Via`: the received-by of RFC 9110
+/// section 7.6.3, as a pseudonym rather than a host, so it names the software
+/// and not the machine.
+const VIA_PSEUDONYM: &str = "syndeo";
+
+/// Whether any `Via` entry says the request has already passed through us.
+///
+/// Every `Via` field is read, each is split into its comma-separated entries,
+/// and the received-by of each is compared with our pseudonym, ignoring ASCII
+/// case. Only that exact token counts: `syndeo-proxy` is another proxy, and a
+/// parenthesised comment is free text, so `(syndeo)` or `(x, 1.1 syndeo)` in
+/// one is not us either.
+fn via_names_us(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all(http::header::VIA)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(via_entries)
+        .any(|entry| {
+            let mut parts = entry.split_whitespace();
+            let _received_protocol = parts.next();
+            parts
+                .next()
+                .is_some_and(|received_by| received_by.eq_ignore_ascii_case(VIA_PSEUDONYM))
+        })
+}
+
+/// The entries of one `Via` field, with comments removed. Commas separate
+/// entries only outside parentheses, and a backslash quotes the next
+/// character inside a comment.
+fn via_entries(field: &str) -> Vec<String> {
+    let mut entries = vec![String::new()];
+    let mut depth = 0usize;
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            '\\' if depth > 0 => {
+                chars.next();
+            }
+            ',' if depth == 0 => entries.push(String::new()),
+            _ if depth == 0 => entries.last_mut().expect("never empty").push(c),
+            _ => {}
+        }
+    }
+    entries
+}
+
+/// Add this proxy to the end of the request's `Via` chain, keeping whatever
+/// was already there, as one field.
+fn append_our_via(headers: &mut http::HeaderMap) {
+    let mut chain: Vec<u8> = Vec::new();
+    for value in headers.get_all(http::header::VIA) {
+        if !chain.is_empty() {
+            chain.extend_from_slice(b", ");
+        }
+        chain.extend_from_slice(value.as_bytes());
+    }
+    if !chain.is_empty() {
+        chain.extend_from_slice(b", ");
+    }
+    chain.extend_from_slice(b"1.1 ");
+    chain.extend_from_slice(VIA_PSEUDONYM.as_bytes());
+    let value = http::HeaderValue::from_bytes(&chain)
+        .unwrap_or_else(|_| http::HeaderValue::from_static("1.1 syndeo"));
+    headers.insert(http::header::VIA, value);
+}
+
+/// Whether a host and port, written as an address, are this proxy's own.
+///
+/// The quick check, for a target that names us literally. A name that
+/// resolves to us is caught by `Via` instead, one hop later, because only
+/// resolving it would say where it goes.
+fn targets_this_proxy(host: &str, port: u16, local: SocketAddr) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    port == local.port() && (ip == local.ip() || ip.is_loopback() || ip.is_unspecified())
+}
+
+fn url_targets_this_proxy(url: &str, local: SocketAddr) -> bool {
+    let Ok(uri) = url.parse::<hyper::Uri>() else {
+        return false;
+    };
+    let (Some(host), Some(scheme)) = (uri.host(), uri.scheme_str()) else {
+        return false;
+    };
+    let port = uri
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    targets_this_proxy(host, port, local)
+}
+
+fn loop_detected() -> Response<Body> {
+    text(
+        StatusCode::LOOP_DETECTED,
+        "this request has already been through this proxy",
+    )
 }
 
 fn text(status: StatusCode, message: &str) -> Response<Body> {
@@ -594,6 +747,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct Seen {
         path: String,
+        headers: http::HeaderMap,
     }
 
     type Answer = Arc<dyn Fn(&str) -> Response<Full<Bytes>> + Send + Sync>;
@@ -621,6 +775,7 @@ mod tests {
                             async move {
                                 log.lock().unwrap().push(Seen {
                                     path: req.uri().path().to_string(),
+                                    headers: req.headers().clone(),
                                 });
                                 Ok::<_, std::convert::Infallible>(answer(req.uri().path()))
                             }
@@ -658,6 +813,12 @@ mod tests {
     /// A real proxy on a free port, resolving through the system resolver so
     /// nothing here needs the internet.
     async fn start_proxy(dir: &std::path::Path) -> SocketAddr {
+        start_proxy_with_count(dir).await.0
+    }
+
+    /// The same, keeping hold of the proxy so a test can ask how many
+    /// requests it was asked to handle.
+    async fn start_proxy_with_count(dir: &std::path::Path) -> (SocketAddr, Arc<Proxy>) {
         let net = Net::new(NetConfig {
             cache_root: dir.join("cache"),
             shared_cache: true,
@@ -670,11 +831,12 @@ mod tests {
             net,
             authority,
             trace: false,
+            handled: Default::default(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        tokio::spawn(serve(listener, proxy));
-        address
+        tokio::spawn(serve(listener, proxy.clone()));
+        (address, proxy)
     }
 
     /// What came back through the proxy.
@@ -687,16 +849,30 @@ mod tests {
     /// Send one request through the proxy the way a browser configured to use
     /// it does: a connection to the proxy, with the full URL as the target.
     async fn through(proxy: SocketAddr, url: &str, headers: &[(&str, &str)]) -> Reply {
+        let uri: hyper::Uri = url.parse().unwrap();
+        let host = uri.authority().unwrap().to_string();
+        send(proxy, hyper::Method::GET, url, &host, headers).await
+    }
+
+    /// Send any request target to the proxy: a full URL, an origin-form path,
+    /// or a CONNECT authority.
+    async fn send(
+        proxy: SocketAddr,
+        method: hyper::Method,
+        target: &str,
+        host: &str,
+        headers: &[(&str, &str)],
+    ) -> Reply {
         let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
                 .await
                 .unwrap();
-        tokio::spawn(connection);
-        let uri: hyper::Uri = url.parse().unwrap();
+        tokio::spawn(connection.with_upgrades());
         let mut request = Request::builder()
-            .uri(&uri)
-            .header(http::header::HOST, uri.authority().unwrap().as_str());
+            .method(method)
+            .uri(target)
+            .header(http::header::HOST, host);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
@@ -746,6 +922,199 @@ mod tests {
         assert_eq!(&reply.body[..], b"moved");
         let paths: Vec<String> = origin.seen().into_iter().map(|s| s.path).collect();
         assert_eq!(paths, ["/start"], "the destination must not be fetched");
+    }
+
+    fn via(fields: &[&str]) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for field in fields {
+            headers.append(http::header::VIA, field.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn via_names_us_only_by_our_exact_received_by() {
+        for fields in [
+            &["1.1 syndeo"][..],
+            &["HTTP/1.1 SynDeo"],
+            &["1.0 fred, 1.1 syndeo"],
+            &["1.0 fred", "1.1 SYNDEO (a comment after it)"],
+            &["1.0 a (x, y), 1.1 syndeo"],
+            &["  1.1   syndeo  "],
+        ] {
+            assert!(via_names_us(&via(fields)), "{fields:?} names us");
+        }
+        for fields in [
+            &[][..],
+            &["1.1 syndeo-proxy"],
+            &["1.1 notsyndeo"],
+            &["1.1 syndeox"],
+            &["1.1 example (syndeo)"],
+            &["1.1 example (x, 1.1 syndeo)"],
+            &[r"1.1 example (a \) , 1.1 syndeo)"],
+            &["syndeo"],
+            &["1.1 syn deo"],
+        ] {
+            assert!(!via_names_us(&via(fields)), "{fields:?} does not name us");
+        }
+    }
+
+    #[test]
+    fn our_via_goes_on_the_end_of_the_chain() {
+        let mut headers = via(&["1.0 fred", "1.1 upstream (squid)"]);
+        append_our_via(&mut headers);
+        let all: Vec<&str> = headers
+            .get_all(http::header::VIA)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(all, ["1.0 fred, 1.1 upstream (squid), 1.1 syndeo"]);
+
+        let mut empty = http::HeaderMap::new();
+        append_our_via(&mut empty);
+        assert_eq!(empty.get(http::header::VIA).unwrap(), "1.1 syndeo");
+    }
+
+    #[test]
+    fn only_an_address_that_is_ours_counts_as_ourselves() {
+        let local: SocketAddr = "127.0.0.1:8899".parse().unwrap();
+        assert!(targets_this_proxy("127.0.0.1", 8899, local));
+        assert!(targets_this_proxy("[::1]", 8899, local));
+        assert!(targets_this_proxy("0.0.0.0", 8899, local));
+        assert!(!targets_this_proxy("127.0.0.1", 8898, local));
+        assert!(!targets_this_proxy("192.0.2.1", 8899, local));
+        // A name is not an address; resolving it is the network's business,
+        // and `Via` catches it when it comes back.
+        assert!(!targets_this_proxy("localhost", 8899, local));
+        assert!(url_targets_this_proxy("http://127.0.0.1:8899/x", local));
+        assert!(!url_targets_this_proxy("http://127.0.0.1/x", local));
+    }
+
+    /// Bounded, or it is not a fix: every loop test has to finish well inside
+    /// this.
+    async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), future)
+            .await
+            .expect("the proxy answered within five seconds")
+    }
+
+    fn handled(proxy: &Proxy) -> usize {
+        proxy.handled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_request_carries_the_via_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"ok"))).await;
+        let proxy = start_proxy(dir.path()).await;
+
+        let plain = through(proxy, &origin.url("/a"), &[]).await;
+        let chained = through(proxy, &origin.url("/b"), &[("via", "1.0 upstream")]).await;
+
+        assert_eq!(plain.status, StatusCode::OK);
+        assert_eq!(chained.status, StatusCode::OK);
+        let seen = origin.seen();
+        assert_eq!(seen.len(), 2, "each request reached the origin once");
+        assert_eq!(seen[0].headers.get("via").unwrap(), "1.1 syndeo");
+        assert_eq!(
+            seen[1].headers.get("via").unwrap(),
+            "1.0 upstream, 1.1 syndeo"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_has_been_through_us_is_a_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"ok"))).await;
+        let proxy = start_proxy(dir.path()).await;
+
+        for chain in [
+            "1.1 syndeo",
+            "1.1 SynDeo",
+            "1.0 upstream, HTTP/1.1 syndeo (x)",
+        ] {
+            let reply = within(through(proxy, &origin.url("/x"), &[("via", chain)])).await;
+            assert_eq!(reply.status, StatusCode::LOOP_DETECTED, "{chain}");
+        }
+        assert!(origin.seen().is_empty(), "nothing was fetched");
+    }
+
+    #[tokio::test]
+    async fn a_near_miss_is_somebody_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"ok"))).await;
+        let proxy = start_proxy(dir.path()).await;
+
+        for chain in ["1.1 syndeo-proxy", "1.1 example (syndeo)"] {
+            let reply = through(proxy, &origin.url("/x"), &[("via", chain)]).await;
+            assert_eq!(reply.status, StatusCode::OK, "{chain}");
+        }
+        assert_eq!(origin.seen().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn asking_the_proxy_for_itself_by_address_stops_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (address, proxy) = start_proxy_with_count(dir.path()).await;
+
+        let url = format!("http://127.0.0.1:{}/x", address.port());
+        let reply = within(through(address, &url, &[])).await;
+
+        assert_eq!(reply.status, StatusCode::LOOP_DETECTED);
+        assert_eq!(handled(&proxy), 1, "refused before anything was fetched");
+    }
+
+    #[tokio::test]
+    async fn asking_the_proxy_for_itself_by_name_stops_one_hop_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let (address, proxy) = start_proxy_with_count(dir.path()).await;
+
+        // A name that resolves back here: the literal check cannot see it, and
+        // `Via` stops it when it arrives the second time.
+        let url = format!("http://localhost:{}/x", address.port());
+        let reply = within(through(address, &url, &[])).await;
+
+        assert_eq!(reply.status, StatusCode::LOOP_DETECTED);
+        assert_eq!(
+            handled(&proxy),
+            2,
+            "one request from the client, one from ourselves"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_statistics_page_and_connect_still_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = start_proxy(dir.path()).await;
+
+        let proxied = through(proxy, "http://syndeo.local/stats", &[]).await;
+        assert_eq!(proxied.status, StatusCode::OK);
+        let direct = send(proxy, hyper::Method::GET, "/stats", "syndeo.local", &[]).await;
+        assert_eq!(direct.status, StatusCode::OK);
+
+        let not_a_website = send(proxy, hyper::Method::GET, "/x", "example.test", &[]).await;
+        assert_eq!(not_a_website.status, StatusCode::BAD_REQUEST);
+
+        let tunnel = within(send(
+            proxy,
+            hyper::Method::CONNECT,
+            "example.test:443",
+            "example.test:443",
+            &[],
+        ))
+        .await;
+        assert_eq!(tunnel.status, StatusCode::OK);
+
+        let ourselves = format!("127.0.0.1:{}", proxy.port());
+        let refused = within(send(
+            proxy,
+            hyper::Method::CONNECT,
+            &ourselves,
+            &ourselves,
+            &[],
+        ))
+        .await;
+        assert_eq!(refused.status, StatusCode::LOOP_DETECTED);
     }
 
     #[test]
