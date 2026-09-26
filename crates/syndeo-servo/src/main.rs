@@ -25,6 +25,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use syndeo_ipc::transport::Endpoint;
+use syndeo_servo::cli::{self, Cli};
 use syndeo_servo::NetworkDelegate;
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -32,41 +33,6 @@ use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
-
-#[derive(Parser)]
-#[command(
-    name = "syndeo-servo",
-    version,
-    about = "A renderer whose every load goes through the network process"
-)]
-struct Cli {
-    /// The page to open.
-    url: String,
-    /// Where cache, keys and sockets live.
-    #[arg(long)]
-    home: Option<PathBuf>,
-    /// system | dot:cloudflare | doh:cloudflare | doh:google | doh:quad9
-    #[arg(long, default_value = "doh:cloudflare")]
-    dns: String,
-    /// Scroll this many times on its own, report how long each frame took, and
-    /// exit.
-    ///
-    /// Driving a window from a test script means synthetic input, which means
-    /// depending on which window the operating system thinks is focused — and
-    /// that is decided by whoever is using the machine at the time. This drives
-    /// the same code path a wheel event does, from inside, so the measurement
-    /// is the renderer's rather than the window server's.
-    #[arg(long, value_name = "COUNT")]
-    scroll_bench: Option<usize>,
-    /// Window size, as WIDTHxHEIGHT. Compositing cost is per pixel, so a
-    /// measurement at the default size says nothing about a maximised window.
-    #[arg(long, value_name = "WxH")]
-    window_size: Option<String>,
-    /// Milliseconds between synthetic scrolls in `--scroll-bench`. A trackpad
-    /// is about 8; anything under one frame is what coalescing exists for.
-    #[arg(long, default_value_t = 8, value_name = "MS")]
-    scroll_rate_ms: u64,
-}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -79,6 +45,9 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // After parsing, so `--help` and `--version` stay what they are; before
+    // anything is loaded, so nobody gets as far as a page without reading it.
+    cli::announce(&mut std::io::stderr());
     let home = cli.home.clone().unwrap_or_else(|| {
         std::env::var_os("SYNDEO_HOME")
             .map(PathBuf::from)

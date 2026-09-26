@@ -34,6 +34,7 @@
 //! the boundary — is outside the gate.
 
 pub mod bridge;
+pub mod cli;
 
 #[cfg(feature = "renderer")]
 pub mod delegate;
