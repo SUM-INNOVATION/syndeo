@@ -11317,6 +11317,7 @@ dependencies = [
  "serde",
  "serde_json",
  "syndeo-cache",
+ "syndeo-ipc",
  "syndeo-net",
  "tempfile",
  "tokio",

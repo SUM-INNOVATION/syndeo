@@ -60,6 +60,15 @@ struct RunArgs {
     /// Log one line per request with its source and timing.
     #[arg(long, default_value_t = true)]
     trace_requests: bool,
+    /// Exit when whoever started this closes our stdin.
+    ///
+    /// For syndeo-webkit, which starts its own proxy and keeps the other end of
+    /// that pipe: the kernel closes it however the browser ends, force-quit and
+    /// `kill -9` included. Off unless asked for, because a proxy started from a
+    /// script or with `nohup` has /dev/null for stdin, which reads as closed at
+    /// once.
+    #[arg(long, hide = true)]
+    exit_with_parent: bool,
 }
 
 #[derive(Parser)]
@@ -157,6 +166,7 @@ async fn main() -> Result<()> {
         dns: "system".into(),
         shared: true,
         trace_requests: true,
+        exit_with_parent: false,
     })) {
         Command::Run(args) => run(args).await,
         Command::Ca(args) => {
@@ -207,6 +217,9 @@ struct Proxy {
 }
 
 async fn run(args: RunArgs) -> Result<()> {
+    if args.exit_with_parent {
+        syndeo_ipc::exit_when_parent_does();
+    }
     let dns: DnsMode = args
         .dns
         .parse()

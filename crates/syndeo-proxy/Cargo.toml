@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 syndeo-cache.workspace = true
 syndeo-net.workspace = true
+syndeo-ipc.workspace = true
 
 tokio.workspace = true
 bytes.workspace = true

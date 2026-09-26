@@ -506,13 +506,78 @@ fn default_home() -> PathBuf {
 
 const DEFAULT_PROXY: &str = "127.0.0.1:8899";
 
+/// The proxy this browser started: that process and no other.
+///
+/// Dropping it kills and reaps the child, which covers returning from `run`,
+/// an error on the way out, and unwinding. Until it is reaped the child's pid
+/// cannot be given to anyone else, so the kill can only ever reach our own
+/// proxy. What a destructor cannot cover — a force-quit, a crash, `kill -9` —
+/// the child covers itself: it holds the other end of its stdin pipe and exits
+/// when the kernel closes ours.
+struct ProxyChild(std::process::Child);
+
+impl Drop for ProxyChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Refuse to start a proxy where something is already listening.
+///
+/// Whatever is there is not ours to stop, and not ours to trust: pages would go
+/// to it, and plain http through it would be readable and changeable by
+/// whoever runs it. If it is a proxy the user started themselves, `--proxy`
+/// says so on purpose.
+fn refuse_if_occupied(address: std::net::SocketAddr) -> Result<()> {
+    if std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(300)).is_ok()
+    {
+        anyhow::bail!(
+            "something is already listening on {address}, and this would start its own \
+             proxy there. If that is a syndeo-proxy you started, use it with \
+             `--proxy {address}`; otherwise stop it first."
+        );
+    }
+    Ok(())
+}
+
+/// Start `command` as this browser's proxy and wait until it listens on
+/// `address`, noticing if it exits first.
+fn start_owned(
+    mut command: std::process::Command,
+    address: std::net::SocketAddr,
+    within: std::time::Duration,
+) -> Result<ProxyChild> {
+    refuse_if_occupied(address)?;
+    let child = command
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("starting the proxy")?;
+    let mut owned = ProxyChild(child);
+
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = owned.0.try_wait()? {
+            anyhow::bail!("the proxy exited before it was listening ({status})");
+        }
+        if std::net::TcpStream::connect(address).is_ok() {
+            tracing::info!(proxy = %address, "the proxy is listening");
+            return Ok(owned);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    anyhow::bail!(
+        "the proxy did not start listening on {address} within {} seconds",
+        within.as_secs()
+    )
+}
+
 /// Start the proxy this browser fetches through, and wait until it answers.
 ///
 /// A sibling binary, found the way the shell finds its own, so a build tree and
-/// an install both work. Killed with this process, and the child watches for
-/// that too, so force-quitting the browser does not leave a proxy holding the
-/// cache.
-fn start_proxy(home: &std::path::Path) -> Result<std::process::Child> {
+/// an install both work. It goes when this process goes, however that happens:
+/// see [`ProxyChild`].
+fn start_proxy(home: &std::path::Path) -> Result<ProxyChild> {
     let exe = std::env::current_exe().context("locating the running binary")?;
     let resolved = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
     let beside = resolved
@@ -524,26 +589,19 @@ fn start_proxy(home: &std::path::Path) -> Result<std::process::Child> {
              has to be installed into the same directory.",
         )?;
 
-    let child = std::process::Command::new(beside)
-        .arg("run")
+    let mut command = std::process::Command::new(beside);
+    command
+        .args(["run", "--exit-with-parent"])
         // On the environment rather than a flag, because that is where the
         // proxy reads it from and inventing a flag it does not have is how the
         // first attempt at this failed.
-        .env("SYNDEO_HOME", home)
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .context("starting the proxy")?;
-
+        .env("SYNDEO_HOME", home);
     // It has to be listening before the first page is asked for.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if std::net::TcpStream::connect(DEFAULT_PROXY).is_ok() {
-            tracing::info!(proxy = DEFAULT_PROXY, "the proxy is listening");
-            return Ok(child);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    anyhow::bail!("the proxy did not start listening on {DEFAULT_PROXY} within ten seconds")
+    start_owned(
+        command,
+        DEFAULT_PROXY.parse().expect("a valid address"),
+        std::time::Duration::from_secs(10),
+    )
 }
 
 /// Whether our authority is in a keychain WebKit's networking process consults.
@@ -559,4 +617,143 @@ fn authority_is_trusted() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    fn alive(pid: u32) -> bool {
+        Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn sleeper() -> ProxyChild {
+        ProxyChild(Command::new("/bin/sleep").arg("60").spawn().unwrap())
+    }
+
+    /// Held by every test that binds a port, or picks one it relies on nobody
+    /// else taking: a port one test lets go of can be handed straight to
+    /// another.
+    static PORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A free port below the ephemeral range. A port handed out by binding to
+    /// port 0 is an ephemeral one, and connecting to it once it is free again
+    /// can be given that same port as its source — a TCP connection to itself,
+    /// which looks exactly like somebody listening. 8899 is never in that
+    /// range, so this is a property of the tests and not of the browser.
+    fn quiet_address() -> std::net::SocketAddr {
+        (20000..30000)
+            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .skip((std::process::id() % 5000) as usize)
+            .find(|address| std::net::TcpListener::bind(address).is_ok())
+            .expect("a free port below the ephemeral range")
+    }
+
+    /// Nobody listens on port 1, and no connection is ever given it as a
+    /// source port.
+    fn nobody() -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], 1))
+    }
+
+    #[test]
+    fn the_proxy_goes_when_its_owner_is_dropped() {
+        let owned = sleeper();
+        let pid = owned.0.id();
+        assert!(alive(pid));
+        drop(owned);
+        assert!(!alive(pid));
+    }
+
+    #[test]
+    fn the_proxy_goes_when_its_owner_returns_an_error() {
+        let mut pid = 0;
+        let result: Result<()> = (|| {
+            let owned = sleeper();
+            pid = owned.0.id();
+            anyhow::bail!("something failed after the proxy started")
+        })();
+        assert!(result.is_err());
+        assert!(!alive(pid));
+    }
+
+    #[test]
+    fn the_proxy_goes_when_its_owner_unwinds() {
+        let pid = std::sync::atomic::AtomicU32::new(0);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owned = sleeper();
+            pid.store(owned.0.id(), std::sync::atomic::Ordering::SeqCst);
+            panic!("something panicked after the proxy started");
+        }));
+        assert!(unwound.is_err());
+        assert!(!alive(pid.load(std::sync::atomic::Ordering::SeqCst)));
+    }
+
+    #[test]
+    fn a_proxy_that_exits_before_listening_is_noticed_at_once() {
+        let _ports = PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let started = Instant::now();
+        let refused = start_owned(
+            Command::new("/usr/bin/false"),
+            nobody(),
+            Duration::from_secs(10),
+        );
+        let message = refused.err().unwrap().to_string();
+        assert!(
+            message.contains("exited before it was listening"),
+            "{message}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waited out the deadline"
+        );
+    }
+
+    #[test]
+    fn a_taken_port_is_refused_before_anything_starts_and_left_alone() {
+        let _ports = PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let marker = std::env::temp_dir().join(format!(
+            "syndeo-webkit-test-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos() + address.port() as u128
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let mut command = Command::new("/usr/bin/touch");
+        command.arg(&marker);
+
+        let message = start_owned(command, address, Duration::from_secs(5))
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(message.contains(&format!("--proxy {address}")), "{message}");
+        assert!(!marker.exists(), "a proxy was started anyway");
+        // Whoever holds the port still holds it, and still answers.
+        std::net::TcpStream::connect(address).unwrap();
+        assert!(listener.accept().is_ok());
+    }
+
+    #[test]
+    fn a_proxy_that_listens_is_kept_until_its_owner_goes() {
+        let _ports = PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let address = quiet_address();
+        // nc rather than python3: /usr/bin/python3 is a launcher that starts
+        // the interpreter as a child of its own, so killing it would leave the
+        // real listener behind.
+        let mut command = Command::new("/usr/bin/nc");
+        command.args(["-lk", "127.0.0.1", &address.port().to_string()]);
+        let owned = start_owned(command, address, Duration::from_secs(10)).unwrap();
+        let pid = owned.0.id();
+        assert!(alive(pid));
+        drop(owned);
+        assert!(!alive(pid));
+    }
 }
