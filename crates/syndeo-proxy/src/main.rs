@@ -207,6 +207,14 @@ async fn run(args: RunArgs) -> Result<()> {
         "statistics at http://syndeo.local/stats through the proxy, or `syndeo-proxy stats`"
     );
 
+    serve(listener, proxy).await
+}
+
+/// Answer every connection on `listener` for as long as the process lives.
+///
+/// Separate from `run` so a test can bind its own listener on a free port and
+/// put a proxy on it, rather than going through the command line and 8899.
+async fn serve(listener: TcpListener, proxy: Arc<Proxy>) -> Result<()> {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
