@@ -32,5 +32,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 
+# The authority's key is opened without following symlinks and checked against
+# the effective user, which std does not expose.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
