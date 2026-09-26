@@ -69,7 +69,8 @@ struct Cli {
     /// so playback can be measured rather than assumed.
     #[arg(long)]
     autoplay: bool,
-    /// Where the proxy is listening. Everything this renders goes through it.
+    /// Where the proxy is listening. The web view is configured to send its
+    /// HTTP and HTTPS traffic through it.
     ///
     /// Optional only so the two halves can be told apart when something does
     /// not load: without it this is an ordinary web view, and if that fails too
@@ -135,7 +136,7 @@ pub fn run() -> Result<()> {
             let (host, port) = spec.rsplit_once(':').context("--proxy wants host:port")?;
             tracing::info!(
                 proxy = %spec,
-                "the renderer reaches the network through this and nothing else"
+                "the web view is configured to send its HTTP and HTTPS traffic through this proxy"
             );
             Some((host.to_string(), port.to_string()))
         }
@@ -592,6 +593,28 @@ mod tests {
     use super::*;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    /// The help says what the proxy setting covers, and claims nothing more.
+    #[test]
+    fn the_help_says_what_the_proxy_covers_and_no_more() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        assert!(
+            help.contains("configured to send its HTTP and HTTPS traffic through it"),
+            "{help}"
+        );
+        for overclaim in [
+            "Everything this renders",
+            "nothing else",
+            "cannot bypass",
+            "every byte",
+        ] {
+            assert!(
+                !help.contains(overclaim),
+                "--help claims: {overclaim}\n{help}"
+            );
+        }
+    }
 
     fn alive(pid: u32) -> bool {
         Command::new("/bin/kill")

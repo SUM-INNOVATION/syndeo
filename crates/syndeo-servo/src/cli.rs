@@ -26,7 +26,8 @@ EXPERIMENTAL, FOR DEVELOPMENT ONLY. UNSAFE FOR UNTRUSTED SITES:
   - form POST bodies are sent empty;
   - responses are buffered completely, with no size cap.
 
-It is in no release. To browse, use syndeo-webkit (macOS) or syndeo-ui.";
+It is not in release archives from v0.1.3 on (v0.1.1 and v0.1.2 carried it).
+To browse, use syndeo-webkit (macOS) or syndeo-ui.";
 
 /// The line written to stderr every time it starts.
 pub const STARTUP_WARNING: &str = "syndeo-servo is experimental and for development only, \
@@ -98,6 +99,15 @@ mod tests {
                 "--help does not say: {reason}\n{help}"
             );
         }
+    }
+
+    /// v0.1.1 and v0.1.2 did ship it, so --help must not say it never shipped.
+    #[test]
+    fn help_tells_the_release_history_truthfully() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("in no release"), "{help}");
+        assert!(help.contains("v0.1.1 and v0.1.2"), "{help}");
+        assert!(help.contains("from v0.1.3 on"), "{help}");
     }
 
     #[test]

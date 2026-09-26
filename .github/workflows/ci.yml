@@ -84,7 +84,8 @@ jobs:
           arguments: --locked --all-features
 
       # Advisories over what ships, which is the renderer's opposite: Servo is
-      # behind an off-by-default feature and is in no release tarball, and its
+      # behind an off-by-default feature and left out of release archives from
+      # v0.1.3 on, and its
       # dependency tree carries advisories nobody here can act on. Gating every
       # merge on those would train people to ignore this check. It is reported
       # weekly instead, by `servo-advisories` below, which never gates.

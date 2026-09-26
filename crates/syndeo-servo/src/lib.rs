@@ -22,8 +22,11 @@
 //! Registering a protocol handler would have been the tidier-looking route and
 //! does not work: Servo's `ProtocolRegistry` refuses `http` and `https` by
 //! design, in `FORBIDDEN_SCHEMES`. Resource-load interception is the supported
-//! way to get in front of them, and it streams, which suits a net process whose
-//! bodies already arrive in pieces.
+//! way to get in front of them. It can take a body in pieces, but this
+//! embedding does not use that yet: `Channel::fetch` collects the network
+//! process's response whole, and the delegate hands it to Servo in one call,
+//! with no size cap. That is one of the reasons `syndeo-servo` warns that it is
+//! unsafe for untrusted sites.
 //!
 //! # What is not here
 //!

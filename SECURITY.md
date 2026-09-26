@@ -53,9 +53,11 @@ welcome as a second opinion; they are not treated as new.
   untrusted sites.** It does not enforce cross-origin reads, so a page can read
   other origins' responses, including services on the machine and its network;
   it sends form POST bodies empty; and it buffers every response completely,
-  with no size cap. It says so on `--help` and each time it starts. It is behind
-  an off-by-default `renderer` feature and is in no release: the v0.1.1 and
-  v0.1.2 tarballs carried it, v0.1.3's do not. Building it yourself also brings
+  with no size cap. It prints those reasons each time it starts, and gives
+  them on `--help`. It is behind an off-by-default `renderer` feature and is
+  not in the release archives from v0.1.3 on. The v0.1.1 and v0.1.2 archives
+  did include it; anyone who unpacked it from one of those by hand should not
+  point it at sites they do not trust. Building it yourself also brings
   in Servo's dependency tree, which carries an RSA timing side channel
   (RUSTSEC-2023-0071) and unmaintained crates. What ships is built with default
   features, and that dependency tree has to pass the advisory check on every

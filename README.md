@@ -71,9 +71,14 @@ shasum -a 256 -c SHA256SUMS --ignore-missing
 These are load-bearing. Get them right at the start and everything else is
 refactorable; get them wrong and no amount of later work recovers it.
 
-1. **Renderers never talk to the network.** They send a `NetRequest` and receive
-   bytes. Sockets, DNS, certificates and the cache all live behind that one call,
-   in `syndeo-net`.
+1. **`syndeo-servo` opens no socket; `syndeo-webkit` is configured to use the
+   proxy.** Servo sends a `NetRequest` and receives bytes: sockets, DNS,
+   certificates and the cache all live behind that one call, in `syndeo-net`,
+   and the renderer itself opens no socket. `syndeo-webkit` holds to something
+   weaker: its web view is configured to send its HTTP and HTTPS traffic
+   through `syndeo-proxy`, in front of `syndeo-net`. That is a configuration,
+   not a sandbox, and it does not cover transports WebKit sends outside its
+   proxy setting — WebRTC is the obvious one, and has not been measured.
 2. **The agent never talks to the keystore.** `ShellRequest` has no keystore
    variant, so there is nothing to call. The agent is not told where the keystore
    listens, and it refuses to start if it finds a session secret in its
@@ -141,8 +146,8 @@ cargo build --release
 export PATH="$PWD/target/release:$PATH"
 ```
 
-`syndeo-servo` is not in that build, or in any release tarball; see below for
-what it costs.
+`syndeo-servo` is not in that build, or in the release archives from v0.1.3
+on; v0.1.1 and v0.1.2 did include it. See below for what it costs to build.
 
 ## Running it
 
@@ -152,8 +157,11 @@ what it costs.
 > `syndeo-servo` does not enforce cross-origin reads, so a page can read other
 > origins' responses, including services on your machine and your network; it
 > sends form POST bodies empty; and it buffers every response completely, with
-> no size cap. It is in no release, and it says so on `--help` and every time it
-> starts. To browse, use `syndeo-webkit` (macOS) or `syndeo-ui`.
+> no size cap. It prints those three reasons every time it starts, and `--help`
+> gives them too, along with which releases included it: it is left out of the
+> release archives from v0.1.3 on, though v0.1.1 and v0.1.2 included it. If you
+> unpacked it from one of those, all of this applies. To browse, use
+> `syndeo-webkit` (macOS) or `syndeo-ui`.
 
 ```sh
 cargo build -p syndeo-servo --features renderer     # long; see below
@@ -174,7 +182,10 @@ policy without knowing any of them exist.
 
 Registering a protocol handler would have looked tidier and does not work:
 Servo's `ProtocolRegistry` refuses `http` and `https` by design. Resource-load
-interception is the supported way in front of them, and it streams.
+interception is the supported way in front of them. It can take a body in
+pieces, but this embedding does not use that yet: each response is fetched
+whole from the network process and handed to Servo in one piece, with no size
+cap, which is one of the reasons for the warning above.
 
 **Building it is the expensive part.** The feature is off by default because
 Servo brings SpiderMonkey, Stylo and WebRender: about 1,200 crates and a 450 MB
@@ -203,8 +214,8 @@ syndeo-webkit https://www.youtube.com/watch?v=wXtngLBkK4Q
 ```
 
 macOS only. This is the one that plays video: WebKit for the engine, so Media
-Source Extensions and adaptive streaming work, with every byte — the DASH
-segments included — going through `syndeo-proxy` into our own cache. It starts
+Source Extensions and adaptive streaming work, with its HTTP and HTTPS loads —
+the DASH segments included — going through `syndeo-proxy` into our own cache. It starts
 that proxy itself, and stops it again however it exits. The installer puts it
 beside the proxy from 0.1.3 on.
 

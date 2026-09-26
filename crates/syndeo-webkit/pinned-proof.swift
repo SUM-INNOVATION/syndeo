@@ -3,9 +3,11 @@ import WebKit
 import Network
 import Security
 
-// The whole design in one file: WebKit renders, every byte goes through our
-// proxy, and the proxy's authority is trusted *here only* — pinned in this
-// process for this one proxy, never added to the system trust store.
+// The whole design in one file: WebKit renders, the web view is configured to
+// send its traffic through our proxy, and the proxy's authority is pinned in
+// this process as the only anchor for its server-trust challenges. Pinning is
+// not the whole of it: WebKit's networking process checks subresources against
+// the user's trust settings, which is why `syndeo-proxy ca --trust` exists.
 let caPath = CommandLine.arguments[1]
 let url = CommandLine.arguments[2]
 

@@ -88,6 +88,16 @@ the documentation said that were not true. This fixes them and says what is true
   to the proxy or `syndeo-webkit`.
 - `syndeo-proxy ca --trust` said macOS would ask for consent. It does not;
   the command asks for `yes` itself.
+- The README, the 0.1.2 notes, and `syndeo-webkit`'s own help and log said
+  every byte of its traffic went through the proxy, and nothing else. Its
+  HTTP and HTTPS loads do. What WebKit sends outside its proxy setting is not
+  covered, and WebRTC has not been measured.
+- The README, SECURITY.md and a CI comment said `syndeo-servo` was in no
+  release. v0.1.1 and v0.1.2 included it; it is out of the release archives
+  from v0.1.3 on.
+- The README and the `syndeo-servo` crate documentation said its resource
+  loading streams. It does not: each response is fetched whole and handed to
+  Servo in one piece, with no size cap.
 
 **Known, and not fixed here**
 
@@ -100,8 +110,9 @@ the documentation said that were not true. This fixes them and says what is true
 
 ## 0.1.2
 
-`syndeo-webkit`: a renderer that plays video, in tabs, with every byte still
-going through our own cache. macOS only, and in the tarball for the first time.
+`syndeo-webkit`: a renderer that plays video, in tabs, with its HTTP and HTTPS
+loads still going through our own cache. macOS only, and in the tarball for the
+first time. (Corrected in 0.1.3: this line first said every byte.)
 
 Servo cannot play a video and was never going to — its script engine contains
 one mention of `MediaSource` and it is a `TODO` — so this embeds WebKit
