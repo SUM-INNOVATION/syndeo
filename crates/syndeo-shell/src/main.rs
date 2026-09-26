@@ -4,7 +4,7 @@
 //! the agent; it decides what each of them is told; and it is the only thing in
 //! the tree that ever speaks to the keystore.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,10 +12,10 @@ use syndeo_dom::Document;
 use syndeo_ipc::confirm::{Confirmer, SessionSecret};
 use syndeo_ipc::protocol::{
     KeystoreRequest, KeystoreResponse, NetRequest, NetResponse, ShellRequest, ShellResponse,
-    SignaturePurpose,
 };
 use syndeo_ipc::transport::{Channel, Endpoint, Server};
-use syndeo_shell::prompt::{self, NonInteractive, Prompter, TerminalPrompter};
+use syndeo_shell::prompt::{NonInteractive, Prompter, TerminalPrompter};
+use syndeo_shell::signing::{self, unseal, Consent};
 use syndeo_shell::{Shell, Supervisor};
 
 #[derive(Parser)]
@@ -370,60 +370,23 @@ async fn sign(
     purpose: &str,
     typed_consent: bool,
 ) -> Result<()> {
-    let purpose = match purpose {
-        "login" => SignaturePurpose::OriginLogin,
-        "transaction" => SignaturePurpose::ChainTransaction,
-        "attestation" => SignaturePurpose::Attestation,
-        other => bail!("unknown purpose {other}; use login, transaction or attestation"),
-    };
-
-    let secret = SessionSecret::generate();
-    let mut supervisor = Supervisor::new(home);
-    let keystore = supervisor.start_keystore(&secret).await?;
-    unseal(&keystore).await?;
-
-    let shell = Shell::new(
-        Arc::new(Confirmer::new(secret)),
-        keystore,
-        Arc::new(TerminalPrompter),
-    );
-    let response = if typed_consent {
-        shell
-            .sign_with_typed_consent(
-                origin.to_string(),
-                purpose,
-                message.to_string(),
-                message.as_bytes().to_vec(),
-            )
-            .await
+    // Both checked before anything is started: an unknown purpose here, and
+    // the request itself inside `sign_message`, which starts and unseals a
+    // keystore only for a request that passed.
+    let purpose = signing::parse_purpose(purpose)?;
+    let consent = if typed_consent {
+        Consent::Typed
     } else {
-        shell
-            .handle(ShellRequest::RequestSignature {
-                origin: origin.to_string(),
-                purpose,
-                description: message.to_string(),
-                payload: message.as_bytes().to_vec(),
-            })
-            .await
+        Consent::Prompted
     };
-    supervisor.shutdown().await;
+    let signed = signing::sign_message(home, origin, message, purpose, consent).await?;
 
-    match response {
-        ShellResponse::Signed {
-            signature,
-            public_key,
-            address,
-        } => {
-            println!("origin      {origin}");
-            println!("address     {address}");
-            println!("public key  {public_key}");
-            println!("signature   {signature}");
-            Ok(())
-        }
-        ShellResponse::Declined(reason) => bail!("declined: {reason}"),
-        ShellResponse::Error(e) => bail!(e),
-        _ => bail!("unexpected reply"),
-    }
+    // The canonical origin, which is the one the key was derived for.
+    println!("origin      {}", signed.origin);
+    println!("address     {}", signed.address);
+    println!("public key  {}", signed.public_key);
+    println!("signature   {}", signed.signature);
+    Ok(())
 }
 
 async fn identity(home: &std::path::Path, origin: &str) -> Result<()> {
@@ -456,39 +419,6 @@ async fn identity(home: &std::path::Path, origin: &str) -> Result<()> {
         }
         ShellResponse::Error(e) => bail!(e),
         _ => bail!("unexpected reply"),
-    }
-}
-
-/// Ask the keystore what it needs, then supply it. The passphrase is read here,
-/// in the shell, and sent to the keystore — it never reaches the agent.
-async fn unseal(keystore: &Endpoint) -> Result<()> {
-    let mut channel = Channel::connect(keystore).await?;
-    let status: KeystoreResponse = channel.call(&KeystoreRequest::Status).await?;
-    let KeystoreResponse::Status {
-        initialized,
-        passphrase_required,
-        ..
-    } = status
-    else {
-        bail!("the keystore did not report a status");
-    };
-    if !initialized {
-        bail!("no keystore yet — run `syndeo-keystore init` first");
-    }
-
-    let passphrase = if passphrase_required {
-        Some(prompt::read_passphrase("Keystore passphrase: ").context("reading the passphrase")?)
-    } else {
-        None
-    };
-
-    match channel
-        .call(&KeystoreRequest::Unseal { passphrase })
-        .await?
-    {
-        KeystoreResponse::Ok => Ok(()),
-        KeystoreResponse::Error(e) => bail!(e),
-        _ => bail!("unexpected reply from the keystore"),
     }
 }
 

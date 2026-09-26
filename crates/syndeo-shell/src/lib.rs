@@ -11,7 +11,11 @@
 
 pub mod prompt;
 pub mod service;
+pub mod signing;
 pub mod supervisor;
+
+#[cfg(test)]
+mod test_support;
 
 pub use prompt::{Decision, NonInteractive, Prompter, SignatureRequest, TerminalPrompter};
 pub use service::Shell;
