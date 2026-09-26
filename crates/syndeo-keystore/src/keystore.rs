@@ -37,6 +37,19 @@ pub enum KeystoreError {
     Locked,
     #[error("a keystore already exists here; restore or remove it first")]
     AlreadyInitialized,
+    #[error(
+        "a wrapping key for a Syndeo keystore already exists in the operating system's \
+         credential store, possibly enrolled by another --home or SYNDEO_HOME; nothing was \
+         changed. `syndeo-keystore restore` with a recovery phrase replaces it deliberately, \
+         and any keystore sealed under the old key can then be opened only from its own phrase"
+    )]
+    WrappingKeyExists,
+    #[error(
+        "could not tell whether a wrapping key for a Syndeo keystore already exists in the \
+         operating system's credential store ({0}); nothing was changed. \
+         `syndeo-keystore restore` with a recovery phrase replaces any key there deliberately"
+    )]
+    WrappingKeyUnknown(crate::wrapping::WrappingError),
     #[error("no keystore has been set up")]
     NotInitialized,
     #[error("a passphrase is required on this platform because user presence is not enforced by the operating system")]
@@ -137,9 +150,21 @@ impl Keystore {
 
     /// First run. Generates entropy, seals it, and returns the recovery phrase
     /// exactly once — it is never written to disk, here or anywhere.
+    ///
+    /// Refuses unless both halves are absent. The sealed seed is per home, but
+    /// the credential store entry holding the wrapping key is one per machine
+    /// user, so a home with no seed says nothing about whether another home's
+    /// seed depends on that entry. Enrolling here would replace its key and
+    /// leave that seed unopenable. Not being able to tell counts as the key
+    /// being there: a refused setup costs a retry, a wrong guess costs a seed.
     pub fn initialize(&self, passphrase: Option<&str>) -> Result<(Zeroizing<String>, Address)> {
         if self.vault.exists() {
             return Err(KeystoreError::AlreadyInitialized);
+        }
+        match self.wrapping.exists() {
+            Ok(false) => {}
+            Ok(true) => return Err(KeystoreError::WrappingKeyExists),
+            Err(err) => return Err(KeystoreError::WrappingKeyUnknown(err)),
         }
         self.require_passphrase(passphrase)?;
 
@@ -155,6 +180,9 @@ impl Keystore {
     }
 
     /// Restore from a recovery phrase, replacing whatever is here.
+    ///
+    /// Including a wrapping key some other home enrolled: this is the deliberate
+    /// way to replace one, which is why [`Keystore::initialize`] points here.
     pub fn restore(&self, phrase: &str, passphrase: Option<&str>) -> Result<Address> {
         self.require_passphrase(passphrase)?;
         let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase.trim())
@@ -589,6 +617,81 @@ mod tests {
             keystore.initialize(Some(PASS)),
             Err(KeystoreError::AlreadyInitialized)
         ));
+    }
+
+    #[test]
+    fn setup_refuses_where_a_seed_is_sealed_even_with_no_key_enrolled() {
+        let (_dir, keystore, wrapping) = keystore();
+        keystore.initialize(Some(PASS)).unwrap();
+        wrapping.erase().unwrap();
+        let seed = std::fs::read(keystore.vault.sealed_path()).unwrap();
+
+        assert!(matches!(
+            keystore.initialize(Some(PASS)),
+            Err(KeystoreError::AlreadyInitialized)
+        ));
+        assert_eq!(std::fs::read(keystore.vault.sealed_path()).unwrap(), seed);
+        assert_eq!(wrapping.stored(), None);
+    }
+
+    /// Two homes, one credential store entry: the second setup must not take
+    /// the key the first home's seed is sealed under.
+    #[test]
+    fn setup_refuses_when_another_home_enrolled_the_wrapping_key() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(InMemoryKeyStore::default());
+        let first = Keystore::open(first_dir.path(), shared.clone()).unwrap();
+        let second = Keystore::open(second_dir.path(), shared.clone()).unwrap();
+
+        first.initialize(Some(PASS)).unwrap();
+        first.lock();
+        let key = shared.stored().unwrap();
+
+        assert!(matches!(
+            second.initialize(Some(PASS)),
+            Err(KeystoreError::WrappingKeyExists)
+        ));
+        assert_eq!(shared.stored(), Some(key));
+        assert!(!second.vault.exists());
+        assert!(!second.status().unsealed);
+        first.unseal(Some(PASS)).unwrap();
+    }
+
+    #[test]
+    fn setup_refuses_when_the_credential_store_cannot_say_whether_a_key_exists() {
+        let (_dir, keystore, wrapping) = keystore();
+        wrapping.fail_existence_checks();
+
+        assert!(matches!(
+            keystore.initialize(Some(PASS)),
+            Err(KeystoreError::WrappingKeyUnknown(_))
+        ));
+        assert_eq!(wrapping.stored(), None);
+        assert!(!keystore.vault.exists());
+    }
+
+    #[test]
+    fn setup_proceeds_when_neither_a_seed_nor_a_key_exists() {
+        let (_dir, keystore, wrapping) = keystore();
+        assert!(!keystore.vault.exists());
+        assert!(!wrapping.exists().unwrap());
+
+        keystore.initialize(Some(PASS)).unwrap();
+        assert!(keystore.vault.exists());
+        assert!(wrapping.exists().unwrap());
+    }
+
+    /// Restore keeps its meaning: it is the deliberate way to replace a key,
+    /// including one another home enrolled.
+    #[test]
+    fn restore_still_replaces_an_enrolled_key() {
+        let (_dir, keystore, wrapping) = keystore();
+        let (mnemonic, address) = keystore.initialize(Some(PASS)).unwrap();
+        let key = wrapping.stored().unwrap();
+
+        assert_eq!(keystore.restore(&mnemonic, Some(PASS)).unwrap(), address);
+        assert_ne!(wrapping.stored(), Some(key));
     }
 
     #[test]

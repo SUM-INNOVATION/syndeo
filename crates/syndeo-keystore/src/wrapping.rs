@@ -32,6 +32,16 @@ pub trait WrappingKeyStore: Send + Sync {
     fn store(&self, key: &[u8; 32]) -> Result<()>;
     fn load(&self) -> Result<Zeroizing<[u8; 32]>>;
     fn erase(&self) -> Result<()>;
+    /// Whether any wrapping key is held under this store's name, wherever the
+    /// store might have put it.
+    ///
+    /// Asked before enrolment writes a new key, because writing replaces: the
+    /// entry is shared by every keystore home on the machine, so an `Ok(false)`
+    /// here is permission to destroy whatever key was there. An `Err` means
+    /// absence could not be shown, and callers treat it as presence. Where the
+    /// store can answer from metadata alone, it must not read the key or ask
+    /// the user for anything.
+    fn exists(&self) -> Result<bool>;
     /// True when the operating system gates access to *this* wrapping key on
     /// user presence. A property of the key as enrolled, not of the platform:
     /// claiming it because the platform could have enforced it, when the key was
@@ -69,14 +79,67 @@ impl OsKeyring {
     }
 
     /// Whether the key is enrolled where the operating system gates it.
+    ///
+    /// Only ever used to choose where to read from and what to report, so an
+    /// answer that could not be had reads as "not gated": claiming a guarantee
+    /// we could not confirm is the worse mistake of the two.
     #[cfg(target_os = "macos")]
     fn enrolled_in_enclave(&self) -> bool {
-        self.enclave.exists()
+        matches!(self.enclave.exists(), Ok(true))
     }
 
     #[cfg(not(target_os = "macos"))]
     fn enrolled_in_enclave(&self) -> bool {
         false
+    }
+
+    /// Whether the ordinary keychain holds the entry `keyring` would read,
+    /// asked for its attributes only.
+    ///
+    /// Same keychain as `keyring` uses (the user's default), same class,
+    /// service and account, so it is the same item. The legacy keychain applies
+    /// its access list when the secret is read, not when attributes are, so
+    /// this does not raise the "allow access" dialog that `get_password` can.
+    #[cfg(target_os = "macos")]
+    fn fallback_exists(&self) -> Result<bool> {
+        use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+        use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
+        use security_framework_sys::base::errSecItemNotFound;
+
+        let keychain = SecKeychain::default_for_domain(SecPreferencesDomain::User)
+            .map_err(|e| WrappingError::Store(e.to_string()))?;
+        let found = ItemSearchOptions::new()
+            .keychains(&[keychain])
+            .class(ItemClass::generic_password())
+            .service(&self.service)
+            .account(&self.account)
+            .load_attributes(true)
+            .limit(Limit::Max(1))
+            .search();
+        match found {
+            Ok(items) => Ok(!items.is_empty()),
+            Err(e) if e.code() == errSecItemNotFound => Ok(false),
+            Err(e) => Err(WrappingError::Store(e.to_string())),
+        }
+    }
+
+    /// Whether the platform credential store holds the entry.
+    ///
+    /// `keyring` has no metadata-only query, so this is `get_password`, and the
+    /// secret it returns is dropped (zeroized) unread. On Linux that may ask the
+    /// Secret Service to unlock its collection, which is the same prompt
+    /// unsealing would raise. Only `NoEntry` is absence; any other failure,
+    /// including an ambiguous match, is an error, never a "no".
+    #[cfg(not(target_os = "macos"))]
+    fn fallback_exists(&self) -> Result<bool> {
+        match self.entry()?.get_password() {
+            Ok(secret) => {
+                drop(Zeroizing::new(secret));
+                Ok(true)
+            }
+            Err(keyring::Error::NoEntry) => Ok(false),
+            Err(e) => Err(WrappingError::Store(e.to_string())),
+        }
     }
 }
 
@@ -130,6 +193,24 @@ impl WrappingKeyStore for OsKeyring {
         }
     }
 
+    /// Both places a key could be, whichever this build would write to.
+    ///
+    /// A signed build writes to the enclave and an unsigned one to the ordinary
+    /// keychain, and either may run against a machine the other enrolled, so
+    /// asking only where this build would write could miss the key it is about
+    /// to orphan. The enclave is asked even when this build cannot enrol there,
+    /// and whatever it answers other than "no such item" is an error, not
+    /// absence.
+    fn exists(&self) -> Result<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            if self.enclave.exists()? {
+                return Ok(true);
+            }
+        }
+        self.fallback_exists()
+    }
+
     /// Whether the key *we actually hold* is gated by the operating system.
     ///
     /// Only the enclave is asked, and only about the item's existence, never its
@@ -146,6 +227,23 @@ impl WrappingKeyStore for OsKeyring {
 #[derive(Default)]
 pub struct InMemoryKeyStore {
     key: std::sync::Mutex<Option<[u8; 32]>>,
+    /// When set, [`WrappingKeyStore::exists`] fails, standing in for a
+    /// credential store that could not be asked.
+    unanswerable: std::sync::atomic::AtomicBool,
+}
+
+impl InMemoryKeyStore {
+    /// Make [`WrappingKeyStore::exists`] return an error from now on, so a test
+    /// can show that not knowing is treated as a key being there.
+    pub fn fail_existence_checks(&self) {
+        self.unanswerable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The key as it is stored now, for comparing before and after.
+    pub fn stored(&self) -> Option<[u8; 32]> {
+        *self.key.lock().unwrap()
+    }
 }
 
 impl WrappingKeyStore for InMemoryKeyStore {
@@ -165,6 +263,15 @@ impl WrappingKeyStore for InMemoryKeyStore {
     fn erase(&self) -> Result<()> {
         *self.key.lock().unwrap() = None;
         Ok(())
+    }
+
+    fn exists(&self) -> Result<bool> {
+        if self.unanswerable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(WrappingError::Store(
+                "the credential store could not be asked".into(),
+            ));
+        }
+        Ok(self.key.lock().unwrap().is_some())
     }
 
     fn presence_enforced(&self) -> bool {

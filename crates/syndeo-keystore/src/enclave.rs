@@ -26,15 +26,28 @@ use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::CFString;
 use core_foundation_sys::base::{CFRelease, CFTypeRef};
+use core_foundation_sys::string::CFStringRef;
 use security_framework::access_control::{ProtectionMode, SecAccessControl};
 use security_framework::passwords::AccessControlOptions;
 use security_framework_sys::base::{errSecItemNotFound, errSecSuccess};
 use security_framework_sys::item::{
     kSecAttrAccessControl, kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword,
-    kSecReturnAttributes, kSecReturnData, kSecUseDataProtectionKeychain, kSecValueData,
+    kSecReturnAttributes, kSecReturnData, kSecUseAuthenticationUI, kSecUseDataProtectionKeychain,
+    kSecValueData,
 };
 use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete};
 use zeroize::Zeroizing;
+
+/// `errSecInteractionNotAllowed`: the item is there, but answering would have
+/// needed the user, and the query said not to ask.
+const INTERACTION_NOT_ALLOWED: i32 = -25308;
+
+// Not exported by `security-framework-sys`. Security.framework, which that
+// crate already links, does.
+#[link(name = "Security", kind = "framework")]
+extern "C" {
+    static kSecUseAuthenticationUIFail: CFStringRef;
+}
 
 /// A generic-password item in the data protection keychain, gated on presence.
 pub struct EnclaveItem {
@@ -177,13 +190,31 @@ impl EnclaveItem {
     ///
     /// Asking for attributes rather than data is what makes this free: the
     /// access control is evaluated when the *data* is returned, so this answers
-    /// "is the key enrolled here" without a biometric prompt.
-    pub fn exists(&self) -> bool {
+    /// "is the key enrolled here" without a biometric prompt. The query also
+    /// says that no authentication UI may be shown, as a second guarantee
+    /// rather than the first.
+    ///
+    /// That is `kSecUseAuthenticationUIFail`, not `...Skip`: skipping would
+    /// silently leave out exactly the items that are gated, so the one item
+    /// this is meant to find could read as absent. With `Fail`, a gated item
+    /// that would have needed the user is reported as
+    /// `errSecInteractionNotAllowed`, which means it is there.
+    ///
+    /// Only `errSecItemNotFound` is absence. Anything else is an error, because
+    /// callers use a `false` here as permission to write over whatever might
+    /// have been there.
+    pub fn exists(&self) -> Result<bool> {
         let mut query = self.identity();
         query.push(unsafe {
             (
                 CFString::wrap_under_get_rule(kSecReturnAttributes),
                 CFBoolean::from(true).into_CFType(),
+            )
+        });
+        query.push(unsafe {
+            (
+                CFString::wrap_under_get_rule(kSecUseAuthenticationUI),
+                CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).into_CFType(),
             )
         });
 
@@ -193,7 +224,11 @@ impl EnclaveItem {
         if !found.is_null() {
             unsafe { CFRelease(found) };
         }
-        status == errSecSuccess
+        match status {
+            s if s == errSecSuccess || s == INTERACTION_NOT_ALLOWED => Ok(true),
+            s if s == errSecItemNotFound => Ok(false),
+            other => Err(WrappingError::Store(describe(other))),
+        }
     }
 
     pub fn delete(&self) -> Result<()> {
@@ -217,6 +252,7 @@ fn describe(status: i32) -> String {
         -25300 => " (no such item)",
         -128 => " (the user cancelled the authentication)",
         -25293 => " (authentication failed)",
+        -25308 => " (user interaction is not allowed)",
         _ => "",
     };
     format!("OSStatus {status}{meaning}")
@@ -248,7 +284,7 @@ mod tests {
     fn an_absent_item_reads_as_missing_rather_than_as_an_error() {
         let item = EnclaveItem::new("com.sum.syndeo.keystore.test", "definitely-not-enrolled");
         let _ = item.delete();
-        assert!(!item.exists());
+        assert!(matches!(item.exists(), Ok(false)));
         assert!(matches!(item.load(), Err(WrappingError::Missing)));
     }
 }

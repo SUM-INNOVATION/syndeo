@@ -7,11 +7,12 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use syndeo_ipc::confirm::{Confirmer, SessionSecret};
 use syndeo_ipc::transport::{Endpoint, Server};
-use syndeo_keystore::{Keystore, OsKeyring};
+use syndeo_keystore::{Address, Keystore, OsKeyring, WrappingKeyStore};
+use zeroize::Zeroizing;
 
 /// The shell passes the session secret this way and then clears it.
 const SECRET_VAR: &str = "SYNDEO_SESSION_SECRET";
@@ -61,9 +62,41 @@ fn home(override_path: Option<PathBuf>) -> PathBuf {
     })
 }
 
-fn open(home: &std::path::Path) -> Result<Arc<Keystore>> {
-    let wrapping = Arc::new(OsKeyring::new("com.sum.syndeo.keystore", "root-seed"));
+/// The operating system's credential store entry for the wrapping key.
+///
+/// One per machine user, not one per home: every `--home` and `SYNDEO_HOME`
+/// shares it, which is why enrolment asks whether it is taken before writing.
+fn os_keyring() -> Arc<dyn WrappingKeyStore> {
+    Arc::new(OsKeyring::new("com.sum.syndeo.keystore", "root-seed"))
+}
+
+fn open(home: &Path, wrapping: Arc<dyn WrappingKeyStore>) -> Result<Arc<Keystore>> {
     Ok(Arc::new(Keystore::open(home, wrapping)?))
+}
+
+/// `init`, once the terminal has been read.
+///
+/// Opens the keystore here, in this process, and never over the socket: the
+/// service refuses enrolment, and the person who is shown the recovery phrase
+/// has to be the one at this terminal. The credential store is a parameter so
+/// the tests can run the command against one that is not the user's.
+fn init(
+    home: &Path,
+    wrapping: Arc<dyn WrappingKeyStore>,
+    passphrase: Option<&str>,
+) -> Result<(Zeroizing<String>, Address)> {
+    Ok(open(home, wrapping)?.initialize(passphrase)?)
+}
+
+/// `restore`, once the terminal has been read. Direct for the same reasons as
+/// [`init`], and, unlike it, replaces whatever wrapping key is enrolled.
+fn restore(
+    home: &Path,
+    wrapping: Arc<dyn WrappingKeyStore>,
+    phrase: &str,
+    passphrase: Option<&str>,
+) -> Result<Address> {
+    Ok(open(home, wrapping)?.restore(phrase, passphrase)?)
 }
 
 #[tokio::main]
@@ -78,7 +111,8 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let home = home(cli.home);
-    let keystore = open(&home)?;
+    let wrapping = os_keyring();
+    let keystore = open(&home, wrapping.clone())?;
 
     match cli.command.unwrap_or(Command::Status) {
         Command::Serve { socket } => {
@@ -123,7 +157,7 @@ async fn main() -> Result<()> {
                 None
             };
 
-            let (mnemonic, address) = keystore.initialize(passphrase.as_deref())?;
+            let (mnemonic, address) = init(&home, wrapping, passphrase.as_deref())?;
             println!();
             println!("Recovery phrase — write it down now. It is shown once and never stored.");
             println!();
@@ -150,7 +184,7 @@ async fn main() -> Result<()> {
                 .read_line(&mut phrase)
                 .context("reading the recovery phrase")?;
             let passphrase = Some(read_new_passphrase()?);
-            let address = keystore.restore(phrase.trim(), passphrase.as_deref())?;
+            let address = restore(&home, wrapping, phrase.trim(), passphrase.as_deref())?;
             println!("Restored: {address}");
             Ok(())
         }
@@ -212,4 +246,110 @@ async fn main() -> Result<()> {
 
 fn read_new_passphrase() -> Result<String> {
     Ok(syndeo_keystore::passphrase::read_new()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syndeo_keystore::wrapping::InMemoryKeyStore;
+    use syndeo_keystore::KeystoreError;
+
+    const PASS: &str = "a passphrase the user chose";
+
+    fn sealed(home: &Path) -> PathBuf {
+        home.join(".keystore").join("seed.sealed")
+    }
+
+    fn keystore_error(err: &anyhow::Error) -> Option<&KeystoreError> {
+        err.downcast_ref::<KeystoreError>()
+    }
+
+    #[test]
+    fn init_seals_a_seed_in_the_home_it_was_given() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryKeyStore::default());
+
+        let (mnemonic, address) = init(home.path(), store.clone(), Some(PASS)).unwrap();
+        assert_eq!(mnemonic.split_whitespace().count(), 24);
+        assert!(sealed(home.path()).is_file());
+        assert!(store.stored().is_some());
+
+        // And the command left behind something that opens.
+        let keystore = open(home.path(), store).unwrap();
+        assert_eq!(keystore.identity_hint(), Some(address.to_base58()));
+        keystore.unseal(Some(PASS)).unwrap();
+    }
+
+    /// The defect this guards against: the credential store entry is shared by
+    /// every home, and `init` in a second one used to replace the first one's
+    /// wrapping key, leaving its seed unopenable.
+    #[test]
+    fn init_in_a_second_home_leaves_the_first_homes_key_alone() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let shared = Arc::new(InMemoryKeyStore::default());
+
+        init(first.path(), shared.clone(), Some(PASS)).unwrap();
+        let key = shared.stored().unwrap();
+
+        let err = init(second.path(), shared.clone(), Some(PASS)).unwrap_err();
+        assert!(
+            matches!(keystore_error(&err), Some(KeystoreError::WrappingKeyExists)),
+            "{err:#}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("nothing was changed"), "{message}");
+        assert!(message.contains("syndeo-keystore restore"), "{message}");
+
+        assert_eq!(shared.stored(), Some(key), "the first home's key changed");
+        assert!(!sealed(second.path()).exists());
+
+        // The first home still opens, which is the whole point.
+        open(first.path(), shared)
+            .unwrap()
+            .unseal(Some(PASS))
+            .unwrap();
+    }
+
+    #[test]
+    fn init_refuses_when_the_credential_store_cannot_say() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryKeyStore::default());
+        store.fail_existence_checks();
+
+        let err = init(home.path(), store.clone(), Some(PASS)).unwrap_err();
+        assert!(
+            matches!(
+                keystore_error(&err),
+                Some(KeystoreError::WrappingKeyUnknown(_))
+            ),
+            "{err:#}"
+        );
+        assert_eq!(store.stored(), None);
+        assert!(!sealed(home.path()).exists());
+    }
+
+    #[test]
+    fn restore_recovers_the_identity_the_phrase_names() {
+        let original = tempfile::tempdir().unwrap();
+        let (mnemonic, address) = init(
+            original.path(),
+            Arc::new(InMemoryKeyStore::default()),
+            Some(PASS),
+        )
+        .unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryKeyStore::default());
+        let restored = restore(
+            home.path(),
+            store.clone(),
+            &mnemonic,
+            Some("a different passphrase"),
+        )
+        .unwrap();
+        assert_eq!(restored, address);
+        assert!(sealed(home.path()).is_file());
+        assert!(store.stored().is_some());
+    }
 }
