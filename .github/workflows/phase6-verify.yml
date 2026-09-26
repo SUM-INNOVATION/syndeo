@@ -1,0 +1,263 @@
+# Temporary: Phase 6 verification of the published v0.1.3, on Linux.
+#
+# Lives only on the phase6/verify branch and runs only when that branch is
+# pushed. It installs and runs the published release, never anything built
+# from this branch: the verifier and the installer come from the immutable
+# v0.1.3 URLs, and the binaries are the ones the installer downloads and
+# checks against the release's SHA256SUMS. No secrets are passed in, and the
+# token can only read.
+name: Phase 6 verification (temporary)
+
+on:
+  push:
+    branches: [phase6/verify]
+
+permissions:
+  contents: read
+
+env:
+  VERSION: "0.1.3"
+  BASE: https://raw.githubusercontent.com/SUM-INNOVATION/syndeo/v0.1.3
+
+jobs:
+  ubuntu:
+    name: native Ubuntu 22.04 ${{ matrix.arch }} VM (E2/E3, with E5 headless UI)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    steps:
+      - name: Identify the environment
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          mkdir -p logs
+          {
+            echo "environment: native Ubuntu 22.04 ${{ matrix.arch }} GitHub-hosted VM (${{ matrix.runner }})"
+            uname -a; cat /etc/os-release; ldd --version | head -1
+          } | tee logs/environment.txt
+
+      - name: Packages for the headless UI and the Secret Service
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            xvfb xauth dbus-x11 gnome-keyring libsecret-tools \
+            libgl1-mesa-dri libegl1 mesa-vulkan-drivers libxkbcommon-x11-0 \
+            file >/dev/null
+
+      - name: ci/verify-release.sh 0.1.3, unchanged, from the tag
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          curl -fsSLo verify.sh "$BASE/ci/verify-release.sh"
+          sha256sum verify.sh | tee logs/verifier.sha256
+          SYNDEO_INSTALLER="$BASE/install.sh" bash verify.sh "$VERSION" 2>&1 | tee logs/verify-release.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Install again, into known directories, for the inventory
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          root="$RUNNER_TEMP/p6"; mkdir -p "$root"
+          echo "BIN=$root/bin" >> "$GITHUB_ENV"
+          echo "HOME_DIR=$root/home" >> "$GITHUB_ENV"
+          curl -fsSL "$BASE/install.sh" | SYNDEO_INSTALL_DIR="$root/bin" SYNDEO_HOME="$root/home" sh 2>&1 | tee logs/install.log
+          {
+            ls -l "$root/bin"
+            sha256sum "$root"/bin/*
+            for b in "$root"/bin/*; do "$b" --version; done
+            for b in "$root"/bin/*; do file -b "$b" | cut -d, -f1-2; done
+          } 2>&1 | tee logs/inventory.txt
+
+      - name: "Smoke 2 and 16: commands, and what is and is not installed"
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -o pipefail
+          export SYNDEO_HOME="$HOME_DIR"
+          {
+            for absent in syndeo-webkit syndeo-servo; do
+              if [ -e "$BIN/$absent" ]; then echo "FAIL: $absent is installed"; exit 1; fi
+              echo "ok: $absent is not installed"
+            done
+            "$BIN/syndeo" browse https://www.rust-lang.org/ --twice 2>/dev/null | head -4
+            "$BIN/syndeo" stats | head -1
+            "$BIN/syndeo" doctor 2>&1
+            # A proxy started the way a script or nohup would, stdin /dev/null:
+            "$BIN/syndeo-proxy" run --listen 127.0.0.1:18899 </dev/null >/dev/null 2>&1 &
+            pid=$!; sleep 5
+            if kill -0 "$pid" 2>/dev/null; then echo "ok: a backgrounded proxy is still up after 5s"; else echo "FAIL: the backgrounded proxy exited"; exit 1; fi
+            kill "$pid"; wait "$pid" 2>/dev/null || true
+          } 2>&1 | tee logs/smoke-2-16.log
+
+      - name: "E5: syndeo-ui starts under Xvfb (headless, software rendering)"
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          export SYNDEO_HOME="$HOME_DIR"
+          set +e
+          xvfb-run -a timeout 20 "$BIN/syndeo-ui" --no-keys https://www.rust-lang.org/ >logs/ui.log 2>&1
+          status=$?
+          set -e
+          echo "exit status $status (124 means it was still running when stopped after 20s)" | tee -a logs/ui.log
+          [ "$status" -eq 124 ]
+
+      - name: "E5 and smoke 12 on Linux: keystore init with a headless Secret Service"
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set +x
+          private=$(mktemp -d); chmod 700 "$private"
+          cat >"$private/keystore.sh" <<'SCRIPT'
+          set +x
+          first="$1"; second="$2"; out="$3"
+          # An unlocked login keyring for this session only, under a password
+          # nobody sees.
+          eval "$(openssl rand -hex 16 | tr -d '\n' | gnome-keyring-daemon --unlock --components=secrets)"
+          export GNOME_KEYRING_CONTROL
+          # A passphrase nobody sees: generated here, handed over once in the
+          # environment, which the keystore removes from itself on reading.
+          SYNDEO_PASSPHRASE="$(openssl rand -hex 16)" SYNDEO_HOME="$first" \
+            "$BIN/syndeo-keystore" init >"$out/init.out" 2>"$out/init.err"
+          code=$?
+          if [ "$code" -eq 0 ] && grep -q "^Identity: " "$out/init.out"; then
+            echo "ok: syndeo-keystore init succeeded (recovery phrase shown and discarded, not logged)"
+          else
+            echo "FAIL: syndeo-keystore init exited $code"; sed "s/^/  stderr: /" "$out/init.err"
+          fi
+          SYNDEO_HOME="$first" "$BIN/syndeo-keystore" status 2>/dev/null | grep -E "initialized|presence" || true
+          # M5: a second home must not replace the key the first depends on.
+          SYNDEO_PASSPHRASE="$(openssl rand -hex 16)" SYNDEO_HOME="$second" \
+            "$BIN/syndeo-keystore" init >"$out/second.out" 2>"$out/second.err"
+          code2=$?
+          if [ "$code2" -ne 0 ] && grep -q "already exists" "$out/second.err"; then
+            echo "ok: init in a second home is refused: $(grep -o "a wrapping key[^;]*; nothing was changed" "$out/second.err" | head -1)"
+          else
+            echo "FAIL: init in a second home was not refused (exit $code2)"
+          fi
+          [ "$code" -eq 0 ] && [ "$code2" -ne 0 ]
+          SCRIPT
+          dbus-run-session -- bash "$private/keystore.sh" "$HOME_DIR" "$RUNNER_TEMP/p6/second-home" "$private" 2>&1 | tee logs/keystore.log
+          status=${PIPESTATUS[0]}
+          rm -rf "$private"
+          exit "$status"
+
+      - name: Refuse to upload anything secret
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          # The recovery phrase is printed as a numbered grid; a match of that
+          # shape, or of the heading above it, in any log fails this job
+          # without printing what matched.
+          if grep -rlE '^ ?1\. [a-z]{3,8} +2\. [a-z]{3,8}|Recovery phrase' logs >/dev/null 2>&1; then
+            echo "a log contains recovery-phrase output; not uploading"; exit 1
+          fi
+          echo "no recovery-phrase output in the logs"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phase6-native-ubuntu-22.04-${{ matrix.arch }}
+          path: logs/
+          if-no-files-found: error
+
+  debian:
+    name: Debian 12 userland in a container on an Ubuntu 22.04 kernel (${{ matrix.arch }}) (E4)
+    runs-on: ${{ matrix.runner }}
+    container: debian:12
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    steps:
+      - name: Packages the verifier needs
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends curl ca-certificates file procps >/dev/null
+
+      - name: Identify the environment
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          mkdir -p logs
+          {
+            echo "environment: Debian 12 userland in a container (debian:12) on a GitHub-hosted Ubuntu 22.04 ${{ matrix.arch }} VM kernel; not a Debian host"
+            uname -a; cat /etc/os-release; ldd --version | head -1
+          } | tee logs/environment.txt
+
+      - name: ci/verify-release.sh 0.1.3, unchanged, from the tag
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          curl -fsSLo verify.sh "$BASE/ci/verify-release.sh"
+          sha256sum verify.sh | tee logs/verifier.sha256
+          SYNDEO_INSTALLER="$BASE/install.sh" bash verify.sh "$VERSION" 2>&1 | tee logs/verify-release.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Install again, into known directories, for the inventory
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          root="$RUNNER_TEMP/p6"; mkdir -p "$root"
+          echo "BIN=$root/bin" >> "$GITHUB_ENV"
+          echo "HOME_DIR=$root/home" >> "$GITHUB_ENV"
+          curl -fsSL "$BASE/install.sh" | SYNDEO_INSTALL_DIR="$root/bin" SYNDEO_HOME="$root/home" sh 2>&1 | tee logs/install.log
+          {
+            ls -l "$root/bin"
+            sha256sum "$root"/bin/*
+            for b in "$root"/bin/*; do "$b" --version; done
+            for b in "$root"/bin/*; do file -b "$b" | cut -d, -f1-2; done
+          } 2>&1 | tee logs/inventory.txt
+
+      - name: "Smoke 2 and 16: commands, and what is and is not installed"
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -o pipefail
+          export SYNDEO_HOME="$HOME_DIR"
+          {
+            for absent in syndeo-webkit syndeo-servo; do
+              if [ -e "$BIN/$absent" ]; then echo "FAIL: $absent is installed"; exit 1; fi
+              echo "ok: $absent is not installed"
+            done
+            "$BIN/syndeo" browse https://www.rust-lang.org/ --twice 2>/dev/null | head -4
+            "$BIN/syndeo" stats | head -1
+            "$BIN/syndeo" doctor 2>&1
+            "$BIN/syndeo-proxy" run --listen 127.0.0.1:18899 </dev/null >/dev/null 2>&1 &
+            pid=$!; sleep 5
+            if kill -0 "$pid" 2>/dev/null; then echo "ok: a backgrounded proxy is still up after 5s"; else echo "FAIL: the backgrounded proxy exited"; exit 1; fi
+            kill "$pid"; wait "$pid" 2>/dev/null || true
+          } 2>&1 | tee logs/smoke-2-16.log
+
+      - name: Refuse to upload anything secret
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          if grep -rlE '^ ?1\. [a-z]{3,8} +2\. [a-z]{3,8}|Recovery phrase' logs >/dev/null 2>&1; then
+            echo "a log contains recovery-phrase output; not uploading"; exit 1
+          fi
+          echo "no recovery-phrase output in the logs"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phase6-debian-12-container-${{ matrix.arch }}
+          path: logs/
+          if-no-files-found: error
