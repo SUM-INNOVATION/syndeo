@@ -86,8 +86,8 @@ jobs:
       # Advisories over what ships, which is the renderer's opposite: Servo is
       # behind an off-by-default feature and is in no release tarball, and its
       # dependency tree carries advisories nobody here can act on. Gating every
-      # merge on those would train people to ignore this check. It is looked at
-      # weekly instead, at the end of the renderer job.
+      # merge on those would train people to ignore this check. It is reported
+      # weekly instead, by `servo-advisories` below, which never gates.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories
@@ -115,10 +115,45 @@ jobs:
 
       - run: cargo check -p syndeo-servo --features renderer --locked
 
-      # What the renderer's own dependency tree is carrying. Weekly, and here
-      # rather than in `deny`, because it is a report on a tree we do not
-      # control and do not ship — worth knowing, not worth blocking a merge on.
-      - uses: EmbarkStudios/cargo-deny-action@v2
+  servo-advisories:
+    name: servo advisories (report, not shipped)
+    # What the renderer's own dependency tree is carrying: weekly, and never a
+    # gate, because it is a report on a tree we do not control and that sits
+    # behind an off-by-default feature. What ships is gated by `deny` above on
+    # every commit. This used to be the last step of `renderer`, where it could
+    # never run: cargo-deny-action is a container action, and containers need
+    # Linux. Reading advisories needs the lock file, not a Servo build, so it
+    # lives on Linux in a job of its own.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
         with:
-          command: check advisories
-          arguments: --locked --all-features
+          tool: cargo-deny@0.20
+
+      # Every finding and cargo-deny's own exit status go in the job summary,
+      # whatever that status is. A non-zero status is a warning on the run
+      # rather than a failure, because the tree it describes is not shipped.
+      - name: Report
+        shell: bash
+        run: |
+          set +e
+          cargo deny --color never --locked --all-features check advisories > report.txt 2>&1
+          status=$?
+          set -e
+          cat report.txt
+          {
+            echo "## Servo advisory report (not shipped, non-gating)"
+            echo
+            echo "\`cargo deny --locked --all-features check advisories\` exited with status **${status}**."
+            echo "This covers every feature, the renderer included. What ships is gated separately, by the \`cargo-deny\` job."
+            echo
+            echo '```'
+            cat report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning title=Servo advisory report::cargo-deny exited with status ${status} over every feature, the renderer included. The full findings are in the job summary."
+          fi
