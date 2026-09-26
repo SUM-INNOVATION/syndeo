@@ -1,14 +1,16 @@
-//! Trusting the proxy's authority here, and nowhere else.
+//! Pinning the proxy's authority in this process.
 //!
 //! Caching HTTPS means terminating it, so `syndeo-proxy` presents a certificate
-//! it issued itself and the web view has to accept that issuer. The obvious way
-//! is to install the authority in the system trust store, and it is the wrong
-//! way: an authority every application on the machine trusts, sitting in a file
-//! on disk, is a key worth stealing — whoever takes it can impersonate any site
-//! to anything, not just to this browser.
+//! it issued itself and the web view has to accept that issuer. WebKit checks
+//! subresources in its networking process against the user's trust settings,
+//! so the authority has to be trusted there too: `syndeo-proxy ca --trust` adds
+//! it to this user's login keychain, for TLS only. It never goes in the System
+//! keychain, so nobody else on the machine trusts it — but every application
+//! this user runs does, which is why `--trust` asks first, says where the key
+//! is, and `--untrust` takes it out again.
 //!
-//! So it is pinned instead. This process trusts that one issuer, evaluated as
-//! the *only* anchor, and the system trust store is never touched. Hostname
+//! This process also pins it. A server-trust challenge in the web view is
+//! evaluated with that one issuer as the *only* anchor. Hostname
 //! verification still applies: this accepts a certificate for `example.com`
 //! issued by our authority, and refuses one for `example.com` issued by
 //! anybody else — including the real web PKI, which is the point. A response

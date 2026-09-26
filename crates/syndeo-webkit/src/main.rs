@@ -1,9 +1,10 @@
-//! A renderer that works, confined to a proxy it cannot bypass.
+//! A renderer that works, configured to send its traffic through
+//! syndeo-proxy, with the proxy's certificate pinned.
 //!
 //! macOS only, and not by omission: this embeds `WKWebView`, and the whole
 //! design rests on two things only WebKit on this platform provides — a data
-//! store that can be pointed at a proxy it cannot route around, and an
-//! authentication challenge we can answer with a pinned authority. There is no
+//! store that can be configured with a proxy, and an authentication challenge
+//! we can answer with a pinned authority. There is no
 //! meaningful "port" of that to another platform; there is a different design,
 //! for a different engine, which is a different piece of work.
 //!

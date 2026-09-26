@@ -10,8 +10,10 @@ going through our own cache. macOS only, and in the tarball for the first time.
 
 Servo cannot play a video and was never going to — its script engine contains
 one mention of `MediaSource` and it is a `TODO` — so this embeds WebKit
-instead, and keeps boundary one by containment rather than by asking the engine
-nicely: the web view is pointed at `syndeo-proxy` and cannot route around it.
+instead, and keeps boundary one by configuration: the web view is configured
+to send its traffic through `syndeo-proxy`, with the proxy's certificate pinned.
+(Corrected in 0.1.3. This paragraph first said the web view could not get past
+the proxy, as though a sandbox held it there; it is a configuration.)
 Measured on a YouTube watch page, sequential DASH segments through our cache:
 
     videoplayback?...&rn=15   200  1678ms
@@ -47,7 +49,9 @@ Measured on a YouTube watch page, sequential DASH segments through our cache:
 
 Unchanged and still true: Servo remains in the tree as the only configuration
 where a renderer provably opens no socket at all, and `syndeo-webkit` is the
-weaker claim — one socket, to loopback, with the sandbox making it the only one.
+weaker claim — configured to send its traffic through syndeo-proxy, with the
+proxy's certificate pinned. (Corrected in 0.1.3: this line first credited a
+sandbox with keeping it there.)
 
 ## 0.1.1
 

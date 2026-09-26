@@ -1,4 +1,5 @@
-//! A renderer that works, confined to a proxy it cannot bypass.
+//! A renderer that works, configured to send its traffic through
+//! syndeo-proxy, with the proxy's certificate pinned.
 //!
 //! `syndeo-servo` honours boundary one exactly: Servo asks the embedder about
 //! every load, and every one is answered from the network process, so the
@@ -9,59 +10,27 @@
 //!
 //! WebKit has both. What WebKit does not have is a way to let an embedder
 //! answer an ordinary HTTP load: `WKURLSchemeHandler` refuses `http` and
-//! `https`, exactly as Servo's `ProtocolRegistry` does. Taken at face value
-//! that means choosing between an engine that works and a boundary that holds.
+//! `https`, exactly as Servo's `ProtocolRegistry` does.
 //!
-//! It is not actually a choice, because the boundary was never about the API.
-//! It is about what the renderer can reach. Here it reaches one proxy on
-//! loopback and nothing else, and that proxy is `syndeo-proxy` in front of
-//! `syndeo-net` — so the cache, the DNS policy, the partitioning and the peer
-//! fetch are all still ours, and the renderer still never learns an address, a
-//! certificate or a DNS answer.
+//! So the web view is given a proxy. Its data store is configured to send its
+//! traffic through `syndeo-proxy` on loopback, in front of `syndeo-net`, so the
+//! cache, the DNS policy and the peer fetch are still ours.
 //!
-//! The claim changes honestly, and it is worth being precise about how. It was
-//! "the renderer opens no socket". It is now "the renderer can open exactly one
-//! socket, to loopback, and the sandbox is what makes it the only one." Weaker
-//! as a sentence. Stronger as an enforcement: the first was the engine agreeing
-//! to ask us, and the second is the kernel refusing to let it do otherwise.
+//! Precisely what that is: a configuration WebKit's networking process honours
+//! for the loads it makes, not a sandbox Syndeo controls and not a rule the
+//! kernel enforces. Servo's claim was "the renderer opens no socket"; this one
+//! is only that the web view is configured to use the proxy. Anything WebKit
+//! does not send through that setting is not covered by it — WebRTC's own
+//! transports are the obvious candidate, and are not yet measured.
 //!
-//! What this costs, stated plainly: caching HTTPS means terminating it, so the
-//! proxy presents its own certificate and the web view has to trust that
-//! authority. Adding it to the system trust store would be the wrong shape —
-//! an authority on disk that every application trusts is a key worth stealing.
-//! The right shape is to pin it here: accept that one issuer, for connections
-//! through that one proxy, in this process, and nowhere else.
-//!
-//! ## What is proven, and what is not
-//!
-//! Proven, by measurement rather than by argument:
-//!
-//! - The containment holds. A web view with `proxyConfigurations` set and no
-//!   pinning fails with "the certificate for this server is invalid — you might
-//!   be connecting to a server that is pretending to be example.com". That
-//!   error can only happen if the bytes went through our proxy and met our
-//!   certificate. The engine has no way around it.
-//! - With the authority pinned rather than installed, pages load and are
-//!   cached: rust-lang.org twice through the proxy gives 95 requests, 24 hits,
-//!   a 49.9% byte hit rate, and the second load reports a title.
-//! - The binary is 2.3 MB against `syndeo-servo`'s 127 MB, because the engine
-//!   is the operating system's rather than ours.
-//!
-//! Not proven, and not to be claimed until it is:
-//!
-//! - **The pinning is not in this binary yet.** It exists as a Swift proof of
-//!   the `didReceive(challenge:)` delegate, because `wry` does not expose that
-//!   callback. Until it is here, through `objc2-web-kit` or a patch upstream,
-//!   HTTPS through the proxy fails on the certificate and this renders nothing
-//!   but plaintext HTTP.
-//! - **Memory is unmeasured.** The figure taken for it turned out to be one of
-//!   Safari's thirteen WebContent processes, not ours. A clean comparison needs
-//!   a harness that attributes processes by parent.
-//! - **A YouTube watch page does not load through the proxy**, and the fault is
-//!   ours rather than WebKit's: the proxy answers
-//!   `transport: client error (SendRequest)` while `syndeo browse` fetches the
-//!   same URL over h2 in 300ms. Something in the proxy's forwarding path, not
-//!   in the network process behind it.
+//! Caching HTTPS means terminating it, so the proxy presents certificates it
+//! issued, and two things make WebKit accept them. The authority is trusted
+//! for TLS in this user's login keychain (`syndeo-proxy ca --trust`, which asks
+//! first), because WebKit validates subresources in its networking process
+//! against the user's trust settings and nothing in ours. And this process pins
+//! it: a server-trust challenge in the web view is evaluated with that one
+//! authority as the only anchor, so a certificate from anyone else is refused.
+//! See `pin_macos.rs`.
 
 use crate::pin;
 use anyhow::{Context, Result};
@@ -78,7 +47,7 @@ use wry::{WebView, WebViewBuilder};
 #[command(
     name = "syndeo-webkit",
     version,
-    about = "A renderer whose every load goes through the proxy, because it can reach nothing else"
+    about = "A renderer configured to send its traffic through syndeo-proxy, with the proxy's certificate pinned"
 )]
 struct Cli {
     /// The page to open.
@@ -104,7 +73,7 @@ struct Cli {
     ///
     /// Optional only so the two halves can be told apart when something does
     /// not load: without it this is an ordinary web view, and if that fails too
-    /// then the containment was never the problem.
+    /// then the proxy was never the problem.
     #[arg(long)]
     proxy: Option<String>,
 }
@@ -366,9 +335,8 @@ impl ApplicationHandler for App {
             )
             .expect("a window");
 
-        // The proxy is not a preference here, it is the containment. A web view
-        // built without it would reach the network directly and there would be
-        // no boundary left to talk about.
+        // The proxy is what puts this renderer behind our cache and DNS policy.
+        // A web view built without it would reach the network directly.
         let mut builder = WebViewBuilder::new()
             .with_initialization_script(if self.autoplay { AUTOPLAY } else { "" })
             .with_bounds(wry::Rect {

@@ -92,7 +92,7 @@ refactorable; get them wrong and no amount of later work recovers it.
 | `syndeo-shell` | the process model and the prompt, as a library, plus the `syndeo` command |
 | `syndeo-ui` | the windowed shell: winit, wgpu, egui, accesskit |
 | `syndeo-servo` | Servo embedded, with its resource loading replaced by the net process |
-| `syndeo-webkit` | WebKit embedded, confined to a proxy it cannot bypass — the one that plays video (macOS) |
+| `syndeo-webkit` | WebKit embedded, configured to send its traffic through syndeo-proxy, with the proxy's certificate pinned — the one that plays video (macOS) |
 | `syndeo-proxy` | a local intercepting proxy, to measure the cache on real traffic |
 
 ## Build order
@@ -199,14 +199,15 @@ Tabs: `⌘T` opens, `⌘W` closes, `⌘[` and `⌘]` cycle, `⌘1`–`⌘9` jump
 rather than destroyed, so a tab keeps its scroll position, its heap and its
 playing video, and all of them share one process.
 
-Boundary one holds differently here, and the difference is worth stating rather
-than glossing. With Servo the renderer opens no socket at all, because Servo
-asks the embedder about every load. WebKit will not do that — `WKURLSchemeHandler`
-refuses `http` and `https` — so instead the web view is pointed at a proxy it
-has no way to route around: one socket, to loopback, with the sandbox making it
-the only one. Weaker as a sentence, stronger as an enforcement, since the first
-is an engine agreeing to ask and the second is the kernel refusing to let it do
-otherwise.
+Boundary one holds differently here, and more weakly, which is worth stating
+rather than glossing. With Servo the renderer opens no socket at all, because
+Servo asks the embedder about every load. WebKit will not do that —
+`WKURLSchemeHandler` refuses `http` and `https` — so instead the web view is
+configured to send its traffic through syndeo-proxy, with the proxy's
+certificate pinned. That is a configuration WebKit honours for the loads it
+makes, not a sandbox Syndeo controls and not something the kernel enforces.
+Anything WebKit does not send through its proxy setting is not covered by it;
+see *Known gaps*.
 
 The trust step is not decoration. Caching HTTPS means terminating it, and
 WebKit validates subresources in its *networking* process, which never consults

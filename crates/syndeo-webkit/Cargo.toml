@@ -3,7 +3,7 @@ name = "syndeo-webkit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "A renderer that works, confined to a proxy it cannot bypass"
+description = "A renderer configured to send its traffic through syndeo-proxy, with the proxy's certificate pinned"
 
 [[bin]]
 name = "syndeo-webkit"
@@ -19,8 +19,9 @@ syndeo-ipc.workspace = true
 syndeo-shell.workspace = true
 
 # WebKit through wry. `mac-proxy` is the whole reason this is viable: it lets
-# the web view be pointed at a proxy it has no way to route around, which is how
-# boundary one survives an engine that will not let an embedder answer loads.
+# the web view be configured to send its traffic through syndeo-proxy, which is
+# how boundary one is kept, by configuration, for an engine that will not let an
+# embedder answer loads.
 wry = { version = "0.57", default-features = false, features = ["mac-proxy", "os-webview"] }
 winit.workspace = true
 
