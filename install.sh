@@ -20,6 +20,10 @@ REPO="SUM-INNOVATION/syndeo"
 INSTALL_DIR="${SYNDEO_INSTALL_DIR:-$HOME/.local/bin}"
 DATA_DIR="${SYNDEO_HOME:-$HOME/.syndeo}"
 BINARIES="syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-ui"
+# syndeo-webkit exists on macOS only, and is installed from 0.1.3 on: the one
+# in 0.1.2's tarball let a redirect's destination run as the site that
+# redirected to it, so an install of 0.1.2 or earlier leaves it out.
+WEBKIT_SINCE="0.1.3"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -84,6 +88,31 @@ download the tarball yourself."
     printf '%s\n' "${tag#v}"
 }
 
+# version_at_least <version> <minimum>
+#
+# Compares major.minor.patch as numbers, ignoring anything after a `-` or `+`
+# (0.1.3-rc.1 counts as 0.1.3). Anything that is not three numeric fields is
+# not at least anything, so a malformed version can only ever mean less.
+version_at_least() {
+    have="${1%%[-+]*}"
+    want="$2"
+    case "$have" in
+        *[!0-9.]* | .* | *. | *..*) return 1 ;;
+    esac
+    case "$have" in
+        *.*.*.*) return 1 ;;
+        *.*.*) ;;
+        *) return 1 ;;
+    esac
+    have_major="${have%%.*}"; rest="${have#*.}"
+    have_minor="${rest%%.*}"; have_patch="${rest#*.}"
+    want_major="${want%%.*}"; rest="${want#*.}"
+    want_minor="${rest%%.*}"; want_patch="${rest#*.}"
+    [ "$have_major" -ne "$want_major" ] && { [ "$have_major" -gt "$want_major" ]; return; }
+    [ "$have_minor" -ne "$want_minor" ] && { [ "$have_minor" -gt "$want_minor" ]; return; }
+    [ "$have_patch" -ge "$want_patch" ]
+}
+
 verify() {
     # verify <tarball> <sums file> <name inside the sums file>
     # Matched as a whole field rather than by pattern: a file name has dots in
@@ -118,6 +147,19 @@ version="${version#v}"
 name="syndeo-${version}-${target}"
 base="https://github.com/${REPO}/releases/download/v${version}"
 
+webkit=no
+case "$target" in
+    *-apple-darwin)
+        if version_at_least "$version" "$WEBKIT_SINCE"; then
+            webkit=yes
+        fi
+        ;;
+esac
+install_list="$BINARIES"
+if [ "$webkit" = yes ]; then
+    install_list="$install_list syndeo-webkit"
+fi
+
 say "Syndeo ${version} for ${target}"
 
 work="$(mktemp -d)"
@@ -141,16 +183,23 @@ tar -xzf "${work}/${name}.tar.gz" -C "$work"
 # others: it looks beside itself before it looks at PATH. Scattering them is
 # the one way to get a working install that cannot start the net process.
 mkdir -p "$INSTALL_DIR"
-for binary in $BINARIES; do
+for binary in $install_list; do
     [ -f "${work}/${name}/${binary}" ] || die "${binary} missing from the tarball."
 done
-for binary in $BINARIES; do
+for binary in $install_list; do
     # Written to a neighbouring name and moved into place, so an install over a
     # running Syndeo replaces the file rather than writing through it.
     cp "${work}/${name}/${binary}" "${INSTALL_DIR}/.${binary}.new"
     chmod 755 "${INSTALL_DIR}/.${binary}.new"
     mv -f "${INSTALL_DIR}/.${binary}.new" "${INSTALL_DIR}/${binary}"
 done
+
+# Only now, with the requested version verified and in place: a syndeo-webkit
+# left by a newer install would run against this older proxy, so it goes.
+if [ "$webkit" = no ] && [ -e "${INSTALL_DIR}/syndeo-webkit" ]; then
+    rm -f "${INSTALL_DIR}/syndeo-webkit"
+    say "  removed ${INSTALL_DIR}/syndeo-webkit, which this version does not include"
+fi
 
 # The example WebAssembly tool, only if there is nothing there already: this
 # directory is the user's, and an upgrade has no business overwriting it.
@@ -176,6 +225,10 @@ say "Next:"
 say ""
 say "  syndeo browse https://www.rust-lang.org/ --twice   # the second fetch says cache"
 say "  syndeo-ui https://www.rust-lang.org/               # the window"
+if [ "$webkit" = yes ]; then
+    say "  syndeo-proxy ca --trust                            # once, before the next line"
+    say "  syndeo-webkit https://www.rust-lang.org/           # the page, rendered, with video"
+fi
 say "  syndeo-keystore init                               # keys, if you want them"
 say "  syndeo doctor                                      # what is set up, and where"
 say ""

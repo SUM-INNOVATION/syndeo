@@ -22,7 +22,10 @@ set -euo pipefail
 
 release="${1:?directory of built binaries}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-binaries=(syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-ui)
+# Every macOS executable in the tarball, and the list used for signing,
+# verifying and notarizing alike, so none of them can be shipped unsigned
+# beside the others.
+binaries=(syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-ui syndeo-webkit)
 
 if [ -z "${CERTIFICATE:-}" ]; then
   echo "No MACOS_CERTIFICATE_P12_BASE64 set: shipping unsigned binaries."
@@ -90,7 +93,7 @@ fi
 notary_key="$RUNNER_TEMP/notary.p8"
 echo "$NOTARY_KEY" | base64 --decode > "$notary_key"
 
-# Only the six binaries go to the notary service. `target/<triple>/release`
+# Only the shipped binaries go to the notary service. `target/<triple>/release`
 # also holds deps/, build scripts and incremental output, which is hundreds of
 # megabytes of nothing the notary needs.
 submission_dir="$RUNNER_TEMP/notarize"
