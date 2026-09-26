@@ -20,6 +20,11 @@ pub enum CacheError {
         match found { Some(v) => v.to_string(), None => "an unversioned layout".to_string() }
     )]
     SchemaMismatch { found: Option<u64>, expected: u64 },
+    /// The index is locked by another open handle, most likely another
+    /// process. redb takes the file exclusively, so two processes cannot share
+    /// one cache; the caller knows the path and what to suggest, this does not.
+    #[error("the cache index is already open elsewhere")]
+    AlreadyOpen,
 }
 
 pub type Result<T> = std::result::Result<T, CacheError>;
@@ -35,7 +40,15 @@ macro_rules! index_err {
 }
 
 index_err!(redb::Error);
-index_err!(redb::DatabaseError);
+
+impl From<redb::DatabaseError> for CacheError {
+    fn from(e: redb::DatabaseError) -> Self {
+        match e {
+            redb::DatabaseError::DatabaseAlreadyOpen => CacheError::AlreadyOpen,
+            other => CacheError::Index(other.to_string()),
+        }
+    }
+}
 index_err!(redb::TransactionError);
 index_err!(redb::TableError);
 index_err!(redb::StorageError);

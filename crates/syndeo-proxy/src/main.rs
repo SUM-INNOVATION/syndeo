@@ -100,10 +100,44 @@ fn home() -> PathBuf {
         })
 }
 
-fn cache_root(override_path: &Option<PathBuf>) -> PathBuf {
-    override_path
-        .clone()
-        .unwrap_or_else(|| home().join("cache"))
+/// Where the proxy's cache lives: `--cache` when it is given, and otherwise a
+/// directory of the proxy's own under the Syndeo home.
+///
+/// Not `<home>/cache`, which is the network process's. redb holds its file
+/// exclusively, so while syndeo-webkit's proxy had that one open, `syndeo
+/// browse`, `syndeo-ui` and the agent could not start a network process at
+/// all. `run` and `stats` both come through here, so they always agree.
+fn cache_root(home: &std::path::Path, explicit: Option<&std::path::Path>) -> PathBuf {
+    explicit
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| home.join("proxy").join("cache"))
+}
+
+/// What to say when the cache is locked. redb cannot say who holds it, so this
+/// does not pretend to either.
+fn already_open(root: &std::path::Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the cache at {} is already open, and only one process can hold it at a time. \
+         Another process may be using it: another syndeo-proxy, or the one syndeo-webkit \
+         starts. To run alongside it, give this one a cache of its own with --cache <path>.",
+        root.display()
+    )
+}
+
+/// The statistics for the cache `stats` would read, rendered as it prints them.
+fn stats_report(home: &std::path::Path, args: &StatsArgs) -> Result<String> {
+    let root = cache_root(home, args.cache.as_deref());
+    let cache = match syndeo_cache::Cache::open(&root) {
+        Ok(cache) => cache,
+        Err(syndeo_cache::CacheError::AlreadyOpen) => return Err(already_open(&root)),
+        Err(err) => return Err(err.into()),
+    };
+    let stats = cache.stats()?;
+    Ok(if args.json {
+        serde_json::to_string_pretty(&stats)?
+    } else {
+        stats.render()
+    })
 }
 
 #[tokio::main]
@@ -156,13 +190,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Stats(args) => {
-            let cache = syndeo_cache::Cache::open(cache_root(&args.cache))?;
-            let stats = cache.stats()?;
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&stats)?);
-            } else {
-                println!("{}", stats.render());
-            }
+            println!("{}", stats_report(&home(), &args)?);
             Ok(())
         }
     }
@@ -184,13 +212,8 @@ async fn run(args: RunArgs) -> Result<()> {
         .parse()
         .map_err(|e: String| anyhow::anyhow!("--dns: {e}"))?;
 
-    let net = Net::new(NetConfig {
-        cache_root: cache_root(&args.cache),
-        shared_cache: args.shared,
-        dns,
-        ..NetConfig::default()
-    })
-    .context("starting the network process")?;
+    let root = cache_root(&home(), args.cache.as_deref());
+    let net = open_net(&root, args.shared, dns)?;
 
     let authority = CertificateAuthority::load_or_create(home().join("proxy"))?;
     let cert_path = authority.certificate_path();
@@ -214,6 +237,20 @@ async fn run(args: RunArgs) -> Result<()> {
     );
 
     serve(listener, proxy).await
+}
+
+/// The network process the proxy fetches through, on the cache at `root`.
+fn open_net(root: &std::path::Path, shared: bool, dns: DnsMode) -> Result<Net> {
+    Net::new(NetConfig {
+        cache_root: root.to_path_buf(),
+        shared_cache: shared,
+        dns,
+        ..NetConfig::default()
+    })
+    .map_err(|err| match err {
+        syndeo_net::NetError::Cache(syndeo_cache::CacheError::AlreadyOpen) => already_open(root),
+        other => anyhow::Error::new(other).context("starting the network process"),
+    })
 }
 
 /// Answer every connection on `listener` for as long as the process lives.
@@ -819,13 +856,7 @@ mod tests {
     /// The same, keeping hold of the proxy so a test can ask how many
     /// requests it was asked to handle.
     async fn start_proxy_with_count(dir: &std::path::Path) -> (SocketAddr, Arc<Proxy>) {
-        let net = Net::new(NetConfig {
-            cache_root: dir.join("cache"),
-            shared_cache: true,
-            dns: DnsMode::System,
-            ..NetConfig::default()
-        })
-        .unwrap();
+        let net = open_net(&cache_root(dir, None), true, DnsMode::System).unwrap();
         let authority = CertificateAuthority::load_or_create(dir.join("proxy")).unwrap();
         let proxy = Arc::new(Proxy {
             net,
@@ -1115,6 +1146,95 @@ mod tests {
         ))
         .await;
         assert_eq!(refused.status, StatusCode::LOOP_DETECTED);
+    }
+
+    /// Put `count` cacheable entries in the cache at `root`, and let go of it.
+    fn seed(root: &std::path::Path, count: usize) {
+        let cache = syndeo_cache::Cache::open(root).unwrap();
+        let mut response = http::HeaderMap::new();
+        response.insert("cache-control", "max-age=600".parse().unwrap());
+        let now = cache.now();
+        for i in 0..count {
+            cache
+                .store(
+                    None,
+                    "GET",
+                    &format!("https://example.test/{i}"),
+                    &http::HeaderMap::new(),
+                    200,
+                    &response,
+                    format!("body {i}").as_bytes(),
+                    now,
+                    now,
+                )
+                .unwrap();
+        }
+    }
+
+    fn entries(home: &std::path::Path, cache: Option<PathBuf>) -> u64 {
+        let json = stats_report(home, &StatsArgs { cache, json: true }).unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&json).unwrap();
+        stats["entries"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn the_proxy_cache_is_not_the_network_process_cache() {
+        let home = std::path::Path::new("/home/someone/.syndeo");
+        // `<home>/cache` is where syndeo-net keeps its own (net/main.rs).
+        assert_eq!(cache_root(home, None), home.join("proxy").join("cache"));
+        assert_ne!(cache_root(home, None), home.join("cache"));
+        let explicit = std::path::Path::new("/elsewhere");
+        assert_eq!(cache_root(home, Some(explicit)), explicit);
+    }
+
+    #[test]
+    fn both_caches_can_be_open_at_once() {
+        let home = tempfile::tempdir().unwrap();
+        let network = syndeo_cache::Cache::open(home.path().join("cache")).unwrap();
+        let proxy = syndeo_cache::Cache::open(cache_root(home.path(), None)).unwrap();
+        assert!(network.stats().is_ok() && proxy.stats().is_ok());
+    }
+
+    #[test]
+    fn stats_reads_the_proxy_cache_unless_told_otherwise() {
+        let home = tempfile::tempdir().unwrap();
+        seed(&cache_root(home.path(), None), 1);
+        seed(&home.path().join("cache"), 3);
+        let elsewhere = tempfile::tempdir().unwrap();
+        seed(elsewhere.path(), 2);
+
+        assert_eq!(entries(home.path(), None), 1);
+        assert_eq!(
+            entries(home.path(), Some(elsewhere.path().to_path_buf())),
+            2
+        );
+    }
+
+    #[test]
+    fn a_cache_in_use_says_so_and_what_to_do() {
+        let home = tempfile::tempdir().unwrap();
+        let root = cache_root(home.path(), None);
+        let _held = open_net(&root, true, DnsMode::System).unwrap();
+
+        let from_run = open_net(&root, true, DnsMode::System)
+            .err()
+            .unwrap()
+            .to_string();
+        let from_stats = stats_report(
+            home.path(),
+            &StatsArgs {
+                cache: None,
+                json: false,
+            },
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        for message in [from_run, from_stats] {
+            assert!(message.contains(&root.display().to_string()), "{message}");
+            assert!(message.contains("may be using it"), "{message}");
+            assert!(message.contains("--cache"), "{message}");
+        }
     }
 
     #[test]
