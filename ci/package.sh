@@ -18,7 +18,7 @@ stage="${root}/dist/${name}"
 rm -rf "$stage"
 mkdir -p "$stage/tools"
 
-binaries=(syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-ui syndeo-servo)
+binaries=(syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-ui)
 
 # syndeo-webkit embeds WKWebView, so it exists on macOS and nowhere else. It is
 # the only one of these that plays video.
@@ -32,11 +32,6 @@ for binary in "${binaries[@]}"; do
   fi
   cp "${release}/${binary}" "${stage}/${binary}"
 done
-
-# syndeo-servo is in that list and is most of the weight: Servo, Stylo and
-# SpiderMonkey come to about 140 MB on their own, against four for everything
-# else put together. It is here because a browser that cannot draw a page is
-# not a browser, and leaving it out made every download a reader.
 
 cp "${root}/README.md" "${root}/LICENSE" "$stage/"
 cp "${root}/crates/syndeo-agent/tools/wordcount.wat" "${stage}/tools/"

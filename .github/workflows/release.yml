@@ -77,49 +77,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             pkg-config libdbus-1-dev libxkbcommon-dev libwayland-dev \
             libx11-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev \
-            libgl1-mesa-dev libegl1-mesa-dev \
-            `# Servo's own, on top of ours: fonts, text shaping, unwinding` \
-            libfontconfig1-dev libfreetype6-dev libharfbuzz-dev libunwind-dev \
-            libssl-dev ccache cmake gperf libgles2-mesa-dev \
-            `# GStreamer, for media` \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev \
-            `# clang 15: Servo's mozangle (ANGLE) does not compile with the
-             # clang 14 that 22.04 ships — its headers reject the SSE builtins
-             # ANGLE uses, and the failure is a wall of
-             # "undeclared identifier __builtin_ia32_paddsb128". arm64 never hit
-             # it, having no x86 intrinsics to compile.` \
-            clang-15 libclang-15-dev
-
-      # Setting CC and CXX is not enough on its own: mozangle's build reaches
-      # for an unversioned `clang` on PATH, which on 22.04 is 14, and then
-      # fails on its own SSE intrinsics headers. The alternatives entry is what
-      # actually redirects that, and the target-suffixed variables cover the
-      # `cc` crate's own lookup order, which prefers them over plain CC when
-      # cargo is passed an explicit --target.
-      - name: Point the C toolchain at clang 15
-        if: runner.os == 'Linux'
-        run: |
-          # A symlink, not an alternatives entry: /usr/bin/clang on these
-          # runners is a real file, and `update-alternatives --install` does
-          # nothing at all when the path it is asked to manage already exists
-          # as one. That is why the previous two attempts changed nothing and
-          # `clang --version` kept answering 14.
-          sudo ln -sf /usr/bin/clang-15 /usr/bin/clang
-          sudo ln -sf /usr/bin/clang++-15 /usr/bin/clang++
-          target=$(echo "${{ matrix.target }}" | tr '-' '_')
-          {
-            echo "CC=clang-15"
-            echo "CXX=clang++-15"
-            echo "CC_${target}=clang-15"
-            echo "CXX_${target}=clang++-15"
-            echo "LIBCLANG_PATH=/usr/lib/llvm-15/lib"
-          } >> "$GITHUB_ENV"
-          # Printed, and checked, so a compiler that did not change fails here
-          # rather than forty minutes into Servo.
-          clang --version | head -1
-          clang --version | grep -q 'version 15' \
-            || { echo "::error::clang is still $(clang --version | head -1)"; exit 1; }
+            libgl1-mesa-dev libegl1-mesa-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -127,14 +85,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-
-      # Servo's WebIDL codegen runs `python3` at build time — Mozilla's build
-      # tooling, not a runtime dependency; nothing Python ships in the binary.
-      # It needs 3.11 or newer, and the failure without it is a SyntaxError
-      # hundreds of crates in that names nothing.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
       - name: Build
         run: |
@@ -151,13 +101,6 @@ jobs:
         run: |
           cargo build --release --locked --target ${{ matrix.target }} \
             -p syndeo-webkit
-
-      # Separately, and with a timeout of its own: this is about 1,200 crates.
-      - name: Build the renderer
-        timeout-minutes: 150
-        run: |
-          cargo build --release --locked --target ${{ matrix.target }} \
-            -p syndeo-servo --features renderer
 
       # A no-op when the signing secrets are not set, so a fork and a first
       # release both still produce usable tarballs. ci/sign-macos.sh says which
@@ -203,7 +146,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum *.tar.gz | tee SHA256SUMS
+          sha256sum -- *.tar.gz | tee SHA256SUMS
 
       - name: Release
         env:
