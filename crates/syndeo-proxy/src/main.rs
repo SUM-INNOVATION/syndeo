@@ -79,9 +79,10 @@ struct CaArgs {
     /// Trust this authority for TLS, for this user only.
     ///
     /// Goes into the login keychain rather than the System one, so it needs no
-    /// `sudo` and applies to nobody else who uses the machine. macOS will ask
-    /// you to authorise the change; that prompt is the consent, and there is
-    /// deliberately no way to skip it from here.
+    /// `sudo` and applies to nobody else who uses the machine. macOS does not
+    /// ask before a trust setting goes into your own login keychain, so this
+    /// asks instead: it changes nothing unless you type exactly `yes`, and
+    /// there is deliberately no way to skip that from here.
     #[arg(long)]
     trust: bool,
     /// Remove the trust this added, and the certificate with it.
@@ -678,9 +679,10 @@ fn text(status: StatusCode, message: &str) -> Response<Body> {
 /// this authority can vouch for a TLS server and for nothing else — not code
 /// signing, not S/MIME, not a timestamp.
 ///
-/// macOS puts up its own authorisation dialog for a trust-setting change, and
-/// that is the consent. There is no flag here to bypass it, because a browser
-/// that can silently add a root to your machine is a browser you should not run.
+/// macOS does not ask before a trust setting goes into the user's own login
+/// keychain, so the consent is ours: nothing changes unless the user types
+/// exactly `yes`. There is no flag here to bypass it, because a browser that
+/// can silently add a root to your machine is a browser you should not run.
 fn trust_in_login_keychain(certificate: &std::path::Path, trust: bool) -> anyhow::Result<()> {
     use std::process::Command as Exec;
 

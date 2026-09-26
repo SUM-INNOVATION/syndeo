@@ -49,10 +49,15 @@ unpacking one yourself does the same thing.
 - **Windows and ChromeOS**: not yet, and tracked at
   [#17](https://github.com/SUM-INNOVATION/syndeo/issues/17).
 
-macOS releases are signed and notarized, so a browser download is not
-quarantined. `syndeo-keystore status` reports whether that build reaches the
-data protection keychain, which is what decides whether Touch ID is enforced by
-the Secure Enclave or the passphrase is mandatory instead.
+**The macOS binaries are not signed or notarized.** v0.1.3 carries no
+Developer ID signature and has not been through Apple's notary service.
+Installed with the one-liner above, the binaries are not quarantined and run.
+An archive downloaded in a browser is quarantined, and Gatekeeper rejects its
+unsigned executables — use the one-liner instead. Unsigned also means the
+keystore cannot reach the data protection keychain, so Secure Enclave presence
+(Touch ID) is not enforced: the keystore uses the ordinary login keychain, and
+the passphrase is mandatory. `syndeo-keystore status` reports which of the two
+a build is in.
 
 ### Verifying a download yourself
 
@@ -143,6 +148,13 @@ what it costs.
 
 ### A page, rendered
 
+> **Experimental, for development only — unsafe for untrusted sites.**
+> `syndeo-servo` does not enforce cross-origin reads, so a page can read other
+> origins' responses, including services on your machine and your network; it
+> sends form POST bodies empty; and it buffers every response completely, with
+> no size cap. It is in no release, and it says so on `--help` and every time it
+> starts. To browse, use `syndeo-webkit` (macOS) or `syndeo-ui`.
+
 ```sh
 cargo build -p syndeo-servo --features renderer     # long; see below
 syndeo-servo https://www.rust-lang.org/
@@ -193,7 +205,12 @@ syndeo-webkit https://www.youtube.com/watch?v=wXtngLBkK4Q
 macOS only. This is the one that plays video: WebKit for the engine, so Media
 Source Extensions and adaptive streaming work, with every byte — the DASH
 segments included — going through `syndeo-proxy` into our own cache. It starts
-that proxy itself.
+that proxy itself, and stops it again however it exits. The installer puts it
+beside the proxy from 0.1.3 on.
+
+If you unpacked the 0.1.2 archive by hand and ran its `syndeo-webkit`, upgrade:
+that build's proxy followed redirects itself, so a page could run as the site
+that redirected to it. The installer never installed that renderer.
 
 Tabs: `⌘T` opens, `⌘W` closes, `⌘[` and `⌘]` cycle, `⌘1`–`⌘9` jump. Hidden
 rather than destroyed, so a tab keeps its scroll position, its heap and its
@@ -257,6 +274,13 @@ syndeo-proxy run           # listens on 127.0.0.1:8899
 Every response carries `x-syndeo-source`: `cache`, `revalidated`, `origin`,
 `peer`, `stale-on-error`, or `pass-through`. Statistics are at
 `http://syndeo.local/stats` through the proxy, or `syndeo-proxy stats`.
+
+The proxy has a cache of its own, at `<SYNDEO_HOME>/proxy/cache` (`--cache`
+moves it), apart from the one `syndeo browse` and the other command-line tools
+use at `<SYNDEO_HOME>/cache`. So its hit rates and statistics are the proxy's,
+not the command line's, and the two can run at once. Upgrading to 0.1.3 starts
+the proxy's cache empty. Proxy traffic is not partitioned by site: see *What it
+does not tell anyone*.
 
 Trust the authority for the duration of the measurement and remove it after. It
 exists so an ordinary browser will talk to us before any of the browser is
@@ -362,7 +386,9 @@ interval — so the next person does not repeat it.
 Privacy here is a set of defaults, not a setting. Each of these is on without
 being asked for, and each costs something that is named rather than hidden.
 
-**The cache is partitioned by the top-level site.** A cache keyed on the URL
+**The cache is partitioned by the top-level site** — for everything that goes
+through `syndeo-net` directly: `syndeo browse`, `syndeo-ui`, the agent and the
+renderers it serves. A cache keyed on the URL
 alone is shared across every site you visit, and that is a way to be tracked: an
 advertiser embedded in two places can time a fetch for a resource and learn
 whether you have been somewhere it was already loaded — no script, no cookie,
@@ -378,6 +404,16 @@ for size — a test asserts exactly that, because it is the claim the trade rest
 on. `syndeo-net --unpartitioned-cache` turns it off, and exists so the two hit
 rates can be measured against each other rather than argued about.
 
+`syndeo-proxy`, and so `syndeo-webkit`, is not partitioned. A browser behind a
+proxy does not say which page a request came from, so the proxy has no
+top-level site to partition by, and its cache is shared across every site
+browsed through it. The timing attack described above works against it.
+
+**The proxy says it is a proxy.** Requests it forwards carry `Via: 1.1 syndeo`
+on the end of whatever chain they arrived with, as HTTP requires of a proxy and
+as the proxy needs in order to recognise a request that has come back to it.
+So a site can tell that a request came through Syndeo's proxy.
+
 **DNS goes over HTTPS by default.** The system resolver sees every hostname you
 visit, in plaintext, and hands it to whoever runs it. The default is
 `doh:cloudflare`; `--dns doh:google`, `doh:quad9` and `dot:cloudflare` are
@@ -387,8 +423,9 @@ ISP, which is a different trust rather than none; and it breaks captive portals
 and split-horizon corporate DNS until you pass `--dns system`.
 
 **Nothing is reported anywhere.** No telemetry, no analytics, no crash
-reporting, no update ping. There is no code in this tree that sends anything
-anywhere except the page you asked for.
+reporting, no update ping. Nothing in this tree sends anything anywhere except
+to the page you asked for, the DNS resolver named above, and — only when you
+turn it on — peers.
 
 **Credentials do not follow a redirect across origins.** `Authorization`,
 `Cookie` and `Proxy-Authorization` are dropped when a redirect changes origin.
@@ -481,7 +518,7 @@ Before handing a release to anyone, check the thing that was published rather
 than the thing that was built:
 
 ```sh
-ci/verify-release.sh 0.1.1
+ci/verify-release.sh 0.1.3
 ```
 
 It installs from the release with the same one-liner the README gives, into a
@@ -496,7 +533,10 @@ version, builds the three targets, signs and notarizes the macOS binaries when
 the signing secrets are present, and publishes the tarballs with a `SHA256SUMS`
 covering them. The secrets it reads are named and explained at the top of
 [`ci/sign-macos.sh`](ci/sign-macos.sh); without them the build still produces
-working tarballs and says in the log that it did not sign them.
+working tarballs and says in the log that it did not sign them. They are not
+set today, which is why the macOS binaries are unsigned. `ci/verify-release.sh`
+checks the signing state against `SYNDEO_EXPECT_SIGNED`, `no` by default, and
+fails a release that is not what it says.
 
 ## Licensing
 
@@ -530,6 +570,13 @@ is a set of honest limits rather than work waiting to be done:
 - Servo does not tell the embedder what a page declared as a subresource's
   integrity, so nothing loaded through the renderer is eligible for peer fetch
   yet. It reaches the cache; it just never asks a peer.
+- WebSockets do not go through `syndeo-proxy`. It removes the `Upgrade` header
+  a WebSocket handshake depends on, as it does every hop-by-hop header, and has
+  no path for an upgraded connection. That is from reading the code; it has not
+  been measured in `syndeo-webkit`.
+- WebRTC in `syndeo-webkit` is not covered by the proxy configuration, and
+  whether WebKit sends its WebRTC traffic anywhere else has not been measured.
+- The proxy and `syndeo-webkit` share an unpartitioned cache.
 
 Two things are done but not *demonstrated* on an ordinary developer machine, and
 both say so where you would meet them:
@@ -547,7 +594,10 @@ both say so where you would meet them:
 cargo test --workspace
 ```
 
-198 of them. Thirty-seven cite the RFC 9111 section they cover.
+Over three hundred on macOS, and a dozen or so fewer on Linux, where the
+Seatbelt, keychain and WebKit tests do not run. The RFC 9111 conformance suite,
+`crates/syndeo-cache/tests/rfc9111.rs`, files its 51 cases under the section of
+the RFC each one covers.
 
 ```sh
 cargo test --workspace                  # does not build Servo
