@@ -3,6 +3,101 @@
 The release workflow reads the section matching the tag and puts it in the
 release notes, so a heading here is `## <version>` and nothing else.
 
+## 0.1.3
+
+A release of repairs. A review before publishing found a vulnerable TLS
+library, a renderer the installer never installed, a proxy that could be
+made to loop or to run one site's page as another's, a keystore setup that
+could overwrite the key another home's seed depended on, and several things
+the documentation said that were not true. This fixes them and says what is true instead.
+
+**Before you upgrade**
+
+- **The macOS binaries are not signed or notarized** — as with every release
+  so far. Installed with the one-line installer they are not quarantined and
+  run. An archive downloaded in a browser is quarantined, and Gatekeeper
+  rejects its unsigned executables. Unsigned, the keystore cannot reach the
+  data protection keychain, so Secure Enclave presence is not enforced: it uses
+  the ordinary keychain, and the passphrase is mandatory.
+- **The proxy's cache moves** to `<SYNDEO_HOME>/proxy/cache` and starts empty.
+  The command-line cache at `<SYNDEO_HOME>/cache` is untouched.
+- **If you unpacked the 0.1.2 archive by hand and ran its `syndeo-webkit`,
+  upgrade.** Its proxy followed redirects itself, so a page could run as the
+  site that redirected to it. The installer never installed that renderer.
+
+**Security**
+
+- **rustls 0.23.45**, for RUSTSEC-2026-0285: TLS 1.3 handshake messages were
+  accepted at the wrong encryption level. It is the TLS under every connection
+  that ships.
+- **The proxy hands redirects to the browser.** It used to follow them and
+  answer the first URL with the destination's page, so the destination ran as
+  the site that redirected to it, and any cookie the redirect set was lost.
+- **A request that comes back to the proxy is stopped** with 508 Loop
+  Detected — whatever name it used to get there — instead of looping until the
+  machine ran out of connections. Forwarded requests now carry
+  `Via: 1.1 syndeo`, so a site can tell they came through Syndeo's proxy.
+- **The proxy's certificate authority key is private from its first byte**:
+  created 0600 in a 0700 directory whatever the umask, loose modes on an
+  existing key tightened before it is read, and symlinks refused.
+- **One response header can no longer stop HTTPS.** An `Alt-Svc` max-age too
+  large to add to the clock panicked with a lock held, and every HTTPS request
+  after it failed until restart. Now clamped to thirty days, and the lock
+  recovers.
+- **The keystore never enrols over a wrapping key another home depends on.**
+  The operating system entry is shared by every `--home`, and `init` in a second
+  one used to replace the first one's key; it now refuses, and says that
+  `syndeo-keystore restore` is the deliberate way to replace it. The keystore
+  socket no longer accepts `Initialize` or `Restore` at all.
+- **A signing request is checked before anyone is asked about it.** The origin
+  must be a plain http or https origin, and is put in the canonical form the
+  key is derived from; the description may not contain control or formatting
+  characters; the payload is shown in full, or the request is refused. The
+  window and the terminal show the same lines, and what is shown is what is
+  confirmed and signed. `syndeo sign` checks all of this before it starts a
+  keystore or asks for a passphrase, and prints the canonical origin. So a
+  typed message longer than 200 characters, or containing a newline, is now
+  refused, as is an origin with a path.
+
+**Fixes**
+
+- `syndeo-webkit` is installed on macOS from 0.1.3 on, beside `syndeo-proxy`.
+  Installing an earlier version installs the core binaries only, and removes a
+  newer `syndeo-webkit` once that install has succeeded.
+- `syndeo-webkit` stops the proxy it starts, however it exits, and refuses to
+  start one where the port is already taken.
+- The proxy has its own cache, so `syndeo-webkit` and `syndeo browse` can run
+  at the same time.
+- `syndeo-servo` is no longer in the release tarballs, and the release build no
+  longer compiles it. It stays in the source tree, and now says on `--help` and
+  every time it starts that it is experimental and unsafe for untrusted sites.
+- The weekly report on the renderer's dependencies runs again; it had never
+  run. The advisory gate on what ships is unchanged.
+- `ci/verify-release.sh` knows which binaries each version and platform should
+  have, checks the signing state it is told to expect, and asks Gatekeeper
+  about every binary.
+
+**Corrected**
+
+- The 0.1.2 notes and the README said `syndeo-webkit` could not get past the
+  proxy, as though a sandbox or the kernel held it there. It is configured to
+  send its traffic through syndeo-proxy, with the proxy's certificate pinned —
+  a configuration, not a sandbox. Corrected in place in the 0.1.2 section.
+- The README said macOS releases were signed and notarized. None has been.
+- Cache partitioning applies to what goes through `syndeo-net` directly, not
+  to the proxy or `syndeo-webkit`.
+- `syndeo-proxy ca --trust` said macOS would ask for consent. It does not;
+  the command asks for `yes` itself.
+
+**Known, and not fixed here**
+
+- A cacheable response that sets a cookie is stored with its `Set-Cookie` and
+  replays it on a cache hit.
+- A cache entry whose stored body is missing or corrupt fails that URL until it
+  is evicted, instead of fetching it again.
+- WebSockets do not work through the proxy, and whether WebKit sends WebRTC
+  traffic outside its proxy setting has not been measured.
+
 ## 0.1.2
 
 `syndeo-webkit`: a renderer that plays video, in tabs, with every byte still

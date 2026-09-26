@@ -594,7 +594,7 @@ both say so where you would meet them:
 cargo test --workspace
 ```
 
-Over three hundred on macOS, and a dozen or so fewer on Linux, where the
+About three hundred on macOS, and a dozen or so fewer on Linux, where the
 Seatbelt, keychain and WebKit tests do not run. The RFC 9111 conformance suite,
 `crates/syndeo-cache/tests/rfc9111.rs`, files its 51 cases under the section of
 the RFC each one covers.
