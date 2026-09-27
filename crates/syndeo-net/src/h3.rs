@@ -201,19 +201,34 @@ impl QuicClient {
 
     /// One request over HTTP/3. Same shape as the TCP path, so the caller does
     /// not branch on which one answered.
+    ///
+    /// A failure says how far it got, because that decides whether the same
+    /// request may be sent again over TCP: see [`Failed`].
     pub async fn request(
         &self,
         uri: &Uri,
         method: &http::Method,
         headers: &HeaderMap,
         body: Bytes,
-    ) -> Result<(u16, HeaderMap, BoxStream<'static, Result<Bytes>>)> {
+    ) -> std::result::Result<(u16, HeaderMap, BoxStream<'static, Result<Bytes>>), Failed> {
+        let nothing_sent = |error| Failed {
+            reached: Reached::Nothing,
+            error,
+        };
+        let request_sent = |error| Failed {
+            reached: Reached::Request,
+            error,
+        };
+
         let authority = uri
             .authority()
             .map(|a| a.to_string())
-            .ok_or_else(|| NetError::InvalidUrl(uri.to_string()))?;
+            .ok_or_else(|| nothing_sent(NetError::InvalidUrl(uri.to_string())))?;
 
-        let mut sender = self.sender_for(uri, &authority).await?;
+        let mut sender = self
+            .sender_for(uri, &authority)
+            .await
+            .map_err(nothing_sent)?;
 
         let mut builder = http::Request::builder().method(method.clone()).uri(uri);
         {
@@ -229,27 +244,31 @@ impl QuicClient {
                 out.append(name.clone(), value.clone());
             }
         }
-        let request = builder.body(()).map_err(NetError::Http)?;
+        let request = builder
+            .body(())
+            .map_err(|e| nothing_sent(NetError::Http(e)))?;
 
+        // From here on the origin may have received some or all of the
+        // request, even if what follows fails.
         let mut stream = sender
             .send_request(request)
             .await
-            .map_err(|e| NetError::Transport(format!("h3 request: {e}")))?;
+            .map_err(|e| request_sent(NetError::Transport(format!("h3 request: {e}"))))?;
         if !body.is_empty() {
             stream
                 .send_data(body)
                 .await
-                .map_err(|e| NetError::Transport(format!("h3 body: {e}")))?;
+                .map_err(|e| request_sent(NetError::Transport(format!("h3 body: {e}"))))?;
         }
         stream
             .finish()
             .await
-            .map_err(|e| NetError::Transport(format!("h3 finish: {e}")))?;
+            .map_err(|e| request_sent(NetError::Transport(format!("h3 finish: {e}"))))?;
 
         let response = stream
             .recv_response()
             .await
-            .map_err(|e| NetError::Transport(format!("h3 response: {e}")))?;
+            .map_err(|e| request_sent(NetError::Transport(format!("h3 response: {e}"))))?;
         let status = response.status().as_u16();
         let mut response_headers = response.headers().clone();
         // HTTP/3 carries no reason phrase and no `Connection`, but it does carry
@@ -333,6 +352,42 @@ impl QuicClient {
             .map(|ip| SocketAddr::new(ip, port))
             .ok_or_else(|| NetError::Dns(format!("no address for {host}")))
     }
+}
+
+/// How far a failed HTTP/3 attempt got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reached {
+    /// Nothing reached the origin: resolving, connecting or the handshake
+    /// failed. Sending the request another way cannot repeat it.
+    Nothing,
+    /// The request was being sent, or had been. The origin may have acted on
+    /// it, so sending it again can make it happen twice.
+    Request,
+}
+
+#[derive(Debug)]
+pub struct Failed {
+    pub reached: Reached,
+    pub error: NetError,
+}
+
+/// Whether a request whose HTTP/3 attempt failed may be sent again over TCP.
+///
+/// Always when nothing reached the origin. Otherwise only for a method RFC
+/// 9110 §9.2.2 calls idempotent, for which a repeat is harmless by definition;
+/// a POST that may already have been received is not sent a second time.
+pub fn may_retry_over_tcp(method: &http::Method, reached: Reached) -> bool {
+    use http::Method;
+    reached == Reached::Nothing
+        || [
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::TRACE,
+            Method::PUT,
+            Method::DELETE,
+        ]
+        .contains(method)
 }
 
 /// Rebuild a header map from pairs, used when a caller supplies extras.
@@ -453,6 +508,88 @@ mod tests {
         assert!(!alt.should_try("after.test"));
         advertise(&alt, "before.test", "clear");
         assert!(!alt.should_try("before.test"));
+    }
+
+    #[test]
+    fn a_request_that_may_have_been_received_is_repeated_only_if_idempotent() {
+        use http::Method;
+        let idempotent = [
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::TRACE,
+            Method::PUT,
+            Method::DELETE,
+        ];
+        let not_idempotent = [
+            Method::POST,
+            Method::PATCH,
+            Method::CONNECT,
+            Method::from_bytes(b"PURGE").unwrap(),
+        ];
+        for method in idempotent.iter().chain(not_idempotent.iter()) {
+            assert!(
+                may_retry_over_tcp(method, Reached::Nothing),
+                "{method}: nothing was sent, so nothing can be repeated"
+            );
+        }
+        for method in &idempotent {
+            assert!(may_retry_over_tcp(method, Reached::Request), "{method}");
+        }
+        for method in &not_idempotent {
+            assert!(
+                !may_retry_over_tcp(method, Reached::Request),
+                "{method} would be sent twice"
+            );
+        }
+    }
+
+    /// A QUIC endpoint on loopback that turns every connection away.
+    fn refusing_endpoint() -> std::net::SocketAddr {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let key =
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+        let config =
+            quinn::ServerConfig::with_single_cert(vec![certified.cert.der().clone()], key.into())
+                .unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                incoming.refuse();
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_reported_as_nothing_having_been_sent() {
+        crate::tls::install_crypto_provider();
+        let address = refusing_endpoint();
+        let client = QuicClient::new(
+            crate::dns::Dns::new(&crate::dns::DnsMode::System).unwrap(),
+            crate::tls::client_config().unwrap(),
+        )
+        .unwrap();
+        let uri: Uri = format!("https://127.0.0.1:{}/submit", address.port())
+            .parse()
+            .unwrap();
+
+        let failed = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.request(
+                &uri,
+                &http::Method::POST,
+                &HeaderMap::new(),
+                Bytes::from_static(b"order=1"),
+            ),
+        )
+        .await
+        .expect("a refused connection should fail promptly")
+        .err()
+        .expect("a refused connection cannot succeed");
+        assert_eq!(failed.reached, Reached::Nothing, "{}", failed.error);
+        assert!(may_retry_over_tcp(&http::Method::POST, failed.reached));
     }
 
     #[test]

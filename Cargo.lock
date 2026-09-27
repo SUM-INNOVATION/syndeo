@@ -11255,6 +11255,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "quinn",
+ "rcgen",
  "rustls",
  "rustls-platform-verifier",
  "serde",

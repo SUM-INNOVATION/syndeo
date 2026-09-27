@@ -620,10 +620,14 @@ impl Net {
                             Protocol::Http3,
                         ));
                     }
-                    Err(err) => {
-                        tracing::debug!(url = %request.url, %err, "HTTP/3 attempt failed; falling back to TCP");
+                    Err(failed) => {
                         self.alt_svc.failed(&authority);
                         quic.forget(&authority).await;
+                        if !crate::h3::may_retry_over_tcp(&request.method, failed.reached) {
+                            tracing::debug!(url = %request.url, err = %failed.error, "HTTP/3 attempt failed after the request was sent; not repeating it");
+                            return Err(failed.error);
+                        }
+                        tracing::debug!(url = %request.url, err = %failed.error, "HTTP/3 attempt failed; falling back to TCP");
                     }
                 }
             }
