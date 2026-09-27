@@ -27,6 +27,9 @@ pub struct Stats {
     /// Entries dropped because their stored body was missing or corrupt.
     #[serde(default)]
     pub corrupt_entries: u64,
+    /// Files left by interrupted writes and removed when the cache opened.
+    #[serde(default)]
+    pub swept_temporaries: u64,
 
     pub entries: u64,
     pub blobs: u64,
@@ -61,6 +64,7 @@ impl Stats {
             c::PARTIAL_STORES => self.partial_stores = value,
             c::EVICTIONS => self.evictions = value,
             c::CORRUPT_ENTRIES => self.corrupt_entries = value,
+            c::SWEPT_TEMPORARIES => self.swept_temporaries = value,
             _ => {}
         }
     }

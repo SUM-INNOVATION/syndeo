@@ -32,6 +32,8 @@ pub mod counters {
     pub const EVICTIONS: &str = "evictions";
     /// Entries dropped because their stored body was missing or corrupt.
     pub const CORRUPT_ENTRIES: &str = "corrupt_entries";
+    /// Temporary files from interrupted writes, removed when the cache opened.
+    pub const SWEPT_TEMPORARIES: &str = "swept_temporaries";
 }
 
 /// A response reconstructed from the store.
@@ -172,6 +174,14 @@ impl Cache {
         };
 
         let blobs = BlobStore::open(&blob_path)?;
+        // The index is ours alone now (redb holds it exclusively), so nothing
+        // else can be mid-write: whatever temporary files are here were left by
+        // a write that never finished.
+        let swept = blobs.sweep_abandoned()?;
+        if swept > 0 {
+            tracing::info!(swept, "removed files left by interrupted cache writes");
+            index.bump(counters::SWEPT_TEMPORARIES, swept as u64)?;
+        }
         Ok(Cache {
             index,
             blobs,
@@ -2125,5 +2135,28 @@ mod tests {
             "at the moment before the file goes, eligibility must already be gone"
         );
         assert!(!blob_path(&cache, body).exists());
+    }
+
+    #[test]
+    fn opening_the_cache_sweeps_what_interrupted_writes_left() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let cache = Cache::open(dir.path()).unwrap();
+            stored(&cache, "https://a.test/kept", b"kept body");
+            let path = blob_path(&cache, b"kept body");
+            let hex = ContentId::of(b"kept body").to_hex();
+            std::fs::write(
+                path.with_file_name(format!(".{hex}.tmp-1-0102030405060708")),
+                b"torn",
+            )
+            .unwrap();
+            std::fs::write(path.with_file_name(format!("{hex}.tmp77")), b"torn").unwrap();
+        }
+        let reopened = Cache::open(dir.path()).unwrap();
+        assert_eq!(reopened.stats().unwrap().swept_temporaries, 2);
+        match get(&reopened, "https://a.test/kept") {
+            Lookup::Fresh(response) => assert_eq!(response.body, b"kept body"),
+            other => panic!("the real blob should survive the sweep, got {other:?}"),
+        }
     }
 }

@@ -58,7 +58,13 @@ pub struct BlobStore {
     zstd_level: i32,
     /// Bodies below this size are not worth compressing.
     compress_threshold: usize,
+    /// Test-only pause points, for driving an interleaving deterministically.
+    #[cfg(test)]
+    pause: std::sync::Mutex<Option<PauseHook>>,
 }
+
+#[cfg(test)]
+type PauseHook = std::sync::Arc<dyn Fn(&'static str) + Send + Sync>;
 
 impl BlobStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
@@ -68,7 +74,89 @@ impl BlobStore {
             root,
             zstd_level: 3,
             compress_threshold: 1024,
+            #[cfg(test)]
+            pause: std::sync::Mutex::new(None),
         })
+    }
+
+    fn pause_point(&self, _name: &'static str) {
+        #[cfg(test)]
+        {
+            let hook = self.pause.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(_name);
+            }
+        }
+    }
+
+    /// Write `payload` under `path`, through a temporary file of its own.
+    ///
+    /// The temporary name is unique to this write — process, a counter and
+    /// randomness — and created with `create_new`, so two writes of the same
+    /// bytes, in one process or two, never share one: a clash is an error,
+    /// never a silent truncation of someone else's half-written file. What is
+    /// renamed into place is only ever a whole file, and a write that fails
+    /// on the way removes its own temporary file.
+    fn write_in_place(&self, path: &Path, compression: Compression, payload: &[u8]) -> Result<()> {
+        let tmp = temporary_beside(path);
+        let written = (|| -> Result<()> {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(&[compression_tag(compression)])?;
+            f.write_all(payload)?;
+            f.sync_all()?;
+            self.pause_point("write:before-rename");
+            fs::rename(&tmp, path)?;
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        written
+    }
+
+    /// Remove what interrupted writes left behind: everything in `staging/`,
+    /// and every temporary file in the fan-out directories, in this build's
+    /// naming or the one before it.
+    ///
+    /// Only safe while nothing else can be writing, which is when the caller
+    /// holds the cache index — redb takes it exclusively, so this is called
+    /// from `Cache::open` and nowhere else. Returns how many were removed.
+    pub(crate) fn sweep_abandoned(&self) -> Result<usize> {
+        let mut removed = 0;
+        let staging = self.root.join("staging");
+        if staging.is_dir() {
+            for entry in fs::read_dir(&staging)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() && fs::remove_file(entry.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        for first in fs::read_dir(&self.root)? {
+            let first = first?;
+            if !first.file_type()?.is_dir() || !is_fan_out(&first.file_name()) {
+                continue;
+            }
+            for second in fs::read_dir(first.path())? {
+                let second = second?;
+                if !second.file_type()?.is_dir() || !is_fan_out(&second.file_name()) {
+                    continue;
+                }
+                for file in fs::read_dir(second.path())? {
+                    let file = file?;
+                    if file.file_type()?.is_file()
+                        && is_temporary(&file.file_name())
+                        && fs::remove_file(file.path()).is_ok()
+                    {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        Ok(removed)
     }
 
     pub fn root(&self) -> &Path {
@@ -119,16 +207,8 @@ impl BlobStore {
             fs::create_dir_all(parent)?;
         }
 
-        // Write to a temp name in the same directory, then rename: a torn write
-        // can never be observed under the content address.
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(&[compression_tag(compression)])?;
-            f.write_all(&payload)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &path)?;
+        // A torn write can never be observed under the content address.
+        self.write_in_place(&path, compression, &payload)?;
 
         let stored_len = payload.len() as u64 + 1;
         Ok(WriteReceipt {
@@ -203,14 +283,7 @@ impl BlobStore {
             (raw, Compression::None)
         };
 
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(&[compression_tag(compression)])?;
-            f.write_all(&payload)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &path)?;
+        self.write_in_place(&path, compression, &payload)?;
         let _ = fs::remove_file(&writer.path);
 
         Ok(WriteReceipt {
@@ -381,6 +454,46 @@ fn rand_suffix() -> [u8; 8] {
     (nanos ^ n.rotate_left(32)).to_le_bytes()
 }
 
+/// A temporary name beside `path`, used by exactly one write:
+/// `.<file name>.tmp-<pid>-<unique>`. The leading dot keeps it from ever
+/// looking like a content address.
+fn temporary_beside(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        hex::encode(rand_suffix())
+    ))
+}
+
+/// A two-hex-digit fan-out directory name.
+fn is_fan_out(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.len() == 2 && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// A temporary file, as this build names them or as 0.1.3 did
+/// (`<hex>.tmp<pid>`). Never a content address, which is 64 hex digits and
+/// nothing else.
+fn is_temporary(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    if name.starts_with('.') && name.contains(".tmp-") {
+        return true;
+    }
+    match name.split_once(".tmp") {
+        Some((stem, pid)) => {
+            stem.len() == 64
+                && stem.chars().all(|c| c.is_ascii_hexdigit())
+                && !pid.is_empty()
+                && pid.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 fn compression_tag(c: Compression) -> u8 {
     match c {
         Compression::None => 0,
@@ -471,5 +584,137 @@ mod tests {
         let (_dir, store) = store();
         let id = ContentId::of(b"never stored");
         assert!(matches!(store.get(id), Err(CacheError::MissingBlob(_))));
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn two_writes_of_the_same_bytes_never_share_a_temporary_file() {
+        // Writer A has written its temporary file in full and is paused before
+        // renaming it; writer B writes the same bytes start to finish. With one
+        // temporary name per process, B truncates A's file, renames it away,
+        // and A's rename then fails. Driven here on purpose, not by chance.
+        let (_dir, store) = store();
+        let store = std::sync::Arc::new(store);
+        let body = vec![b'q'; 5_000];
+        let path = store.path_for(ContentId::of(&body));
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        *store.pause.lock().unwrap() = Some(std::sync::Arc::new(move |point| {
+            if point == "write:before-rename"
+                && first.swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                paused_tx.send(()).unwrap();
+                resume_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+
+        let a = {
+            let store = store.clone();
+            let body = body.clone();
+            std::thread::spawn(move || store.put(&body))
+        };
+        paused_rx.recv().unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+        let a_temporary = files_in(&dir);
+        assert_eq!(a_temporary.len(), 1, "{a_temporary:?}");
+        let a_len = fs::metadata(dir.join(&a_temporary[0])).unwrap().len();
+
+        // B, entirely, while A is paused.
+        let b = store.put(&body).unwrap();
+        assert!(b.newly_written);
+        assert_eq!(
+            fs::metadata(dir.join(&a_temporary[0])).unwrap().len(),
+            a_len,
+            "B touched A's temporary file"
+        );
+
+        resume_tx.send(()).unwrap();
+        let a = a.join().unwrap().expect("A's write failed");
+        assert_eq!(a.id, b.id);
+        assert_eq!(store.get(a.id).unwrap(), body);
+        assert_eq!(
+            files_in(&dir),
+            vec![ContentId::of(&body).to_hex()],
+            "a temporary file was left behind"
+        );
+    }
+
+    #[test]
+    fn a_write_that_cannot_be_renamed_leaves_no_temporary_file() {
+        let (_dir, store) = store();
+        let body = b"cannot land".to_vec();
+        let path = store.path_for(ContentId::of(&body));
+        let blocker = path.clone();
+        // Something occupies the address between the existence check and the
+        // rename: a directory, which a file cannot be renamed over.
+        *store.pause.lock().unwrap() = Some(std::sync::Arc::new(move |point| {
+            if point == "write:before-rename" {
+                fs::create_dir_all(blocker.join("occupied")).unwrap();
+            }
+        }));
+        assert!(store.put(&body).is_err());
+        let dir = path.parent().unwrap();
+        assert_eq!(
+            files_in(dir),
+            vec![ContentId::of(&body).to_hex()],
+            "only the blocking directory should remain"
+        );
+    }
+
+    #[test]
+    fn abandoned_temporary_files_are_swept_and_blobs_are_not() {
+        let (_dir, store) = store();
+        let kept = store.put(b"a real blob").unwrap();
+        let dir = store.path_for(kept.id).parent().unwrap().to_path_buf();
+        let hex = kept.id.to_hex();
+
+        // This build's naming, the 0.1.3 naming, and a streaming write.
+        fs::write(
+            dir.join(format!(".{hex}.tmp-123-00ff00ff00ff00ff")),
+            b"torn",
+        )
+        .unwrap();
+        fs::write(dir.join(format!("{hex}.tmp4567")), b"torn").unwrap();
+        fs::create_dir_all(store.root().join("staging")).unwrap();
+        fs::write(store.root().join("staging").join("99-abcdef"), b"torn").unwrap();
+
+        assert_eq!(store.sweep_abandoned().unwrap(), 3);
+        assert_eq!(files_in(&dir), vec![hex]);
+        assert!(files_in(&store.root().join("staging")).is_empty());
+        assert_eq!(store.get(kept.id).unwrap(), b"a real blob");
+    }
+
+    #[test]
+    fn only_temporary_names_are_recognised_as_temporary() {
+        let hex = "ab".repeat(32);
+        for temporary in [
+            format!(".{hex}.tmp-1-00"),
+            format!("{hex}.tmp1"),
+            format!("{hex}.tmp123456"),
+        ] {
+            assert!(
+                is_temporary(std::ffi::OsStr::new(&temporary)),
+                "{temporary}"
+            );
+        }
+        for kept in [
+            hex.clone(),
+            format!("{hex}.tmp"),
+            format!("{hex}.tmpx"),
+            "notes.tmp1".to_string(),
+        ] {
+            assert!(!is_temporary(std::ffi::OsStr::new(&kept)), "{kept}");
+        }
     }
 }
