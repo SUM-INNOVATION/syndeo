@@ -160,7 +160,7 @@ impl StoredBody {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryRecord {
     /// The top-level site this was fetched under. `None` is unpartitioned.
     ///
@@ -505,37 +505,38 @@ impl Index {
     }
 
     /// Drop an entry whose body turned out to be missing or corrupt — but only
-    /// if it still names the body that failed.
+    /// if it is still exactly the entry that failed.
     ///
-    /// Checked and removed in one transaction, so a replacement stored in the
-    /// meantime is left alone, and of any number of callers that found the
-    /// same broken entry exactly one removes it. `None` means it had already
-    /// gone or been replaced; otherwise the blobs whose last reference it held.
-    /// Bytes that failed to read back also stop being offered to peers, even
-    /// while another entry still refers to them.
+    /// The whole record is compared, in the same transaction that removes it:
+    /// a replacement stored in the meantime is left alone even when it holds
+    /// the same bytes under newer headers, and of any number of callers that
+    /// found the same broken entry exactly one removes it. `None` means it had
+    /// already gone or changed; otherwise the blobs whose last reference it
+    /// held. Bytes that failed to read back also stop being offered to peers,
+    /// even while another entry still refers to them.
     pub fn drop_broken_entry(
         &self,
         key: &str,
-        expected: &StoredBody,
+        expected: &EntryRecord,
     ) -> Result<Option<Vec<ContentId>>> {
-        self.drop_entry_if_body(key, expected, true)
+        self.drop_entry_if_unchanged(key, expected, true)
     }
 
-    /// Drop an entry only if it still holds `expected`, in one transaction.
-    /// Unlike [`Index::drop_broken_entry`] the bytes are sound, so whether a
-    /// peer may have them is left as it was.
+    /// Drop an entry only if it is still exactly `expected`, in one
+    /// transaction. Unlike [`Index::drop_broken_entry`] the bytes are sound, so
+    /// whether a peer may have them is left as it was.
     pub fn drop_entry_holding(
         &self,
         key: &str,
-        expected: &StoredBody,
+        expected: &EntryRecord,
     ) -> Result<Option<Vec<ContentId>>> {
-        self.drop_entry_if_body(key, expected, false)
+        self.drop_entry_if_unchanged(key, expected, false)
     }
 
-    fn drop_entry_if_body(
+    fn drop_entry_if_unchanged(
         &self,
         key: &str,
-        expected: &StoredBody,
+        expected: &EntryRecord,
         revoke_sharing: bool,
     ) -> Result<Option<Vec<ContentId>>> {
         let tx = self.db.begin_write()?;
@@ -548,7 +549,7 @@ impl Index {
             }
         };
         match current {
-            Some(record) if &record.body == expected => {
+            Some(record) if &record == expected => {
                 let orphan = remove_entry_in(&tx, key)?;
                 if revoke_sharing {
                     let mut eligible = tx.open_table(PEER_ELIGIBLE)?;

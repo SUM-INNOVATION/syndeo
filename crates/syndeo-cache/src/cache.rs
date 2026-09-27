@@ -396,8 +396,8 @@ impl Cache {
     /// An entry whose stored body is missing or corrupt stops being an entry.
     ///
     /// The alternative is a URL that fails on every request until eviction
-    /// happens to reach it. The entry is dropped (only if it still names the
-    /// body that failed; see [`Index::drop_broken_entry`]), the blobs it alone
+    /// happens to reach it. The entry is dropped (only if it is still exactly
+    /// the entry that failed; see [`Index::drop_broken_entry`]), the blobs it alone
     /// referred to are deleted, and the request becomes a miss, so the caller
     /// fetches it again and the store is repaired by the next write.
     fn discard_broken(
@@ -414,7 +414,7 @@ impl Cache {
     }
 
     fn drop_broken(&self, key: &str, record: &EntryRecord, err: &CacheError) -> Result<()> {
-        if let Some(orphaned) = self.index.drop_broken_entry(key, &record.body)? {
+        if let Some(orphaned) = self.index.drop_broken_entry(key, record)? {
             tracing::warn!(url = %record.url, %err, "dropped a cache entry whose body was lost");
             self.index.bump(counters::CORRUPT_ENTRIES, 1)?;
             self.delete_orphans(&orphaned)?;
@@ -668,7 +668,7 @@ impl Cache {
         if record.content_id() != Some(content) {
             return Ok(false);
         }
-        match self.index.drop_entry_holding(key, &record.body)? {
+        match self.index.drop_entry_holding(key, &record)? {
             Some(orphaned) => {
                 self.delete_orphans(&orphaned)?;
                 Ok(true)
@@ -1833,6 +1833,52 @@ mod tests {
 
         match get(&cache, "https://a.test/page") {
             Lookup::Fresh(response) => assert_eq!(response.body, b"new body"),
+            other => panic!("the replacement should survive, got {other:?}"),
+        }
+        assert_eq!(cache.stats().unwrap().corrupt_entries, 0);
+    }
+
+    #[test]
+    fn a_replacement_with_the_same_bytes_and_newer_headers_is_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let url = "https://a.test/same-bytes";
+        let store_with_etag = |etag: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::CACHE_CONTROL, "max-age=600".parse().unwrap());
+            headers.insert(http::header::ETAG, etag.parse().unwrap());
+            let now = cache.now();
+            cache
+                .store(
+                    None,
+                    "GET",
+                    url,
+                    &HeaderMap::new(),
+                    200,
+                    &headers,
+                    b"unchanged bytes",
+                    now,
+                    now,
+                )
+                .unwrap();
+        };
+        store_with_etag("\"v1\"");
+        let (key, old) = only_entry(&cache);
+
+        // The old entry is found broken; before it is dropped, the origin's
+        // newer response replaces it — the same body, different metadata.
+        store_with_etag("\"v2\"");
+        let (_, current) = only_entry(&cache);
+        assert_eq!(current.body, old.body, "the same bytes, so the same body");
+        assert_ne!(current, old);
+
+        cache
+            .drop_broken(&key, &old, &CacheError::MissingBlob("old".into()))
+            .unwrap();
+        match get(&cache, url) {
+            Lookup::Fresh(response) => {
+                assert_eq!(response.headers.get(http::header::ETAG).unwrap(), "\"v2\"")
+            }
             other => panic!("the replacement should survive, got {other:?}"),
         }
         assert_eq!(cache.stats().unwrap().corrupt_entries, 0);
