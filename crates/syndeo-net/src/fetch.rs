@@ -831,9 +831,10 @@ impl Net {
             headers.insert(http::header::CONTENT_LENGTH, value);
         }
 
-        // Not announced. The body is held as a blob no entry refers to, so no
-        // grant exists for it and `serve` would refuse it; saying we have it
-        // would be a claim about our history with nothing behind it.
+        // Not kept, so not announced: a peer hands over bytes without the
+        // response metadata an entry needs, and `accept_peer_body` checks them
+        // without writing them. Saying we have them would be a claim with
+        // nothing behind it.
 
         Some(self.finish(
             200,

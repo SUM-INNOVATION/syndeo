@@ -1299,8 +1299,16 @@ impl Cache {
         Ok(Some(response))
     }
 
-    /// Accept a body offered by a peer. The rule is absolute: without an
+    /// Check a body offered by a peer. The rule is absolute: without an
     /// independent hash to check it against, the body is refused.
+    ///
+    /// Checked, counted, and not kept. A peer hands over bytes, not a
+    /// response: there are no headers to decide freshness or storability by,
+    /// and nothing an entry could be written from. Written to the blob store
+    /// anyway, the bytes had no record, no entry and no reference, so garbage
+    /// collection could never find them and no grant could ever make them
+    /// shareable. The caller uses them for the request in hand; the next
+    /// request asks again.
     pub fn accept_peer_body(&self, expected: &PeerProof, body: &[u8]) -> Result<()> {
         let ok = match expected {
             PeerProof::Content(id) => ContentId::of(body) == *id,
@@ -1318,10 +1326,6 @@ impl Cache {
                 expected: expected.describe(),
                 actual: ContentId::of(body).to_hex(),
             });
-        }
-        {
-            let _gate = self.storing();
-            self.blobs.put(body)?;
         }
         self.index.bump(counters::PEER_ACCEPTED, 1)?;
         Ok(())
@@ -2066,6 +2070,44 @@ mod tests {
             .is_empty());
         assert!(cache.peer_eligibility(id).unwrap().is_empty());
         assert!(cache.body_for_peer(PeerAsk::Content(id)).unwrap().is_none());
+    }
+
+    /// Every file under the blob store, temporary or not.
+    fn every_blob_file(cache: &Cache) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(cache.blobs.root(), &mut out);
+        out
+    }
+
+    #[test]
+    fn an_accepted_peer_body_is_not_written_anywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let body = b"from a peer, verified";
+        let hash = Hash::compute(Algorithm::Sha384, body);
+        cache
+            .accept_peer_body(&PeerProof::Integrity(declared(&[hash])), body)
+            .unwrap();
+        cache
+            .accept_peer_body(&PeerProof::Content(ContentId::of(body)), body)
+            .unwrap();
+        assert!(
+            every_blob_file(&cache).is_empty(),
+            "{:?}",
+            every_blob_file(&cache)
+        );
+        assert!(!cache.has_content(ContentId::of(body)));
+        assert_eq!(cache.stats().unwrap().peer_accepted, 2);
     }
 
     #[test]
