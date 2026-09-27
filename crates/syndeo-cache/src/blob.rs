@@ -77,7 +77,7 @@ impl BlobStore {
 
     /// `<root>/ab/cd/<full hex>` — two levels of fan-out keeps directory sizes sane
     /// at hundreds of millions of objects.
-    fn path_for(&self, id: ContentId) -> PathBuf {
+    pub(crate) fn path_for(&self, id: ContentId) -> PathBuf {
         let hex = id.to_hex();
         self.root.join(&hex[0..2]).join(&hex[2..4]).join(&hex)
     }

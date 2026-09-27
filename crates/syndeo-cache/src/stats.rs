@@ -24,6 +24,9 @@ pub struct Stats {
     pub partial_stores: u64,
     /// Live entries dropped to stay inside the size budget.
     pub evictions: u64,
+    /// Entries dropped because their stored body was missing or corrupt.
+    #[serde(default)]
+    pub corrupt_entries: u64,
 
     pub entries: u64,
     pub blobs: u64,
@@ -57,6 +60,7 @@ impl Stats {
             c::RANGE_HITS => self.range_hits = value,
             c::PARTIAL_STORES => self.partial_stores = value,
             c::EVICTIONS => self.evictions = value,
+            c::CORRUPT_ENTRIES => self.corrupt_entries = value,
             _ => {}
         }
     }
@@ -102,7 +106,7 @@ impl Stats {
              hit rate {:.1}%  byte hit rate {:.1}%\n\
              entries {}  blobs {}  dedupe {:.2}x  compression {:.2}x\n\
              unique {}  on disk {}  logical {}\n\
-             range hits {}  partial stores {}  evictions {}\n\
+             range hits {}  partial stores {}  evictions {}  lost bodies {}\n\
              peer accepted {}  peer rejected {}",
             self.requests,
             self.hits,
@@ -122,6 +126,7 @@ impl Stats {
             self.range_hits,
             self.partial_stores,
             self.evictions,
+            self.corrupt_entries,
             self.peer_accepted,
             self.peer_rejected,
         )

@@ -27,6 +27,17 @@ pub enum CacheError {
     AlreadyOpen,
 }
 
+impl CacheError {
+    /// A stored body that could not be read back as the bytes it was stored
+    /// as: gone from disk, or no longer hashing to its address.
+    pub fn is_lost_body(&self) -> bool {
+        matches!(
+            self,
+            CacheError::MissingBlob(_) | CacheError::Integrity { .. }
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CacheError>;
 
 macro_rules! index_err {

@@ -30,6 +30,8 @@ pub mod counters {
     pub const RANGE_HITS: &str = "range_hits";
     pub const PARTIAL_STORES: &str = "partial_stores";
     pub const EVICTIONS: &str = "evictions";
+    /// Entries dropped because their stored body was missing or corrupt.
+    pub const CORRUPT_ENTRIES: &str = "corrupt_entries";
 }
 
 /// A response reconstructed from the store.
@@ -116,7 +118,24 @@ pub struct Cache {
     options: CacheOptions,
     root: PathBuf,
     clock: Clock,
+    /// Orders deleting a blob file against storing one.
+    ///
+    /// A store checks whether the bytes are already on disk and, if they
+    /// are, takes a reference to the existing file. A deletion checks that
+    /// nothing refers to a blob and removes its file. Interleaved, the store
+    /// can take its reference to a file the deletion is about to remove, and
+    /// the entry it writes names bytes that are gone. So every store holds this
+    /// shared from the moment it looks at the disk until its references are
+    /// committed, and every deletion holds it exclusively. The index is opened
+    /// by one process at a time, so an in-process lock is enough.
+    blob_gate: std::sync::RwLock<()>,
+    /// Test-only pause points, for driving an interleaving deterministically.
+    #[cfg(test)]
+    pause: std::sync::Mutex<Option<PauseHook>>,
 }
+
+#[cfg(test)]
+type PauseHook = Arc<dyn Fn(&'static str) + Send + Sync>;
 
 impl Cache {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -159,7 +178,25 @@ impl Cache {
             options,
             root,
             clock: Arc::new(now_secs),
+            blob_gate: std::sync::RwLock::new(()),
+            #[cfg(test)]
+            pause: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Held by a store from its look at the disk until its references commit.
+    fn storing(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.blob_gate.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pause_point(&self, _name: &'static str) {
+        #[cfg(test)]
+        {
+            let hook = self.pause.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(_name);
+            }
+        }
     }
 
     /// Replace the clock. Tests use this to age entries instantly.
@@ -262,7 +299,13 @@ impl Cache {
 
         match policy::evaluate(request_headers, &meta, now, &self.options) {
             Freshness::Fresh { age, .. } => {
-                let response = self.materialize(key.clone(), &record, &meta, age, &want)?;
+                let response = match self.materialize(key.clone(), &record, &meta, age, &want) {
+                    Ok(response) => response,
+                    Err(err) if err.is_lost_body() => {
+                        return self.discard_broken(&key, &record, tally, &err)
+                    }
+                    Err(err) => return Err(err),
+                };
                 tally.push((counters::HITS, 1));
                 if want.range.is_some() {
                     tally.push((counters::RANGE_HITS, 1));
@@ -277,7 +320,13 @@ impl Cache {
                 reason,
                 ..
             } => {
-                let response = self.materialize(key.clone(), &record, &meta, age, &want)?;
+                let response = match self.materialize(key.clone(), &record, &meta, age, &want) {
+                    Ok(response) => response,
+                    Err(err) if err.is_lost_body() => {
+                        return self.discard_broken(&key, &record, tally, &err)
+                    }
+                    Err(err) => return Err(err),
+                };
                 tally.push((counters::STALE_HITS, 1));
                 if want.range.is_some() {
                     tally.push((counters::RANGE_HITS, 1));
@@ -310,7 +359,13 @@ impl Cache {
                         "a stale partial entry is refetched, not revalidated",
                     ));
                 }
-                let response = self.materialize(key.clone(), &record, &meta, age, &want)?;
+                let response = match self.materialize(key.clone(), &record, &meta, age, &want) {
+                    Ok(response) => response,
+                    Err(err) if err.is_lost_body() => {
+                        return self.discard_broken(&key, &record, tally, &err)
+                    }
+                    Err(err) => return Err(err),
+                };
                 tally.push((counters::REVALIDATIONS, 1));
                 self.index.record_access(None, 0, &tally)?;
                 Ok(Lookup::Revalidate {
@@ -326,6 +381,56 @@ impl Cache {
                 Ok(Lookup::Miss(reason))
             }
         }
+    }
+
+    /// An entry whose stored body is missing or corrupt stops being an entry.
+    ///
+    /// The alternative is a URL that fails on every request until eviction
+    /// happens to reach it. The entry is dropped (only if it still names the
+    /// body that failed; see [`Index::drop_broken_entry`]), the blobs it alone
+    /// referred to are deleted, and the request becomes a miss, so the caller
+    /// fetches it again and the store is repaired by the next write.
+    fn discard_broken(
+        &self,
+        key: &str,
+        record: &EntryRecord,
+        mut tally: Vec<(&str, u64)>,
+        err: &CacheError,
+    ) -> Result<Lookup> {
+        self.drop_broken(key, record, err)?;
+        tally.push((counters::MISSES, 1));
+        self.index.record_access(None, 0, &tally)?;
+        Ok(Lookup::Miss("stored body missing or corrupt"))
+    }
+
+    fn drop_broken(&self, key: &str, record: &EntryRecord, err: &CacheError) -> Result<()> {
+        if let Some(orphaned) = self.index.drop_broken_entry(key, &record.body)? {
+            tracing::warn!(url = %record.url, %err, "dropped a cache entry whose body was lost");
+            self.index.bump(counters::CORRUPT_ENTRIES, 1)?;
+            self.delete_orphans(&orphaned)?;
+        }
+        Ok(())
+    }
+
+    /// Delete the files of blobs nothing refers to, and their records.
+    ///
+    /// The only place a blob file is deleted. Each one is re-checked under the
+    /// exclusive gate, so a blob a store has taken a new reference to since it
+    /// was released keeps its file. Returns how many were deleted.
+    fn delete_orphans(&self, candidates: &[ContentId]) -> Result<usize> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let _exclusive = self.blob_gate.write().unwrap_or_else(|e| e.into_inner());
+        self.pause_point("delete:locked");
+        let mut deleted = 0;
+        for id in candidates {
+            if self.index.forget_blob_if_unreferenced(*id)? {
+                self.blobs.remove(*id)?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     /// What this request wants out of the stored entry.
@@ -633,7 +738,9 @@ impl Cache {
             );
         }
 
+        let gate = self.storing();
         let receipt = self.blobs.put(body)?;
+        self.pause_point("store:after-put");
         if !receipt.newly_written {
             self.index.bump(counters::BYTES_DEDUPED, receipt.len)?;
         }
@@ -666,7 +773,8 @@ impl Cache {
             created: now,
         };
         let orphaned = self.index.put_entry(&record, &[(receipt.id, blob)])?;
-        self.drop_blobs(&orphaned)?;
+        drop(gate);
+        self.delete_orphans(&orphaned)?;
         self.index.index_sri(&sri_digests(body, receipt.id))?;
         self.index.bump(counters::STORES, 1)?;
 
@@ -748,6 +856,7 @@ impl Cache {
 
         let fields = vary::vary_fields(response_headers);
         let vkey = vary::vary_key(&fields, request_headers);
+        let gate = self.storing();
         let (receipt, digests) = self.blobs.commit(writer)?;
         if !receipt.newly_written {
             self.index.bump(counters::BYTES_DEDUPED, receipt.len)?;
@@ -781,7 +890,8 @@ impl Cache {
             created: now,
         };
         let orphaned = self.index.put_entry(&record, &[(receipt.id, blob)])?;
-        self.drop_blobs(&orphaned)?;
+        drop(gate);
+        self.delete_orphans(&orphaned)?;
 
         let rows: Vec<(Vec<u8>, [u8; 32])> = digests
             .each()
@@ -861,7 +971,7 @@ impl Cache {
         };
         if existing.is_some() && !combinable {
             let orphaned = self.index.remove_entry(&key)?;
-            self.drop_blobs(&orphaned)?;
+            self.delete_orphans(&orphaned)?;
         }
         let existing = if combinable { existing } else { None };
 
@@ -883,6 +993,7 @@ impl Cache {
         // a re-fetched range add to the entry rather than replace it.
         let coverage = Coverage::from_sorted(segments.iter().map(|s| (s.start, s.end)).collect());
         let (start, end) = content_range.half_open();
+        let gate = self.storing();
         let mut new_blobs: Vec<(ContentId, BlobRecord)> = Vec::new();
         let now = self.now();
         for (from, to) in coverage.missing(start, end) {
@@ -973,7 +1084,8 @@ impl Cache {
         }
 
         let orphaned = self.index.put_entry(&record, &new_blobs)?;
-        self.drop_blobs(&orphaned)?;
+        drop(gate);
+        self.delete_orphans(&orphaned)?;
         self.index.bump(counters::STORES, 1)?;
         if completed.is_none() {
             self.index.bump(counters::PARTIAL_STORES, 1)?;
@@ -1010,7 +1122,7 @@ impl Cache {
 
         if !same_representation(&stored, head_headers) {
             let orphaned = self.index.remove_entry(&key)?;
-            self.drop_blobs(&orphaned)?;
+            self.delete_orphans(&orphaned)?;
             tracing::debug!(url, "a HEAD contradicted the stored GET; invalidated it");
             return Ok(());
         }
@@ -1018,15 +1130,6 @@ impl Cache {
         policy::apply_304(&mut stored, head_headers);
         record.headers = StoredHeaders::for_storage(&stored);
         self.index.refresh_entry(&record)?;
-        Ok(())
-    }
-
-    /// Delete blobs whose last reference has gone, and forget their records.
-    fn drop_blobs(&self, orphaned: &[ContentId]) -> Result<()> {
-        for id in orphaned {
-            self.blobs.remove(*id)?;
-            self.index.forget_blob(*id)?;
-        }
         Ok(())
     }
 
@@ -1060,7 +1163,17 @@ impl Cache {
             range: None,
             omit_body: false,
         };
-        let response = self.materialize(key.to_string(), &record, &meta, age, &want)?;
+        let response = match self.materialize(key.to_string(), &record, &meta, age, &want) {
+            Ok(response) => response,
+            // The origin confirmed a body we no longer hold. The entry goes,
+            // and the error says so: the caller asks the origin again, once,
+            // without a validator.
+            Err(err) if err.is_lost_body() => {
+                self.drop_broken(key, &record, &err)?;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         self.index
             .bump(counters::BYTES_FROM_CACHE, response.body.len() as u64)?;
         self.index.bump(counters::HITS, 1)?;
@@ -1087,7 +1200,10 @@ impl Cache {
                 actual: ContentId::of(body).to_hex(),
             });
         }
-        self.blobs.put(body)?;
+        {
+            let _gate = self.storing();
+            self.blobs.put(body)?;
+        }
         self.index.bump(counters::PEER_ACCEPTED, 1)?;
         Ok(())
     }
@@ -1102,7 +1218,7 @@ impl Cache {
         for m in ["GET", "HEAD"] {
             let orphaned = self.index.invalidate(partition, m, &url)?;
             removed += orphaned.len();
-            self.drop_blobs(&orphaned)?;
+            self.delete_orphans(&orphaned)?;
         }
         Ok(removed)
     }
@@ -1110,7 +1226,8 @@ impl Cache {
     pub fn purge(&self, partition: Option<&str>, method: &str, url: &str) -> Result<()> {
         let url = Self::normalize_url(url);
         let orphaned = self.index.invalidate(partition, method, &url)?;
-        self.drop_blobs(&orphaned)
+        self.delete_orphans(&orphaned)?;
+        Ok(())
     }
 
     /// Delete blobs nothing points at any more, and the integrity rows that
@@ -1123,15 +1240,12 @@ impl Cache {
     /// [`enforce_budget`]: Cache::enforce_budget
     pub fn collect_garbage(&self) -> Result<usize> {
         let orphans = self.index.orphaned_blobs()?;
-        for id in &orphans {
-            self.blobs.remove(*id)?;
-            self.index.forget_blob(*id)?;
-        }
+        let deleted = self.delete_orphans(&orphans)?;
         let pruned = self.index.prune_sri()?;
         if pruned > 0 {
             tracing::debug!(pruned, "dropped integrity rows whose body is gone");
         }
-        Ok(orphans.len())
+        Ok(deleted)
     }
 
     /// Bring the store back under its size budget by dropping entries.
@@ -1159,13 +1273,13 @@ impl Cache {
             if on_disk <= target {
                 break;
             }
-            for id in self.index.remove_entry(&key)? {
-                if let Some(blob) = self.index.get_blob(id)? {
+            let orphaned = self.index.remove_entry(&key)?;
+            for id in &orphaned {
+                if let Some(blob) = self.index.get_blob(*id)? {
                     on_disk = on_disk.saturating_sub(blob.stored_len);
                 }
-                self.blobs.remove(id)?;
-                self.index.forget_blob(id)?;
             }
+            self.delete_orphans(&orphaned)?;
             evicted += 1;
         }
         if evicted > 0 {
@@ -1445,5 +1559,252 @@ mod tests {
             }
             other => panic!("expected a fresh hit, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------- bodies that went missing
+
+    fn get(cache: &Cache, url: &str) -> Lookup {
+        cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap()
+    }
+
+    fn blob_path(cache: &Cache, body: &[u8]) -> std::path::PathBuf {
+        cache.blobs.path_for(ContentId::of(body))
+    }
+
+    fn assert_miss_for_lost_body(lookup: Lookup) {
+        match lookup {
+            Lookup::Miss(reason) => assert_eq!(reason, "stored body missing or corrupt"),
+            other => panic!("expected a miss for a lost body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deleted_body_is_a_miss_and_the_entry_goes_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        stored(&cache, "https://a.test/gone", b"vanishing");
+        std::fs::remove_file(blob_path(&cache, b"vanishing")).unwrap();
+
+        assert_miss_for_lost_body(get(&cache, "https://a.test/gone"));
+        assert_eq!(cache.index.entry_count().unwrap(), 0);
+        assert!(cache
+            .index
+            .get_blob(ContentId::of(b"vanishing"))
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .index
+            .variant_keys(None, "GET", "https://a.test/gone")
+            .unwrap()
+            .is_empty());
+        assert_eq!(cache.stats().unwrap().corrupt_entries, 1);
+
+        // And it can be stored again, and served.
+        stored(&cache, "https://a.test/gone", b"vanishing");
+        assert!(matches!(
+            get(&cache, "https://a.test/gone"),
+            Lookup::Fresh(_)
+        ));
+    }
+
+    #[test]
+    fn a_corrupt_body_is_a_miss_and_the_entry_goes_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        stored(&cache, "https://a.test/rot", b"original bytes");
+        std::fs::write(blob_path(&cache, b"original bytes"), [0u8, b'x']).unwrap();
+
+        assert_miss_for_lost_body(get(&cache, "https://a.test/rot"));
+        assert_eq!(cache.index.entry_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_partial_entry_missing_a_segment_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let url = "https://a.test/video";
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CACHE_CONTROL, "max-age=600".parse().unwrap());
+        headers.insert(http::header::ETAG, "\"v1\"".parse().unwrap());
+        headers.insert(
+            http::header::CONTENT_RANGE,
+            "bytes 0-9/100".parse().unwrap(),
+        );
+        let now = cache.now();
+        let outcome = cache
+            .store(
+                None,
+                "GET",
+                url,
+                &HeaderMap::new(),
+                206,
+                &headers,
+                b"0123456789",
+                now,
+                now,
+            )
+            .unwrap();
+        assert!(matches!(outcome, StoreOutcome::StoredPartial { .. }));
+        std::fs::remove_file(blob_path(&cache, b"0123456789")).unwrap();
+
+        let mut request = HeaderMap::new();
+        request.insert(http::header::RANGE, "bytes=0-4".parse().unwrap());
+        assert_miss_for_lost_body(cache.lookup(None, "GET", url, &request).unwrap());
+        assert_eq!(cache.index.entry_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn dropping_one_broken_entry_leaves_another_that_shares_the_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        stored(&cache, "https://a.test/one", b"shared body");
+        stored(&cache, "https://a.test/two", b"shared body");
+        let id = ContentId::of(b"shared body");
+        std::fs::remove_file(blob_path(&cache, b"shared body")).unwrap();
+
+        // Only /one is asked for. It goes, and only its reference goes with it.
+        assert_miss_for_lost_body(get(&cache, "https://a.test/one"));
+        assert_eq!(cache.index.get_blob(id).unwrap().unwrap().refcount, 1);
+        assert_eq!(cache.index.entry_count().unwrap(), 1);
+
+        // /two is untouched. Once the bytes exist again it is served.
+        stored(&cache, "https://a.test/three", b"shared body");
+        match get(&cache, "https://a.test/two") {
+            Lookup::Fresh(response) => assert_eq!(response.body, b"shared body"),
+            other => panic!("the other entry should still be served, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_replacement_stored_meanwhile_is_not_dropped_for_the_old_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        stored(&cache, "https://a.test/page", b"old body");
+        let (key, old) = only_entry(&cache);
+
+        // The old body is found broken, but before the entry is dropped a new
+        // response replaces it.
+        stored(&cache, "https://a.test/page", b"new body");
+        cache
+            .drop_broken(&key, &old, &CacheError::MissingBlob("old".into()))
+            .unwrap();
+
+        match get(&cache, "https://a.test/page") {
+            Lookup::Fresh(response) => assert_eq!(response.body, b"new body"),
+            other => panic!("the replacement should survive, got {other:?}"),
+        }
+        assert_eq!(cache.stats().unwrap().corrupt_entries, 0);
+    }
+
+    #[test]
+    fn many_lookups_of_one_broken_entry_drop_it_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::open(dir.path()).unwrap());
+        stored(&cache, "https://a.test/busy", b"popular");
+        std::fs::remove_file(blob_path(&cache, b"popular")).unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    get(&cache, "https://a.test/busy")
+                })
+            })
+            .collect();
+        for thread in threads {
+            match thread.join().unwrap() {
+                Lookup::Miss(_) => {}
+                other => panic!("every lookup should miss, got {other:?}"),
+            }
+        }
+
+        assert_eq!(cache.stats().unwrap().corrupt_entries, 1);
+        assert_eq!(cache.index.entry_count().unwrap(), 0);
+        assert!(cache
+            .index
+            .get_blob(ContentId::of(b"popular"))
+            .unwrap()
+            .is_none());
+        assert!(cache.index.orphaned_blobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_store_that_reuses_a_file_is_never_left_pointing_at_a_deleted_one() {
+        // The interleaving this guards against, made to happen on purpose: a
+        // blob whose last reference has gone but whose file is still on disk;
+        // a store of the same bytes finds the file and pauses before taking
+        // its reference; garbage collection runs. Without the gate the file is
+        // deleted under the store, and the entry it then writes names bytes
+        // that are gone.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::open(dir.path()).unwrap());
+        stored(&cache, "https://a.test/first", b"reused");
+        let (key, _) = only_entry(&cache);
+        // Release the reference without deleting the file.
+        let released = cache.index.remove_entry(&key).unwrap();
+        assert_eq!(released, vec![ContentId::of(b"reused")]);
+        assert!(blob_path(&cache, b"reused").exists());
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        *cache.pause.lock().unwrap() = Some(Arc::new(move |point| {
+            if point == "store:after-put" {
+                paused_tx.send(()).unwrap();
+                resume_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+
+        let storing = {
+            let cache = cache.clone();
+            std::thread::spawn(move || stored(&cache, "https://a.test/second", b"reused"))
+        };
+        paused_rx.recv().unwrap();
+        *cache.pause.lock().unwrap() = None;
+
+        let (collected_tx, collected_rx) = std::sync::mpsc::channel::<usize>();
+        let collecting = {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                collected_tx.send(cache.collect_garbage().unwrap()).unwrap();
+            })
+        };
+        // With the gate, collection waits for the store and this times out;
+        // without it, collection finishes here and deletes the file. Either
+        // way the store is then let go, and the outcome is what is checked.
+        let early = collected_rx.recv_timeout(std::time::Duration::from_millis(500));
+        resume_tx.send(()).unwrap();
+        storing.join().unwrap();
+        collecting.join().unwrap();
+        let deleted = early.or_else(|_| collected_rx.recv()).unwrap();
+
+        assert_eq!(
+            deleted, 0,
+            "the blob was deleted while a store was using it"
+        );
+        assert!(blob_path(&cache, b"reused").exists());
+        match get(&cache, "https://a.test/second") {
+            Lookup::Fresh(response) => assert_eq!(response.body, b"reused"),
+            other => panic!("the new entry should be served, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_304_for_a_body_that_is_gone_drops_the_entry_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        stored(&cache, "https://a.test/confirmed", b"no longer here");
+        let (key, _) = only_entry(&cache);
+        std::fs::remove_file(blob_path(&cache, b"no longer here")).unwrap();
+
+        let err = cache
+            .record_not_modified(&key, &HeaderMap::new(), cache.now(), cache.now())
+            .unwrap_err();
+        assert!(err.is_lost_body(), "{err}");
+        assert_eq!(cache.index.entry_count().unwrap(), 0);
+        assert_eq!(cache.stats().unwrap().corrupt_entries, 1);
     }
 }

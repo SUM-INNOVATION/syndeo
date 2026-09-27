@@ -488,37 +488,44 @@ impl Index {
 
     /// Drop one entry. Returns the blobs whose last reference it held.
     pub fn remove_entry(&self, key: &str) -> Result<Vec<ContentId>> {
-        let mut orphan = Vec::new();
         let tx = self.db.begin_write()?;
-        {
-            let mut entries = tx.open_table(ENTRIES)?;
-            let mut blobs = tx.open_table(BLOBS)?;
-            let removed: Option<EntryRecord> = match entries.remove(key)? {
-                Some(bytes) => Some(bincode::deserialize(bytes.value())?),
-                None => None,
-            };
-            if let Some(record) = removed {
-                for content in record.contents() {
-                    if release(&mut blobs, &content)? {
-                        orphan.push(ContentId(content));
-                    }
-                }
-                let pkey = primary_key(record.partition.as_deref(), &record.method, &record.url);
-                let mut variants = tx.open_table(VARIANTS)?;
-                let mut keys: Vec<String> = match variants.get(pkey.as_str())? {
-                    Some(v) => bincode::deserialize(v.value())?,
-                    None => Vec::new(),
-                };
-                keys.retain(|k| k != &record.vary_key);
-                if keys.is_empty() {
-                    variants.remove(pkey.as_str())?;
-                } else {
-                    variants.insert(pkey.as_str(), bincode::serialize(&keys)?.as_slice())?;
-                }
-            }
-        }
+        let orphan = remove_entry_in(&tx, key)?;
         tx.commit()?;
         Ok(orphan)
+    }
+
+    /// Drop an entry whose body turned out to be missing or corrupt — but only
+    /// if it still names the body that failed.
+    ///
+    /// Checked and removed in one transaction, so a replacement stored in the
+    /// meantime is left alone, and of any number of callers that found the
+    /// same broken entry exactly one removes it. `None` means it had already
+    /// gone or been replaced; otherwise the blobs whose last reference it held.
+    pub fn drop_broken_entry(
+        &self,
+        key: &str,
+        expected: &StoredBody,
+    ) -> Result<Option<Vec<ContentId>>> {
+        let tx = self.db.begin_write()?;
+        let current: Option<EntryRecord> = {
+            let entries = tx.open_table(ENTRIES)?;
+            let found = entries.get(key)?;
+            match found {
+                Some(bytes) => Some(bincode::deserialize(bytes.value())?),
+                None => None,
+            }
+        };
+        match current {
+            Some(record) if &record.body == expected => {
+                let orphan = remove_entry_in(&tx, key)?;
+                tx.commit()?;
+                Ok(Some(orphan))
+            }
+            _ => {
+                tx.abort()?;
+                Ok(None)
+            }
+        }
     }
 
     /// Everything one served request changes, in a single transaction.
@@ -671,14 +678,32 @@ impl Index {
         Ok(out)
     }
 
-    pub fn forget_blob(&self, id: ContentId) -> Result<()> {
+    /// Forget a blob's record if nothing refers to it, and say whether its file
+    /// may now be deleted.
+    ///
+    /// The reference count is read and the row removed in one transaction. A
+    /// blob that was released and then taken again before this ran — a new
+    /// entry storing the same bytes — keeps its record and its file.
+    pub fn forget_blob_if_unreferenced(&self, id: ContentId) -> Result<bool> {
         let tx = self.db.begin_write()?;
-        {
+        let forget = {
             let mut blobs = tx.open_table(BLOBS)?;
-            blobs.remove(id.0.as_slice())?;
-        }
+            let refcount = match blobs.get(id.0.as_slice())? {
+                Some(bytes) => Some(bincode::deserialize::<BlobRecord>(bytes.value())?.refcount),
+                None => None,
+            };
+            match refcount {
+                Some(0) => {
+                    blobs.remove(id.0.as_slice())?;
+                    true
+                }
+                Some(_) => false,
+                // No record at all: nothing refers to it through the index.
+                None => true,
+            }
+        };
         tx.commit()?;
-        Ok(())
+        Ok(forget)
     }
 
     // ---- integrity index ---------------------------------------------------
@@ -776,6 +801,39 @@ impl Index {
         }
         Ok(out)
     }
+}
+
+/// Remove an entry inside a caller's transaction: release its blob references
+/// and take it out of its URL's variant list. Returns the blobs whose last
+/// reference it held.
+fn remove_entry_in(tx: &redb::WriteTransaction, key: &str) -> Result<Vec<ContentId>> {
+    let mut orphan = Vec::new();
+    let mut entries = tx.open_table(ENTRIES)?;
+    let mut blobs = tx.open_table(BLOBS)?;
+    let removed: Option<EntryRecord> = match entries.remove(key)? {
+        Some(bytes) => Some(bincode::deserialize(bytes.value())?),
+        None => None,
+    };
+    if let Some(record) = removed {
+        for content in record.contents() {
+            if release(&mut blobs, &content)? {
+                orphan.push(ContentId(content));
+            }
+        }
+        let pkey = primary_key(record.partition.as_deref(), &record.method, &record.url);
+        let mut variants = tx.open_table(VARIANTS)?;
+        let mut keys: Vec<String> = match variants.get(pkey.as_str())? {
+            Some(v) => bincode::deserialize(v.value())?,
+            None => Vec::new(),
+        };
+        keys.retain(|k| k != &record.vary_key);
+        if keys.is_empty() {
+            variants.remove(pkey.as_str())?;
+        } else {
+            variants.insert(pkey.as_str(), bincode::serialize(&keys)?.as_slice())?;
+        }
+    }
+    Ok(orphan)
 }
 
 /// Drop one reference to a blob. Returns true when it reached zero.
