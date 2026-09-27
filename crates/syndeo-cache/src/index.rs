@@ -41,6 +41,15 @@ const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
 /// body by its SRI digest, which is the only hash a page declares, and the
 /// answer is still self-verifying.
 const SRI: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sri");
+/// Content a peer may be given, each with the declared integrity hashes that
+/// were verified against its bytes (as [`crate::cache::sri_key`] keys).
+///
+/// Separate from [`SRI`] on purpose. That table indexes every stored body by
+/// all three digests, whether or not any page declared one, so it says nothing
+/// about what may be shared. A row here exists only because a page declared an
+/// integrity value and the body was checked against it, and it goes in the
+/// same transaction as the blob's own record.
+const PEER_ELIGIBLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("peer_eligible");
 
 /// Where a stored body came from. A peer-supplied body is only ever recorded
 /// after it has been checked against a hash obtained independently.
@@ -301,6 +310,7 @@ impl Index {
             tx.open_table(VARIANTS)?;
             tx.open_table(COUNTERS)?;
             tx.open_table(SRI)?;
+            tx.open_table(PEER_ELIGIBLE)?;
         }
         tx.commit()?;
         Ok(Index {
@@ -518,6 +528,14 @@ impl Index {
         match current {
             Some(record) if &record.body == expected => {
                 let orphan = remove_entry_in(&tx, key)?;
+                // Bytes that failed to read back are not offered to anyone,
+                // even while another entry still refers to them.
+                {
+                    let mut eligible = tx.open_table(PEER_ELIGIBLE)?;
+                    for content in record.contents() {
+                        eligible.remove(content.as_slice())?;
+                    }
+                }
                 tx.commit()?;
                 Ok(Some(orphan))
             }
@@ -702,8 +720,62 @@ impl Index {
                 None => true,
             }
         };
+        if forget {
+            tx.open_table(PEER_ELIGIBLE)?.remove(id.0.as_slice())?;
+        }
         tx.commit()?;
         Ok(forget)
+    }
+
+    // ---- peer eligibility --------------------------------------------------
+
+    /// Record that these verified hashes name `id`, merged with any already
+    /// recorded. Refused — `false` — unless an entry refers to the blob, so
+    /// nothing is offered that eviction could not also take away.
+    ///
+    /// The caller has checked the bytes; see `Cache::grant_peer_eligibility`,
+    /// which is the only way to reach this from outside the crate.
+    pub(crate) fn grant_eligibility(&self, id: ContentId, verified: &[Vec<u8>]) -> Result<bool> {
+        if verified.is_empty() {
+            return Ok(false);
+        }
+        let tx = self.db.begin_write()?;
+        let referenced = {
+            let blobs = tx.open_table(BLOBS)?;
+            let found = blobs.get(id.0.as_slice())?;
+            match found {
+                Some(bytes) => bincode::deserialize::<BlobRecord>(bytes.value())?.refcount > 0,
+                None => false,
+            }
+        };
+        if !referenced {
+            tx.abort()?;
+            return Ok(false);
+        }
+        {
+            let mut eligible = tx.open_table(PEER_ELIGIBLE)?;
+            let mut keys: Vec<Vec<u8>> = match eligible.get(id.0.as_slice())? {
+                Some(bytes) => bincode::deserialize(bytes.value())?,
+                None => Vec::new(),
+            };
+            keys.extend(verified.iter().cloned());
+            keys.sort();
+            keys.dedup();
+            eligible.insert(id.0.as_slice(), bincode::serialize(&keys)?.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The verified hashes a peer may name `id` by. Empty means it may not be
+    /// given to a peer at all.
+    pub fn eligible_hashes(&self, id: ContentId) -> Result<Vec<Vec<u8>>> {
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(PEER_ELIGIBLE)?;
+        match table.get(id.0.as_slice())? {
+            Some(bytes) => Ok(bincode::deserialize(bytes.value())?),
+            None => Ok(Vec::new()),
+        }
     }
 
     // ---- integrity index ---------------------------------------------------

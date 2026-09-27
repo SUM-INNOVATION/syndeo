@@ -3,11 +3,48 @@
 use std::sync::Arc;
 use std::time::Duration;
 use syndeo_cache::sri::{Algorithm, Hash};
-use syndeo_cache::{Cache, ContentId};
+use syndeo_cache::{Cache, ContentId, Integrity};
 use syndeo_peer::{BlobRequest, PeerConfig, PeerHandle, PeerNode};
 
 fn cache(dir: &std::path::Path) -> Arc<Cache> {
     Arc::new(Cache::open(dir).unwrap())
+}
+
+/// Store a body the way the network process does once a page's declared
+/// integrity has been verified: an entry, and a grant that lets peers have it.
+fn store_shared(cache: &Arc<Cache>, url: &str, body: &[u8]) -> Hash {
+    store_only(cache, url, body);
+    let declared = Hash::compute(Algorithm::Sha384, body);
+    let granted = cache
+        .grant_peer_eligibility(
+            ContentId::of(body),
+            &Integrity {
+                hashes: vec![declared.clone()],
+            },
+        )
+        .unwrap();
+    assert_eq!(granted, vec![declared.clone()]);
+    declared
+}
+
+/// Store a body as any response is stored, with no integrity declared.
+fn store_only(cache: &Arc<Cache>, url: &str, body: &[u8]) {
+    let mut headers = http::HeaderMap::new();
+    headers.insert("cache-control", "max-age=600".parse().unwrap());
+    let now = cache.now();
+    cache
+        .store(
+            None,
+            "GET",
+            url,
+            &http::HeaderMap::new(),
+            200,
+            &headers,
+            body,
+            now,
+            now,
+        )
+        .unwrap();
 }
 
 fn config() -> PeerConfig {
@@ -58,25 +95,7 @@ async fn a_peer_serves_a_body_by_its_content_address() {
 
     let body = vec![b'p'; 20_000];
     let server_cache = cache(server_dir.path());
-    let headers = {
-        let mut h = http::HeaderMap::new();
-        h.insert("cache-control", "max-age=600".parse().unwrap());
-        h
-    };
-    let now = syndeo_cache::headers::now_secs();
-    server_cache
-        .store(
-            None,
-            "GET",
-            "https://origin.test/asset.js",
-            &http::HeaderMap::new(),
-            200,
-            &headers,
-            &body,
-            now,
-            now,
-        )
-        .unwrap();
+    store_shared(&server_cache, "https://origin.test/asset.js", &body);
 
     let server = PeerNode::start(server_cache, config()).unwrap();
     let client = PeerNode::start(cache(client_dir.path()), config()).unwrap();
@@ -93,22 +112,7 @@ async fn a_peer_serves_a_body_by_the_integrity_a_page_declared() {
 
     let body = b"console.log('the real library');".to_vec();
     let server_cache = cache(server_dir.path());
-    let mut headers = http::HeaderMap::new();
-    headers.insert("cache-control", "max-age=600".parse().unwrap());
-    let now = syndeo_cache::headers::now_secs();
-    server_cache
-        .store(
-            None,
-            "GET",
-            "https://cdn.test/lib.js",
-            &http::HeaderMap::new(),
-            200,
-            &headers,
-            &body,
-            now,
-            now,
-        )
-        .unwrap();
+    store_shared(&server_cache, "https://cdn.test/lib.js", &body);
 
     let server = PeerNode::start(server_cache, config()).unwrap();
     let client_cache = cache(client_dir.path());
@@ -128,31 +132,18 @@ async fn a_peer_serves_a_body_by_the_integrity_a_page_declared() {
 }
 
 #[tokio::test]
-async fn bytes_that_do_not_hash_to_the_request_are_refused() {
+async fn a_poisoned_integrity_row_cannot_make_a_node_share_other_bytes() {
     let server_dir = tempfile::tempdir().unwrap();
     let client_dir = tempfile::tempdir().unwrap();
 
     let real = b"console.log('the real library');".to_vec();
     let substituted = b"console.log('exfiltrate everything');".to_vec();
 
-    // A peer that will answer the real library's digest with different bytes.
+    // A node whose integrity index has been made to claim the real library's
+    // digest names different bytes. Those bytes are shareable under their own
+    // hash; the poisoned name was never verified against them.
     let server_cache = cache(server_dir.path());
-    let mut headers = http::HeaderMap::new();
-    headers.insert("cache-control", "max-age=600".parse().unwrap());
-    let now = syndeo_cache::headers::now_secs();
-    server_cache
-        .store(
-            None,
-            "GET",
-            "https://cdn.test/lib.js",
-            &http::HeaderMap::new(),
-            200,
-            &headers,
-            &substituted,
-            now,
-            now,
-        )
-        .unwrap();
+    store_shared(&server_cache, "https://cdn.test/lib.js", &substituted);
     let declared = Hash::compute(Algorithm::Sha384, &real);
     server_cache
         .associate_integrity(&declared, ContentId::of(&substituted))
@@ -162,10 +153,58 @@ async fn bytes_that_do_not_hash_to_the_request_are_refused() {
     let client = PeerNode::start(cache(client_dir.path()), config()).unwrap();
     connect(&server, &client).await;
 
-    // The peer answers. The bytes do not hash to what was asked for, so they are
-    // discarded and the fetch fails rather than succeeding with a lie.
+    // The server refuses rather than answering the name with the wrong bytes.
+    // (A peer that answers anyway is refused by the requester: see
+    // `BlobRequest::is_satisfied_by` and its tests.)
     let result = client.fetch_integrity(&declared).await;
     assert!(result.is_err(), "substituted bytes must never be returned");
+}
+
+#[tokio::test]
+async fn a_body_no_page_declared_integrity_for_is_never_shared() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let client_dir = tempfile::tempdir().unwrap();
+
+    // An ordinary page, stored as every response is — which also indexes it
+    // under all three SRI digests. None of that makes it shareable.
+    let page = b"<html>a page only this user has seen</html>".to_vec();
+    let server_cache = cache(server_dir.path());
+    store_only(&server_cache, "https://private.test/inbox", &page);
+
+    let server = PeerNode::start(server_cache, config()).unwrap();
+    let client = PeerNode::start(cache(client_dir.path()), config()).unwrap();
+    connect(&server, &client).await;
+
+    assert!(client.fetch_content(ContentId::of(&page)).await.is_err());
+    for algorithm in [Algorithm::Sha256, Algorithm::Sha384, Algorithm::Sha512] {
+        assert!(
+            client
+                .fetch_integrity(&Hash::compute(algorithm, &page))
+                .await
+                .is_err(),
+            "shared by {}",
+            algorithm.name()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_body_is_shared_only_under_the_hash_that_was_verified() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let client_dir = tempfile::tempdir().unwrap();
+
+    let body = b"export const shared = true;".to_vec();
+    let server_cache = cache(server_dir.path());
+    let verified = store_shared(&server_cache, "https://cdn.test/shared.js", &body);
+
+    let server = PeerNode::start(server_cache, config()).unwrap();
+    let client = PeerNode::start(cache(client_dir.path()), config()).unwrap();
+    connect(&server, &client).await;
+
+    // Same bytes, a hash nobody declared.
+    let undeclared = Hash::compute(Algorithm::Sha256, &body);
+    assert!(client.fetch_integrity(&undeclared).await.is_err());
+    assert_eq!(client.fetch_integrity(&verified).await.unwrap(), body);
 }
 
 #[tokio::test]
@@ -200,23 +239,7 @@ async fn with_no_peers_a_fetch_fails_immediately_rather_than_hanging() {
 
 /// A body stored in a cache, and the integrity hash a page would declare for it.
 fn seed(cache: &Arc<Cache>, body: &[u8]) -> Hash {
-    let mut headers = http::HeaderMap::new();
-    headers.insert("cache-control", "max-age=600".parse().unwrap());
-    let now = cache.now();
-    cache
-        .store(
-            None,
-            "GET",
-            "https://example.test/lib.js",
-            &http::HeaderMap::new(),
-            200,
-            &headers,
-            body,
-            now,
-            now,
-        )
-        .unwrap();
-    Hash::compute(Algorithm::Sha384, body)
+    store_shared(cache, "https://example.test/lib.js", body)
 }
 
 #[tokio::test]
@@ -320,24 +343,11 @@ async fn a_peer_that_only_takes_is_eventually_asked_to_wait() {
     let hashes: Vec<Hash> = (0..OPENING_CREDIT + 4)
         .map(|i| {
             let body = format!("body number {i}").repeat(64).into_bytes();
-            let hash = Hash::compute(Algorithm::Sha384, &body);
-            let mut headers = http::HeaderMap::new();
-            headers.insert("cache-control", "max-age=600".parse().unwrap());
-            let now = server_cache.now();
-            server_cache
-                .store(
-                    None,
-                    "GET",
-                    &format!("https://example.test/{i}.js"),
-                    &http::HeaderMap::new(),
-                    200,
-                    &headers,
-                    &body,
-                    now,
-                    now,
-                )
-                .unwrap();
-            hash
+            store_shared(
+                &server_cache,
+                &format!("https://example.test/{i}.js"),
+                &body,
+            )
         })
         .collect();
 

@@ -25,7 +25,7 @@ use libp2p_swarm::{NetworkBehaviour, Swarm, SwarmEvent};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use syndeo_cache::{Cache, ContentId};
+use syndeo_cache::{Cache, ContentId, PeerAsk};
 use tokio::sync::{mpsc, oneshot};
 
 pub use libp2p_identity::PeerId;
@@ -731,9 +731,15 @@ fn exhausted(swarm: &mut Swarm<Behaviour>, config: &PeerConfig, state: &mut Stat
 ///
 /// Note what this cannot leak: the request is a hash, so we never learn which
 /// URL the peer is after, and we never tell them one either.
+///
+/// And what it cannot share: only a body some page declared an integrity value
+/// for, verified against these bytes, and — when asked by integrity — only by
+/// a hash that was part of that verification. Everything else in the store is
+/// answered exactly as a body we do not have, so a peer that can compute the
+/// address of a page cannot use this to learn whether we visited it.
 fn serve(cache: &Arc<Cache>, request: &BlobRequest) -> BlobResponse {
-    let content = match request {
-        BlobRequest::Content(id) => Some(ContentId(*id)),
+    let found = match request {
+        BlobRequest::Content(id) => cache.body_for_peer(PeerAsk::Content(ContentId(*id))),
         BlobRequest::Integrity { algorithm, digest } => {
             let Some(algorithm) = crate::protocol::algorithm_from_tag(*algorithm) else {
                 return BlobResponse::Missing;
@@ -742,15 +748,11 @@ fn serve(cache: &Arc<Cache>, request: &BlobRequest) -> BlobResponse {
                 algorithm,
                 digest: digest.clone(),
             };
-            cache.content_for_integrity(&hash).ok().flatten()
+            cache.body_for_peer(PeerAsk::Integrity(&hash))
         }
     };
-
-    let Some(content) = content else {
-        return BlobResponse::Missing;
-    };
-    match cache.body_by_content(content) {
-        Ok(body) if body.len() <= MAX_BODY => BlobResponse::Have(body),
+    match found {
+        Ok(Some(body)) if body.len() <= MAX_BODY => BlobResponse::Have(body),
         _ => BlobResponse::Missing,
     }
 }

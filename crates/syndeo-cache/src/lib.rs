@@ -23,7 +23,7 @@ pub mod stats;
 pub mod vary;
 
 pub use blob::{BlobStore, Compression, ContentId};
-pub use cache::{Cache, Clock, Lookup, PeerProof, StoreOutcome, StoredResponse};
+pub use cache::{Cache, Clock, Lookup, PeerAsk, PeerProof, StoreOutcome, StoredResponse};
 pub use error::{CacheError, Result};
 pub use index::Provenance;
 pub use policy::{CacheOptions, Eviction, Freshness, Storability, StoredMeta};

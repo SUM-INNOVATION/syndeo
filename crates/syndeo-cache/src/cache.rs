@@ -426,6 +426,7 @@ impl Cache {
         let mut deleted = 0;
         for id in candidates {
             if self.index.forget_blob_if_unreferenced(*id)? {
+                self.pause_point("delete:forgotten");
                 self.blobs.remove(*id)?;
                 deleted += 1;
             }
@@ -644,11 +645,97 @@ impl Cache {
             .index_sri(&[(sri_key(hash.algorithm, &hash.digest), content.0)])
     }
 
-    /// Read a body straight out of the blob store by content address. This is
-    /// what a peer request is answered from — it never consults the index, so it
-    /// cannot leak which URL the body came from.
-    pub fn body_by_content(&self, id: ContentId) -> Result<Vec<u8>> {
-        self.blobs.get(id)
+    /// Mark a stored body as one a peer may be given, by the declared hashes it
+    /// actually satisfies.
+    ///
+    /// The only way anything becomes shareable, and it checks rather than
+    /// trusts: the body is read back from disk (which re-verifies its content
+    /// address), hashed at the strongest algorithm `declared` names, and only
+    /// the declared hashes at that level which match are recorded. A weaker
+    /// algorithm, or a declared hash that does not match, is never recorded
+    /// even when another hash made the declaration as a whole valid. Nothing
+    /// is granted for a body no entry refers to.
+    ///
+    /// Returns the hashes recorded, which are exactly the ones worth
+    /// announcing; empty means nothing was granted.
+    pub fn grant_peer_eligibility(
+        &self,
+        content: ContentId,
+        declared: &Integrity,
+    ) -> Result<Vec<crate::sri::Hash>> {
+        let Some(strongest) = declared.strongest() else {
+            return Ok(Vec::new());
+        };
+        // Shared, so the file cannot be deleted between the check and the grant.
+        let _gate = self.storing();
+        let bytes = match self.blobs.get(content) {
+            Ok(bytes) => bytes,
+            Err(err) if err.is_lost_body() => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let mut matching: Vec<crate::sri::Hash> = declared
+            .hashes
+            .iter()
+            .filter(|h| h.algorithm == strongest && h.matches(&bytes))
+            .cloned()
+            .collect();
+        matching.dedup();
+        let keys: Vec<Vec<u8>> = matching
+            .iter()
+            .map(|h| sri_key(h.algorithm, &h.digest))
+            .collect();
+        if !self.index.grant_eligibility(content, &keys)? {
+            return Ok(Vec::new());
+        }
+        Ok(matching)
+    }
+
+    /// The verified hashes a peer may name this body by. Empty: not shareable.
+    pub fn peer_eligibility(&self, content: ContentId) -> Result<Vec<crate::sri::Hash>> {
+        Ok(self
+            .index
+            .eligible_hashes(content)?
+            .iter()
+            .filter_map(|key| hash_from_sri_key(key))
+            .collect())
+    }
+
+    /// What a peer asking for this gets: the body, if it is one we may share
+    /// under this name, and `None` otherwise — including when we hold it but
+    /// no page's declared integrity was ever verified against it.
+    ///
+    /// Never consults the entries, so it cannot say which URL a body came from.
+    pub fn body_for_peer(&self, ask: PeerAsk<'_>) -> Result<Option<Vec<u8>>> {
+        let (content, named) = match ask {
+            PeerAsk::Content(id) => (id, None),
+            PeerAsk::Integrity(hash) => match self.content_for_integrity(hash)? {
+                Some(id) => (id, Some(hash)),
+                None => return Ok(None),
+            },
+        };
+        let eligible = self.index.eligible_hashes(content)?;
+        if eligible.is_empty() {
+            return Ok(None);
+        }
+        if let Some(hash) = named {
+            if !eligible.contains(&sri_key(hash.algorithm, &hash.digest)) {
+                return Ok(None);
+            }
+        }
+        let bytes = match self.blobs.get(content) {
+            Ok(bytes) => bytes,
+            Err(err) if err.is_lost_body() => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        // The content address was re-verified by the read; the named hash is
+        // checked too, because it costs one digest and a poisoned index row
+        // costs more.
+        if let Some(hash) = named {
+            if !hash.matches(&bytes) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(bytes))
     }
 
     pub fn has_content(&self, id: ContentId) -> bool {
@@ -1312,6 +1399,13 @@ impl Cache {
     }
 }
 
+/// How a peer names the body it wants.
+#[derive(Debug, Clone, Copy)]
+pub enum PeerAsk<'a> {
+    Content(ContentId),
+    Integrity(&'a crate::sri::Hash),
+}
+
 /// The independent hash a peer body is checked against.
 #[derive(Debug, Clone)]
 pub enum PeerProof {
@@ -1359,6 +1453,22 @@ pub fn sri_key(algorithm: crate::sri::Algorithm, digest: &[u8]) -> Vec<u8> {
     key.push(tag);
     key.extend_from_slice(digest);
     key
+}
+
+/// The hash an [`sri_key`] was made from.
+fn hash_from_sri_key(key: &[u8]) -> Option<crate::sri::Hash> {
+    use crate::sri::Algorithm;
+    let (tag, digest) = key.split_first()?;
+    let algorithm = match tag {
+        1 => Algorithm::Sha256,
+        2 => Algorithm::Sha384,
+        3 => Algorithm::Sha512,
+        _ => return None,
+    };
+    Some(crate::sri::Hash {
+        algorithm,
+        digest: digest.to_vec(),
+    })
 }
 
 /// Every SRI digest a body could be named by. Computing all three on store costs
@@ -1806,5 +1916,192 @@ mod tests {
         assert!(err.is_lost_body(), "{err}");
         assert_eq!(cache.index.entry_count().unwrap(), 0);
         assert_eq!(cache.stats().unwrap().corrupt_entries, 1);
+    }
+
+    // ------------------------------------------------- peer eligibility
+
+    use crate::sri::{Algorithm, Hash};
+
+    fn declared(hashes: &[Hash]) -> Integrity {
+        Integrity {
+            hashes: hashes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_grant_records_only_matching_hashes_at_the_strongest_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let body = b"library code";
+        stored(&cache, "https://cdn.test/lib.js", body);
+        let id = ContentId::of(body);
+
+        let weak = Hash::compute(Algorithm::Sha256, body);
+        let strong = Hash::compute(Algorithm::Sha384, body);
+        let wrong = Hash {
+            algorithm: Algorithm::Sha384,
+            digest: vec![9; 48],
+        };
+        let granted = cache
+            .grant_peer_eligibility(
+                id,
+                &declared(&[weak.clone(), wrong.clone(), strong.clone()]),
+            )
+            .unwrap();
+        assert_eq!(granted, vec![strong.clone()]);
+        assert_eq!(cache.peer_eligibility(id).unwrap(), vec![strong.clone()]);
+
+        assert_eq!(
+            cache.body_for_peer(PeerAsk::Content(id)).unwrap().unwrap(),
+            body
+        );
+        assert!(cache
+            .body_for_peer(PeerAsk::Integrity(&strong))
+            .unwrap()
+            .is_some());
+        // Valid, declared, and weaker: never recorded, never served under.
+        assert!(cache
+            .body_for_peer(PeerAsk::Integrity(&weak))
+            .unwrap()
+            .is_none());
+        assert!(cache
+            .body_for_peer(PeerAsk::Integrity(&wrong))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn nothing_is_granted_for_bytes_that_do_not_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        stored(&cache, "https://cdn.test/lib.js", b"what was served");
+        let id = ContentId::of(b"what was served");
+
+        let other = Hash::compute(Algorithm::Sha512, b"what the page declared");
+        assert!(cache
+            .grant_peer_eligibility(id, &declared(&[other]))
+            .unwrap()
+            .is_empty());
+        assert!(cache
+            .grant_peer_eligibility(id, &Integrity::default())
+            .unwrap()
+            .is_empty());
+        assert!(cache.peer_eligibility(id).unwrap().is_empty());
+        assert!(cache.body_for_peer(PeerAsk::Content(id)).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_body_no_entry_refers_to_is_never_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let body = b"from a peer";
+        let hash = Hash::compute(Algorithm::Sha384, body);
+        cache
+            .accept_peer_body(
+                &PeerProof::Integrity(declared(std::slice::from_ref(&hash))),
+                body,
+            )
+            .unwrap();
+        assert!(cache
+            .grant_peer_eligibility(ContentId::of(body), &declared(&[hash]))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_stored_body_is_not_shareable_until_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let body = b"an ordinary page";
+        stored(&cache, "https://a.test/page", body);
+        let id = ContentId::of(body);
+        // Indexed under every SRI digest, as every stored body is.
+        let sha = Hash::compute(Algorithm::Sha384, body);
+        assert_eq!(cache.content_for_integrity(&sha).unwrap(), Some(id));
+
+        assert!(cache.body_for_peer(PeerAsk::Content(id)).unwrap().is_none());
+        assert!(cache
+            .body_for_peer(PeerAsk::Integrity(&sha))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn eligibility_goes_with_the_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let body = b"shared then evicted";
+        stored(&cache, "https://cdn.test/a.js", body);
+        let id = ContentId::of(body);
+        let hash = Hash::compute(Algorithm::Sha384, body);
+        assert!(!cache
+            .grant_peer_eligibility(id, &declared(std::slice::from_ref(&hash)))
+            .unwrap()
+            .is_empty());
+
+        cache.purge(None, "GET", "https://cdn.test/a.js").unwrap();
+        assert!(cache.peer_eligibility(id).unwrap().is_empty());
+
+        // Stored again, it is not shareable again until it is verified again.
+        stored(&cache, "https://cdn.test/a.js", body);
+        assert!(cache.body_for_peer(PeerAsk::Content(id)).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_lost_body_stops_being_shareable_even_while_still_referenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let body = b"two entries, one blob";
+        stored(&cache, "https://cdn.test/one.js", body);
+        stored(&cache, "https://cdn.test/two.js", body);
+        let id = ContentId::of(body);
+        let hash = Hash::compute(Algorithm::Sha384, body);
+        assert!(!cache
+            .grant_peer_eligibility(id, &declared(&[hash]))
+            .unwrap()
+            .is_empty());
+
+        std::fs::remove_file(blob_path(&cache, body)).unwrap();
+        assert_miss_for_lost_body(get(&cache, "https://cdn.test/one.js"));
+        assert_eq!(cache.index.get_blob(id).unwrap().unwrap().refcount, 1);
+        assert!(cache.peer_eligibility(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn eligibility_is_gone_before_the_file_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::open(dir.path()).unwrap());
+        let body = b"deleted in order";
+        stored(&cache, "https://cdn.test/order.js", body);
+        let id = ContentId::of(body);
+        let hash = Hash::compute(Algorithm::Sha384, body);
+        cache
+            .grant_peer_eligibility(id, &declared(&[hash]))
+            .unwrap();
+
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        {
+            let observed = observed.clone();
+            let path = blob_path(&cache, body);
+            let cache_for_hook = Arc::downgrade(&cache);
+            *cache.pause.lock().unwrap() = Some(Arc::new(move |point| {
+                if point == "delete:forgotten" {
+                    let cache = cache_for_hook.upgrade().unwrap();
+                    *observed.lock().unwrap() = Some((
+                        cache.index.eligible_hashes(id).unwrap().is_empty(),
+                        path.exists(),
+                    ));
+                }
+            }));
+        }
+        cache
+            .purge(None, "GET", "https://cdn.test/order.js")
+            .unwrap();
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some((true, true)),
+            "at the moment before the file goes, eligibility must already be gone"
+        );
+        assert!(!blob_path(&cache, body).exists());
     }
 }

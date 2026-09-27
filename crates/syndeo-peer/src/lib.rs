@@ -36,6 +36,13 @@
 //! are shared between sites and were public to begin with; nothing is announced
 //! by a node that is not serving.
 //!
+//! Serving is bounded the same way. A body is given to a peer only after a
+//! declared integrity value has been verified against it, and asked for by
+//! integrity, only under a hash that was part of that verification. Anything
+//! else we hold — a page, a private response — is answered exactly as a body
+//! we do not have, so a peer that can compute a page's address cannot use a
+//! request to learn whether we have been there.
+//!
 //! **What would fix it,** and is not built: padding and cover traffic to blunt
 //! the timing signal, and asking through a relay so the peer that answers is not
 //! the peer that learns who asked. Both are real work and neither is here, so
