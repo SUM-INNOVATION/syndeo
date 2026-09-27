@@ -401,6 +401,95 @@ pub fn with_extra(headers: &HeaderMap, extra: &[(HeaderName, String)]) -> Header
     out
 }
 
+/// QUIC endpoints for tests, on loopback, and a client that trusts them.
+#[cfg(test)]
+pub(crate) mod test_quic {
+    use super::*;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn self_signed() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let key = PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+        (certified.cert.der().clone(), key.into())
+    }
+
+    /// An endpoint that turns every connection away before anything is sent.
+    pub(crate) async fn refusing_endpoint() -> SocketAddr {
+        crate::tls::install_crypto_provider();
+        let (cert, key) = self_signed();
+        let config = quinn::ServerConfig::with_single_cert(vec![cert], key).unwrap();
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = endpoint.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                incoming.refuse();
+            }
+        });
+        address
+    }
+
+    /// An HTTP/3 origin that reads each request whole — headers and body — and
+    /// then drops the connection without answering. Counts what it received.
+    pub(crate) async fn origin_that_drops_after_the_request(
+    ) -> (SocketAddr, Arc<AtomicUsize>, CertificateDer<'static>) {
+        crate::tls::install_crypto_provider();
+        let (cert, key) = self_signed();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
+        let config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = endpoint.local_addr().unwrap();
+        let received = Arc::new(AtomicUsize::new(0));
+        let seen = received.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let Ok(connection) = incoming.await else {
+                        return;
+                    };
+                    let raw = connection.clone();
+                    let Ok(mut h3) = h3::server::Connection::<_, Bytes>::new(
+                        h3_quinn::Connection::new(connection),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    if let Ok(Some(resolver)) = h3.accept().await {
+                        if let Ok((_request, mut stream)) = resolver.resolve_request().await {
+                            while let Ok(Some(_)) = stream.recv_data().await {}
+                            seen.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    raw.close(0u32.into(), b"gone");
+                });
+            }
+        });
+        (address, received, cert)
+    }
+
+    /// A QUIC client that trusts `cert`, and nothing else.
+    pub(crate) fn client_trusting(cert: CertificateDer<'static>) -> QuicClient {
+        crate::tls::install_crypto_provider();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        QuicClient::new(
+            crate::dns::Dns::new(&crate::dns::DnsMode::System).unwrap(),
+            Arc::new(tls),
+        )
+        .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,28 +633,10 @@ mod tests {
         }
     }
 
-    /// A QUIC endpoint on loopback that turns every connection away.
-    fn refusing_endpoint() -> std::net::SocketAddr {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let key =
-            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
-        let config =
-            quinn::ServerConfig::with_single_cert(vec![certified.cert.der().clone()], key.into())
-                .unwrap();
-        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let address = endpoint.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Some(incoming) = endpoint.accept().await {
-                incoming.refuse();
-            }
-        });
-        address
-    }
-
     #[tokio::test]
     async fn a_refused_connection_is_reported_as_nothing_having_been_sent() {
         crate::tls::install_crypto_provider();
-        let address = refusing_endpoint();
+        let address = test_quic::refusing_endpoint().await;
         let client = QuicClient::new(
             crate::dns::Dns::new(&crate::dns::DnsMode::System).unwrap(),
             crate::tls::client_config().unwrap(),

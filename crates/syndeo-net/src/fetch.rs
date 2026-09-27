@@ -1457,3 +1457,133 @@ fn infer_content_type(url: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::h3::test_quic;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Count TCP connections to the same port the QUIC origin is on, which is
+    /// where a fallback to TCP would go. Each is closed at once, so a fallback
+    /// fails, but only after it has been counted.
+    async fn tcp_attempts_on(port: u16) -> Arc<AtomicUsize> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("the TCP twin of the QUIC port is free");
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        count
+    }
+
+    /// A network process whose QUIC client trusts the test origin, and which
+    /// has been told that origin speaks HTTP/3.
+    fn net_speaking_h3_to(
+        dir: &std::path::Path,
+        authority: &str,
+        client: crate::h3::QuicClient,
+    ) -> Net {
+        let mut net = Net::new(NetConfig {
+            cache_root: dir.to_path_buf(),
+            ..NetConfig::default()
+        })
+        .unwrap();
+        net.quic = Some(Arc::new(client));
+        let port = authority.rsplit(':').next().unwrap();
+        let mut advertised = HeaderMap::new();
+        advertised.insert(
+            "alt-svc",
+            HeaderValue::from_str(&format!("h3=\":{port}\"")).unwrap(),
+        );
+        net.alt_svc.observe(authority, &advertised);
+        assert!(net.alt_svc.should_try(authority));
+        net
+    }
+
+    fn request(method: Method, authority: &str) -> FetchRequest {
+        FetchRequest {
+            method,
+            url: format!("https://{authority}/submit"),
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(b"order=1"),
+            integrity: None,
+            partition: None,
+            redirect: RedirectMode::Follow,
+        }
+    }
+
+    async fn settle(count: &AtomicUsize, expected: usize) -> usize {
+        for _ in 0..50 {
+            if count.load(Ordering::SeqCst) >= expected.max(1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Long enough for an unexpected extra attempt to show up too.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        count.load(Ordering::SeqCst)
+    }
+
+    /// The origin received the whole request over HTTP/3 and then failed.
+    async fn after_the_request_was_received(method: Method) -> (usize, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let (address, received, cert) = test_quic::origin_that_drops_after_the_request().await;
+        let tcp = tcp_attempts_on(address.port()).await;
+        let authority = address.to_string();
+        let net = net_speaking_h3_to(dir.path(), &authority, test_quic::client_trusting(cert));
+
+        let result = net.origin_any(&request(method, &authority), &[]).await;
+        assert!(result.is_err(), "nothing answered, so nothing can succeed");
+        (received.load(Ordering::SeqCst), settle(&tcp, 1).await)
+    }
+
+    #[tokio::test]
+    async fn a_post_the_origin_already_received_is_not_sent_again_over_tcp() {
+        let (received, tcp) = after_the_request_was_received(Method::POST).await;
+        assert_eq!(received, 1, "the origin should have had the whole request");
+        assert_eq!(tcp, 0, "the POST was sent a second time over TCP");
+    }
+
+    #[tokio::test]
+    async fn a_get_the_origin_already_received_is_retried_once_over_tcp() {
+        let (received, tcp) = after_the_request_was_received(Method::GET).await;
+        assert_eq!(received, 1);
+        assert_eq!(
+            tcp, 1,
+            "an idempotent request should fall back to TCP, once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_post_that_never_reached_the_origin_may_go_over_tcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let address = test_quic::refusing_endpoint().await;
+        let tcp = tcp_attempts_on(address.port()).await;
+        let authority = address.to_string();
+        // Trusting nothing in particular: the connection is refused before
+        // any certificate is looked at.
+        let (_, _, unrelated) = test_quic::origin_that_drops_after_the_request().await;
+        let net = net_speaking_h3_to(
+            dir.path(),
+            &authority,
+            test_quic::client_trusting(unrelated),
+        );
+
+        let result = net
+            .origin_any(&request(Method::POST, &authority), &[])
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            settle(&tcp, 1).await,
+            1,
+            "nothing was sent, so TCP may carry it"
+        );
+    }
+}
