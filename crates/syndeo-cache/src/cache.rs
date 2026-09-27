@@ -645,6 +645,28 @@ impl Cache {
             .index_sri(&[(sri_key(hash.algorithm, &hash.digest), content.0)])
     }
 
+    /// Drop a stored entry because its bytes are not the representation a
+    /// caller asked for — they do not satisfy a declared integrity value —
+    /// but only while it still holds `content`. Returns whether it went.
+    ///
+    /// The bytes themselves are sound, so this is not counted as a lost body
+    /// and whether a peer may have them is left as it was.
+    pub fn discard_representation(&self, key: &str, content: ContentId) -> Result<bool> {
+        let Some(record) = self.index.get_entry(key)? else {
+            return Ok(false);
+        };
+        if record.content_id() != Some(content) {
+            return Ok(false);
+        }
+        match self.index.drop_entry_holding(key, &record.body)? {
+            Some(orphaned) => {
+                self.delete_orphans(&orphaned)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     /// Mark a stored body as one a peer may be given, by the declared hashes it
     /// actually satisfies.
     ///

@@ -288,6 +288,7 @@ impl Net {
     /// Each hop is a cache lookup in its own right, so a permanent redirect is
     /// answered from the store on the second visit and the destination is too.
     pub async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse> {
+        refuse_unusable_integrity(&request)?;
         let mut current = request;
         let mut redirects = 0u8;
         let mut visited = vec![Cache::normalize_url(&current.url)];
@@ -315,12 +316,12 @@ impl Net {
 
             let next = match url::Url::parse(&current.url).and_then(|base| base.join(&location)) {
                 Ok(u) => u,
-                Err(_) => return Ok(response),
+                Err(_) => return final_redirect(&current, response),
             };
             // Only http and https; a redirect is not a way to reach another
             // scheme's handler.
             if !matches!(next.scheme(), "http" | "https") {
-                return Ok(response);
+                return final_redirect(&current, response);
             }
             let normalized = Cache::normalize_url(next.as_str());
             if visited.contains(&normalized) {
@@ -382,20 +383,28 @@ impl Net {
             &request.url,
             &request.headers,
         )? {
-            Lookup::Fresh(stored) => Ok(self.finish(
-                stored.status,
-                stored.headers.clone(),
-                Bytes::from(stored.body.clone()),
-                Source::Cache,
-                stored.content,
-                started,
-            )),
+            Lookup::Fresh(stored) => {
+                if !self.stored_satisfies(&request, &stored) {
+                    return self.fetch_from_origin(&request, &[], started).await;
+                }
+                Ok(self.finish(
+                    stored.status,
+                    stored.headers.clone(),
+                    Bytes::from(stored.body.clone()),
+                    Source::Cache,
+                    stored.content,
+                    started,
+                ))
+            }
 
             Lookup::Stale {
                 response,
                 refresh_in_background,
                 ..
             } => {
+                if !self.stored_satisfies(&request, &response) {
+                    return self.fetch_from_origin(&request, &[], started).await;
+                }
                 if refresh_in_background {
                     // The whole point of the directive: move the revalidation
                     // off this request's critical path, having already answered
@@ -419,6 +428,12 @@ impl Net {
                 stale_if_error,
                 ..
             } => {
+                // Asking whether bytes that do not satisfy the declaration are
+                // still current would be a wasted round trip; ask for the
+                // representation instead, once.
+                if !self.stored_satisfies(&request, &response) {
+                    return self.fetch_from_origin(&request, &[], started).await;
+                }
                 let attempt = self.origin(&request, &conditional).await;
                 match attempt {
                     Ok((304, headers, _)) => {
@@ -427,14 +442,19 @@ impl Net {
                             .cache
                             .record_not_modified(&response.key, &headers, now, now)
                         {
-                            Ok(Some(refreshed)) => Ok(self.finish(
-                                refreshed.status,
-                                with_cookies_of(refreshed.headers.clone(), &headers),
-                                Bytes::from(refreshed.body.clone()),
-                                Source::Revalidated,
-                                refreshed.content,
-                                started,
-                            )),
+                            Ok(Some(refreshed)) => {
+                                if !self.stored_satisfies(&request, &refreshed) {
+                                    return self.fetch_from_origin(&request, &[], started).await;
+                                }
+                                Ok(self.finish(
+                                    refreshed.status,
+                                    with_cookies_of(refreshed.headers.clone(), &headers),
+                                    Bytes::from(refreshed.body.clone()),
+                                    Source::Revalidated,
+                                    refreshed.content,
+                                    started,
+                                ))
+                            }
                             Ok(None) => Ok(self.finish(
                                 response.status,
                                 with_cookies_of(response.headers.clone(), &headers),
@@ -452,10 +472,30 @@ impl Net {
                             Err(err) => Err(err.into()),
                         }
                     }
-                    Ok((status, headers, body)) => {
-                        let content = self.store(&request, status, &headers, &body, started);
-                        Ok(self.finish(status, headers, body, Source::Origin, content, started))
-                    }
+                    Ok((status, headers, body)) => match &request.integrity {
+                        Some(integrity) => self.accept_declared(
+                            &request,
+                            integrity,
+                            status,
+                            headers,
+                            body,
+                            started,
+                            Protocol::None,
+                        ),
+                        None => {
+                            let content = self.store(&request, status, &headers, &body, started);
+                            Ok(
+                                self.finish(
+                                    status,
+                                    headers,
+                                    body,
+                                    Source::Origin,
+                                    content,
+                                    started,
+                                ),
+                            )
+                        }
+                    },
                     Err(err) => {
                         // The origin is unreachable. `stale-if-error` is the only
                         // licence to answer anyway.
@@ -521,23 +561,14 @@ impl Net {
     ) -> Result<FetchResponse> {
         let (status, headers, incoming, protocol) = self.origin_any(request, extra).await?;
 
-        if request.integrity.is_some() {
+        if let Some(integrity) = &request.integrity {
             let body = collect_body(incoming, self.config.max_body_bytes).await?;
-            let content = self.store(request, status, &headers, &body, started);
-            if content.is_some() {
-                self.announce(request);
-            }
-            let source = if content.is_some() {
-                Source::Origin
-            } else {
-                Source::PassThrough
-            };
-            return Ok(self.finish_with(status, headers, body, source, content, started, protocol));
+            return self
+                .accept_declared(request, integrity, status, headers, body, started, protocol);
         }
 
         let body = stream_body(
             self.cache.clone(),
-            self.peers.clone(),
             request.clone(),
             status,
             headers.clone(),
@@ -608,18 +639,96 @@ impl Net {
         Ok((status, headers, OriginBody::Tcp(incoming), protocol))
     }
 
-    /// Tell the swarm we hold a body someone else could ask for.
+    /// A whole body from the origin, for a request that declared integrity:
+    /// checked before anything is stored, shared or returned.
     ///
-    /// Only bodies a page declared an integrity hash for: those are exactly the
-    /// ones another node can name and check, and announcing anything else would
-    /// be disclosing what we have been reading for no one's benefit. Every
-    /// declared digest is published, not just the strongest, because a different
-    /// page may name the same body by a different algorithm.
-    fn announce(&self, request: &FetchRequest) {
-        let (Some(peers), Some(integrity)) = (&self.peers, &request.integrity) else {
+    /// A mismatch stores nothing, grants nothing, announces nothing and returns
+    /// an error; the bytes never reach the caller. A match is stored, and then
+    /// granted to peers under exactly the declared hashes it satisfied at the
+    /// strongest level, which are then the only ones announced. A redirect this
+    /// process will follow is not the representation the integrity describes,
+    /// so it is neither checked nor shared — the response it leads to is.
+    #[allow(clippy::too_many_arguments)]
+    fn accept_declared(
+        &self,
+        request: &FetchRequest,
+        integrity: &syndeo_cache::Integrity,
+        status: u16,
+        headers: HeaderMap,
+        body: Bytes,
+        started: Instant,
+        protocol: Protocol,
+    ) -> Result<FetchResponse> {
+        if is_hop(request, status, &headers) {
+            let content = self.store(request, status, &headers, &body, started);
+            let source = if content.is_some() {
+                Source::Origin
+            } else {
+                Source::PassThrough
+            };
+            return Ok(self.finish_with(status, headers, body, source, content, started, protocol));
+        }
+        if let Err(err) = integrity.check(&body) {
+            tracing::warn!(url = %request.url, %err, "the origin's body does not satisfy the declared integrity");
+            return Err(NetError::Integrity(format!("{}: {err}", request.url)));
+        }
+        let content = self.store(request, status, &headers, &body, started);
+        if let Some(content) = content {
+            match self.cache.grant_peer_eligibility(content, integrity) {
+                Ok(granted) => self.announce(granted),
+                Err(err) => {
+                    tracing::warn!(url = %request.url, %err, "could not record a verified body")
+                }
+            }
+        }
+        let source = if content.is_some() {
+            Source::Origin
+        } else {
+            Source::PassThrough
+        };
+        Ok(self.finish_with(status, headers, body, source, content, started, protocol))
+    }
+
+    /// Whether a stored response may answer this request.
+    ///
+    /// Always, unless the request declared integrity and these bytes do not
+    /// satisfy it. Then the entry is dropped — only if it still holds these
+    /// bytes — and the caller asks the origin once; a representation the
+    /// declaration names is stored in its place when that verifies.
+    fn stored_satisfies(
+        &self,
+        request: &FetchRequest,
+        stored: &syndeo_cache::StoredResponse,
+    ) -> bool {
+        let Some(integrity) = &request.integrity else {
+            return true;
+        };
+        if is_hop(request, stored.status, &stored.headers) || integrity.verify(&stored.body) {
+            return true;
+        }
+        tracing::info!(url = %request.url, "the stored body does not satisfy the declared integrity; asking the origin");
+        if let Some(content) = stored.content {
+            if let Err(err) = self.cache.discard_representation(&stored.key, content) {
+                tracing::warn!(url = %request.url, %err, "could not drop the stored entry");
+            }
+        }
+        false
+    }
+
+    /// Tell the swarm we hold a body someone else could ask for, under the
+    /// hashes it was verified against.
+    ///
+    /// Only those: they are exactly the names another node can ask for and
+    /// check, and exactly the names `serve` will answer. A weaker algorithm the
+    /// page also declared, or a declared hash that did not match, is never
+    /// published, even when another hash made the declaration valid.
+    fn announce(&self, hashes: Vec<syndeo_cache::sri::Hash>) {
+        let Some(peers) = &self.peers else {
             return;
         };
-        let hashes = integrity.hashes.clone();
+        if hashes.is_empty() {
+            return;
+        }
         let peers = peers.clone();
         tokio::spawn(async move {
             for hash in hashes {
@@ -718,8 +827,9 @@ impl Net {
             headers.insert(http::header::CONTENT_LENGTH, value);
         }
 
-        // We hold it now, so the next node to want it has one more place to ask.
-        self.announce(request);
+        // Not announced. The body is held as a blob no entry refers to, so no
+        // grant exists for it and `serve` would refuse it; saying we have it
+        // would be a claim about our history with nothing behind it.
 
         Some(self.finish(
             200,
@@ -964,7 +1074,6 @@ struct Teed {
     status: u16,
     headers: HeaderMap,
     request_time: u64,
-    peers: Option<syndeo_peer::PeerHandle>,
     done: bool,
 }
 
@@ -980,13 +1089,15 @@ struct Teed {
 /// and a size bound on the web.
 fn stream_body(
     cache: Arc<Cache>,
-    peers: Option<syndeo_peer::PeerHandle>,
     request: FetchRequest,
     status: u16,
     headers: HeaderMap,
     incoming: OriginBody,
     limit: u64,
 ) -> FetchBody {
+    // A declared integrity is checked against the whole body before any of
+    // it is handed out, so such a request is buffered and never gets here.
+    debug_assert!(request.integrity.is_none());
     let writer = match cache.begin_streamed() {
         Ok(writer) => writer,
         Err(err) => {
@@ -1003,7 +1114,6 @@ fn stream_body(
         status,
         headers,
         request_time: now_secs(),
-        peers,
         done: false,
     };
 
@@ -1052,19 +1162,7 @@ fn finish_streamed(state: &mut Teed) {
         Provenance::Origin,
     );
     match outcome {
-        Ok(StoreOutcome::Stored { .. }) => {
-            if let (Some(peers), Some(integrity)) = (&state.peers, &state.request.integrity) {
-                let hashes = integrity.hashes.clone();
-                let peers = peers.clone();
-                tokio::spawn(async move {
-                    for hash in hashes {
-                        if peers.announce_integrity(&hash).await.is_err() {
-                            return;
-                        }
-                    }
-                });
-            }
-        }
+        Ok(StoreOutcome::Stored { .. }) => {}
         Ok(StoreOutcome::NotStored(reason)) => {
             tracing::debug!(url = %state.request.url, reason, "not cached");
         }
@@ -1091,6 +1189,15 @@ async fn refresh_entry(
             .is_some());
     }
 
+    // A refresh for a request that declared integrity stores nothing that
+    // does not satisfy it; the entry stays as it was.
+    if let Some(integrity) = &request.integrity {
+        if !is_hop(request, status, &headers) && !integrity.verify(&body) {
+            tracing::warn!(url = %request.url, "a refreshed body does not satisfy the declared integrity; not stored");
+            return Ok(false);
+        }
+    }
+
     let outcome = cache.store(
         request.partition.as_deref(),
         request.method.as_str(),
@@ -1103,6 +1210,54 @@ async fn refresh_entry(
         now,
     )?;
     Ok(!matches!(outcome, StoreOutcome::NotStored(_)))
+}
+
+/// Refuse a declared integrity that could not constrain anything.
+///
+/// Stricter than a browser's rule for `integrity` attributes, which treats a
+/// value naming only unknown algorithms as no constraint at all. A caller here
+/// declared one on purpose, and one that ends up empty is a declaration that
+/// would silently accept any bytes, so it fails closed. The same goes for a
+/// method or a range the declaration cannot describe: integrity names a whole
+/// representation, fetched with GET.
+fn refuse_unusable_integrity(request: &FetchRequest) -> Result<()> {
+    let Some(integrity) = &request.integrity else {
+        return Ok(());
+    };
+    let refusal = if integrity.is_empty() {
+        "no usable hash was declared"
+    } else if request.method != Method::GET {
+        "declared integrity applies only to a GET"
+    } else if request.headers.contains_key(http::header::RANGE) {
+        "declared integrity describes a whole body, and this asked for a range"
+    } else {
+        return Ok(());
+    };
+    Err(NetError::Integrity(format!("{}: {refusal}", request.url)))
+}
+
+/// A redirect this process will follow rather than hand back: not the
+/// representation a declared integrity describes, but the way to it.
+fn is_hop(request: &FetchRequest, status: u16, headers: &HeaderMap) -> bool {
+    request.redirect == RedirectMode::Follow
+        && matches!(status, 301 | 302 | 303 | 307 | 308)
+        && headers
+            .get(http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// A redirect that will not be followed after all — a target that does not
+/// parse, or another scheme — is the final answer. With integrity declared it
+/// is checked like any other, and a redirect satisfies none.
+fn final_redirect(request: &FetchRequest, response: FetchResponse) -> Result<FetchResponse> {
+    if request.integrity.is_some() {
+        return Err(NetError::Integrity(format!(
+            "{}: a redirect that cannot be followed does not satisfy the declared integrity",
+            request.url
+        )));
+    }
+    Ok(response)
 }
 
 /// A stored response with the cookies a 304 just set added back.

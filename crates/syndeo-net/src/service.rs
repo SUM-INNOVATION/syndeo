@@ -109,14 +109,24 @@ where
         }
     }
 
+    // A declaration that names no usable hash — empty, or only algorithms we
+    // do not know — is refused rather than treated as no declaration: it was
+    // made on purpose, and accepting any bytes under it would be failing open.
     let declared = match integrity.as_deref().map(Integrity::parse) {
         Some(Ok(i)) if !i.is_empty() => Some(i),
+        Some(Ok(_)) => {
+            return framed
+                .send(&NetResponse::Error(
+                    "integrity: no usable hash was declared".into(),
+                ))
+                .await
+        }
         Some(Err(err)) => {
             return framed
                 .send(&NetResponse::Error(format!("integrity: {err}")))
                 .await
         }
-        _ => None,
+        None => None,
     };
 
     // Timed so that "the browser feels slow" can be attributed rather than
@@ -271,5 +281,54 @@ pub async fn handle(net: &Net, request: NetRequest) -> NetResponse {
         },
 
         NetRequest::Ping => NetResponse::Pong,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NetConfig;
+
+    /// Ask the service over an in-memory stream, as a renderer would over its
+    /// socket, and return the first reply.
+    async fn ask(net: &Net, request: NetRequest) -> NetResponse {
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let mut server = Framed::new(theirs);
+        let mut client = Framed::new(ours);
+        respond(net, request, &mut server).await.unwrap();
+        client.recv().await.unwrap()
+    }
+
+    fn fetch_with(integrity: &str) -> NetRequest {
+        NetRequest::Fetch {
+            method: "GET".into(),
+            // Nothing listens here; a declaration that is refused must be
+            // refused before anything is asked of the network.
+            url: "http://127.0.0.1:9/lib.js".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            integrity: Some(integrity.into()),
+            partition: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declaration_naming_no_usable_hash_is_refused_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let net = Net::new(NetConfig {
+            cache_root: dir.path().to_path_buf(),
+            ..NetConfig::default()
+        })
+        .unwrap();
+
+        for declared in ["", "   ", "md5-deadbeef", "sha1-abc md4-xyz"] {
+            match ask(&net, fetch_with(declared)).await {
+                NetResponse::Error(message) => assert!(
+                    message.contains("no usable hash"),
+                    "{declared:?}: {message}"
+                ),
+                other => panic!("{declared:?} was not refused: {other:?}"),
+            }
+        }
     }
 }

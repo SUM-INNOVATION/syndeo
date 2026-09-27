@@ -22,6 +22,8 @@ pub enum NetError {
     RedirectLoop(String),
     #[error("the stored body of {0} was lost, and the origin would not send it again")]
     LostBody(String),
+    #[error("integrity: {0}")]
+    Integrity(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

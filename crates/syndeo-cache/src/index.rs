@@ -511,10 +511,32 @@ impl Index {
     /// meantime is left alone, and of any number of callers that found the
     /// same broken entry exactly one removes it. `None` means it had already
     /// gone or been replaced; otherwise the blobs whose last reference it held.
+    /// Bytes that failed to read back also stop being offered to peers, even
+    /// while another entry still refers to them.
     pub fn drop_broken_entry(
         &self,
         key: &str,
         expected: &StoredBody,
+    ) -> Result<Option<Vec<ContentId>>> {
+        self.drop_entry_if_body(key, expected, true)
+    }
+
+    /// Drop an entry only if it still holds `expected`, in one transaction.
+    /// Unlike [`Index::drop_broken_entry`] the bytes are sound, so whether a
+    /// peer may have them is left as it was.
+    pub fn drop_entry_holding(
+        &self,
+        key: &str,
+        expected: &StoredBody,
+    ) -> Result<Option<Vec<ContentId>>> {
+        self.drop_entry_if_body(key, expected, false)
+    }
+
+    fn drop_entry_if_body(
+        &self,
+        key: &str,
+        expected: &StoredBody,
+        revoke_sharing: bool,
     ) -> Result<Option<Vec<ContentId>>> {
         let tx = self.db.begin_write()?;
         let current: Option<EntryRecord> = {
@@ -528,9 +550,7 @@ impl Index {
         match current {
             Some(record) if &record.body == expected => {
                 let orphan = remove_entry_in(&tx, key)?;
-                // Bytes that failed to read back are not offered to anyone,
-                // even while another entry still refers to them.
-                {
+                if revoke_sharing {
                     let mut eligible = tx.open_table(PEER_ELIGIBLE)?;
                     for content in record.contents() {
                         eligible.remove(content.as_slice())?;
