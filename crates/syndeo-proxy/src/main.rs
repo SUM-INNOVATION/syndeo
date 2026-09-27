@@ -211,6 +211,10 @@ struct Proxy {
     net: Net,
     authority: CertificateAuthority,
     trace: bool,
+    /// How long a tunnel may stay silent before its first byte says what it
+    /// carries. Past it, the tunnel is closed without a certificate minted or
+    /// an origin asked.
+    tunnel_first_byte: std::time::Duration,
     /// Requests this proxy has been asked to handle, so a test can see that a
     /// loop stopped rather than only that an answer came back.
     #[cfg(test)]
@@ -236,6 +240,7 @@ async fn run(args: RunArgs) -> Result<()> {
         net,
         authority,
         trace: args.trace_requests,
+        tunnel_first_byte: TUNNEL_FIRST_BYTE,
         #[cfg(test)]
         handled: Default::default(),
     });
@@ -352,14 +357,28 @@ async fn handle(
     Ok(forward(proxy, req, None, local).await)
 }
 
-/// `CONNECT host:port` — answer 200, then take over the tunnel and terminate TLS
-/// with a leaf we mint for that host.
+/// How long a new tunnel may stay silent before it is closed.
+const TUNNEL_FIRST_BYTE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The first byte of every TLS handshake: a record of type handshake.
+const TLS_HANDSHAKE_RECORD: u8 = 0x16;
+
+/// `CONNECT host:port` — answer 200, take over the tunnel, and serve whatever
+/// it carries: TLS, terminated with a leaf we mint for that host, or plain
+/// HTTP/1, which is how WebKit's proxy setting sends every `http://` page.
+///
+/// What the tunnel carries is read from its first byte, not guessed from the
+/// port: a TLS handshake always starts with one record type, and anything else
+/// goes to an HTTP/1 parser, which refuses what is not HTTP. The scheme follows
+/// from that — `https` for TLS, `http` otherwise — whatever port was named.
 fn connect(proxy: Arc<Proxy>, req: Request<Incoming>, local: SocketAddr) -> Response<Body> {
     let Some(authority) = req.uri().authority().cloned() else {
         return text(StatusCode::BAD_REQUEST, "CONNECT needs an authority");
     };
     let host = authority.host().to_string();
-    let port = authority.port_u16().unwrap_or(443);
+    let Some(port) = authority.port_u16() else {
+        return text(StatusCode::BAD_REQUEST, "CONNECT needs a port");
+    };
     if via_names_us(req.headers()) || targets_this_proxy(&host, port, local) {
         return loop_detected();
     }
@@ -372,43 +391,72 @@ fn connect(proxy: Arc<Proxy>, req: Request<Incoming>, local: SocketAddr) -> Resp
                 return;
             }
         };
-        let config = match proxy.authority.server_config(&host) {
-            Ok(c) => c,
-            Err(err) => {
-                tracing::warn!(%host, %err, "could not mint a leaf certificate");
+        let mut io = TokioIo::new(upgraded);
+
+        // Bounded: a tunnel that says nothing, or closes, costs no certificate
+        // and no request to anyone.
+        let mut first = [0u8; 1];
+        let read = tokio::time::timeout(
+            proxy.tunnel_first_byte,
+            tokio::io::AsyncReadExt::read(&mut io, &mut first),
+        )
+        .await;
+        match read {
+            Ok(Ok(1)) => {}
+            Ok(Ok(_)) => {
+                tracing::debug!(%host, "tunnel closed before it carried anything");
                 return;
             }
-        };
-        let acceptor = tokio_rustls::TlsAcceptor::from(config);
-        let tls = match acceptor.accept(TokioIo::new(upgraded)).await {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::debug!(%host, %err, "tls handshake failed");
+            Ok(Err(err)) => {
+                tracing::debug!(%host, %err, "tunnel failed before it carried anything");
                 return;
             }
+            Err(_) => {
+                tracing::debug!(%host, "tunnel carried nothing in time; closed");
+                return;
+            }
+        }
+        let io = Prefixed {
+            first: Some(first[0]),
+            io,
         };
 
-        let origin = Arc::new(format!(
-            "https://{host}{}",
-            if port == 443 {
-                String::new()
-            } else {
-                format!(":{port}")
+        if first[0] == TLS_HANDSHAKE_RECORD {
+            // Only now, with a handshake actually arriving, is a leaf minted.
+            let config = match proxy.authority.server_config(&host) {
+                Ok(c) => c,
+                Err(err) => {
+                    tracing::warn!(%host, %err, "could not mint a leaf certificate");
+                    return;
+                }
+            };
+            let acceptor = tokio_rustls::TlsAcceptor::from(config);
+            let tls = match acceptor.accept(io).await {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::debug!(%host, %err, "tls handshake failed");
+                    return;
+                }
+            };
+            let origin = tunnel_origin("https", &host, port);
+            let service = tunnel_service(proxy, origin, local);
+            if let Err(err) = ServerBuilder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(tls), service)
+                .await
+            {
+                tracing::debug!(%host, %err, "tunnelled connection closed");
             }
-        ));
-        let service = service_fn(move |req| {
-            let proxy = proxy.clone();
-            let origin = origin.clone();
-            async move {
-                Ok::<_, hyper::Error>(forward(proxy, req, Some(origin.to_string()), local).await)
+        } else {
+            let origin = tunnel_origin("http", &host, port);
+            let service = tunnel_service(proxy, origin, local);
+            // Keep-alive, so one tunnel carries as many requests as the browser
+            // sends down it.
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(io), service)
+                .await
+            {
+                tracing::debug!(%host, %err, "plain tunnelled connection closed");
             }
-        });
-
-        if let Err(err) = ServerBuilder::new(TokioExecutor::new())
-            .serve_connection(TokioIo::new(tls), service)
-            .await
-        {
-            tracing::debug!(%host, %err, "tunnelled connection closed");
         }
     });
 
@@ -416,6 +464,87 @@ fn connect(proxy: Arc<Proxy>, req: Request<Incoming>, local: SocketAddr) -> Resp
         .status(StatusCode::OK)
         .body(whole(Bytes::new()))
         .expect("static response")
+}
+
+/// The origin a tunnel reaches: the CONNECT authority, under the scheme the
+/// tunnel turned out to carry, with the port left out only when it is that
+/// scheme's default.
+fn tunnel_origin(scheme: &str, host: &str, port: u16) -> String {
+    let default = if scheme == "https" { 443 } else { 80 };
+    if port == default {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}:{port}")
+    }
+}
+
+/// Every request inside a tunnel goes to the tunnel's origin and nowhere else.
+fn tunnel_service(
+    proxy: Arc<Proxy>,
+    origin: String,
+    local: SocketAddr,
+) -> impl hyper::service::Service<
+    Request<Incoming>,
+    Response = Response<Body>,
+    Error = hyper::Error,
+    Future = impl std::future::Future<Output = Result<Response<Body>, hyper::Error>> + Send,
+> + Clone {
+    let origin = Arc::new(origin);
+    service_fn(move |req| {
+        let proxy = proxy.clone();
+        let origin = origin.clone();
+        async move { Ok::<_, hyper::Error>(forward(proxy, req, Some(origin.to_string()), local).await) }
+    })
+}
+
+/// A stream with one byte already read from it, put back in front.
+///
+/// Deciding what a tunnel carries means reading its first byte, and whatever
+/// then parses the stream — TLS or HTTP — has to see that byte too.
+struct Prefixed<IO> {
+    first: Option<u8>,
+    io: IO,
+}
+
+impl<IO: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Prefixed<IO> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(byte) = self.first {
+            if buf.remaining() > 0 {
+                buf.put_slice(&[byte]);
+                self.first = None;
+                return std::task::Poll::Ready(Ok(()));
+            }
+        }
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<IO: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Prefixed<IO> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.io).poll_write(cx, data)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }
 
 /// Turn one proxied request into a fetch, and the fetch back into a response.
@@ -438,14 +567,9 @@ async fn forward(
     // the proxy as though it were the website. Only the statistics page is
     // meant to be reached that way.
     let direct = origin.is_none() && req.uri().authority().is_none();
-    let url = match absolute_url(&req, origin.as_deref()) {
-        Some(u) => u,
-        None => {
-            return text(
-                StatusCode::BAD_REQUEST,
-                "could not determine the target url",
-            )
-        }
+    let url = match target_url(&req, origin.as_deref()) {
+        Ok(u) => u,
+        Err(refusal) => return text(StatusCode::BAD_REQUEST, refusal),
     };
 
     if let Some(response) = stats::intercept(&proxy.net, &url) {
@@ -548,18 +672,55 @@ async fn forward(
     }
 }
 
-/// Proxied requests arrive in absolute form; requests inside a CONNECT tunnel
-/// arrive in origin form and need the tunnel's authority put back.
-fn absolute_url(req: &Request<Incoming>, origin: Option<&str>) -> Option<String> {
+/// The URL a request is for.
+///
+/// Proxied requests arrive in absolute form. Requests inside a CONNECT tunnel
+/// arrive in origin form, and go to the tunnel's origin — the authority the
+/// CONNECT named — and nowhere else. A request inside a tunnel that names an
+/// absolute URL for another origin is refused rather than followed there, and
+/// its `Host` header is never consulted: a tunnel opened to one site is not a
+/// way to reach a second.
+fn target_url(req: &Request<Incoming>, origin: Option<&str>) -> Result<String, &'static str> {
     let uri = req.uri();
-    if uri.scheme().is_some() && uri.authority().is_some() {
-        return Some(uri.to_string());
-    }
+    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
     if let Some(origin) = origin {
-        return Some(format!("{origin}{}", uri.path_and_query()?.as_str()));
+        if uri.authority().is_some() && !same_origin(uri, origin) {
+            return Err("a request inside a tunnel may only be for the tunnel's own origin");
+        }
+        return Ok(format!("{origin}{path}"));
     }
-    let host = req.headers().get(http::header::HOST)?.to_str().ok()?;
-    Some(format!("http://{host}{}", uri.path_and_query()?.as_str()))
+    if uri.scheme().is_some() && uri.authority().is_some() {
+        return Ok(uri.to_string());
+    }
+    let host = req
+        .headers()
+        .get(http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .ok_or("could not determine the target url")?;
+    Ok(format!("http://{host}{path}"))
+}
+
+/// Whether an absolute-form request URI names the same origin as `origin`:
+/// scheme and host ignoring ASCII case, and the port after defaults.
+fn same_origin(uri: &hyper::Uri, origin: &str) -> bool {
+    let Ok(origin) = origin.parse::<hyper::Uri>() else {
+        return false;
+    };
+    let port = |u: &hyper::Uri| {
+        u.port_u16().or_else(|| match u.scheme_str() {
+            Some(s) if s.eq_ignore_ascii_case("https") => Some(443),
+            Some(s) if s.eq_ignore_ascii_case("http") => Some(80),
+            _ => None,
+        })
+    };
+    let same = |a: Option<&str>, b: Option<&str>| match (a, b) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    };
+    same(uri.scheme_str(), origin.scheme_str())
+        && same(uri.host(), origin.host())
+        && port(uri).is_some()
+        && port(uri) == port(&origin)
 }
 
 /// The name this proxy gives itself in `Via`: the received-by of RFC 9110
@@ -877,6 +1038,7 @@ mod tests {
             net,
             authority,
             trace: false,
+            tunnel_first_byte: std::time::Duration::from_millis(300),
             handled: Default::default(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1344,5 +1506,252 @@ mod tests {
         }
         assert_eq!(out.get("accept").unwrap(), "text/html");
         assert_eq!(out.get("user-agent").unwrap(), "syndeo-test");
+    }
+
+    // ------------------------------------------------ what a tunnel carries
+
+    /// Open a CONNECT tunnel through the proxy by hand, as WebKit does, and
+    /// return the stream and the status the proxy answered with.
+    async fn open_tunnel(proxy: SocketAddr, authority: &str) -> (tokio::net::TcpStream, u16) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        stream
+            .write_all(
+                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(
+                stream.read(&mut byte).await.unwrap(),
+                1,
+                "the proxy hung up"
+            );
+            head.push(byte[0]);
+        }
+        let status = String::from_utf8_lossy(&head)
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        (stream, status)
+    }
+
+    /// Speak HTTP/1 inside an open tunnel.
+    async fn http_over<S>(stream: S) -> hyper::client::conn::http1::SendRequest<Full<Bytes>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (sender, connection) =
+            hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
+                .await
+                .unwrap();
+        tokio::spawn(connection);
+        sender
+    }
+
+    async fn get(
+        sender: &mut hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+        target: &str,
+        headers: &[(&str, &str)],
+    ) -> Reply {
+        let mut request = Request::builder().method(hyper::Method::GET).uri(target);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = within(sender.send_request(request.body(Full::new(Bytes::new())).unwrap()))
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        Reply {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_http_through_a_tunnel_reaches_the_origin_and_the_tunnel_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|path| {
+            respond(
+                200,
+                &[("cache-control", "max-age=600")],
+                match path {
+                    "/one" => b"first",
+                    _ => b"second",
+                },
+            )
+        }))
+        .await;
+        let (proxy, handle) = start_proxy_with_count(dir.path()).await;
+        // A port that is not 80: what the tunnel carries decides the scheme.
+        let authority = format!("localhost:{}", origin.address.port());
+
+        let (stream, status) = open_tunnel(proxy, &authority).await;
+        assert_eq!(status, 200);
+        let mut sender = http_over(stream).await;
+
+        let first = get(&mut sender, "/one", &[("host", &authority)]).await;
+        assert_eq!(first.status, StatusCode::OK);
+        assert_eq!(&first.body[..], b"first");
+        // The same tunnel, a second request.
+        let second = get(&mut sender, "/two", &[("host", &authority)]).await;
+        assert_eq!(&second.body[..], b"second");
+        assert!(second.headers.contains_key("x-syndeo-source"));
+
+        let paths: Vec<String> = origin.seen().into_iter().map(|s| s.path).collect();
+        assert_eq!(paths, ["/one", "/two"]);
+        assert_eq!(
+            handle.authority.leaf_count(),
+            0,
+            "a certificate was minted for plain HTTP"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_through_a_tunnel_is_terminated_with_a_leaf_for_that_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"plain"))).await;
+        let (proxy, handle) = start_proxy_with_count(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+
+        let (stream, status) = open_tunnel(proxy, &authority).await;
+        assert_eq!(status, 200);
+
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut handle.authority.certificate_pem().as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let tls = within(tokio_rustls::TlsConnector::from(Arc::new(config)).connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        ))
+        .await
+        .expect("the proxy should present a leaf for the tunnel's host");
+        assert_eq!(handle.authority.leaf_count(), 1);
+
+        // Inside TLS the scheme is https, whatever the port: the proxy asks the
+        // origin over TLS, and this plain-HTTP origin cannot answer that.
+        let mut sender = http_over(tls).await;
+        let reply = get(&mut sender, "/secure", &[("host", &authority)]).await;
+        assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+        assert!(
+            origin.seen().is_empty(),
+            "the request went out as plain HTTP"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_to_one_origin_cannot_be_used_to_reach_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Origin::start(Arc::new(|_| respond(200, &[], b"A"))).await;
+        let second = Origin::start(Arc::new(|_| respond(200, &[], b"B"))).await;
+        let proxy = start_proxy(dir.path()).await;
+        let authority = format!("127.0.0.1:{}", first.address.port());
+
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let mut sender = http_over(stream).await;
+
+        // An absolute URL for B, inside a tunnel to A: refused.
+        let refused = get(&mut sender, &second.url("/secret"), &[]).await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+
+        // A Host header naming B changes nothing: the request goes to A.
+        let b_host = format!("127.0.0.1:{}", second.address.port());
+        let reply = get(&mut sender, "/page", &[("host", &b_host)]).await;
+        assert_eq!(&reply.body[..], b"A");
+
+        // An absolute URL for A itself, in any case, is A.
+        let same = format!("HTTP://127.0.0.1:{}/again", first.address.port());
+        assert_eq!(&get(&mut sender, &same, &[]).await.body[..], b"A");
+
+        assert!(
+            second.seen().is_empty(),
+            "the tunnel reached another origin"
+        );
+        let paths: Vec<String> = first.seen().into_iter().map(|s| s.path).collect();
+        assert_eq!(paths, ["/page", "/again"]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_silent_tunnel_closes_without_a_certificate_or_a_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"never"))).await;
+        let (proxy, handle) = start_proxy_with_count(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+
+        // Closed at once.
+        let (mut stream, _) = open_tunnel(proxy, &authority).await;
+        stream.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        within(stream.read_to_end(&mut rest)).await.unwrap();
+
+        // Silent past the proxy's patience (300ms in tests): the proxy closes it.
+        let (mut stream, _) = open_tunnel(proxy, &authority).await;
+        let mut byte = [0u8; 1];
+        let read = within(stream.read(&mut byte)).await.unwrap();
+        assert_eq!(read, 0, "the proxy should have closed a silent tunnel");
+
+        assert_eq!(handle.authority.leaf_count(), 0);
+        assert!(origin.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_is_not_http_or_tls_is_refused_by_the_parser() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"never"))).await;
+        let (proxy, handle) = start_proxy_with_count(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+
+        let (mut stream, _) = open_tunnel(proxy, &authority).await;
+        stream
+            .write_all(b"\x00\x01garbage that is no protocol\r\n\r\n")
+            .await
+            .unwrap();
+        // Refused: a 400 and a close, or a reset when the close finds bytes
+        // the parser never read. Never anything forwarded.
+        let mut answer = Vec::new();
+        match within(stream.read_to_end(&mut answer)).await {
+            Ok(_) => {
+                let answer = String::from_utf8_lossy(&answer);
+                assert!(
+                    answer.is_empty() || answer.starts_with("HTTP/1.1 400"),
+                    "{answer}"
+                );
+            }
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset),
+        }
+        assert_eq!(handle.authority.leaf_count(), 0);
+        assert!(origin.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_loop_through_a_tunnel_is_still_a_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"never"))).await;
+        let proxy = start_proxy(dir.path()).await;
+
+        // To the proxy itself: refused at the CONNECT.
+        let (_, status) = open_tunnel(proxy, &format!("127.0.0.1:{}", proxy.port())).await;
+        assert_eq!(status, 508);
+
+        // A request inside a tunnel that has already been through us.
+        let authority = format!("127.0.0.1:{}", origin.address.port());
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let mut sender = http_over(stream).await;
+        let reply = get(&mut sender, "/x", &[("via", "1.1 syndeo")]).await;
+        assert_eq!(reply.status, StatusCode::LOOP_DETECTED);
+        assert!(origin.seen().is_empty());
     }
 }

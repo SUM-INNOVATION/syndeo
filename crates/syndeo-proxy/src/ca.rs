@@ -151,6 +151,12 @@ impl CertificateAuthority {
         &self.ca_pem
     }
 
+    /// How many leaf certificates have been minted and kept.
+    #[cfg(test)]
+    pub fn leaf_count(&self) -> usize {
+        self.leaves.lock().unwrap().len()
+    }
+
     /// A rustls server config for one origin, minted on demand and kept.
     pub fn server_config(&self, host: &str) -> Result<Arc<rustls::ServerConfig>> {
         if let Some(existing) = self.leaves.lock().unwrap().get(host) {
