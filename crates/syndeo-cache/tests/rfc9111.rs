@@ -240,9 +240,62 @@ fn stale_if_error_is_reported_to_the_caller() {
         100,
     );
     match eval(&[], &meta, &private()) {
-        Freshness::Revalidate { stale_if_error, .. } => assert_eq!(stale_if_error, Some(600)),
+        // Ninety seconds stale, so 510 of the 600 are left.
+        Freshness::Revalidate { stale_if_error, .. } => assert_eq!(stale_if_error, Some(510)),
         other => panic!("expected revalidate, got {other:?}"),
     }
+}
+
+fn stale_if_error_of(cache_control: &str, age: u64, opts: &CacheOptions) -> Option<u64> {
+    let meta = stored(
+        200,
+        &[("cache-control", cache_control), ("etag", "\"v1\"")],
+        age,
+    );
+    match eval(&[], &meta, opts) {
+        Freshness::Revalidate { stale_if_error, .. } => stale_if_error,
+        other => panic!("expected revalidate for {cache_control:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn rfc5861_stale_if_error_covers_only_its_window() {
+    // Staleness is age minus the ten-second lifetime.
+    assert_eq!(
+        stale_if_error_of("max-age=10, stale-if-error=60", 30, &private()),
+        Some(40)
+    );
+    assert_eq!(
+        stale_if_error_of("max-age=10, stale-if-error=60", 70, &private()),
+        Some(0)
+    );
+    assert_eq!(
+        stale_if_error_of("max-age=10, stale-if-error=60", 71, &private()),
+        None,
+        "past the window the origin's error is the answer"
+    );
+    assert_eq!(
+        stale_if_error_of("max-age=10, stale-if-error=60", 5000, &private()),
+        None
+    );
+}
+
+#[test]
+fn s4_2_4_stale_if_error_never_overrides_a_directive_against_stale() {
+    for directive in [
+        "max-age=10, must-revalidate, stale-if-error=600",
+        "no-cache, stale-if-error=600",
+    ] {
+        assert_eq!(
+            stale_if_error_of(directive, 30, &private()),
+            None,
+            "{directive}"
+        );
+    }
+    // proxy-revalidate binds a shared cache, and only a shared cache.
+    let directive = "max-age=10, proxy-revalidate, stale-if-error=600";
+    assert_eq!(stale_if_error_of(directive, 30, &shared()), None);
+    assert_eq!(stale_if_error_of(directive, 30, &private()), Some(580));
 }
 
 // ------------------------------------------------------------ §4.1 vary matching

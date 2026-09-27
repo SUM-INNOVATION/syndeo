@@ -293,7 +293,9 @@ pub fn evaluate(
     let cc = CacheControl::from_headers(&meta.headers);
     let age = current_age(meta, now);
     let (lifetime, _) = freshness_lifetime(meta, opts);
-    let stale_if_error = cc.stale_if_error;
+    let staleness = age.saturating_sub(lifetime);
+    let pinned = cc.must_revalidate || (opts.shared && cc.proxy_revalidate);
+    let stale_if_error = stale_if_error_allowance(&cc, staleness, pinned);
 
     if req_cc.no_cache {
         return Freshness::Revalidate {
@@ -338,9 +340,6 @@ pub fn evaluate(
         };
     }
 
-    let staleness = age.saturating_sub(lifetime);
-    let pinned = cc.must_revalidate || (opts.shared && cc.proxy_revalidate);
-
     if !pinned {
         if let Some(max_stale) = req_cc.max_stale {
             let acceptable = max_stale.map(|s| staleness <= s).unwrap_or(true);
@@ -368,9 +367,25 @@ pub fn evaluate(
     Freshness::Revalidate {
         age,
         lifetime,
-        stale_if_error: if pinned { None } else { stale_if_error },
+        stale_if_error,
         reason: if pinned { "must-revalidate" } else { "stale" },
     }
+}
+
+/// How many more seconds `stale-if-error` lets this body be served if the
+/// origin cannot be reached, or `None` when it may not be.
+///
+/// RFC 5861 §4: the directive covers a response only while its staleness is
+/// within the window, not indefinitely after. And RFC 9111 §4.2.4: a stale
+/// response is never served against `must-revalidate` (or, in a shared cache,
+/// `proxy-revalidate`), or against an unqualified `no-cache`, which requires
+/// validation before every use.
+fn stale_if_error_allowance(cc: &CacheControl, staleness: u64, pinned: bool) -> Option<u64> {
+    if pinned || (cc.no_cache && cc.no_cache_fields.is_empty()) {
+        return None;
+    }
+    let window = cc.stale_if_error?;
+    window.checked_sub(staleness)
 }
 
 /// Headers to add to an outbound request so the origin can answer 304.
