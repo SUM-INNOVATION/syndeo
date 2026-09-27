@@ -1559,3 +1559,247 @@ fn counters_survive_the_process_that_recorded_them() {
     );
     assert!(stats.requests >= 1, "so must the request that produced it");
 }
+
+// ------------------------------------------------ cookies are never replayed
+//
+// Syndeo's own rule rather than RFC 9111's: a cookie belongs to the client whose
+// request produced it. The first response carries it; nothing served out of the
+// store ever does.
+
+fn cookies(h: &HeaderMap) -> Vec<String> {
+    h.get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect()
+}
+
+fn store_with_cookies(cache: &Cache, url: &str, status: u16, extra: &[(&str, &str)], at: u64) {
+    let when = date(at);
+    let mut pairs = vec![
+        ("set-cookie", "session=abc; Path=/"),
+        ("set-cookie", "theme=dark; Path=/"),
+        ("set-cookie2", "legacy=1"),
+        ("date", when.as_str()),
+    ];
+    pairs.extend_from_slice(extra);
+    let outcome = cache
+        .store(
+            None,
+            "GET",
+            url,
+            &HeaderMap::new(),
+            status,
+            &headers(&pairs),
+            b"body",
+            at,
+            at,
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, StoreOutcome::Stored { .. }),
+        "expected the response to be stored, got {outcome:?}"
+    );
+}
+
+#[test]
+fn a_fresh_hit_replays_no_cookie() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/fresh";
+    store_with_cookies(&cache, url, 200, &[("cache-control", "max-age=600")], NOW);
+
+    match cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap() {
+        Lookup::Fresh(response) => {
+            assert!(cookies(&response.headers).is_empty());
+            assert!(!response.headers.contains_key("set-cookie2"));
+            assert!(cookies(&response.meta.headers).is_empty());
+            assert_eq!(response.body, b"body");
+        }
+        other => panic!("expected a fresh hit, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_stale_hit_replays_no_cookie() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/stale-allowed";
+    store_with_cookies(
+        &cache,
+        url,
+        200,
+        &[("cache-control", "max-age=1")],
+        NOW - 100,
+    );
+
+    let request = headers(&[("cache-control", "max-stale")]);
+    match cache.lookup(None, "GET", url, &request).unwrap() {
+        Lookup::Stale { response, .. } => assert!(cookies(&response.headers).is_empty()),
+        other => panic!("expected a stale hit, got {other:?}"),
+    }
+}
+
+#[test]
+fn stale_while_revalidate_replays_no_cookie() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/swr";
+    store_with_cookies(
+        &cache,
+        url,
+        200,
+        &[
+            ("cache-control", "max-age=1, stale-while-revalidate=600"),
+            ("etag", "\"v1\""),
+        ],
+        NOW - 100,
+    );
+
+    match cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap() {
+        Lookup::Stale {
+            response,
+            refresh_in_background,
+            ..
+        } => {
+            assert!(refresh_in_background);
+            assert!(cookies(&response.headers).is_empty());
+        }
+        other => panic!("expected stale-while-revalidate, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_304_neither_stores_nor_replays_its_cookies() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/revalidated";
+    store_with_cookies(
+        &cache,
+        url,
+        200,
+        &[("cache-control", "max-age=1"), ("etag", "\"v1\"")],
+        NOW - 100,
+    );
+
+    let key = match cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap() {
+        Lookup::Revalidate { response, .. } => {
+            assert!(cookies(&response.headers).is_empty());
+            response.key.clone()
+        }
+        other => panic!("expected revalidate, got {other:?}"),
+    };
+
+    // Two cookies on the 304 itself. The network layer hands those to the
+    // client that made this request; the cache keeps neither.
+    let not_modified = headers(&[
+        ("cache-control", "max-age=600"),
+        ("date", &date(NOW)),
+        ("set-cookie", "fresh=1"),
+        ("set-cookie", "fresher=2"),
+    ]);
+    let refreshed = cache
+        .record_not_modified(&key, &not_modified, NOW, NOW)
+        .unwrap()
+        .expect("entry still present");
+    assert!(cookies(&refreshed.headers).is_empty());
+
+    match cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap() {
+        Lookup::Fresh(response) => assert!(cookies(&response.headers).is_empty()),
+        other => panic!("expected a fresh hit after the 304, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_cached_redirect_replays_no_cookie() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/moved";
+    store_with_cookies(
+        &cache,
+        url,
+        301,
+        &[("cache-control", "max-age=600"), ("location", "/elsewhere")],
+        NOW,
+    );
+
+    match cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap() {
+        Lookup::Fresh(response) => {
+            assert_eq!(response.status, 301);
+            assert_eq!(response.headers.get("location").unwrap(), "/elsewhere");
+            assert!(cookies(&response.headers).is_empty());
+        }
+        other => panic!("expected the redirect from the store, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_shared_cache_stores_a_public_response_without_its_cookie() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = Cache::with_options(dir.path(), shared())
+        .unwrap()
+        .with_clock(Arc::new(|| NOW));
+    let url = "https://example.test/public";
+    store_with_cookies(
+        &cache,
+        url,
+        200,
+        &[("cache-control", "public, max-age=600")],
+        NOW,
+    );
+
+    match cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap() {
+        Lookup::Fresh(response) => assert!(cookies(&response.headers).is_empty()),
+        other => panic!("expected a fresh hit, got {other:?}"),
+    }
+
+    // Without `public`, a shared cache still refuses it outright.
+    let outcome = cache
+        .store(
+            None,
+            "GET",
+            "https://example.test/not-public",
+            &HeaderMap::new(),
+            200,
+            &headers(&[("cache-control", "max-age=600"), ("set-cookie", "a=1")]),
+            b"body",
+            NOW,
+            NOW,
+        )
+        .unwrap();
+    assert!(matches!(outcome, StoreOutcome::NotStored(_)));
+}
+
+#[test]
+fn a_304_replaces_a_repeated_field_with_all_of_its_values_in_order() {
+    let mut stored = headers(&[
+        ("link", "</old.css>; rel=preload"),
+        ("etag", "\"v1\""),
+        ("content-length", "4"),
+    ]);
+    let fresh = headers(&[
+        ("link", "</a.css>; rel=preload"),
+        ("link", "</b.js>; rel=preload"),
+        ("set-cookie", "one=1"),
+        ("set-cookie", "two=2"),
+        ("content-length", "0"),
+        ("connection", "close"),
+    ]);
+    policy::apply_304(&mut stored, &fresh);
+
+    let values = |name: &str| -> Vec<String> {
+        stored
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        values("link"),
+        ["</a.css>; rel=preload", "</b.js>; rel=preload"]
+    );
+    assert_eq!(values("set-cookie"), ["one=1", "two=2"]);
+    // Untouched by the 304, and never updated by one.
+    assert_eq!(values("etag"), ["\"v1\""]);
+    assert_eq!(values("content-length"), ["4"]);
+    assert!(stored.get("connection").is_none());
+}

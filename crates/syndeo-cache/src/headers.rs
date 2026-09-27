@@ -232,6 +232,61 @@ pub fn sanitize(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Response fields this cache never keeps and never replays.
+///
+/// Syndeo's own privacy rule, not something RFC 9111 asks for. A cookie is
+/// addressed to the one client whose request produced it, at the moment it was
+/// produced. Replayed from a store it reaches whoever asks next — every client
+/// of a shared proxy — or comes back after the user has logged out and the
+/// site has cleared it. So a response's cookies go to the client that caused
+/// the fetch, and are left out of everything written to disk.
+pub const NEVER_STORED: &[&str] = &["set-cookie", "set-cookie2"];
+
+pub fn is_never_stored(name: &str) -> bool {
+    NEVER_STORED
+        .iter()
+        .any(|never| name.eq_ignore_ascii_case(never))
+}
+
+/// Remove every [`NEVER_STORED`] field from a header map.
+pub fn strip_never_stored(headers: &mut HeaderMap) {
+    for name in NEVER_STORED {
+        headers.remove(*name);
+    }
+}
+
+/// The headers of a stored response, as they are written to the index.
+///
+/// The only constructor is [`StoredHeaders::for_storage`], which drops the
+/// hop-by-hop fields and the [`NEVER_STORED`] ones. That makes the storage
+/// boundary one function rather than a rule every store path has to remember.
+///
+/// Encoded exactly as the `Vec` it wraps, so an index written before this type
+/// existed reads back unchanged. Such an index can hold a `Set-Cookie`, which
+/// is why serving strips the same fields again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct StoredHeaders(Vec<(String, String)>);
+
+impl StoredHeaders {
+    pub fn for_storage(headers: &HeaderMap) -> Self {
+        StoredHeaders(
+            sanitize(headers)
+                .into_iter()
+                .filter(|(name, _)| !is_never_stored(name))
+                .collect(),
+        )
+    }
+
+    pub fn pairs(&self) -> &[(String, String)] {
+        &self.0
+    }
+
+    pub fn to_header_map(&self) -> HeaderMap {
+        crate::cache::to_header_map(&self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +346,33 @@ mod tests {
         assert!(kept.iter().any(|(n, _)| n == "x-kept"));
         assert!(!kept.iter().any(|(n, _)| n == "x-custom"));
         assert!(!kept.iter().any(|(n, _)| n == "connection"));
+    }
+
+    #[test]
+    fn cookies_never_reach_storage() {
+        let mut h = HeaderMap::new();
+        h.append("set-cookie", "a=1".parse().unwrap());
+        h.append("Set-Cookie2", "b=2".parse().unwrap());
+        h.append("content-type", "text/plain".parse().unwrap());
+        let stored = StoredHeaders::for_storage(&h);
+        assert_eq!(
+            stored.pairs(),
+            &[("content-type".to_string(), "text/plain".to_string())]
+        );
+    }
+
+    #[test]
+    fn stored_headers_encode_exactly_as_the_list_they_replace() {
+        // An index written before `StoredHeaders` holds a bare list. Reading it
+        // back must not need a schema change, and must see every field that
+        // was written, cookies included: those are removed on serve.
+        let legacy: Vec<(String, String)> = vec![
+            ("set-cookie".into(), "old=1".into()),
+            ("etag".into(), "\"v1\"".into()),
+        ];
+        let bytes = bincode::serialize(&legacy).unwrap();
+        let read: StoredHeaders = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(read.pairs(), legacy.as_slice());
+        assert_eq!(bincode::serialize(&read).unwrap(), bytes);
     }
 }

@@ -402,18 +402,26 @@ pub fn has_validator(meta: &StoredMeta) -> bool {
 const NOT_UPDATED_BY_304: &[&str] = &["content-length", "content-encoding", "content-range"];
 
 /// Fold a 304's headers into the stored response.
+///
+/// Every field the 304 names replaces the stored one as a whole, with all of
+/// the 304's values in the order it sent them. Removing and appending value by
+/// value would keep only the last of a repeated field — one `Set-Cookie` or
+/// `Link` out of several.
 pub fn apply_304(stored: &mut HeaderMap, fresh: &HeaderMap) {
     let tokens = crate::headers::connection_tokens(fresh);
+    let updates = |name: &http::HeaderName| {
+        let lname = name.as_str();
+        !crate::headers::is_hop_by_hop(lname, &tokens) && !NOT_UPDATED_BY_304.contains(&lname)
+    };
+    for name in fresh.keys() {
+        if updates(name) {
+            stored.remove(name);
+        }
+    }
     for (name, value) in fresh.iter() {
-        let lname = name.as_str().to_ascii_lowercase();
-        if crate::headers::is_hop_by_hop(&lname, &tokens) {
-            continue;
+        if updates(name) {
+            stored.append(name.clone(), value.clone());
         }
-        if NOT_UPDATED_BY_304.contains(&lname.as_str()) {
-            continue;
-        }
-        stored.remove(name);
-        stored.append(name.clone(), value.clone());
     }
 }
 

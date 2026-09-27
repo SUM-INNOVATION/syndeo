@@ -164,7 +164,11 @@ pub struct EntryRecord {
     pub url: String,
     pub method: String,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    /// Built only by [`StoredHeaders::for_storage`], so nothing that reaches
+    /// the index can carry a field the cache has promised never to keep.
+    ///
+    /// [`StoredHeaders::for_storage`]: crate::headers::StoredHeaders::for_storage
+    pub headers: crate::headers::StoredHeaders,
     pub vary_fields: Vec<String>,
     pub vary_key: String,
     pub body: StoredBody,

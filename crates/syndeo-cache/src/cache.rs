@@ -2,7 +2,7 @@
 
 use crate::blob::{BlobStore, ContentId};
 use crate::error::{CacheError, Result};
-use crate::headers::{now_secs, sanitize};
+use crate::headers::{now_secs, StoredHeaders};
 use crate::index::{entry_key, BlobRecord, EntryRecord, Index, Provenance, Segment, StoredBody};
 use crate::policy::{self, CacheOptions, Freshness, Storability, StoredMeta};
 use crate::range::{self, Coverage, Resolved};
@@ -235,7 +235,7 @@ impl Cache {
 
         let meta = StoredMeta {
             status: record.status,
-            headers: to_header_map(&record.headers),
+            headers: record.headers.to_header_map(),
             request_time: record.request_time,
             response_time: record.response_time,
         };
@@ -471,9 +471,15 @@ impl Cache {
             }
         };
 
+        // The serving boundary. Storage already refuses these fields; an index
+        // written before it did can still hold them, and nothing that leaves
+        // the store may carry one. The metadata goes out with the response too,
+        // so it is cleaned the same way.
+        let mut meta = meta.clone();
+        crate::headers::strip_never_stored(&mut meta.headers);
         let mut headers = meta.headers.clone();
         // A qualified `no-cache="field"` means that field may not be reused.
-        for field in policy::suppressed_fields(meta) {
+        for field in policy::suppressed_fields(&meta) {
             if let Ok(name) = HeaderName::from_bytes(field.as_bytes()) {
                 headers.remove(name);
             }
@@ -504,7 +510,7 @@ impl Cache {
             content: record.content_id(),
             provenance: record.provenance,
             age,
-            meta: meta.clone(),
+            meta,
             range: want.range,
             body_omitted: want.omit_body,
         })
@@ -638,7 +644,7 @@ impl Cache {
             url: url.clone(),
             method: method.to_ascii_uppercase(),
             status,
-            headers: sanitize(response_headers),
+            headers: StoredHeaders::for_storage(response_headers),
             vary_fields: fields,
             vary_key: vkey,
             body: StoredBody::Complete {
@@ -753,7 +759,7 @@ impl Cache {
             url: url.clone(),
             method: method.to_ascii_uppercase(),
             status,
-            headers: sanitize(response_headers),
+            headers: StoredHeaders::for_storage(response_headers),
             vary_fields: fields,
             vary_key: vkey,
             body: StoredBody::Complete {
@@ -850,7 +856,7 @@ impl Cache {
 
         // Is what we already hold the same representation as this range?
         let combinable = match &existing {
-            Some(record) => same_representation(&to_header_map(&record.headers), response_headers),
+            Some(record) => same_representation(&record.headers.to_header_map(), response_headers),
             None => false,
         };
         if existing.is_some() && !combinable {
@@ -924,7 +930,7 @@ impl Cache {
             // A stored partial is a stored *representation*; the 206 status
             // belongs to the exchange, and we synthesise it again on serve.
             status: 200,
-            headers: sanitize(&stored_headers),
+            headers: StoredHeaders::for_storage(&stored_headers),
             vary_fields: fields,
             vary_key: vkey,
             body: StoredBody::Partial {
@@ -1000,7 +1006,7 @@ impl Cache {
         else {
             return Ok(());
         };
-        let mut stored = to_header_map(&record.headers);
+        let mut stored = record.headers.to_header_map();
 
         if !same_representation(&stored, head_headers) {
             let orphaned = self.index.remove_entry(&key)?;
@@ -1010,7 +1016,7 @@ impl Cache {
         }
 
         policy::apply_304(&mut stored, head_headers);
-        record.headers = sanitize(&stored);
+        record.headers = StoredHeaders::for_storage(&stored);
         self.index.refresh_entry(&record)?;
         Ok(())
     }
@@ -1035,9 +1041,9 @@ impl Cache {
         let Some(mut record) = self.index.get_entry(key)? else {
             return Ok(None);
         };
-        let mut headers = to_header_map(&record.headers);
+        let mut headers = record.headers.to_header_map();
         policy::apply_304(&mut headers, fresh_headers);
-        record.headers = sanitize(&headers);
+        record.headers = StoredHeaders::for_storage(&headers);
         record.request_time = request_time;
         record.response_time = response_time;
         self.index.refresh_entry(&record)?;
@@ -1342,5 +1348,102 @@ mod tests {
         // And it is a working cache afterwards, not a wedged one.
         stored(&rebuilt, "https://a.test/two", b"world");
         assert_eq!(rebuilt.stats().unwrap().entries, 1);
+    }
+
+    fn with_cookie() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CACHE_CONTROL, "max-age=600".parse().unwrap());
+        headers.append(http::header::SET_COOKIE, "a=1".parse().unwrap());
+        headers.append(http::header::SET_COOKIE, "b=2".parse().unwrap());
+        headers
+    }
+
+    fn only_entry(cache: &Cache) -> (String, EntryRecord) {
+        let mut all = cache.index.all_entries().unwrap();
+        assert_eq!(all.len(), 1);
+        all.remove(0)
+    }
+
+    #[test]
+    fn what_is_written_to_the_index_carries_no_cookie() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let now = cache.now();
+        cache
+            .store(
+                None,
+                "GET",
+                "https://a.test/c",
+                &HeaderMap::new(),
+                200,
+                &with_cookie(),
+                b"x",
+                now,
+                now,
+            )
+            .unwrap();
+        let (_, record) = only_entry(&cache);
+        assert!(!record
+            .headers
+            .pairs()
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("set-cookie")));
+
+        // The streamed path writes through the same boundary.
+        let mut writer = cache.begin_streamed().unwrap();
+        writer.write(b"streamed").unwrap();
+        cache
+            .finish_streamed(
+                None,
+                "GET",
+                "https://a.test/streamed",
+                &HeaderMap::new(),
+                200,
+                &with_cookie(),
+                writer,
+                now,
+                now,
+                Provenance::Origin,
+            )
+            .unwrap();
+        for (_, record) in cache.index.all_entries().unwrap() {
+            assert!(!record
+                .headers
+                .pairs()
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("set-cookie")));
+        }
+    }
+
+    #[test]
+    fn an_entry_written_before_the_rule_is_served_without_its_cookie() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        stored(&cache, "https://a.test/legacy", b"old");
+
+        // What v0.1.3 wrote: the same bincode layout, cookie included.
+        let (_, mut record) = only_entry(&cache);
+        let legacy: Vec<(String, String)> = vec![
+            ("cache-control".into(), "max-age=600".into()),
+            ("set-cookie".into(), "stale=1".into()),
+        ];
+        record.headers = bincode::deserialize(&bincode::serialize(&legacy).unwrap()).unwrap();
+        cache.index.refresh_entry(&record).unwrap();
+
+        match cache
+            .lookup(None, "GET", "https://a.test/legacy", &HeaderMap::new())
+            .unwrap()
+        {
+            Lookup::Fresh(response) => {
+                assert!(response.headers.get(http::header::SET_COOKIE).is_none());
+                assert!(response
+                    .meta
+                    .headers
+                    .get(http::header::SET_COOKIE)
+                    .is_none());
+                assert_eq!(response.body, b"old");
+            }
+            other => panic!("expected a fresh hit, got {other:?}"),
+        }
     }
 }
