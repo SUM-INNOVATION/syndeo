@@ -751,14 +751,23 @@ impl Index {
     // ---- peer eligibility --------------------------------------------------
 
     /// Record that these verified hashes name `id`, merged with any already
-    /// recorded. Refused — `false` — unless an entry refers to the blob, so
+    /// recorded, and return the ones that were not recorded before.
+    ///
+    /// Deciding what is new happens inside the write transaction that merges
+    /// it, so of any number of callers granting the same hash at once exactly
+    /// one is told it is new — and so exactly one announces it. Nothing is
+    /// recorded, and nothing returned, unless an entry refers to the blob, so
     /// nothing is offered that eviction could not also take away.
     ///
     /// The caller has checked the bytes; see `Cache::grant_peer_eligibility`,
     /// which is the only way to reach this from outside the crate.
-    pub(crate) fn grant_eligibility(&self, id: ContentId, verified: &[Vec<u8>]) -> Result<bool> {
+    pub(crate) fn grant_eligibility(
+        &self,
+        id: ContentId,
+        verified: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>> {
         if verified.is_empty() {
-            return Ok(false);
+            return Ok(Vec::new());
         }
         let tx = self.db.begin_write()?;
         let referenced = {
@@ -771,21 +780,34 @@ impl Index {
         };
         if !referenced {
             tx.abort()?;
-            return Ok(false);
+            return Ok(Vec::new());
         }
-        {
+        let new: Vec<Vec<u8>> = {
             let mut eligible = tx.open_table(PEER_ELIGIBLE)?;
             let mut keys: Vec<Vec<u8>> = match eligible.get(id.0.as_slice())? {
                 Some(bytes) => bincode::deserialize(bytes.value())?,
                 None => Vec::new(),
             };
-            keys.extend(verified.iter().cloned());
-            keys.sort();
-            keys.dedup();
-            eligible.insert(id.0.as_slice(), bincode::serialize(&keys)?.as_slice())?;
+            let mut new: Vec<Vec<u8>> = verified
+                .iter()
+                .filter(|key| !keys.contains(key))
+                .cloned()
+                .collect();
+            new.sort();
+            new.dedup();
+            if !new.is_empty() {
+                keys.extend(new.iter().cloned());
+                keys.sort();
+                eligible.insert(id.0.as_slice(), bincode::serialize(&keys)?.as_slice())?;
+            }
+            new
+        };
+        if new.is_empty() {
+            tx.abort()?;
+        } else {
+            tx.commit()?;
         }
-        tx.commit()?;
-        Ok(true)
+        Ok(new)
     }
 
     /// The verified hashes a peer may name `id` by. Empty means it may not be

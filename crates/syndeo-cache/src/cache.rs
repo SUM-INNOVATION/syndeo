@@ -714,16 +714,16 @@ impl Cache {
             .cloned()
             .collect();
         matching.dedup();
-        let recorded = self.index.eligible_hashes(content)?;
-        let (keys, new): (Vec<Vec<u8>>, Vec<crate::sri::Hash>) = matching
+        let keys: Vec<Vec<u8>> = matching
+            .iter()
+            .map(|h| sri_key(h.algorithm, &h.digest))
+            .collect();
+        // What is new is decided in the transaction that records it.
+        let new = self.index.grant_eligibility(content, &keys)?;
+        Ok(matching
             .into_iter()
-            .map(|h| (sri_key(h.algorithm, &h.digest), h))
-            .filter(|(key, _)| !recorded.contains(key))
-            .unzip();
-        if keys.is_empty() || !self.index.grant_eligibility(content, &keys)? {
-            return Ok(Vec::new());
-        }
-        Ok(new)
+            .filter(|h| new.contains(&sri_key(h.algorithm, &h.digest)))
+            .collect())
     }
 
     /// The verified hashes a peer may name this body by. Empty: not shareable.
@@ -2060,6 +2060,40 @@ mod tests {
             .body_for_peer(PeerAsk::Integrity(&wrong))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn of_many_simultaneous_first_grants_exactly_one_is_told_a_hash_is_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::open(dir.path()).unwrap());
+        let body = b"verified by eight hits at once";
+        stored(&cache, "https://cdn.test/popular.js", body);
+        let id = ContentId::of(body);
+        let hash = Hash::compute(Algorithm::Sha384, body);
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                let hash = hash.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache
+                        .grant_peer_eligibility(id, &declared(std::slice::from_ref(&hash)))
+                        .unwrap()
+                })
+            })
+            .collect();
+        let told_new: Vec<Vec<Hash>> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+
+        assert_eq!(
+            told_new.iter().filter(|new| !new.is_empty()).count(),
+            1,
+            "{told_new:?}"
+        );
+        assert_eq!(told_new.concat(), vec![hash.clone()]);
+        assert_eq!(cache.peer_eligibility(id).unwrap(), vec![hash]);
     }
 
     #[test]
