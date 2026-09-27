@@ -69,7 +69,19 @@ struct RunArgs {
     /// once.
     #[arg(long, hide = true)]
     exit_with_parent: bool,
+    /// Once listening, write one line to stdout saying where — see
+    /// [`READY`] — and nothing else there; logs go to stderr instead.
+    ///
+    /// For syndeo-webkit, which starts its own proxy on a port the system
+    /// picks, and learns which one from the proxy itself rather than by
+    /// finding something that answers.
+    #[arg(long, hide = true)]
+    announce: bool,
 }
+
+/// The one line `run --announce` writes to stdout, followed by the address it
+/// is listening on and a newline. The number is the version of this record.
+const READY: &str = "SYNDEO-PROXY-READY 1";
 
 #[derive(Parser)]
 struct CaArgs {
@@ -152,22 +164,31 @@ fn stats_report(home: &std::path::Path, args: &StatsArgs) -> Result<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
+    let cli = Cli::parse();
+    // Parsed first, because `--announce` decides where logs go: stdout then
+    // belongs to the one line that says where the proxy listens.
+    let announcing = matches!(&cli.command, Some(Command::Run(args)) if args.announce);
+    let logs = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG").unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new("syndeo_proxy=info,syndeo_net=info")
             }),
         )
-        .with_target(false)
-        .init();
+        .with_target(false);
+    if announcing {
+        logs.with_writer(std::io::stderr).init();
+    } else {
+        logs.init();
+    }
 
-    match Cli::parse().command.unwrap_or(Command::Run(RunArgs {
+    match cli.command.unwrap_or(Command::Run(RunArgs {
         listen: "127.0.0.1:8899".parse().unwrap(),
         cache: None,
         dns: "system".into(),
         shared: true,
         trace_requests: true,
         exit_with_parent: false,
+        announce: false,
     })) {
         Command::Run(args) => run(args).await,
         Command::Ca(args) => {
@@ -248,14 +269,28 @@ async fn run(args: RunArgs) -> Result<()> {
     let listener = TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("binding {}", args.listen))?;
+    // Where it actually listens: with port 0 the system chose, and only the
+    // bound socket knows which.
+    let bound = listener.local_addr().context("reading the bound address")?;
+    if args.announce {
+        announce_ready(&mut std::io::stdout().lock(), bound)
+            .context("announcing where the proxy listens")?;
+    }
 
-    tracing::info!(listen = %args.listen, cache = %proxy.net.config().cache_root.display(), "proxy up");
+    tracing::info!(listen = %bound, cache = %proxy.net.config().cache_root.display(), "proxy up");
     tracing::info!(certificate = %cert_path.display(), "trust this to intercept https");
     tracing::info!(
         "statistics at http://syndeo.local/stats through the proxy, or `syndeo-proxy stats`"
     );
 
     serve(listener, proxy).await
+}
+
+/// Say where the proxy listens: one line, written only once it is bound, and
+/// flushed at once, since the reader is waiting for it.
+fn announce_ready(out: &mut impl std::io::Write, address: SocketAddr) -> std::io::Result<()> {
+    writeln!(out, "{READY} {address}")?;
+    out.flush()
 }
 
 /// The network process the proxy fetches through, on the cache at `root`.

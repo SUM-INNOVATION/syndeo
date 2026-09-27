@@ -92,10 +92,6 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let home = cli.home.clone().unwrap_or_else(default_home);
 
-    let spec = cli
-        .proxy
-        .clone()
-        .unwrap_or_else(|| DEFAULT_PROXY.to_string());
     let authority = cli
         .proxy_ca
         .clone()
@@ -119,11 +115,23 @@ pub fn run() -> Result<()> {
 
     // Start the proxy unless told to use one that is already running. Without
     // this the browser is two commands and a path, which is two more than a
-    // browser should need.
-    let _proxy_process = if cli.proxy.is_none() {
+    // browser should need. It lives exactly as long as this binding.
+    let owned = if cli.proxy.is_none() {
         Some(start_proxy(&home)?)
     } else {
         None
+    };
+    if let Some(owned) = &owned {
+        tracing::info!(
+            proxy = %owned.endpoint,
+            pid = owned.pid(),
+            "started this browser's own proxy; it goes when the browser does"
+        );
+    }
+    let spec = match (&cli.proxy, &owned) {
+        (Some(spec), _) => spec.clone(),
+        (None, Some(owned)) => owned.endpoint.to_string(),
+        (None, None) => unreachable!("a proxy is either named or started"),
     };
 
     let cli = Cli {
@@ -473,8 +481,6 @@ fn default_home() -> PathBuf {
         })
 }
 
-const DEFAULT_PROXY: &str = "127.0.0.1:8899";
-
 /// The proxy this browser started: that process and no other.
 ///
 /// Dropping it kills and reaps the child, which covers returning from `run`,
@@ -492,61 +498,174 @@ impl Drop for ProxyChild {
     }
 }
 
-/// Refuse to start a proxy where something is already listening.
+/// Our proxy, and where it said it listens.
 ///
-/// Whatever is there is not ours to stop, and not ours to trust: pages would go
-/// to it, and plain http through it would be readable and changeable by
-/// whoever runs it. If it is a proxy the user started themselves, `--proxy`
-/// says so on purpose.
-fn refuse_if_occupied(address: std::net::SocketAddr) -> Result<()> {
-    if std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(300)).is_ok()
-    {
-        anyhow::bail!(
-            "something is already listening on {address}, and this would start its own \
-             proxy there. If that is a syndeo-proxy you started, use it with \
-             `--proxy {address}`; otherwise stop it first."
-        );
-    }
-    Ok(())
+/// Built only from a child this process spawned and heard from, so the
+/// address is the one that child bound — never whatever happened to answer on
+/// a port.
+struct OwnedProxy {
+    child: ProxyChild,
+    endpoint: std::net::SocketAddr,
 }
 
-/// Start `command` as this browser's proxy and wait until it listens on
-/// `address`, noticing if it exits first.
+impl OwnedProxy {
+    fn pid(&self) -> u32 {
+        self.child.0.id()
+    }
+}
+
+/// What `syndeo-proxy run --announce` writes once it is listening, before the
+/// address. Kept in step with the proxy's `READY`.
+const READY: &str = "SYNDEO-PROXY-READY 1 ";
+
+/// The longest announcement worth reading: the prefix, the longest IPv4
+/// socket address, and room to spare. Anything longer is not one.
+const MAX_ANNOUNCEMENT: usize = 96;
+
+/// Read a proxy's announcement, strictly: the exact prefix and version, one
+/// socket address and nothing after it, on loopback IPv4 — which is what was
+/// asked for — and a port the system actually chose.
+fn parse_announcement(line: &[u8]) -> Result<std::net::SocketAddr> {
+    let text = std::str::from_utf8(line).context("the announcement is not text")?;
+    let rest = text
+        .strip_prefix(READY)
+        .with_context(|| format!("not a readiness announcement: {text:?}"))?;
+    let address: std::net::SocketAddr = rest
+        .parse()
+        .with_context(|| format!("not an address: {rest:?}"))?;
+    if !address.is_ipv4() || !address.ip().is_loopback() {
+        anyhow::bail!("the proxy announced {address}, which is not loopback IPv4");
+    }
+    if address.port() == 0 {
+        anyhow::bail!("the proxy announced port 0");
+    }
+    Ok(address)
+}
+
+/// On the child's stdout, on a thread of its own: the one announcement line,
+/// bounded, and then everything after it drained until the child goes, so a
+/// child that writes more can never block on a full pipe.
+fn read_announcement(
+    mut stdout: std::process::ChildStdout,
+    found: std::sync::mpsc::Sender<Result<std::net::SocketAddr>>,
+) {
+    use std::io::Read;
+    let mut line = Vec::with_capacity(MAX_ANNOUNCEMENT);
+    let mut byte = [0u8; 1];
+    loop {
+        match stdout.read(&mut byte) {
+            Ok(0) => {
+                let _ = found.send(Err(anyhow::anyhow!(
+                    "the proxy closed its output before saying where it listens"
+                )));
+                return;
+            }
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => {
+                line.push(byte[0]);
+                if line.len() > MAX_ANNOUNCEMENT {
+                    let _ = found.send(Err(anyhow::anyhow!(
+                        "the proxy's first line is longer than an announcement"
+                    )));
+                    return;
+                }
+            }
+            Err(err) => {
+                let _ = found.send(Err(
+                    anyhow::Error::from(err).context("reading the proxy's announcement")
+                ));
+                return;
+            }
+        }
+    }
+    let _ = found.send(parse_announcement(&line));
+    let mut sink = [0u8; 8192];
+    while let Ok(n) = stdout.read(&mut sink) {
+        if n == 0 {
+            return;
+        }
+        tracing::debug!(bytes = n, "the proxy wrote to stdout after announcing");
+    }
+}
+
+/// Start `command` as this browser's proxy and wait until it says where it
+/// listens.
+///
+/// Readiness is the child's own word, on its own stdout, and not a connection
+/// to a port: something else listening there is never mistaken for our proxy,
+/// because nothing else can write to that pipe. A child that exits, or says
+/// anything but a well-formed announcement, is an error, and dropping it on
+/// the way out kills and reaps it.
 fn start_owned(
     mut command: std::process::Command,
-    address: std::net::SocketAddr,
     within: std::time::Duration,
-) -> Result<ProxyChild> {
-    refuse_if_occupied(address)?;
+) -> Result<OwnedProxy> {
     let child = command
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .spawn()
         .context("starting the proxy")?;
     let mut owned = ProxyChild(child);
+    let stdout = owned.0.stdout.take().context("the proxy's stdout")?;
+    let (found, announced) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("proxy-stdout".into())
+        .spawn(move || read_announcement(stdout, found))
+        .context("reading the proxy's output")?;
 
     let deadline = std::time::Instant::now() + within;
-    while std::time::Instant::now() < deadline {
+    loop {
         if let Some(status) = owned.0.try_wait()? {
-            anyhow::bail!("the proxy exited before it was listening ({status})");
+            anyhow::bail!("the proxy exited before it was ready ({status})");
         }
-        if std::net::TcpStream::connect(address).is_ok() {
-            tracing::info!(proxy = %address, "the proxy is listening");
-            return Ok(owned);
+        match announced.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(Ok(endpoint)) => {
+                tracing::info!(proxy = %endpoint, "the proxy is listening");
+                return Ok(OwnedProxy {
+                    child: owned,
+                    endpoint,
+                });
+            }
+            Ok(Err(err)) => {
+                // A child that ended its output by exiting is reported by how
+                // it exited, which is the more useful of the two.
+                if let Some(status) = exited_soon(&mut owned) {
+                    anyhow::bail!("the proxy exited before it was ready ({status})");
+                }
+                return Err(err);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("the proxy's output could not be read")
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the proxy did not say where it listens within {} seconds",
+                within.as_secs()
+            );
+        }
     }
-    anyhow::bail!(
-        "the proxy did not start listening on {address} within {} seconds",
-        within.as_secs()
-    )
 }
 
-/// Start the proxy this browser fetches through, and wait until it answers.
+/// How the child exited, if it does so within a moment.
+fn exited_soon(owned: &mut ProxyChild) -> Option<std::process::ExitStatus> {
+    for _ in 0..20 {
+        if let Ok(Some(status)) = owned.0.try_wait() {
+            return Some(status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    None
+}
+
+/// Start the proxy this browser fetches through, and wait until it says where.
 ///
 /// A sibling binary, found the way the shell finds its own, so a build tree and
-/// an install both work. It goes when this process goes, however that happens:
-/// see [`ProxyChild`].
-fn start_proxy(home: &std::path::Path) -> Result<ProxyChild> {
+/// an install both work. It listens on a loopback port the system picks —
+/// never a fixed one that something else could already hold — and goes when
+/// this process goes, however that happens: see [`ProxyChild`].
+fn start_proxy(home: &std::path::Path) -> Result<OwnedProxy> {
     let exe = std::env::current_exe().context("locating the running binary")?;
     let resolved = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
     let beside = resolved
@@ -560,17 +679,18 @@ fn start_proxy(home: &std::path::Path) -> Result<ProxyChild> {
 
     let mut command = std::process::Command::new(beside);
     command
-        .args(["run", "--exit-with-parent"])
+        .args([
+            "run",
+            "--exit-with-parent",
+            "--listen",
+            "127.0.0.1:0",
+            "--announce",
+        ])
         // On the environment rather than a flag, because that is where the
         // proxy reads it from and inventing a flag it does not have is how the
         // first attempt at this failed.
         .env("SYNDEO_HOME", home);
-    // It has to be listening before the first page is asked for.
-    start_owned(
-        command,
-        DEFAULT_PROXY.parse().expect("a valid address"),
-        std::time::Duration::from_secs(10),
-    )
+    start_owned(command, std::time::Duration::from_secs(10))
 }
 
 /// Whether our authority is in a keychain WebKit's networking process consults.
@@ -629,28 +749,10 @@ mod tests {
         ProxyChild(Command::new("/bin/sleep").arg("60").spawn().unwrap())
     }
 
-    /// Held by every test that binds a port, or picks one it relies on nobody
-    /// else taking: a port one test lets go of can be handed straight to
-    /// another.
-    static PORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// A free port below the ephemeral range. A port handed out by binding to
-    /// port 0 is an ephemeral one, and connecting to it once it is free again
-    /// can be given that same port as its source — a TCP connection to itself,
-    /// which looks exactly like somebody listening. 8899 is never in that
-    /// range, so this is a property of the tests and not of the browser.
-    fn quiet_address() -> std::net::SocketAddr {
-        (20000..30000)
-            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
-            .skip((std::process::id() % 5000) as usize)
-            .find(|address| std::net::TcpListener::bind(address).is_ok())
-            .expect("a free port below the ephemeral range")
-    }
-
-    /// Nobody listens on port 1, and no connection is ever given it as a
-    /// source port.
-    fn nobody() -> std::net::SocketAddr {
-        std::net::SocketAddr::from(([127, 0, 0, 1], 1))
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
     }
 
     #[test]
@@ -687,19 +789,80 @@ mod tests {
     }
 
     #[test]
-    fn a_proxy_that_exits_before_listening_is_noticed_at_once() {
-        let _ports = PORTS.lock().unwrap_or_else(|e| e.into_inner());
-        let started = Instant::now();
-        let refused = start_owned(
-            Command::new("/usr/bin/false"),
-            nobody(),
-            Duration::from_secs(10),
+    fn only_a_well_formed_loopback_announcement_is_believed() {
+        assert_eq!(
+            parse_announcement(b"SYNDEO-PROXY-READY 1 127.0.0.1:4567").unwrap(),
+            "127.0.0.1:4567".parse().unwrap()
         );
-        let message = refused.err().unwrap().to_string();
+        for refused in [
+            &b""[..],
+            b"SYNDEO-PROXY-READY 1 ",
+            b"SYNDEO-PROXY-READY 2 127.0.0.1:4567",
+            b"syndeo-proxy-ready 1 127.0.0.1:4567",
+            b"SYNDEO-PROXY-READY 1 127.0.0.1:4567 ",
+            b"SYNDEO-PROXY-READY 1 127.0.0.1:4567 extra",
+            b"SYNDEO-PROXY-READY 1  127.0.0.1:4567",
+            b"SYNDEO-PROXY-READY 1 10.0.0.1:4567",
+            b"SYNDEO-PROXY-READY 1 0.0.0.0:4567",
+            b"SYNDEO-PROXY-READY 1 [::1]:4567",
+            b"SYNDEO-PROXY-READY 1 127.0.0.1:0",
+            b"SYNDEO-PROXY-READY 1 localhost:4567",
+            b"SYNDEO-PROXY-READY 1 127.0.0.1:4567\r",
+            b"\xffSYNDEO-PROXY-READY 1 127.0.0.1:4567",
+        ] {
+            assert!(
+                parse_announcement(refused).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(refused)
+            );
+        }
+    }
+
+    #[test]
+    fn a_proxy_that_announces_is_kept_until_its_owner_goes() {
+        let owned = start_owned(
+            sh("printf 'SYNDEO-PROXY-READY 1 127.0.0.1:4567\\n'; exec /bin/sleep 60"),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(owned.endpoint, "127.0.0.1:4567".parse().unwrap());
+        let pid = owned.pid();
+        assert!(alive(pid));
+        drop(owned);
+        assert!(!alive(pid));
+    }
+
+    #[test]
+    fn something_else_listening_is_never_taken_for_our_proxy() {
+        // The race this replaces: a port probed free, something else binding
+        // it, and its answer taken for our proxy's. Here something listens and
+        // accepts, and our child never says anything.
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let started = Instant::now();
+        let mut silent = Command::new("/bin/sleep");
+        silent.arg("60");
+        let result = start_owned(silent, Duration::from_secs(1));
+        let message = result
+            .err()
+            .expect("a silent child is not ready")
+            .to_string();
         assert!(
-            message.contains("exited before it was listening"),
+            message.contains("did not say where it listens"),
             "{message}"
         );
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        drop(squatter);
+    }
+
+    #[test]
+    fn a_proxy_that_exits_first_is_noticed_at_once_with_its_status() {
+        let started = Instant::now();
+        let message = start_owned(Command::new("/usr/bin/false"), Duration::from_secs(10))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("exited before it was ready"), "{message}");
+        assert!(message.contains("exit status: 1"), "{message}");
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "waited out the deadline"
@@ -707,44 +870,79 @@ mod tests {
     }
 
     #[test]
-    fn a_taken_port_is_refused_before_anything_starts_and_left_alone() {
-        let _ports = PORTS.lock().unwrap_or_else(|e| e.into_inner());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let marker = std::env::temp_dir().join(format!(
-            "syndeo-webkit-test-{}-{}",
-            std::process::id(),
-            Instant::now().elapsed().as_nanos() + address.port() as u128
-        ));
-        let _ = std::fs::remove_file(&marker);
-        let mut command = Command::new("/usr/bin/touch");
-        command.arg(&marker);
-
-        let message = start_owned(command, address, Duration::from_secs(5))
-            .err()
-            .unwrap()
-            .to_string();
-
-        assert!(message.contains(&format!("--proxy {address}")), "{message}");
-        assert!(!marker.exists(), "a proxy was started anyway");
-        // Whoever holds the port still holds it, and still answers.
-        std::net::TcpStream::connect(address).unwrap();
-        assert!(listener.accept().is_ok());
+    fn a_proxy_from_before_announce_existed_fails_with_its_exit_status() {
+        // What a 0.1.3 syndeo-proxy does with `--announce`: clap refuses the
+        // argument and exits 2.
+        let message = start_owned(
+            sh("echo \"error: unexpected argument '--announce' found\" >&2; exit 2"),
+            Duration::from_secs(10),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert_eq!(
+            message,
+            "the proxy exited before it was ready (exit status: 2)"
+        );
     }
 
     #[test]
-    fn a_proxy_that_listens_is_kept_until_its_owner_goes() {
-        let _ports = PORTS.lock().unwrap_or_else(|e| e.into_inner());
-        let address = quiet_address();
-        // nc rather than python3: /usr/bin/python3 is a launcher that starts
-        // the interpreter as a child of its own, so killing it would leave the
-        // real listener behind.
-        let mut command = Command::new("/usr/bin/nc");
-        command.args(["-lk", "127.0.0.1", &address.port().to_string()]);
-        let owned = start_owned(command, address, Duration::from_secs(10)).unwrap();
-        let pid = owned.0.id();
-        assert!(alive(pid));
+    fn a_malformed_or_endless_first_line_is_refused_and_the_child_goes() {
+        for (n, output) in [
+            "printf 'SYNDEO-PROXY-READY 1 10.0.0.1:80\\n'",
+            "head -c 4096 /dev/zero | tr '\\0' 'x'",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pidfile = std::env::temp_dir()
+                .join(format!("syndeo-webkit-refused-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_file(&pidfile);
+            let script = format!(
+                "echo $$ > '{}'; {output}; exec /bin/sleep 60",
+                pidfile.display()
+            );
+            let started = Instant::now();
+            let result = start_owned(sh(&script), Duration::from_secs(10));
+            assert!(result.is_err(), "{output}");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "refused only at the deadline, not when the line went wrong: {output}"
+            );
+            let pid: u32 = std::fs::read_to_string(&pidfile)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(!alive(pid), "a refused proxy was left running: {output}");
+            let _ = std::fs::remove_file(&pidfile);
+        }
+    }
+
+    #[test]
+    fn output_after_the_announcement_never_blocks_the_proxy() {
+        // A megabyte to stdout after announcing, then a mark on disk — only if
+        // every byte was written. Undrained, the write blocks on a full pipe,
+        // or fails outright once the reader has gone (the real proxy ignores
+        // SIGPIPE, so for it that is a failed write), and the mark never comes.
+        let marker = std::env::temp_dir().join(format!(
+            "syndeo-webkit-drain-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "printf 'SYNDEO-PROXY-READY 1 127.0.0.1:4567\\n'; \
+             head -c 1048576 /dev/zero && touch '{}'; exec /bin/sleep 60",
+            marker.display()
+        );
+        let owned = start_owned(sh(&script), Duration::from_secs(10)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "the proxy blocked writing to its stdout");
         drop(owned);
-        assert!(!alive(pid));
+        let _ = std::fs::remove_file(&marker);
     }
 }
