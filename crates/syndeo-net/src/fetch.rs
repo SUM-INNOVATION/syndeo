@@ -205,6 +205,8 @@ pub struct Net {
     /// and one refresh per request would turn `stale-while-revalidate` from a
     /// saving into a stampede. They collapse onto the first.
     refreshing: Arc<Mutex<HashSet<String>>>,
+    /// Hashes handed to the swarm to announce, over this process's life.
+    announcements: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Net {
@@ -268,6 +270,7 @@ impl Net {
             quic,
             alt_svc: Arc::new(AltSvc::default()),
             refreshing: Arc::new(Mutex::new(HashSet::new())),
+            announcements: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -707,7 +710,17 @@ impl Net {
         let Some(integrity) = &request.integrity else {
             return true;
         };
-        if is_hop(request, stored.status, &stored.headers) || integrity.verify(&stored.body) {
+        if is_hop(request, stored.status, &stored.headers) {
+            return true;
+        }
+        let matching = matching_strongest(integrity, &stored.body);
+        if !matching.is_empty() {
+            // Verified against a stored entry: as good a reason to share it as
+            // a fresh download, and the only one a body first fetched without
+            // a declaration will ever get.
+            if let Some(content) = stored.content {
+                self.share_verified(content, integrity, &matching);
+            }
             return true;
         }
         tracing::info!(url = %request.url, "the stored body does not satisfy the declared integrity; asking the origin");
@@ -727,21 +740,37 @@ impl Net {
     /// page also declared, or a declared hash that did not match, is never
     /// published, even when another hash made the declaration valid.
     fn announce(&self, hashes: Vec<syndeo_cache::sri::Hash>) {
-        let Some(peers) = &self.peers else {
-            return;
-        };
-        if hashes.is_empty() {
-            return;
-        }
-        let peers = peers.clone();
-        tokio::spawn(async move {
-            for hash in hashes {
-                if let Err(err) = peers.announce_integrity(&hash).await {
-                    tracing::debug!(%err, "could not announce a body to the swarm");
-                    return;
-                }
+        announce_to(self.peers.as_ref(), &self.announcements, hashes);
+    }
+
+    /// Record a stored body a declaration was just verified against as
+    /// shareable, and announce what that newly made shareable.
+    ///
+    /// `matching` is what the caller computed from the bytes in hand. When all
+    /// of it is recorded already — every hit after the first — this is one
+    /// read and nothing else: no write, and no second announcement.
+    fn share_verified(
+        &self,
+        content: syndeo_cache::ContentId,
+        integrity: &syndeo_cache::Integrity,
+        matching: &[syndeo_cache::sri::Hash],
+    ) {
+        if let Ok(recorded) = self.cache.peer_eligibility(content) {
+            if matching.iter().all(|hash| recorded.contains(hash)) {
+                return;
             }
-        });
+        }
+        match self.cache.grant_peer_eligibility(content, integrity) {
+            Ok(new) => self.announce(new),
+            Err(err) => tracing::warn!(%err, "could not record a verified body as shareable"),
+        }
+    }
+
+    /// How many hashes this process has asked the swarm to announce. Each
+    /// shareable name is asked for once, however often the body is served.
+    pub fn announcements(&self) -> u64 {
+        self.announcements
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What the swarm looks like from here, when we are in one.
@@ -869,13 +898,20 @@ impl Net {
         let config = self.config.clone();
         let cache = self.cache.clone();
         let inflight = self.refreshing.clone();
+        let peers = self.peers.clone();
+        let announcements = self.announcements.clone();
 
         tokio::spawn(async move {
             let outcome =
                 refresh_entry(&client, &config, &cache, &request, &key, &conditional).await;
             match outcome {
-                Ok(true) => tracing::debug!(url = %request.url, "refreshed a stale entry"),
-                Ok(false) => tracing::debug!(url = %request.url, "the refresh was not storable"),
+                Ok(Refreshed::Stored { shared }) => {
+                    tracing::debug!(url = %request.url, "refreshed a stale entry");
+                    announce_to(peers.as_ref(), &announcements, shared);
+                }
+                Ok(Refreshed::NotStored) => {
+                    tracing::debug!(url = %request.url, "the refresh was not storable")
+                }
                 Err(err) => {
                     tracing::debug!(url = %request.url, %err, "background refresh failed; the stored entry stands")
                 }
@@ -1176,7 +1212,17 @@ fn finish_streamed(state: &mut Teed) {
     }
 }
 
-/// Revalidate one stored entry, out of band. Returns whether the store changed.
+/// What a background refresh did to the store.
+enum Refreshed {
+    /// The entry was refreshed or replaced. `shared` is what a declared
+    /// integrity newly made shareable, to be announced.
+    Stored {
+        shared: Vec<syndeo_cache::sri::Hash>,
+    },
+    NotStored,
+}
+
+/// Revalidate one stored entry, out of band.
 async fn refresh_entry(
     client: &HttpsClient,
     config: &NetConfig,
@@ -1184,24 +1230,29 @@ async fn refresh_entry(
     request: &FetchRequest,
     key: &str,
     conditional: &[(HeaderName, String)],
-) -> Result<bool> {
+) -> Result<Refreshed> {
     let (status, headers, body) = origin_request(client, config, request, conditional).await?;
     let now = now_secs();
 
     if status == 304 {
-        return Ok(cache
-            .record_not_modified(key, &headers, now, now)?
-            .is_some());
+        return Ok(match cache.record_not_modified(key, &headers, now, now)? {
+            Some(_) => Refreshed::Stored { shared: Vec::new() },
+            None => Refreshed::NotStored,
+        });
     }
 
     // A refresh for a request that declared integrity stores nothing that
     // does not satisfy it; the entry stays as it was.
-    if let Some(integrity) = &request.integrity {
-        if !is_hop(request, status, &headers) && !integrity.verify(&body) {
-            tracing::warn!(url = %request.url, "a refreshed body does not satisfy the declared integrity; not stored");
-            return Ok(false);
+    let verified = match &request.integrity {
+        Some(integrity) if !is_hop(request, status, &headers) => {
+            if !integrity.verify(&body) {
+                tracing::warn!(url = %request.url, "a refreshed body does not satisfy the declared integrity; not stored");
+                return Ok(Refreshed::NotStored);
+            }
+            Some(integrity)
         }
-    }
+        _ => None,
+    };
 
     let outcome = cache.store(
         request.partition.as_deref(),
@@ -1214,7 +1265,63 @@ async fn refresh_entry(
         now,
         now,
     )?;
-    Ok(!matches!(outcome, StoreOutcome::NotStored(_)))
+    Ok(match outcome {
+        // Verified and stored: shareable, exactly as a foreground download is.
+        StoreOutcome::Stored { content, .. } => Refreshed::Stored {
+            shared: match verified {
+                Some(integrity) => cache.grant_peer_eligibility(content, integrity)?,
+                None => Vec::new(),
+            },
+        },
+        StoreOutcome::StoredPartial { .. } => Refreshed::Stored { shared: Vec::new() },
+        StoreOutcome::NotStored(_) => Refreshed::NotStored,
+    })
+}
+
+/// The declared hashes at the strongest level that these bytes satisfy.
+/// Empty exactly when the declaration is not satisfied.
+fn matching_strongest(
+    integrity: &syndeo_cache::Integrity,
+    body: &[u8],
+) -> Vec<syndeo_cache::sri::Hash> {
+    let Some(strongest) = integrity.strongest() else {
+        return Vec::new();
+    };
+    integrity
+        .hashes
+        .iter()
+        .filter(|hash| hash.algorithm == strongest && hash.matches(body))
+        .cloned()
+        .collect()
+}
+
+/// Ask the swarm to announce these names, and count them.
+///
+/// Only verified names reach here: they are exactly the names another node can
+/// ask for and check, and exactly the names `serve` will answer. A weaker
+/// algorithm the page also declared, or a declared hash that did not match, is
+/// never published, even when another hash made the declaration valid.
+fn announce_to(
+    peers: Option<&syndeo_peer::PeerHandle>,
+    announcements: &std::sync::atomic::AtomicU64,
+    hashes: Vec<syndeo_cache::sri::Hash>,
+) {
+    let Some(peers) = peers else {
+        return;
+    };
+    if hashes.is_empty() {
+        return;
+    }
+    announcements.fetch_add(hashes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    let peers = peers.clone();
+    tokio::spawn(async move {
+        for hash in hashes {
+            if let Err(err) = peers.announce_integrity(&hash).await {
+                tracing::debug!(%err, "could not announce a body to the swarm");
+                return;
+            }
+        }
+    });
 }
 
 /// Refuse a declared integrity that could not constrain anything.

@@ -688,8 +688,10 @@ impl Cache {
     /// even when another hash made the declaration as a whole valid. Nothing
     /// is granted for a body no entry refers to.
     ///
-    /// Returns the hashes recorded, which are exactly the ones worth
-    /// announcing; empty means nothing was granted.
+    /// Returns the hashes this call newly recorded, which are exactly the ones
+    /// worth announcing: empty when nothing matched, and empty when everything
+    /// that matched was already recorded, so a body verified again on every
+    /// hit is announced once.
     pub fn grant_peer_eligibility(
         &self,
         content: ContentId,
@@ -712,14 +714,16 @@ impl Cache {
             .cloned()
             .collect();
         matching.dedup();
-        let keys: Vec<Vec<u8>> = matching
-            .iter()
-            .map(|h| sri_key(h.algorithm, &h.digest))
-            .collect();
-        if !self.index.grant_eligibility(content, &keys)? {
+        let recorded = self.index.eligible_hashes(content)?;
+        let (keys, new): (Vec<Vec<u8>>, Vec<crate::sri::Hash>) = matching
+            .into_iter()
+            .map(|h| (sri_key(h.algorithm, &h.digest), h))
+            .filter(|(key, _)| !recorded.contains(key))
+            .unzip();
+        if keys.is_empty() || !self.index.grant_eligibility(content, &keys)? {
             return Ok(Vec::new());
         }
-        Ok(matching)
+        Ok(new)
     }
 
     /// The verified hashes a peer may name this body by. Empty: not shareable.
@@ -2031,6 +2035,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(granted, vec![strong.clone()]);
+        assert_eq!(cache.peer_eligibility(id).unwrap(), vec![strong.clone()]);
+        // Verified again, nothing new: nothing to announce again.
+        assert!(cache
+            .grant_peer_eligibility(id, &declared(&[weak.clone(), strong.clone()]))
+            .unwrap()
+            .is_empty());
         assert_eq!(cache.peer_eligibility(id).unwrap(), vec![strong.clone()]);
 
         assert_eq!(

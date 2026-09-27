@@ -235,6 +235,13 @@ async fn a_stored_representation_the_declaration_does_not_name_is_replaced_once(
         "A was served for a declaration of B"
     );
     assert_eq!(b, LIB);
+    assert!(
+        net.cache()
+            .peer_eligibility(ContentId::of(EVIL))
+            .unwrap()
+            .is_empty(),
+        "a representation that failed the declaration became shareable"
+    );
     assert_eq!(origin.hits(), 2, "exactly one fetch to replace A");
 
     let (source, _) = fetch(&net, with_integrity(&url, declared(&[sha384(LIB)])))
@@ -328,4 +335,142 @@ async fn a_declaration_that_constrains_nothing_is_refused_before_any_request() {
     ));
 
     assert_eq!(origin.hits(), 0, "a refused declaration reached the origin");
+}
+
+const OTHER: &[u8] = b"export const library = 'the next release';";
+
+#[tokio::test]
+async fn a_cached_body_becomes_shareable_once_when_a_declaration_matches_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = Origin::start(Arc::new(|_, _| {
+        respond(200, &[("cache-control", "max-age=600")], LIB)
+    }))
+    .await;
+    let net = net_with_peers(dir.path());
+    let url = origin.url("/lib.js");
+
+    // Stored by a fetch that declared nothing: not shareable.
+    fetch(&net, FetchRequest::get(&url)).await.unwrap();
+    assert!(net
+        .cache()
+        .peer_eligibility(ContentId::of(LIB))
+        .unwrap()
+        .is_empty());
+
+    // A page then declares integrity it satisfies, and it is served from the
+    // store — which is a verification, and makes it shareable.
+    for _ in 0..4 {
+        let (source, body) = fetch(&net, with_integrity(&url, declared(&[sha384(LIB)])))
+            .await
+            .unwrap();
+        assert_eq!(source, Source::Cache);
+        assert_eq!(body, LIB);
+    }
+    assert_eq!(
+        net.cache().peer_eligibility(ContentId::of(LIB)).unwrap(),
+        vec![sha384(LIB)]
+    );
+    assert_eq!(
+        net.announcements(),
+        1,
+        "four verified hits should announce the one name once"
+    );
+    assert_eq!(announced(&net, 1).await, 1);
+    assert_eq!(origin.hits(), 1);
+}
+
+/// Stored with no declaration and born stale, so the next request with a
+/// declaration is served from the store and refreshed behind it; the refresh
+/// answers with `refreshed`.
+async fn refreshing_origin(refreshed: &'static [u8]) -> Origin {
+    Origin::start(Arc::new(move |_, n| {
+        if n == 0 {
+            respond(
+                200,
+                &[
+                    ("cache-control", "max-age=0, stale-while-revalidate=600"),
+                    ("etag", "\"one\""),
+                ],
+                LIB,
+            )
+        } else {
+            respond(
+                200,
+                &[("cache-control", "max-age=600"), ("etag", "\"two\"")],
+                refreshed,
+            )
+        }
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_matching_background_refresh_makes_its_new_body_shareable() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = refreshing_origin(OTHER).await;
+    let net = net_with_peers(dir.path());
+    let url = origin.url("/lib.js");
+    fetch(&net, FetchRequest::get(&url)).await.unwrap();
+
+    // Either release satisfies the page: any match at the strongest level.
+    let either = declared(&[sha384(LIB), sha384(OTHER)]);
+    let (source, body) = fetch(&net, with_integrity(&url, either)).await.unwrap();
+    assert_eq!(source, Source::CacheStale);
+    assert_eq!(body, LIB);
+
+    let mut shared = Vec::new();
+    for _ in 0..100 {
+        shared = net.cache().peer_eligibility(ContentId::of(OTHER)).unwrap();
+        if !shared.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        shared,
+        vec![sha384(OTHER)],
+        "the refreshed body was not made shareable"
+    );
+    // The body it replaced is gone from the store, and so is its sharing.
+    assert!(net
+        .cache()
+        .peer_eligibility(ContentId::of(LIB))
+        .unwrap()
+        .is_empty());
+    // One name for the stale body served, one for the refreshed body stored.
+    assert_eq!(announced(&net, 2).await, 2);
+    assert_eq!(net.announcements(), 2);
+}
+
+#[tokio::test]
+async fn a_mismatching_background_refresh_stores_shares_and_announces_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = refreshing_origin(EVIL).await;
+    let net = net_with_peers(dir.path());
+    let url = origin.url("/lib.js");
+    fetch(&net, FetchRequest::get(&url)).await.unwrap();
+
+    let (source, _) = fetch(&net, with_integrity(&url, declared(&[sha384(LIB)])))
+        .await
+        .unwrap();
+    assert_eq!(source, Source::CacheStale);
+    assert_eq!(origin.wait_for_hits(2, Duration::from_secs(5)).await, 2);
+    // Let the refresh finish whatever it was going to do.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(net
+        .cache()
+        .peer_eligibility(ContentId::of(EVIL))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        net.announcements(),
+        1,
+        "only the verified stale body's name"
+    );
+    // The stored entry is still the body that satisfies the declaration.
+    let (_, body) = fetch(&net, with_integrity(&url, declared(&[sha384(LIB)])))
+        .await
+        .unwrap();
+    assert_eq!(body, LIB);
 }
