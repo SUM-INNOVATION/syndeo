@@ -970,6 +970,60 @@ mod tests {
         assert_eq!(paths, ["/start"], "the destination must not be fetched");
     }
 
+    fn cookies_of(reply: &Reply) -> Vec<String> {
+        reply
+            .headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_cookie_reaches_the_client_that_caused_it_and_no_later_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|path| match path {
+            "/moved" => respond(
+                301,
+                &[
+                    ("cache-control", "public, max-age=600"),
+                    ("location", "/page"),
+                    ("set-cookie", "hop=1; Path=/"),
+                ],
+                b"",
+            ),
+            _ => respond(
+                200,
+                &[
+                    ("cache-control", "public, max-age=600"),
+                    ("set-cookie", "a=1; Path=/"),
+                    ("set-cookie", "b=2; Path=/"),
+                ],
+                b"shared page",
+            ),
+        }))
+        .await;
+        let proxy = start_proxy(dir.path()).await;
+
+        let first = through(proxy, &origin.url("/page"), &[]).await;
+        assert_eq!(cookies_of(&first), ["a=1; Path=/", "b=2; Path=/"]);
+        let second = through(proxy, &origin.url("/page"), &[]).await;
+        assert_eq!(&second.body[..], b"shared page");
+        assert!(cookies_of(&second).is_empty(), "replayed to a later client");
+
+        // A redirect the browser follows itself is cached as a redirect, and
+        // the cookie it set is not handed to the next client either.
+        let first = through(proxy, &origin.url("/moved"), &[]).await;
+        assert_eq!(first.status, StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(cookies_of(&first), ["hop=1; Path=/"]);
+        let second = through(proxy, &origin.url("/moved"), &[]).await;
+        assert_eq!(second.status, StatusCode::MOVED_PERMANENTLY);
+        assert!(cookies_of(&second).is_empty(), "replayed to a later client");
+
+        let paths: Vec<String> = origin.seen().into_iter().map(|s| s.path).collect();
+        assert_eq!(paths, ["/page", "/moved"], "the second of each was a hit");
+    }
+
     fn via(fields: &[&str]) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();
         for field in fields {

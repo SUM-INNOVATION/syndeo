@@ -429,7 +429,7 @@ impl Net {
                         {
                             Some(refreshed) => Ok(self.finish(
                                 refreshed.status,
-                                refreshed.headers.clone(),
+                                with_cookies_of(refreshed.headers.clone(), &headers),
                                 Bytes::from(refreshed.body.clone()),
                                 Source::Revalidated,
                                 refreshed.content,
@@ -437,7 +437,7 @@ impl Net {
                             )),
                             None => Ok(self.finish(
                                 response.status,
-                                response.headers.clone(),
+                                with_cookies_of(response.headers.clone(), &headers),
                                 Bytes::from(response.body.clone()),
                                 Source::CacheStale,
                                 response.content,
@@ -1075,6 +1075,24 @@ async fn refresh_entry(
         now,
     )?;
     Ok(!matches!(outcome, StoreOutcome::NotStored(_)))
+}
+
+/// A stored response with the cookies a 304 just set added back.
+///
+/// The cache keeps no cookie and serves none (see
+/// `syndeo_cache::headers::NEVER_STORED`). A 304 is still a response from the
+/// origin to this request, though, and what it sets belongs to the client that
+/// made it: delivered here, once, every field in the order it came, and never
+/// written anywhere. A background refresh has no client waiting, so its
+/// cookies go nowhere.
+fn with_cookies_of(mut served: HeaderMap, not_modified: &HeaderMap) -> HeaderMap {
+    for name in syndeo_cache::headers::NEVER_STORED {
+        let name = HeaderName::from_static(name);
+        for value in not_modified.get_all(&name) {
+            served.append(name.clone(), value.clone());
+        }
+    }
+    served
 }
 
 /// The `Location` of a redirect we should follow, if this is one.
