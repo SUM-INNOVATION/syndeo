@@ -425,9 +425,9 @@ impl Net {
                         let now = now_secs();
                         match self
                             .cache
-                            .record_not_modified(&response.key, &headers, now, now)?
+                            .record_not_modified(&response.key, &headers, now, now)
                         {
-                            Some(refreshed) => Ok(self.finish(
+                            Ok(Some(refreshed)) => Ok(self.finish(
                                 refreshed.status,
                                 with_cookies_of(refreshed.headers.clone(), &headers),
                                 Bytes::from(refreshed.body.clone()),
@@ -435,7 +435,7 @@ impl Net {
                                 refreshed.content,
                                 started,
                             )),
-                            None => Ok(self.finish(
+                            Ok(None) => Ok(self.finish(
                                 response.status,
                                 with_cookies_of(response.headers.clone(), &headers),
                                 Bytes::from(response.body.clone()),
@@ -443,6 +443,13 @@ impl Net {
                                 response.content,
                                 started,
                             )),
+                            // The origin confirmed a body the store no longer
+                            // holds; the cache has dropped the entry.
+                            Err(err) if err.is_lost_body() => {
+                                tracing::warn!(url = %request.url, %err, "the confirmed body was lost; fetching it again");
+                                self.refetch_lost(&request, started).await
+                            }
+                            Err(err) => Err(err.into()),
                         }
                     }
                     Ok((status, headers, body)) => {
@@ -476,6 +483,27 @@ impl Net {
                 self.fetch_from_origin(&request, &[], started).await
             }
         }
+    }
+
+    /// Ask the origin once more, without a validator, for a body the store lost.
+    ///
+    /// Exactly once. The request is the one that was being revalidated, and it
+    /// carries no validator of its own — `policy::evaluate` sends a client's
+    /// conditional request straight to the origin, so one never reaches
+    /// revalidation — so the origin has no reason to answer 304. If it does
+    /// anyway there is nothing to serve, and that is an error rather than
+    /// another round trip. Nothing here consults the store again, so this
+    /// cannot loop.
+    async fn refetch_lost(
+        &self,
+        request: &FetchRequest,
+        started: Instant,
+    ) -> Result<FetchResponse> {
+        let response = self.fetch_from_origin(request, &[], started).await?;
+        if response.status == 304 {
+            return Err(NetError::LostBody(request.url.clone()));
+        }
+        Ok(response)
     }
 
     /// Fetch from the origin and answer with it, streaming where we can.

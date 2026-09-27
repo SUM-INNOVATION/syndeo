@@ -20,6 +20,8 @@ pub enum NetError {
     TooManyRedirects { limit: u8 },
     #[error("redirect loop back to {0}")]
     RedirectLoop(String),
+    #[error("the stored body of {0} was lost, and the origin would not send it again")]
+    LostBody(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
