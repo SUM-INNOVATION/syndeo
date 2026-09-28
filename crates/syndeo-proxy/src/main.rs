@@ -3,6 +3,7 @@
 //! real traffic. That measurement is the go/no-go, and it costs weeks, not
 //! quarters. No browser exists yet at this point, deliberately.
 
+mod auth;
 mod ca;
 mod stats;
 
@@ -77,6 +78,14 @@ struct RunArgs {
     /// finding something that answers.
     #[arg(long, hide = true)]
     announce: bool,
+    /// Require every client to present a per-launch credential, read from
+    /// stdin as one frame before anything else is read from it.
+    ///
+    /// For syndeo-webkit, which generates the token, hands it over on the pipe
+    /// it already holds, and configures its web view to answer with it. The
+    /// token never appears in arguments, the environment, or any log.
+    #[arg(long, hide = true)]
+    auth_stdin: bool,
 }
 
 /// The one line `run --announce` writes to stdout, followed by the address it
@@ -189,6 +198,7 @@ async fn main() -> Result<()> {
         trace_requests: true,
         exit_with_parent: false,
         announce: false,
+        auth_stdin: false,
     })) {
         Command::Run(args) => run(args).await,
         Command::Ca(args) => {
@@ -232,6 +242,8 @@ struct Proxy {
     net: Net,
     authority: CertificateAuthority,
     trace: bool,
+    /// The credential every client must present, when one was handed over.
+    auth: Option<auth::ProxyAuth>,
     /// How long a tunnel may stay silent before its first byte says what it
     /// carries. Past it, the tunnel is closed without a certificate minted or
     /// an origin asked.
@@ -243,6 +255,20 @@ struct Proxy {
 }
 
 async fn run(args: RunArgs) -> Result<()> {
+    // The token frame is read first, synchronously and in full, while nothing
+    // else is reading stdin; only then may the parent watch take it over.
+    let auth = if args.auth_stdin {
+        match auth::ProxyAuth::read_frame(&mut std::io::stdin().lock()) {
+            Ok(auth) => Some(auth),
+            Err(refusal) => {
+                // Says what was wrong with the frame, never what was in it.
+                eprintln!("syndeo-proxy: {refusal}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
     if args.exit_with_parent {
         syndeo_ipc::exit_when_parent_does();
     }
@@ -261,6 +287,7 @@ async fn run(args: RunArgs) -> Result<()> {
         net,
         authority,
         trace: args.trace_requests,
+        auth,
         tunnel_first_byte: TUNNEL_FIRST_BYTE,
         #[cfg(test)]
         handled: Default::default(),
@@ -386,6 +413,15 @@ async fn handle(
     proxy
         .handled
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // Every request that reaches the proxy itself — a CONNECT, a proxied
+    // request, or one addressed to the proxy directly — answers for itself.
+    // Requests inside a tunnel never come through here: the CONNECT that
+    // opened the tunnel was the one that had to.
+    if let Some(auth) = &proxy.auth {
+        if !auth.admits(req.headers()) {
+            return Ok(auth::required(&req));
+        }
+    }
     if req.method() == hyper::Method::CONNECT {
         return Ok(connect(proxy, req, local));
     }
@@ -1073,6 +1109,7 @@ mod tests {
             net,
             authority,
             trace: false,
+            auth: None,
             tunnel_first_byte: std::time::Duration::from_millis(300),
             handled: Default::default(),
         });
@@ -1787,6 +1824,236 @@ mod tests {
         let mut sender = http_over(stream).await;
         let reply = get(&mut sender, "/x", &[("via", "1.1 syndeo")]).await;
         assert_eq!(reply.status, StatusCode::LOOP_DETECTED);
+        assert!(origin.seen().is_empty());
+    }
+
+    // -------------------------------------------------------- authentication
+
+    const TOKEN: [u8; 32] = [0x5a; 32];
+    const STALE: [u8; 32] = [0xa5; 32];
+
+    async fn start_proxy_with_auth(dir: &std::path::Path) -> (SocketAddr, Arc<Proxy>) {
+        let net = open_net(&cache_root(dir, None), true, DnsMode::System).unwrap();
+        let authority = CertificateAuthority::load_or_create(dir.join("proxy")).unwrap();
+        let frame = auth::frame_for(&TOKEN);
+        let proxy = Arc::new(Proxy {
+            net,
+            authority,
+            trace: false,
+            auth: Some(auth::ProxyAuth::read_frame(&mut frame.as_slice()).unwrap()),
+            tunnel_first_byte: std::time::Duration::from_millis(300),
+            handled: Default::default(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, proxy.clone()));
+        (address, proxy)
+    }
+
+    /// Write a request head and read the response head, on a socket the caller
+    /// keeps — which is the point: a 407 is answered on the same connection.
+    async fn exchange(stream: &mut tokio::net::TcpStream, head: &str) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            let n = within(stream.read(&mut byte)).await.unwrap();
+            assert_eq!(n, 1, "the proxy closed the connection");
+            response.push(byte[0]);
+        }
+        let text = String::from_utf8_lossy(&response).to_string();
+        let status = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (status, text)
+    }
+
+    #[tokio::test]
+    async fn a_407_is_answered_on_the_same_connection_and_the_tunnel_then_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"inside"))).await;
+        let (proxy, _) = start_proxy_with_auth(dir.path()).await;
+        let authority = format!("127.0.0.1:{}", origin.address.port());
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+
+        let (status, head) = exchange(
+            &mut stream,
+            &format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(status, 407);
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("proxy-authenticate: basic realm=\"syndeo\""),
+            "{head}"
+        );
+        assert!(
+            !head.to_ascii_lowercase().contains("connection: close"),
+            "{head}"
+        );
+
+        // The same socket, with the credential, as WebKit retries.
+        let credential = auth::header_for(&TOKEN);
+        let (status, _) = exchange(
+            &mut stream,
+            &format!(
+                "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: {credential}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // Inside the tunnel nothing is asked for again — and a credential sent
+        // anyway never reaches the origin.
+        let mut sender = http_over(stream).await;
+        let reply = get(
+            &mut sender,
+            "/inside",
+            &[("host", &authority), ("proxy-authorization", &credential)],
+        )
+        .await;
+        assert_eq!(&reply.body[..], b"inside");
+        let seen = origin.seen();
+        assert_eq!(seen.len(), 1);
+        assert!(!seen[0].headers.contains_key("proxy-authorization"));
+    }
+
+    #[tokio::test]
+    async fn proxied_requests_and_the_statistics_page_need_the_credential_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"page"))).await;
+        let (proxy, _) = start_proxy_with_auth(dir.path()).await;
+        let credential = auth::header_for(&TOKEN);
+
+        let refused = through(proxy, &origin.url("/page"), &[]).await;
+        assert_eq!(refused.status, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        let stats = send(proxy, hyper::Method::GET, "/stats", "syndeo.local", &[]).await;
+        assert_eq!(stats.status, StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        assert!(origin.seen().is_empty());
+
+        let admitted = through(
+            proxy,
+            &origin.url("/page"),
+            &[("proxy-authorization", &credential)],
+        )
+        .await;
+        assert_eq!(admitted.status, StatusCode::OK);
+        let stats = send(
+            proxy,
+            hyper::Method::GET,
+            "/stats",
+            "syndeo.local",
+            &[("proxy-authorization", &credential)],
+        )
+        .await;
+        assert_eq!(stats.status, StatusCode::OK);
+
+        let seen = origin.seen();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            !seen[0].headers.contains_key("proxy-authorization"),
+            "the credential was forwarded to the origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_repeated_or_malformed_credential_reaches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"never"))).await;
+        let (proxy, handle) = start_proxy_with_auth(dir.path()).await;
+        let authority = format!("127.0.0.1:{}", origin.address.port());
+        let right = auth::header_for(&TOKEN);
+        // A token from an earlier launch — what a stale credential cached
+        // somewhere would carry.
+        let stale = auth::header_for(&STALE);
+
+        for credentials in [
+            vec![stale.as_str()],
+            vec![right.as_str(), right.as_str()],
+            vec!["Basic"],
+            vec!["Bearer abc"],
+        ] {
+            let headers: Vec<(&str, &str)> = credentials
+                .iter()
+                .map(|c| ("proxy-authorization", *c))
+                .collect();
+            let tunnel = send(
+                proxy,
+                hyper::Method::CONNECT,
+                &authority,
+                &authority,
+                &headers,
+            )
+            .await;
+            assert_eq!(
+                tunnel.status,
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                "{credentials:?}"
+            );
+            let page = through(proxy, &origin.url("/x"), &headers).await;
+            assert_eq!(
+                page.status,
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                "{credentials:?}"
+            );
+            let stats = send(
+                proxy,
+                hyper::Method::GET,
+                "/stats",
+                "syndeo.local",
+                &headers,
+            )
+            .await;
+            assert_eq!(
+                stats.status,
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                "{credentials:?}"
+            );
+            // Nothing in a refusal repeats the credential.
+            for reply in [&tunnel, &page, &stats] {
+                assert!(reply.body.is_empty());
+                for value in reply.headers.values() {
+                    assert!(!value.to_str().unwrap_or("").contains(&right[6..]));
+                }
+            }
+        }
+        assert!(
+            origin.seen().is_empty(),
+            "a refused request reached the origin"
+        );
+        assert_eq!(
+            handle.authority.leaf_count(),
+            0,
+            "a refused CONNECT opened a tunnel"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_upload_closes_its_connection_rather_than_leaving_the_body_unread() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"never"))).await;
+        let (proxy, _) = start_proxy_with_auth(dir.path()).await;
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let url = origin.url("/upload");
+        let authority = format!("127.0.0.1:{}", origin.address.port());
+        let (status, head) = exchange(
+            &mut stream,
+            &format!(
+                "POST {url} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 11\r\n\r\nhello world"
+            ),
+        )
+        .await;
+        assert_eq!(status, 407);
+        assert!(
+            head.to_ascii_lowercase().contains("connection: close"),
+            "{head}"
+        );
+        let mut rest = Vec::new();
+        let _ = within(stream.read_to_end(&mut rest)).await;
+        assert!(
+            rest.is_empty(),
+            "the connection was kept for another request"
+        );
         assert!(origin.seen().is_empty());
     }
 }

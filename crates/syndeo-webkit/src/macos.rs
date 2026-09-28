@@ -36,6 +36,7 @@ use crate::pin;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
+use syndeo_webkit::proxied;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::EventLoop;
@@ -116,10 +117,11 @@ pub fn run() -> Result<()> {
     // Start the proxy unless told to use one that is already running. Without
     // this the browser is two commands and a path, which is two more than a
     // browser should need. It lives exactly as long as this binding.
-    let owned = if cli.proxy.is_none() {
-        Some(start_proxy(&home)?)
+    let (owned, credential) = if cli.proxy.is_none() {
+        let (owned, credential) = start_proxy(&home)?;
+        (Some(owned), Some(credential))
     } else {
-        None
+        (None, None)
     };
     if let Some(owned) = &owned {
         tracing::info!(
@@ -146,7 +148,13 @@ pub fn run() -> Result<()> {
                 proxy = %spec,
                 "the web view is configured to send its HTTP and HTTPS traffic through this proxy"
             );
-            Some((host.to_string(), port.to_string()))
+            Some(proxied::ProxyTarget {
+                host: host.to_string(),
+                port: port.to_string(),
+                // Our own proxy asks every client for this; one named with
+                // --proxy is somebody else's and asks for nothing.
+                credential,
+            })
         }
         None => {
             tracing::warn!("no --proxy: this web view reaches the network directly");
@@ -239,7 +247,7 @@ impl Running {
 
 struct App {
     url: String,
-    proxy: Option<(String, String)>,
+    proxy: Option<proxied::ProxyTarget>,
     pinned: Option<String>,
     state: Option<Running>,
     modifiers: winit::keyboard::ModifiersState,
@@ -268,6 +276,15 @@ const AUTOPLAY: &str = r#"
 })();
 "#;
 
+/// The configuration a web view is built with: its data store, with the proxy
+/// and its credential already set, before the web view exists.
+fn proxy_configuration(
+    target: &proxied::ProxyTarget,
+) -> Result<objc2::rc::Retained<objc2_web_kit::WKWebViewConfiguration>> {
+    let mtm = objc2::MainThreadMarker::new().context("web views are built on the main thread")?;
+    proxied::configuration(target, mtm)
+}
+
 impl App {
     /// A new tab, sharing everything the others share.
     ///
@@ -282,11 +299,17 @@ impl App {
         let mut builder = WebViewBuilder::new()
             .with_bounds(state.content())
             .with_url("about:blank");
-        if let Some((host, port)) = &self.proxy {
-            builder = builder.with_proxy_config(wry::ProxyConfig::Http(wry::ProxyEndpoint {
-                host: host.clone(),
-                port: port.clone(),
-            }));
+        if let Some(target) = &self.proxy {
+            match proxy_configuration(target) {
+                Ok(configuration) => {
+                    use wry::WebViewBuilderExtMacos;
+                    builder = builder.with_webview_configuration(configuration);
+                }
+                Err(err) => {
+                    tracing::error!(%err, "could not configure the proxy; not opening a tab");
+                    return;
+                }
+            }
         }
         match builder.build_as_child(&state.window) {
             Ok(tab) => {
@@ -361,11 +384,20 @@ impl ApplicationHandler for App {
                 tracing::info!(%url, "navigating");
                 true
             });
-        if let Some((host, port)) = &self.proxy {
-            builder = builder.with_proxy_config(wry::ProxyConfig::Http(wry::ProxyEndpoint {
-                host: host.clone(),
-                port: port.clone(),
-            }));
+        if let Some(target) = &self.proxy {
+            match proxy_configuration(target) {
+                Ok(configuration) => {
+                    use wry::WebViewBuilderExtMacos;
+                    builder = builder.with_webview_configuration(configuration);
+                }
+                Err(err) => {
+                    // Never a web view without its proxy: it would reach the
+                    // network directly.
+                    tracing::error!(%err, "could not configure the proxy");
+                    event_loop.exit();
+                    return;
+                }
+            }
         }
         let webview = match builder.build_as_child(&window) {
             Ok(webview) => webview,
@@ -599,6 +631,7 @@ fn read_announcement(
 fn start_owned(
     mut command: std::process::Command,
     within: std::time::Duration,
+    credential_frame: Option<Vec<u8>>,
 ) -> Result<OwnedProxy> {
     let child = command
         .stdin(std::process::Stdio::piped())
@@ -606,6 +639,16 @@ fn start_owned(
         .spawn()
         .context("starting the proxy")?;
     let mut owned = ProxyChild(child);
+    // The credential goes down the pipe first, whole, before anything else
+    // could read it; the pipe then stays open for the child's parent watch.
+    if let Some(mut frame) = credential_frame {
+        use std::io::Write;
+        let mut stdin = owned.0.stdin.take().context("the proxy's stdin")?;
+        let written = stdin.write_all(&frame).and_then(|()| stdin.flush());
+        frame.fill(0);
+        written.context("handing the proxy its credential")?;
+        owned.0.stdin = Some(stdin);
+    }
     let stdout = owned.0.stdout.take().context("the proxy's stdout")?;
     let (found, announced) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -665,7 +708,7 @@ fn exited_soon(owned: &mut ProxyChild) -> Option<std::process::ExitStatus> {
 /// an install both work. It listens on a loopback port the system picks —
 /// never a fixed one that something else could already hold — and goes when
 /// this process goes, however that happens: see [`ProxyChild`].
-fn start_proxy(home: &std::path::Path) -> Result<OwnedProxy> {
+fn start_proxy(home: &std::path::Path) -> Result<(OwnedProxy, proxied::ProxyCredential)> {
     let exe = std::env::current_exe().context("locating the running binary")?;
     let resolved = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
     let beside = resolved
@@ -685,12 +728,15 @@ fn start_proxy(home: &std::path::Path) -> Result<OwnedProxy> {
             "--listen",
             "127.0.0.1:0",
             "--announce",
+            "--auth-stdin",
         ])
         // On the environment rather than a flag, because that is where the
         // proxy reads it from and inventing a flag it does not have is how the
         // first attempt at this failed.
         .env("SYNDEO_HOME", home);
-    start_owned(command, std::time::Duration::from_secs(10))
+    let (credential, frame) = proxied::ProxyCredential::generate()?;
+    let owned = start_owned(command, std::time::Duration::from_secs(10), Some(frame))?;
+    Ok((owned, credential))
 }
 
 /// Whether our authority is in a keychain WebKit's networking process consults.
@@ -823,6 +869,7 @@ mod tests {
         let owned = start_owned(
             sh("printf 'SYNDEO-PROXY-READY 1 127.0.0.1:4567\\n'; exec /bin/sleep 60"),
             Duration::from_secs(10),
+            None,
         )
         .unwrap();
         assert_eq!(owned.endpoint, "127.0.0.1:4567".parse().unwrap());
@@ -841,7 +888,7 @@ mod tests {
         let started = Instant::now();
         let mut silent = Command::new("/bin/sleep");
         silent.arg("60");
-        let result = start_owned(silent, Duration::from_secs(1));
+        let result = start_owned(silent, Duration::from_secs(1), None);
         let message = result
             .err()
             .expect("a silent child is not ready")
@@ -857,10 +904,14 @@ mod tests {
     #[test]
     fn a_proxy_that_exits_first_is_noticed_at_once_with_its_status() {
         let started = Instant::now();
-        let message = start_owned(Command::new("/usr/bin/false"), Duration::from_secs(10))
-            .err()
-            .unwrap()
-            .to_string();
+        let message = start_owned(
+            Command::new("/usr/bin/false"),
+            Duration::from_secs(10),
+            None,
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(message.contains("exited before it was ready"), "{message}");
         assert!(message.contains("exit status: 1"), "{message}");
         assert!(
@@ -876,6 +927,7 @@ mod tests {
         let message = start_owned(
             sh("echo \"error: unexpected argument '--announce' found\" >&2; exit 2"),
             Duration::from_secs(10),
+            None,
         )
         .err()
         .unwrap()
@@ -903,7 +955,7 @@ mod tests {
                 pidfile.display()
             );
             let started = Instant::now();
-            let result = start_owned(sh(&script), Duration::from_secs(10));
+            let result = start_owned(sh(&script), Duration::from_secs(10), None);
             assert!(result.is_err(), "{output}");
             assert!(
                 started.elapsed() < Duration::from_secs(5),
@@ -917,6 +969,35 @@ mod tests {
             assert!(!alive(pid), "a refused proxy was left running: {output}");
             let _ = std::fs::remove_file(&pidfile);
         }
+    }
+
+    #[test]
+    fn the_credential_goes_down_stdin_whole_and_the_pipe_stays_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "syndeo-webkit-frame-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let received = dir.join("frame");
+        let closed = dir.join("closed");
+        // Take exactly the frame, announce, then wait on the rest of stdin:
+        // `cat` ends, and the mark appears, only if the pipe is closed.
+        let script = format!(
+            "head -c 37 > '{}'; printf 'SYNDEO-PROXY-READY 1 127.0.0.1:4567\\n'; \
+             cat > /dev/null; touch '{}'; exec /bin/sleep 60",
+            received.display(),
+            closed.display()
+        );
+        let mut frame = b"SYA1".to_vec();
+        frame.extend_from_slice(&[0x42u8; 32]);
+        frame.push(b'\n');
+        let owned = start_owned(sh(&script), Duration::from_secs(10), Some(frame.clone())).unwrap();
+        assert_eq!(std::fs::read(&received).unwrap(), frame);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!closed.exists(), "stdin was closed after the frame");
+        drop(owned);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -936,7 +1017,7 @@ mod tests {
              head -c 1048576 /dev/zero && touch '{}'; exec /bin/sleep 60",
             marker.display()
         );
-        let owned = start_owned(sh(&script), Duration::from_secs(10)).unwrap();
+        let owned = start_owned(sh(&script), Duration::from_secs(10), None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !marker.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));

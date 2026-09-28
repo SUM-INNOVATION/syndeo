@@ -67,6 +67,11 @@ jobs:
       # usable while a half-finished thought is on screen.
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+        env:
+          # macOS only: drive a real WKWebView through an authenticating proxy
+          # against the default WebKit data store, which is only acceptable on a
+          # machine that is thrown away afterwards.
+          SYNDEO_WEBKIT_UI_TEST: ${{ runner.os == 'macOS' && '1' || '' }}
 
   deny:
     name: cargo-deny
