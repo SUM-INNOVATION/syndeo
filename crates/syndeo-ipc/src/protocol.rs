@@ -352,4 +352,119 @@ mod tests {
         let variants = serde_json::to_string(&super::ShellRequest::Ping).unwrap();
         assert_eq!(variants, "\"Ping\"");
     }
+    /// One of every keystore request and response, with fixed contents.
+    fn keystore_samples() -> (Vec<super::KeystoreRequest>, Vec<super::KeystoreResponse>) {
+        use super::{KeystoreRequest as Q, KeystoreResponse as R};
+        let confirmation = crate::confirm::Confirmation {
+            origin: "https://a.test".into(),
+            purpose: super::SignaturePurpose::OriginLogin,
+            payload_hash: "p".repeat(64),
+            description_hash: "d".repeat(64),
+            nonce: "n".repeat(32),
+            issued_at: 1_700_000_000,
+            expires_at: 1_700_000_120,
+            mac: "m".repeat(64),
+        };
+        let requests = vec![
+            Q::SignConfirmed {
+                confirmation,
+                payload: b"payload".to_vec(),
+            },
+            Q::PublicIdentity {
+                origin: "https://a.test".into(),
+            },
+            Q::Status,
+            Q::Initialize {
+                passphrase: Some("pass".into()),
+            },
+            Q::Restore {
+                mnemonic: "words".into(),
+                passphrase: None,
+            },
+            Q::Unseal { passphrase: None },
+            Q::Lock,
+        ];
+        let responses = vec![
+            R::Signature {
+                signature: "s".into(),
+                public_key: "k".into(),
+                address: "a".into(),
+            },
+            R::Identity {
+                public_key: "k".into(),
+                address: "a".into(),
+            },
+            R::Status {
+                initialized: true,
+                unsealed: false,
+                passphrase_required: true,
+                presence_enforced: false,
+                idle_timeout_secs: Some(300),
+                idle_for_secs: 12,
+            },
+            R::Locked,
+            R::Initialized {
+                mnemonic: "words".into(),
+                address: "a".into(),
+            },
+            R::Ok,
+            R::Error("e".into()),
+        ];
+        (requests, responses)
+    }
+
+    /// What 0.1.3 put on the wire for every keystore request and response,
+    /// byte for byte. A 0.1.3 shell or keystore on the other end of a socket
+    /// reads these; changing one is a protocol break, so adding to the
+    /// protocol must leave every one of them as it is.
+    const KEYSTORE_WIRE: [&str; 14] = [
+        r#"{"SignConfirmed":{"confirmation":{"origin":"https://a.test","purpose":"OriginLogin","payload_hash":"PPPP","description_hash":"DDDD","nonce":"NNNN","issued_at":1700000000,"expires_at":1700000120,"mac":"MMMM"},"payload":"cGF5bG9hZA=="}}"#,
+        r#"{"PublicIdentity":{"origin":"https://a.test"}}"#,
+        r#""Status""#,
+        r#"{"Initialize":{"passphrase":"pass"}}"#,
+        r#"{"Restore":{"mnemonic":"words","passphrase":null}}"#,
+        r#"{"Unseal":{"passphrase":null}}"#,
+        r#""Lock""#,
+        r#"{"Signature":{"signature":"s","public_key":"k","address":"a"}}"#,
+        r#"{"Identity":{"public_key":"k","address":"a"}}"#,
+        r#"{"Status":{"initialized":true,"unsealed":false,"passphrase_required":true,"presence_enforced":false,"idle_timeout_secs":300,"idle_for_secs":12}}"#,
+        r#""Locked""#,
+        r#"{"Initialized":{"mnemonic":"words","address":"a"}}"#,
+        r#""Ok""#,
+        r#"{"Error":"e"}"#,
+    ];
+
+    fn expected_wire() -> Vec<String> {
+        KEYSTORE_WIRE
+            .iter()
+            .map(|line| {
+                line.replace("PPPP", &"p".repeat(64))
+                    .replace("DDDD", &"d".repeat(64))
+                    .replace("NNNN", &"n".repeat(32))
+                    .replace("MMMM", &"m".repeat(64))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_existing_keystore_message_encodes_exactly_as_in_0_1_3() {
+        let (requests, responses) = keystore_samples();
+        let actual: Vec<String> = requests
+            .iter()
+            .map(|q| serde_json::to_string(q).unwrap())
+            .chain(responses.iter().map(|r| serde_json::to_string(r).unwrap()))
+            .collect();
+        assert_eq!(actual, expected_wire());
+
+        // And what 0.1.3 sends is still read, as the same message.
+        let expected = expected_wire();
+        for line in &expected[..7] {
+            let read: super::KeystoreRequest = serde_json::from_str(line).unwrap();
+            assert_eq!(&serde_json::to_string(&read).unwrap(), line);
+        }
+        for line in &expected[7..] {
+            let read: super::KeystoreResponse = serde_json::from_str(line).unwrap();
+            assert_eq!(&serde_json::to_string(&read).unwrap(), line);
+        }
+    }
 }
