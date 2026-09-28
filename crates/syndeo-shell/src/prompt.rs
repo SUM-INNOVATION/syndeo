@@ -158,7 +158,7 @@ impl std::error::Error for Refusal {}
 /// confirmation is minted over, and the one the keystore derives from.
 #[derive(Debug, Clone)]
 pub struct SignatureRequest {
-    origin: String,
+    origin: ValidatedOrigin,
     purpose: SignaturePurpose,
     /// What the site says it is asking for, in its own words. Untrusted, which
     /// is why it is checked before it is ever put on screen.
@@ -179,7 +179,7 @@ impl SignatureRequest {
         description: impl Into<String>,
         payload: impl Into<Vec<u8>>,
     ) -> Result<Self, Refusal> {
-        let origin = canonical_origin(origin.as_ref())?;
+        let origin = ValidatedOrigin::parse(origin.as_ref())?;
         let description = description.into();
         check_description(&description)?;
         let payload = payload.into();
@@ -195,7 +195,7 @@ impl SignatureRequest {
     /// The canonical origin: `scheme://host`, with the port only when it is
     /// not the scheme's default.
     pub fn origin(&self) -> &str {
-        &self.origin
+        self.origin.as_str()
     }
 
     pub fn purpose(&self) -> SignaturePurpose {
@@ -268,6 +268,31 @@ fn is_unshowable(c: char) -> bool {
         GeneralCategory::Control | GeneralCategory::Format
     ) || c == '\u{2028}'
         || c == '\u{2029}'
+}
+
+/// An origin that has passed every check a signing request's origin passes,
+/// in the canonical form the keystore derives keys from.
+///
+/// The only way to have one is [`ValidatedOrigin::parse`], so anything that
+/// takes one — a signing request, a request for an identity — cannot be handed
+/// an origin nobody checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedOrigin(String);
+
+impl ValidatedOrigin {
+    pub fn parse(raw: &str) -> Result<Self, Refusal> {
+        canonical_origin(raw).map(ValidatedOrigin)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ValidatedOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Scheme, host and non-default port, written once in the form the keystore

@@ -80,23 +80,7 @@ impl Shell {
                 payload,
             } => self.sign(origin, purpose, description, payload).await,
 
-            ShellRequest::IdentityFor { origin } => {
-                match self
-                    .keystore_call(KeystoreRequest::PublicIdentity { origin })
-                    .await
-                {
-                    Ok(KeystoreResponse::Identity {
-                        public_key,
-                        address,
-                    }) => ShellResponse::Identity {
-                        public_key,
-                        address,
-                    },
-                    Ok(KeystoreResponse::Error(e)) => ShellResponse::Error(e),
-                    Ok(_) => ShellResponse::Error("unexpected keystore reply".into()),
-                    Err(e) => ShellResponse::Error(e.to_string()),
-                }
-            }
+            ShellRequest::IdentityFor { origin } => self.identity_for(&origin).await,
 
             ShellRequest::Confirm { title, detail } => {
                 if !self.prompter.is_interactive() {
@@ -109,6 +93,54 @@ impl Shell {
             }
 
             ShellRequest::Ping => ShellResponse::Pong,
+        }
+    }
+
+    /// The agent asks which identity this user has at a site.
+    ///
+    /// A public key is not a secret, but the set of them is: the identity for
+    /// each site is derived separately precisely so that nobody can tell two
+    /// sites' identities belong to one person. An agent that could collect
+    /// them for any sites it named could link them. So the origin is checked
+    /// and put in canonical form exactly as a signing request's is, a run with
+    /// nobody to ask declines, and the person at the screen is asked. Only a
+    /// yes reaches the keystore: every other path contacts it not at all.
+    async fn identity_for(&self, origin: &str) -> ShellResponse {
+        let origin = match crate::prompt::ValidatedOrigin::parse(origin) {
+            Ok(origin) => origin,
+            Err(refusal) => return ShellResponse::Error(format!("refused: {refusal}")),
+        };
+        if !self.prompter.is_interactive() {
+            return ShellResponse::Declined("this run is not interactive".into());
+        }
+        let detail = format!(
+            "The agent is asking for your public key and address at {origin}. \
+             Anything it is given can be matched against what it collects for \
+             other sites."
+        );
+        if self
+            .prompter
+            .ask("Reveal your identity for this site to the agent?", &detail)
+            != Decision::Yes
+        {
+            return ShellResponse::Declined("the user declined".into());
+        }
+        match self
+            .keystore_call(KeystoreRequest::PublicIdentity {
+                origin: origin.to_string(),
+            })
+            .await
+        {
+            Ok(KeystoreResponse::Identity {
+                public_key,
+                address,
+            }) => ShellResponse::Identity {
+                public_key,
+                address,
+            },
+            Ok(KeystoreResponse::Error(e)) => ShellResponse::Error(e),
+            Ok(_) => ShellResponse::Error("unexpected keystore reply".into()),
+            Err(e) => ShellResponse::Error(e.to_string()),
         }
     }
 
@@ -434,5 +466,123 @@ mod tests {
             panic!("expected one SignConfirmed, got {received:?}");
         };
         assert_eq!(confirmation.origin, ORIGIN);
+    }
+
+    // ------------------------------------------------ identity for the agent
+
+    fn identity_harness(answer: Decision) -> (FakeKeystore, Arc<CountingPrompter>, Shell) {
+        let keystore = FakeKeystore::start(Arc::new(|request| match request {
+            KeystoreRequest::PublicIdentity { .. } => KeystoreResponse::Identity {
+                public_key: "k".into(),
+                address: "a".into(),
+            },
+            _ => KeystoreResponse::Error("unexpected".into()),
+        }));
+        let prompter = CountingPrompter::new(answer);
+        let shell = Shell::new(
+            Arc::new(Confirmer::new(SessionSecret::generate())),
+            keystore.endpoint.clone(),
+            prompter.clone(),
+        );
+        (keystore, prompter, shell)
+    }
+
+    async fn ask_identity(shell: &Shell, origin: &str) -> ShellResponse {
+        shell
+            .handle(ShellRequest::IdentityFor {
+                origin: origin.into(),
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn an_invalid_origin_is_refused_before_anyone_is_asked() {
+        let (keystore, prompter, shell) = identity_harness(Decision::Yes);
+        for origin in [
+            "not a url",
+            "ftp://a.test",
+            "https://a.test/path",
+            "https://a\u{202e}.test",
+        ] {
+            let response = ask_identity(&shell, origin).await;
+            assert!(
+                matches!(response, ShellResponse::Error(_)),
+                "{origin}: {response:?}"
+            );
+        }
+        assert_eq!(prompter.asked(), 0);
+        assert_eq!(keystore.connections(), 0);
+    }
+
+    /// Says nobody is there — and would say yes if asked anyway, so only the
+    /// shell's own check keeps a non-interactive run from reaching the keystore.
+    struct AbsentButAgreeable {
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Prompter for AbsentButAgreeable {
+        fn ask_to_sign(&self, _: &SignatureRequest) -> Decision {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Decision::Yes
+        }
+        fn ask(&self, _: &str, _: &str) -> Decision {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Decision::Yes
+        }
+        fn read_passphrase(&self, _: &str) -> std::io::Result<String> {
+            Err(std::io::Error::other("nobody"))
+        }
+        fn is_interactive(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_with_nobody_to_ask_declines_without_asking_or_touching_the_keystore() {
+        let keystore = FakeKeystore::refusing();
+        let prompter = Arc::new(AbsentButAgreeable {
+            asked: Default::default(),
+        });
+        let shell = Shell::new(
+            Arc::new(Confirmer::new(SessionSecret::generate())),
+            keystore.endpoint.clone(),
+            prompter.clone(),
+        );
+        let response = ask_identity(&shell, "https://a.test").await;
+        assert!(
+            matches!(response, ShellResponse::Declined(_)),
+            "{response:?}"
+        );
+        assert_eq!(prompter.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(keystore.connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_means_no_keystore_call_at_all() {
+        let (keystore, prompter, shell) = identity_harness(Decision::No);
+        let response = ask_identity(&shell, "https://a.test").await;
+        assert!(
+            matches!(response, ShellResponse::Declined(_)),
+            "{response:?}"
+        );
+        assert_eq!(prompter.asked(), 1);
+        assert_eq!(keystore.connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn yes_asks_the_keystore_once_for_the_canonical_origin() {
+        let (keystore, prompter, shell) = identity_harness(Decision::Yes);
+        let response = ask_identity(&shell, "HTTPS://A.test:443/").await;
+        assert!(
+            matches!(response, ShellResponse::Identity { .. }),
+            "{response:?}"
+        );
+        assert_eq!(prompter.asked(), 1);
+        assert_eq!(keystore.connections(), 1);
+        let received = keystore.received();
+        let [KeystoreRequest::PublicIdentity { origin }] = received.as_slice() else {
+            panic!("expected one PublicIdentity, got {received:?}");
+        };
+        assert_eq!(origin, "https://a.test");
     }
 }
