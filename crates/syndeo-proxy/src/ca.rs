@@ -23,7 +23,52 @@ pub struct CertificateAuthority {
     issuer_der: Vec<u8>,
     ca_pem: String,
     dir: PathBuf,
-    leaves: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
+    leaves: Mutex<Leaves>,
+}
+
+/// How many hosts' leaves are kept. A client names the host of every CONNECT,
+/// so without a bound the map grows with whatever it chooses to name.
+const LEAF_CAPACITY: usize = 1024;
+
+/// Minted leaves, least recently used first to go.
+struct Leaves {
+    by_host: HashMap<String, (Arc<rustls::ServerConfig>, u64)>,
+    clock: u64,
+    capacity: usize,
+}
+
+impl Leaves {
+    fn new(capacity: usize) -> Self {
+        Leaves {
+            by_host: HashMap::new(),
+            clock: 0,
+            capacity,
+        }
+    }
+
+    fn get(&mut self, host: &str) -> Option<Arc<rustls::ServerConfig>> {
+        self.clock += 1;
+        let clock = self.clock;
+        self.by_host.get_mut(host).map(|(config, used)| {
+            *used = clock;
+            config.clone()
+        })
+    }
+
+    fn insert(&mut self, host: &str, config: Arc<rustls::ServerConfig>) {
+        self.clock += 1;
+        if !self.by_host.contains_key(host) && self.by_host.len() >= self.capacity {
+            let oldest = self
+                .by_host
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(host, _)| host.clone());
+            if let Some(oldest) = oldest {
+                self.by_host.remove(&oldest);
+            }
+        }
+        self.by_host.insert(host.to_string(), (config, self.clock));
+    }
 }
 
 const CERTIFICATE: &str = "syndeo-ca.pem";
@@ -89,7 +134,7 @@ impl CertificateAuthority {
             issuer_der,
             ca_pem,
             dir,
-            leaves: Mutex::new(HashMap::new()),
+            leaves: Mutex::new(Leaves::new(LEAF_CAPACITY)),
         })
     }
 
@@ -154,13 +199,27 @@ impl CertificateAuthority {
     /// How many leaf certificates have been minted and kept.
     #[cfg(test)]
     pub fn leaf_count(&self) -> usize {
-        self.leaves.lock().unwrap().len()
+        self.leaves.lock().unwrap().by_host.len()
     }
 
-    /// A rustls server config for one origin, minted on demand and kept.
+    /// Whether a leaf for `host` is kept right now.
+    #[cfg(test)]
+    pub fn has_leaf(&self, host: &str) -> bool {
+        self.leaves.lock().unwrap().by_host.contains_key(host)
+    }
+
+    /// Keep at most `capacity` leaves, for a test that cannot mint a thousand.
+    #[cfg(test)]
+    pub fn with_leaf_capacity(self, capacity: usize) -> Self {
+        *self.leaves.lock().unwrap() = Leaves::new(capacity);
+        self
+    }
+
+    /// A rustls server config for one origin, minted on demand and kept — the
+    /// most recently used [`LEAF_CAPACITY`] of them.
     pub fn server_config(&self, host: &str) -> Result<Arc<rustls::ServerConfig>> {
         if let Some(existing) = self.leaves.lock().unwrap().get(host) {
-            return Ok(existing.clone());
+            return Ok(existing);
         }
 
         let (chain, key) = self.leaf_chain(host)?;
@@ -170,10 +229,7 @@ impl CertificateAuthority {
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         let config = Arc::new(config);
-        self.leaves
-            .lock()
-            .unwrap()
-            .insert(host.to_string(), config.clone());
+        self.leaves.lock().unwrap().insert(host, config.clone());
         Ok(config)
     }
 }
@@ -650,5 +706,29 @@ mod tests {
         let config = ca.server_config("example.test").unwrap();
         let again = ca.server_config("example.test").unwrap();
         assert!(Arc::ptr_eq(&config, &again));
+    }
+
+    #[test]
+    fn leaves_are_kept_for_the_most_recently_used_hosts_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let authority = CertificateAuthority::load_or_create(dir.path())
+            .unwrap()
+            .with_leaf_capacity(3);
+        for host in ["a.test", "b.test", "c.test"] {
+            authority.server_config(host).unwrap();
+        }
+        // a is used again, so b is now the one used longest ago.
+        let a = authority.server_config("a.test").unwrap();
+        authority.server_config("d.test").unwrap();
+
+        assert_eq!(authority.leaf_count(), 3);
+        assert!(authority.has_leaf("a.test"));
+        assert!(
+            !authority.has_leaf("b.test"),
+            "the least recently used was kept"
+        );
+        assert!(authority.has_leaf("c.test") && authority.has_leaf("d.test"));
+        // Kept means reused, not minted again.
+        assert!(Arc::ptr_eq(&a, &authority.server_config("a.test").unwrap()));
     }
 }

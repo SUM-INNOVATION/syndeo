@@ -74,6 +74,10 @@ struct RunArgs {
         default_missing_value = "true"
     )]
     trace_requests: bool,
+    /// The largest request body, in bytes, a client may send through the
+    /// proxy. A larger upload is refused with 413 before it is read.
+    #[arg(long, default_value_t = DEFAULT_MAX_REQUEST_BODY)]
+    max_request_body: u64,
     /// Exit when whoever started this closes our stdin.
     ///
     /// For syndeo-webkit, which starts its own proxy and keeps the other end of
@@ -100,6 +104,10 @@ struct RunArgs {
     #[arg(long, hide = true)]
     auth_stdin: bool,
 }
+
+/// 64 MiB: generous for a form or an upload, and a ceiling on what one client
+/// can make the proxy hold in memory.
+const DEFAULT_MAX_REQUEST_BODY: u64 = 64 * 1024 * 1024;
 
 /// What `syndeo-proxy` with no subcommand runs: `run`, with nothing given.
 fn bare_run() -> RunArgs {
@@ -258,6 +266,8 @@ struct Proxy {
     net: Net,
     authority: CertificateAuthority,
     trace: bool,
+    /// The largest request body accepted; see `--max-request-body`.
+    max_request_body: u64,
     /// The credential every client must present, when one was handed over.
     auth: Option<auth::ProxyAuth>,
     /// How long a tunnel may stay silent before its first byte says what it
@@ -303,6 +313,7 @@ async fn run(args: RunArgs) -> Result<()> {
         net,
         authority,
         trace: args.trace_requests,
+        max_request_body: args.max_request_body,
         auth,
         tunnel_first_byte: TUNNEL_FIRST_BYTE,
         #[cfg(test)]
@@ -675,8 +686,25 @@ async fn forward(
     let mut headers = forwardable(req.headers());
     append_our_via(&mut headers);
 
-    let body = match req.into_body().collect().await {
+    // The body is read whole before it is sent on, so how much of it is read
+    // is bounded: by what the client declares, and by what actually arrives.
+    let declared = req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|len| len > proxy.max_request_body) {
+        return too_large(proxy.max_request_body);
+    }
+    let limit = usize::try_from(proxy.max_request_body).unwrap_or(usize::MAX);
+    let body = match http_body_util::Limited::new(req.into_body(), limit)
+        .collect()
+        .await
+    {
         Ok(collected) => collected.to_bytes(),
+        Err(err) if err.is::<http_body_util::LengthLimitError>() => {
+            return too_large(proxy.max_request_body)
+        }
         Err(err) => {
             return text(
                 StatusCode::BAD_REQUEST,
@@ -905,6 +933,22 @@ fn url_targets_this_proxy(url: &str, local: SocketAddr) -> bool {
     targets_this_proxy(host, port, local)
 }
 
+/// 413, and the connection closed: what is left of the body is unread, and
+/// the connection could not be used for another request without reading it.
+fn too_large(limit: u64) -> Response<Body> {
+    let mut response = text(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        &format!(
+            "request bodies through this proxy are limited to {limit} bytes (--max-request-body)"
+        ),
+    );
+    response.headers_mut().insert(
+        http::header::CONNECTION,
+        http::HeaderValue::from_static("close"),
+    );
+    response
+}
+
 fn loop_detected() -> Response<Body> {
     text(
         StatusCode::LOOP_DETECTED,
@@ -1125,6 +1169,7 @@ mod tests {
             net,
             authority,
             trace: false,
+            max_request_body: 16,
             auth: None,
             tunnel_first_byte: std::time::Duration::from_millis(300),
             handled: Default::default(),
@@ -1856,6 +1901,7 @@ mod tests {
             net,
             authority,
             trace: false,
+            max_request_body: DEFAULT_MAX_REQUEST_BODY,
             auth: Some(auth::ProxyAuth::read_frame(&mut frame.as_slice()).unwrap()),
             tunnel_first_byte: std::time::Duration::from_millis(300),
             handled: Default::default(),
@@ -2105,5 +2151,82 @@ mod tests {
         assert_eq!(bare_run(), run_args(&[]));
         assert_eq!(bare_run().dns, "doh:cloudflare");
         assert_eq!(bare_run().listen, "127.0.0.1:8899".parse().unwrap());
+    }
+
+    // ----------------------------------------------------- request bodies
+
+    /// Send `body` through the proxy with `method`, declaring its length or
+    /// streaming it chunked, and return the status and whether the proxy
+    /// closed the connection after answering.
+    async fn upload(proxy: SocketAddr, url: &str, body: &[u8], chunked: bool) -> (u16, String) {
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let authority = url.split('/').nth(2).unwrap();
+        let framing = if chunked {
+            "Transfer-Encoding: chunked".to_string()
+        } else {
+            format!("Content-Length: {}", body.len())
+        };
+        let (status, head) = if chunked {
+            stream
+                .write_all(
+                    format!("POST {url} HTTP/1.1\r\nHost: {authority}\r\n{framing}\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut chunk = format!("{:x}\r\n", body.len()).into_bytes();
+            chunk.extend_from_slice(body);
+            chunk.extend_from_slice(b"\r\n0\r\n\r\n");
+            exchange(&mut stream, std::str::from_utf8(&chunk).unwrap()).await
+        } else {
+            let mut request =
+                format!("POST {url} HTTP/1.1\r\nHost: {authority}\r\n{framing}\r\n\r\n");
+            request.push_str(std::str::from_utf8(body).unwrap());
+            exchange(&mut stream, &request).await
+        };
+        (status, head)
+    }
+
+    #[tokio::test]
+    async fn a_request_body_past_the_limit_is_refused_before_anything_is_sent_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"received"))).await;
+        // The test proxy's limit is 16 bytes.
+        let proxy = start_proxy(dir.path()).await;
+        let url = origin.url("/upload");
+
+        let (status, _) = upload(proxy, &url, b"sixteen bytes!!!", false).await;
+        assert_eq!(status, 200, "a body at the limit goes through");
+
+        for chunked in [false, true] {
+            let (status, head) = upload(proxy, &url, b"seventeen bytes!!", chunked).await;
+            assert_eq!(status, 413, "chunked: {chunked}");
+            assert!(
+                head.to_ascii_lowercase().contains("connection: close"),
+                "{head}"
+            );
+        }
+        assert_eq!(
+            origin.seen().len(),
+            1,
+            "a refused upload reached the origin"
+        );
+    }
+
+    #[test]
+    fn the_request_body_limit_is_a_documented_flag() {
+        assert_eq!(run_args(&[]).max_request_body, 64 * 1024 * 1024);
+        assert_eq!(
+            run_args(&["--max-request-body", "1048576"]).max_request_body,
+            1_048_576
+        );
+        use clap::CommandFactory;
+        let help = Cli::command()
+            .find_subcommand_mut("run")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--max-request-body"), "{help}");
     }
 }
