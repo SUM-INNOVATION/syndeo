@@ -157,15 +157,25 @@ impl Keystore {
     /// seed depends on that entry. Enrolling here would replace its key and
     /// leave that seed unopenable. Not being able to tell counts as the key
     /// being there: a refused setup costs a retry, a wrong guess costs a seed.
-    pub fn initialize(&self, passphrase: Option<&str>) -> Result<(Zeroizing<String>, Address)> {
+    /// Whether `initialize` could go ahead: no sealed seed in this home, and
+    /// the credential store can say for certain it holds no wrapping key.
+    ///
+    /// Separate so a caller can ask before it asks a person for anything: a
+    /// passphrase typed for an `init` that was always going to be refused is a
+    /// passphrase typed for nothing.
+    pub fn check_can_initialize(&self) -> Result<()> {
         if self.vault.exists() {
             return Err(KeystoreError::AlreadyInitialized);
         }
         match self.wrapping.exists() {
-            Ok(false) => {}
-            Ok(true) => return Err(KeystoreError::WrappingKeyExists),
-            Err(err) => return Err(KeystoreError::WrappingKeyUnknown(err)),
+            Ok(false) => Ok(()),
+            Ok(true) => Err(KeystoreError::WrappingKeyExists),
+            Err(err) => Err(KeystoreError::WrappingKeyUnknown(err)),
         }
+    }
+
+    pub fn initialize(&self, passphrase: Option<&str>) -> Result<(Zeroizing<String>, Address)> {
+        self.check_can_initialize()?;
         self.require_passphrase(passphrase)?;
 
         let mut entropy = Zeroizing::new([0u8; 32]);

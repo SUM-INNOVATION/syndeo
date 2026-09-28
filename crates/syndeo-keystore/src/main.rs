@@ -88,6 +88,32 @@ fn init(
     Ok(open(home, wrapping)?.initialize(passphrase)?)
 }
 
+/// `init` as the command runs it: everything that could refuse is checked
+/// before `passphrase` is asked for anything, so a person is never made to
+/// choose a passphrase for an enrolment that was never going to happen.
+fn init_command(
+    home: &Path,
+    wrapping: Arc<dyn WrappingKeyStore>,
+    passphrase: impl FnOnce() -> Result<Zeroizing<String>>,
+) -> Result<(Zeroizing<String>, Address)> {
+    let keystore = open(home, wrapping.clone())?;
+    keystore.check_can_initialize()?;
+    let status = keystore.status();
+    drop(keystore);
+    let passphrase = if status.passphrase_required || !status.presence_enforced {
+        if !status.presence_enforced {
+            eprintln!(
+                "This platform does not enforce user presence on the credential store,\n\
+                 so a passphrase is required rather than optional."
+            );
+        }
+        Some(passphrase()?)
+    } else {
+        None
+    };
+    init(home, wrapping, passphrase.as_ref().map(|p| p.as_str()))
+}
+
 /// `restore`, once the terminal has been read. Direct for the same reasons as
 /// [`init`], and, unlike it, replaces whatever wrapping key is enrolled.
 fn restore(
@@ -151,21 +177,8 @@ async fn run() -> Result<()> {
         }
 
         Command::Init => {
-            let status = keystore.status();
-            let passphrase = if status.passphrase_required || !status.presence_enforced {
-                if !status.presence_enforced {
-                    eprintln!(
-                        "This platform does not enforce user presence on the credential store,\n\
-                         so a passphrase is required rather than optional."
-                    );
-                }
-                Some(read_new_passphrase()?)
-            } else {
-                None
-            };
-
-            let (mnemonic, address) =
-                init(&home, wrapping, passphrase.as_ref().map(|p| p.as_str()))?;
+            drop(keystore);
+            let (mnemonic, address) = init_command(&home, wrapping, read_new_passphrase)?;
             println!();
             println!("Recovery phrase — write it down now. It is shown once and never stored.");
             println!();
@@ -340,6 +353,68 @@ mod tests {
         );
         assert_eq!(store.stored(), None);
         assert!(!sealed(home.path()).exists());
+    }
+
+    /// Counts how often the passphrase is asked for.
+    fn counted(asked: &std::cell::Cell<usize>) -> impl FnOnce() -> Result<Zeroizing<String>> + '_ {
+        move || {
+            asked.set(asked.get() + 1);
+            Ok(Zeroizing::new(PASS.to_string()))
+        }
+    }
+
+    #[test]
+    fn init_refuses_before_asking_for_a_passphrase() {
+        let asked = std::cell::Cell::new(0);
+
+        // Already initialized here.
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryKeyStore::default());
+        init(home.path(), store.clone(), Some(PASS)).unwrap();
+        let err = init_command(home.path(), store, counted(&asked)).unwrap_err();
+        assert!(
+            matches!(
+                keystore_error(&err),
+                Some(KeystoreError::AlreadyInitialized)
+            ),
+            "{err:#}"
+        );
+
+        // A second home, whose credential store already holds a key.
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let shared = Arc::new(InMemoryKeyStore::default());
+        init(first.path(), shared.clone(), Some(PASS)).unwrap();
+        let err = init_command(second.path(), shared, counted(&asked)).unwrap_err();
+        assert!(
+            matches!(keystore_error(&err), Some(KeystoreError::WrappingKeyExists)),
+            "{err:#}"
+        );
+
+        // A credential store that cannot say.
+        let unknown = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemoryKeyStore::default());
+        store.fail_existence_checks();
+        let err = init_command(unknown.path(), store, counted(&asked)).unwrap_err();
+        assert!(
+            matches!(
+                keystore_error(&err),
+                Some(KeystoreError::WrappingKeyUnknown(_))
+            ),
+            "{err:#}"
+        );
+
+        assert_eq!(asked.get(), 0, "a passphrase was asked for a refused init");
+    }
+
+    #[test]
+    fn init_that_can_go_ahead_asks_at_most_once_and_seals() {
+        let home = tempfile::tempdir().unwrap();
+        let asked = std::cell::Cell::new(0);
+        let store = Arc::new(InMemoryKeyStore::default());
+        init_command(home.path(), store, counted(&asked)).unwrap();
+        assert!(asked.get() <= 1);
+        assert!(sealed(home.path()).is_file());
     }
 
     #[test]
