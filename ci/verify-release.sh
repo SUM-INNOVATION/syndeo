@@ -251,10 +251,15 @@ check_signing() {
   fi
 }
 
-check_runtime() {
-  local doctor out stats proxy_pid host code
+# What `syndeo doctor` says about the installed release, for a home with no
+# keys in it: the only kind this script makes, since making keys would write
+# the machine's credential store. Its stderr is kept, because when the
+# keystore cannot start that is where the reason is.
+check_doctor() {
+  local os doctor missing
+  os="$(uname -s)"
   note "the process model"
-  doctor=$(SYNDEO_HOME="$HOME_DIR" "$BIN/syndeo" doctor 2>/dev/null)
+  doctor=$(SYNDEO_HOME="$HOME_DIR" "$BIN/syndeo" doctor 2>"$WORK/doctor.err")
   if echo "$doctor" | grep -q 'NOT FOUND'; then
     bad "the shell finds its sibling processes" "$(echo "$doctor" | grep 'NOT FOUND' | tr '\n' ' ')"
   else
@@ -263,8 +268,48 @@ check_runtime() {
   if echo "$doctor" | grep -q 'keystore .*initialized'; then
     ok "the keystore starts and answers"
   else
-    bad "the keystore starts" "$(echo "$doctor" | grep -i keystore | head -1)"
+    bad "the keystore starts" "$(echo "$doctor" | grep -i keystore | head -1 | tr -s ' ')"
+    if [ -s "$WORK/doctor.err" ]; then
+      printf '        doctor said on stderr:\n'
+      tail -n 5 "$WORK/doctor.err" | sed 's/^/        | /'
+    fi
+    # Which libraries the loader cannot find, for the reader: never a verdict,
+    # since what ldd prints differs from one libc to another.
+    if [ "$os" = Linux ] && command -v ldd >/dev/null 2>&1; then
+      missing=$(ldd "$BIN/syndeo-keystore" 2>&1 | grep 'not found')
+      printf '        ldd syndeo-keystore: %s\n' "${missing:-every library found}"
+    fi
   fi
+
+  # The boundaries are the keystore's own account of this session. 0.1.3
+  # printed a fixed list whatever the platform or session could do.
+  if echo "$doctor" | grep -q 'the seed is forgotten on idleness, on sleep, and on screen lock'; then
+    bad "doctor states facts, not a fixed list" "it prints 0.1.3's fixed seed-retention claim"
+  elif echo "$doctor" | grep -q 'no seed exists: the keystore is not initialized'; then
+    ok "doctor says no seed exists, for a home with no keys"
+  else
+    bad "doctor states facts, not a fixed list" "no seed-retention line for an uninitialized keystore"
+  fi
+  if [ "$os" = Linux ]; then
+    if echo "$doctor" | grep -q 'on screen lock'; then
+      bad "no screen-lock claim on Linux" "$(echo "$doctor" | grep 'on screen lock' | head -1 | sed 's/^ *//')"
+    else
+      ok "doctor claims nothing about screen lock on Linux"
+    fi
+  fi
+  if [ "$os" = Darwin ]; then
+    if echo "$doctor" | grep -q 'syndeo-webkit is outside that' \
+       && echo "$doctor" | grep -q 'localhost and loopback'; then
+      ok "doctor says WebKit is outside the net process, and names the loopback bypass"
+    else
+      bad "the WebKit line" "doctor does not say WebKit is outside the net process, with its loopback bypass"
+    fi
+  fi
+}
+
+check_runtime() {
+  local out stats proxy_pid host code
+  check_doctor
 
   note "fetching, and the cache"
   out=$(SYNDEO_HOME="$HOME_DIR" "$BIN/syndeo" browse https://www.rust-lang.org/ --twice 2>/dev/null)
@@ -405,7 +450,26 @@ for b in $FAKE_INSTALL; do
   chmod 755 "$SYNDEO_INSTALL_DIR/$b"
 done
 EOF
-  chmod 755 "$dir/uname" "$dir/codesign" "$dir/spctl" "$dir/curl" "$dir/installer"
+  cat >"$dir/ldd" <<'EOF'
+#!/bin/sh
+echo "ldd $*" >>"$FAKE_LOG"
+echo "	libdbus-1.so.3 => not found"
+echo "	libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6"
+EOF
+  chmod 755 "$dir/uname" "$dir/codesign" "$dir/spctl" "$dir/curl" "$dir/installer" "$dir/ldd"
+}
+
+# A doctor that says what $FAKE_DOCTOR holds on stdout and $FAKE_DOCTOR_ERR on
+# stderr, installed as <dir>/syndeo.
+fake_doctor() {
+  mkdir -p "$1"
+  cat >"$1/syndeo" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$FAKE_DOCTOR"
+[ -n "${FAKE_DOCTOR_ERR:-}" ] && printf '%s\n' "$FAKE_DOCTOR_ERR" >&2
+exit 0
+EOF
+  chmod 755 "$1/syndeo"
 }
 
 self_test() {
@@ -549,6 +613,109 @@ self_test() {
     run_case "signed expected, nothing installed to assess" fail 0.1.3 "signing — no executables were installed to assess"
   FAKE_GATEKEEPER=disabled FAKE_ASSESSED=no \
     run_case "Gatekeeper assessments disabled" fail 0.1.3 "Gatekeeper — assessments are disabled"
+
+  # doctor_case <name> <os> <pass|fail> <failure texts> <shown texts>, each
+  # list "|"-separated. The doctor's output is $FAKE_DOCTOR, its stderr
+  # $FAKE_DOCTOR_ERR.
+  doctor_case() {
+    local name="$1" want="$3" texts="$4" shown="$5" dir result n text problems=""
+    cases=$((cases+1))
+    dir="$root/case-$cases"
+    mkdir -p "$dir"
+    export FAKE_LOG="$dir/calls.log"
+    : >"$FAKE_LOG"
+    fake_doctor "$dir/bin"
+    result=$(
+      PATH="$stand_ins:$PATH"
+      FAKE_OS="$2"
+      WORK="$dir"; BIN="$dir/bin"; HOME_DIR="$dir/home"
+      pass=0; fail=0; failures=""
+      check_doctor >"$dir/output.log" 2>&1
+      printf '%s\n%s' "$fail" "$failures"
+    )
+    n="${result%%$'\n'*}"
+    if [ "$want" = pass ] && [ "$n" != 0 ]; then
+      problems="$problems; expected to pass, $n failed"
+    elif [ "$want" = fail ] && [ "$n" = 0 ]; then
+      problems="$problems; expected to fail, passed"
+    fi
+    while [ -n "$texts" ]; do
+      text="${texts%%|*}"
+      case "$result" in *"$text"*) ;; *) problems="$problems; no failure reading '$text'" ;; esac
+      [ "$texts" = "$text" ] && break
+      texts="${texts#*|}"
+    done
+    while [ -n "$shown" ]; do
+      text="${shown%%|*}"
+      grep -qF -- "$text" "$dir/output.log" || problems="$problems; the output does not show '$text'"
+      [ "$shown" = "$text" ] && break
+      shown="${shown#*|}"
+    done
+    if [ -z "$problems" ]; then
+      printf '  ok    %s\n' "$name"
+    else
+      printf '  WRONG %s%s\n' "$name" "$problems"
+      sed 's/^/          | /' "$dir/output.log"
+      wrong=$((wrong+1))
+    fi
+  }
+
+  local head="version         0.1.4
+syndeo-net      /x/syndeo-net
+syndeo-keystore /x/syndeo-keystore
+syndeo-agent    /x/syndeo-agent"
+  local uninitialized="keystore        initialized false, unsealed false
+                passphrase required true
+boundaries
+  the shell's renderers (syndeo-ui, syndeo-servo) and the agent fetch only through the net process
+  the agent has no keystore socket and no session secret
+  the keystore signs only what the shell confirmed, once, for one payload
+  no seed exists: the keystore is not initialized"
+  local webkit="  syndeo-webkit is outside that: WebKit sends traffic to syndeo-proxy by its proxy setting, which does not cover every transport, and was seen to bypass it for localhost and loopback addresses (see the README)"
+  local fixed="keystore        initialized false, unsealed false
+boundaries
+  renderers and the agent reach the network only through the net process
+  the agent has no keystore socket and no session secret
+  the keystore signs only what the shell confirmed, once, for one payload
+  the seed is forgotten on idleness, on sleep, and on screen lock"
+  local unreachable="keystore        not reachable: syndeo-keystore exited before it was ready (exit status: 127)
+boundaries
+  seed retention unknown: the keystore is not reachable"
+
+  printf '\n  what doctor says\n'
+  FAKE_DOCTOR="$head
+$uninitialized" \
+    doctor_case "Linux, no keys: facts, and no screen-lock claim" Linux pass "" ""
+  FAKE_DOCTOR="$head
+$uninitialized
+$webkit" \
+    doctor_case "macOS, no keys, with the WebKit line and its loopback bypass" Darwin pass "" ""
+  FAKE_DOCTOR="$head
+$uninitialized" \
+    doctor_case "macOS without the WebKit line" Darwin fail "the WebKit line" ""
+  FAKE_DOCTOR="$head
+$uninitialized
+  syndeo-webkit is outside that: WebKit sends traffic to syndeo-proxy by its proxy setting" \
+    doctor_case "macOS, the WebKit line without the loopback bypass" Darwin fail "the WebKit line" ""
+  FAKE_DOCTOR="$head
+$fixed" \
+    doctor_case "Linux, 0.1.3's fixed claims" Linux fail "0.1.3's fixed seed-retention claim|no screen-lock claim on Linux" ""
+  FAKE_DOCTOR="$head
+$uninitialized
+  once unsealed, the seed is forgotten on sleep, on screen lock" \
+    doctor_case "Linux, a screen-lock claim" Linux fail "no screen-lock claim on Linux" ""
+  FAKE_DOCTOR="$head
+$unreachable" FAKE_DOCTOR_ERR="syndeo-keystore: error while loading shared libraries: libdbus-1.so.3: cannot open shared object file" \
+    doctor_case "Linux, the keystore cannot start: its stderr and ldd are shown" Linux fail \
+      "the keystore starts|no seed-retention line" \
+      "doctor said on stderr:|libdbus-1.so.3: cannot open shared object file|ldd syndeo-keystore: 	libdbus-1.so.3 => not found"
+  FAKE_DOCTOR="$head
+$unreachable" FAKE_DOCTOR_ERR="" \
+    doctor_case "macOS, the keystore cannot start: no ldd" Darwin fail "the keystore starts" ""
+  if grep -q '^ldd' "$root/case-$cases/calls.log"; then
+    printf '  WRONG ldd was run on macOS\n'
+    wrong=$((wrong+1))
+  fi
 
   printf '\n  %d cases, %d wrong\n\n' "$cases" "$wrong"
   [ "$wrong" -eq 0 ]

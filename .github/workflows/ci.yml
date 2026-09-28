@@ -35,6 +35,21 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  scripts:
+    name: scripts (${{ matrix.os }})
+    # The installer, run for real against a release made on the spot, and the
+    # release verifier's judgement against stand-ins: no network, no Rust.
+    # Both platforms, because the two ship different sed, grep and tar.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash ci/test-install.sh
+      - run: bash ci/verify-release.sh --self-test
+
   test:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
