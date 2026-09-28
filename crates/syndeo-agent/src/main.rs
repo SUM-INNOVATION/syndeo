@@ -225,6 +225,13 @@ fn page_summary(
         "  {} in {elapsed}ms, {bytes} bytes",
         single_line(source)
     );
+    if let Some(cut) = document.cut_short() {
+        let _ = writeln!(
+            out,
+            "  cut short: only the first {} of {bytes} bytes were parsed",
+            cut.parsed
+        );
+    }
 
     let blocks = document.blocks();
     let _ = writeln!(

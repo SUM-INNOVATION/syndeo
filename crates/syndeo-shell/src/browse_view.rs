@@ -58,6 +58,14 @@ pub fn human(fetch: &Fetch, document: &Document, full: bool) -> String {
             single_line(protocol)
         );
     }
+    if let Some(cut) = document.cut_short() {
+        let _ = writeln!(
+            out,
+            "  cut short: parsed {} of {}; the rest would cost more work than a page is allowed",
+            syndeo_cache::stats::human(cut.parsed as u64),
+            syndeo_cache::stats::human(cut.of as u64)
+        );
+    }
     let _ = writeln!(out);
 
     if let Some(title) = document.title() {
@@ -194,6 +202,16 @@ mod tests {
         assert!(shown.contains("# T]52;c;cGF3bmVkitle"), "{shown}");
         // The page's text normaliser already reads U+2028 as whitespace.
         assert!(shown.contains("prose[1Aline next"), "{shown}");
+    }
+
+    #[test]
+    fn a_page_cut_short_says_so() {
+        let html = format!("<title>deep</title>{}", "<div>".repeat(200_000));
+        let document = Document::parse(&html, None);
+        let shown = human(&fetch("https://site.test/"), &document, false);
+        assert!(shown.contains("cut short: parsed"), "{shown}");
+        let whole = Document::parse("<title>t</title><p>x", None);
+        assert!(!human(&fetch("https://site.test/"), &whole, false).contains("cut short"));
     }
 
     #[test]

@@ -241,6 +241,9 @@ async fn browse(
             "elapsed_ms": elapsed_ms,
             "content": content,
             "bytes": body.len(),
+            "cut_short": document.cut_short().map(|cut| serde_json::json!({
+                "parsed": cut.parsed, "of": cut.of
+            })),
             "title": document.title(),
             "text": document.text(),
             "links": document.links().iter().map(|l| serde_json::json!({"url": l.url, "text": l.text})).collect::<Vec<_>>(),

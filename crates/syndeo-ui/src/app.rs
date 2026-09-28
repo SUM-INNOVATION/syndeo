@@ -281,6 +281,19 @@ impl App {
                     .size(12.0)
                     .color(Color32::GRAY),
                 );
+                if let Some(cut) = page.document.cut_short() {
+                    ui.label(
+                        RichText::new("cut short")
+                            .size(12.0)
+                            .color(Color32::from_rgb(190, 160, 80)),
+                    )
+                    .on_hover_text(format!(
+                        "Only the first {} of {} were parsed: the rest would have \
+                         cost more work than a page is allowed.",
+                        syndeo_cache::stats::human(cut.parsed as u64),
+                        syndeo_cache::stats::human(cut.of as u64)
+                    ));
+                }
                 if let Some(content) = &page.content {
                     ui.label(
                         RichText::new(format!("blake3:{}", &content[..12.min(content.len())]))

@@ -9,14 +9,15 @@
 //! Nothing here fetches. A [`Document`] is parsed from bytes the network process
 //! already produced.
 
+mod budget;
 mod extract;
 pub mod terminal;
 mod text;
 
+pub use budget::WORK_BUDGET;
 pub use extract::{Form, FormField, Link, Subresource};
 pub use text::TextBlock;
 
-use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use syndeo_cache::Integrity;
 
@@ -24,20 +25,46 @@ use syndeo_cache::Integrity;
 pub struct Document {
     dom: RcDom,
     base: Option<url::Url>,
+    cut_short: Option<CutShort>,
+}
+
+/// A page that was only partly parsed, because parsing the rest would have
+/// cost more than [`WORK_BUDGET`] allows. See `budget` for what is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutShort {
+    /// How many bytes of the page were parsed.
+    pub parsed: usize,
+    /// How many bytes the page had.
+    pub of: usize,
 }
 
 impl Document {
     /// Parse HTML. `base_url` resolves relative references; without it, relative
     /// links are reported as they appear.
+    ///
+    /// However the page is written, this does a bounded amount of work: a
+    /// page that would cost more is parsed as far as its budget goes, and
+    /// [`Document::cut_short`] says so.
     pub fn parse(html: &str, base_url: Option<&str>) -> Self {
-        let dom = html5ever::parse_document(RcDom::default(), Default::default())
-            .from_utf8()
-            .read_from(&mut html.as_bytes())
-            .expect("parsing html into an RcDom is infallible");
+        Self::parse_within(html, base_url, WORK_BUDGET)
+    }
+
+    pub(crate) fn parse_within(html: &str, base_url: Option<&str>, budget: u64) -> Self {
+        let parsed = budget::parse(html, budget);
         Document {
-            dom,
+            dom: parsed.dom,
             base: base_url.and_then(|u| url::Url::parse(u).ok()),
+            cut_short: parsed.cut_at.map(|parsed| CutShort {
+                parsed,
+                of: html.len(),
+            }),
         }
+    }
+
+    /// Whether the page was too costly to parse whole, and how far it got.
+    /// Everything read from a page that was cut short is from its beginning.
+    pub fn cut_short(&self) -> Option<CutShort> {
+        self.cut_short
     }
 
     pub fn parse_bytes(bytes: &[u8], base_url: Option<&str>) -> Self {
@@ -229,10 +256,8 @@ mod depth {
 
     #[test]
     fn a_deeply_nested_page_is_parsed_read_and_dropped_on_a_small_stack() {
-        // Through the parser, which is what a real page takes. Kept to a depth
-        // that parses quickly: html5ever's own parse grows with the square of
-        // the depth, which is its behaviour rather than ours. The depth that
-        // proves there is no recursion is in the built-tree test above.
+        // Through the parser, which is what a real page takes, at a depth
+        // well inside the work budget, so all of it is parsed and read.
         on_a_small_stack(|| {
             let depth = 6_000;
             let mut html = String::with_capacity(depth * 30);
@@ -252,13 +277,30 @@ mod depth {
             assert!(!document.subresources().is_empty());
             assert!(!document.forms().is_empty());
             let _ = document.integrity_map();
+            assert_eq!(document.cut_short(), None);
+            drop(document);
+        });
+    }
+
+    /// The page that took eleven minutes in 0.1.4's first draft, served as
+    /// bytes and parsed by the public entry point with its real budget: cut
+    /// short, and what was parsed is read and dropped on a small stack.
+    #[test]
+    fn a_page_two_hundred_thousand_deep_is_cut_short_and_read() {
+        on_a_small_stack(|| {
+            let html = format!("<title>deep</title>{}the bottom", "<div>".repeat(200_000));
+            let document = Document::parse(&html, Some("https://deep.test/"));
+            let cut = document.cut_short().expect("parsed whole");
+            assert!(cut.parsed < html.len() / 5, "{cut:?}");
+            assert_eq!(document.title().as_deref(), Some("deep"));
+            let _ = (document.text(), document.blocks(), document.links());
             drop(document);
         });
     }
 
     /// A document `depth` elements deep, built directly rather than parsed:
-    /// the parser's own cost grows with the square of the depth, and this is
-    /// about what happens after parsing.
+    /// a parsed page that deep is cut short long before, and this is about
+    /// what happens after parsing whatever the depth.
     fn built(depth: usize) -> Document {
         use html5ever::{local_name, ns, QualName};
         use markup5ever_rcdom::Node;
@@ -298,7 +340,11 @@ mod depth {
                 contents: RefCell::new("the bottom".into()),
             }),
         );
-        Document { dom, base: None }
+        Document {
+            dom,
+            base: None,
+            cut_short: None,
+        }
     }
 
     #[test]
