@@ -431,7 +431,8 @@ impl ApplicationHandler<Woken> for App {
             // that keeps producing loads must not be allowed to hold the event
             // loop and with it every click and keystroke.
             const BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
-            let mut delivered = std::time::Duration::ZERO;
+            // Assigned on every pass, and the loop always makes one.
+            let mut delivered;
             loop {
                 let applied = state.network.deliver();
                 delivered = started.elapsed();
