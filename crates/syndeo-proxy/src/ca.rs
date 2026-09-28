@@ -138,9 +138,8 @@ impl CertificateAuthority {
         })
     }
 
-    /// The stored authority certificate, as it is on disk. Read by the test
-    /// that holds the chain to it; the running proxy uses `issuer_der` directly.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The stored authority certificate, as it is on disk: what goes in the
+    /// chain, and what `ca --untrust` fingerprints to find it in the keychain.
     pub fn issuer_der(&self) -> &[u8] {
         &self.issuer_der
     }

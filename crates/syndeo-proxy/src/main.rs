@@ -247,8 +247,19 @@ async fn main() -> Result<()> {
             }
             let path = authority.certificate_path();
 
-            if args.trust || args.untrust {
-                return trust_in_login_keychain(&path, args.trust);
+            if args.trust {
+                return trust_in_login_keychain(&path);
+            }
+            if args.untrust {
+                // This certificate and no other: by its fingerprint, never its
+                // name, which a stale authority from another home shares.
+                let sha256 = keychain::sha256_hex(authority.issuer_der());
+                keychain::untrust_local(
+                    &keychain::Security::login()?,
+                    &sha256,
+                    &mut std::io::stdout(),
+                )?;
+                return Ok(());
             }
 
             println!("authority certificate: {}", path.display());
@@ -1006,13 +1017,13 @@ fn untrust_without_local_ca(
     Ok(true)
 }
 
-fn trust_in_login_keychain(certificate: &std::path::Path, trust: bool) -> anyhow::Result<()> {
+fn trust_in_login_keychain(certificate: &std::path::Path) -> anyhow::Result<()> {
     use std::process::Command as Exec;
 
     let home = std::env::var("HOME").context("HOME is not set")?;
     let keychain = format!("{home}/Library/Keychains/login.keychain-db");
 
-    if trust {
+    {
         // Asked here, because macOS does not ask. A trust setting in the user's
         // own login keychain goes in without a prompt, so a browser that ran
         // this silently would be adding a root to someone's machine without
@@ -1056,31 +1067,6 @@ fn trust_in_login_keychain(certificate: &std::path::Path, trust: bool) -> anyhow
         }
         println!();
         println!("Trusted. Remove it with `syndeo-proxy ca --untrust` when you are done.");
-    } else {
-        // No `-d`: that is the admin domain, and `--trust` put this in the
-        // user's own. Asking the wrong domain answers "the specified item
-        // could not be found in the keychain" and leaves the trust setting
-        // exactly where it was.
-        let status = Exec::new("/usr/bin/security")
-            .args(["remove-trusted-cert"])
-            .arg(certificate)
-            .status();
-        // `remove-trusted-cert` fails when there was no trust setting to
-        // remove, which is the state the caller asked for, so it is not an
-        // error worth stopping on.
-        match status {
-            Ok(s) if s.success() => println!("Trust removed."),
-            _ => println!("No trust setting to remove."),
-        }
-        let _ = Exec::new("/usr/bin/security")
-            .args([
-                "delete-certificate",
-                "-c",
-                "Syndeo Local Measurement CA",
-                &keychain,
-            ])
-            .status();
-        println!("The certificate is out of the login keychain.");
     }
     Ok(())
 }

@@ -131,6 +131,58 @@ impl Ask for Terminal {
     }
 }
 
+/// The SHA-256 fingerprint of a certificate's DER, as `security` prints it.
+pub fn sha256_hex(der: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(der)
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect()
+}
+
+fn lists(keychain: &dyn Keychain, sha256: &str) -> Result<bool> {
+    Ok(parse(&keychain.find(NAME)?)
+        .iter()
+        .any(|l| l.sha256.eq_ignore_ascii_case(sha256)))
+}
+
+/// Remove this home's own authority, identified by its fingerprint alone,
+/// with its trust setting, from `keychain`.
+///
+/// Never by name: a stale authority from another home carries the same one,
+/// and `delete-certificate -c` then either refuses or reaches the wrong
+/// certificate. Success is said only once the deletion has succeeded and a
+/// fresh listing no longer shows the fingerprint; otherwise it is an error.
+pub fn untrust_local(
+    keychain: &dyn Keychain,
+    sha256: &str,
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
+    if !lists(keychain, sha256)? {
+        writeln!(
+            out,
+            "This authority (SHA-256 {sha256}) is not in {}; nothing was removed.",
+            keychain.describe()
+        )?;
+        return Ok(());
+    }
+    keychain
+        .delete(sha256)
+        .with_context(|| format!("removing SHA-256 {sha256} from {}", keychain.describe()))?;
+    if lists(keychain, sha256)? {
+        anyhow::bail!(
+            "SHA-256 {sha256} is still in {} after deleting it; its trust setting may remain",
+            keychain.describe()
+        );
+    }
+    writeln!(
+        out,
+        "Removed this authority (SHA-256 {sha256}) and its trust setting from {}.",
+        keychain.describe()
+    )?;
+    Ok(())
+}
+
 /// Remove, on confirmation, every certificate named exactly [`NAME`]. Returns
 /// how many were removed.
 pub fn untrust_by_name(
@@ -287,70 +339,207 @@ attributes:
         assert!(keychain.deleted.borrow().is_empty());
     }
 
-    /// Against a real keychain, but a throwaway one: created here, named on
-    /// every command, and deleted however the test ends. It checks the user's
-    /// keychain search list is exactly as it was. CI only.
-    #[test]
-    fn a_stale_certificate_is_found_and_deleted_from_a_throwaway_keychain() {
-        if std::env::var("SYNDEO_KEYCHAIN_TEST").as_deref() != Ok("1") {
-            return;
-        }
-        use std::process::Command;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("throwaway.keychain-db");
-        let search_list = || {
-            let out = Command::new("/usr/bin/security")
-                .args(["list-keychains", "-d", "user"])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        };
-        let before = search_list();
+    /// Lists what it is told, and fails or pretends as told.
+    struct Scripted {
+        listings: RefCell<Vec<String>>,
+        delete_fails: bool,
+        deleted: RefCell<Vec<String>>,
+    }
 
-        struct Gone(PathBuf);
-        impl Drop for Gone {
-            fn drop(&mut self) {
-                let _ = std::process::Command::new("/usr/bin/security")
-                    .arg("delete-keychain")
-                    .arg(&self.0)
-                    .status();
+    impl Keychain for Scripted {
+        fn describe(&self) -> String {
+            "a scripted keychain".into()
+        }
+        fn find(&self, _: &str) -> Result<String> {
+            Ok(self.listings.borrow_mut().remove(0))
+        }
+        fn delete(&self, sha256: &str) -> Result<()> {
+            self.deleted.borrow_mut().push(sha256.to_string());
+            if self.delete_fails {
+                anyhow::bail!("security could not delete it");
+            }
+            Ok(())
+        }
+    }
+
+    fn listing_of(hashes: &[&str]) -> String {
+        hashes
+            .iter()
+            .map(|h| {
+                format!(
+                    "SHA-256 hash: {h}\nSHA-1 hash: {}\n    \"labl\"<blob>=\"{NAME}\"\n",
+                    "0".repeat(40)
+                )
+            })
+            .collect()
+    }
+
+    fn scripted(listings: Vec<String>, delete_fails: bool) -> Scripted {
+        Scripted {
+            listings: RefCell::new(listings),
+            delete_fails,
+            deleted: RefCell::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn a_failed_deletion_is_an_error_and_never_reported_as_success() {
+        let (ours, theirs) = ("A".repeat(64), "B".repeat(64));
+        let keychain = scripted(vec![listing_of(&[&ours, &theirs])], true);
+        let mut out = Vec::new();
+        assert!(untrust_local(&keychain, &ours, &mut out).is_err());
+        assert_eq!(
+            *keychain.deleted.borrow(),
+            vec![ours.clone()],
+            "by fingerprint only"
+        );
+        assert!(!String::from_utf8(out).unwrap().contains("Removed"));
+    }
+
+    #[test]
+    fn a_deletion_that_leaves_the_fingerprint_behind_is_an_error() {
+        let ours = "A".repeat(64);
+        let keychain = scripted(vec![listing_of(&[&ours]), listing_of(&[&ours])], false);
+        let mut out = Vec::new();
+        assert!(untrust_local(&keychain, &ours, &mut out).is_err());
+        assert!(!String::from_utf8(out).unwrap().contains("Removed"));
+    }
+
+    #[test]
+    fn only_a_verified_removal_is_reported_and_nothing_is_touched_when_absent() {
+        let (ours, theirs) = ("A".repeat(64), "B".repeat(64));
+        let keychain = scripted(
+            vec![listing_of(&[&ours, &theirs]), listing_of(&[&theirs])],
+            false,
+        );
+        let mut out = Vec::new();
+        untrust_local(&keychain, &ours, &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("Removed"));
+
+        let absent = scripted(vec![listing_of(&[&theirs])], false);
+        let mut out = Vec::new();
+        untrust_local(&absent, &ours, &mut out).unwrap();
+        assert!(absent.deleted.borrow().is_empty());
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("nothing was removed"));
+    }
+
+    /// A real keychain, but a throwaway one: created here, named on every
+    /// command, and deleted however the test ends, with a check that the
+    /// user's keychain search list is exactly as it was. CI only.
+    struct Throwaway {
+        dir: tempfile::TempDir,
+        path: PathBuf,
+        search_list_before: String,
+    }
+
+    fn search_list() -> String {
+        let out = std::process::Command::new("/usr/bin/security")
+            .args(["list-keychains", "-d", "user"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    impl Throwaway {
+        fn create() -> Option<Self> {
+            if std::env::var("SYNDEO_KEYCHAIN_TEST").as_deref() != Ok("1") {
+                return None;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("throwaway.keychain-db");
+            let search_list_before = search_list();
+            let password: String = (0..24)
+                .map(|i| char::from(b'a' + (i * 7 % 26) as u8))
+                .collect();
+            let created = std::process::Command::new("/usr/bin/security")
+                .args(["create-keychain", "-p", &password])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(created.success());
+            let throwaway = Throwaway {
+                dir,
+                path,
+                search_list_before,
+            };
+            throwaway.assert_search_list_untouched();
+            Some(throwaway)
+        }
+
+        fn assert_search_list_untouched(&self) {
+            assert_eq!(
+                search_list(),
+                self.search_list_before,
+                "the search list changed"
+            );
+        }
+
+        /// A new self-signed authority under our name, imported here. Returns
+        /// its SHA-256 fingerprint.
+        fn import_authority(&self, file: &str) -> String {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, NAME);
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = params.self_signed(&key).unwrap();
+            let pem = self.dir.path().join(file);
+            std::fs::write(&pem, cert.pem()).unwrap();
+            let imported = std::process::Command::new("/usr/bin/security")
+                .arg("import")
+                .arg(&pem)
+                .arg("-k")
+                .arg(&self.path)
+                .status()
+                .unwrap();
+            assert!(imported.success());
+            sha256_hex(cert.der())
+        }
+
+        fn keychain(&self) -> Security {
+            Security {
+                path: self.path.clone(),
             }
         }
-        let password: String = (0..24)
-            .map(|i| char::from(b'a' + (i * 7 % 26) as u8))
-            .collect();
-        let created = Command::new("/usr/bin/security")
-            .args(["create-keychain", "-p", &password])
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(created.success());
-        let _gone = Gone(path.clone());
-        assert_eq!(
-            search_list(),
-            before,
-            "creating the keychain changed the search list"
-        );
+    }
 
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, NAME);
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        let pem = dir.path().join("stale.pem");
-        std::fs::write(&pem, cert.pem()).unwrap();
-        let imported = Command::new("/usr/bin/security")
-            .args(["import"])
-            .arg(&pem)
-            .arg("-k")
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(imported.success());
+    impl Drop for Throwaway {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/security")
+                .arg("delete-keychain")
+                .arg(&self.path)
+                .status();
+        }
+    }
 
-        let keychain = Security { path: path.clone() };
+    #[test]
+    fn untrusting_the_local_authority_removes_it_and_leaves_a_same_named_one() {
+        let Some(throwaway) = Throwaway::create() else {
+            return;
+        };
+        let ours = throwaway.import_authority("ours.pem");
+        let theirs = throwaway.import_authority("theirs.pem");
+        let keychain = throwaway.keychain();
+        assert!(lists(&keychain, &ours).unwrap() && lists(&keychain, &theirs).unwrap());
+
+        let mut out = Vec::new();
+        untrust_local(&keychain, &ours, &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("Removed"));
+        assert!(!lists(&keychain, &ours).unwrap(), "ours is still there");
+        assert!(lists(&keychain, &theirs).unwrap(), "the other one went too");
+        throwaway.assert_search_list_untouched();
+    }
+
+    #[test]
+    fn a_stale_certificate_is_found_and_deleted_from_a_throwaway_keychain() {
+        let Some(throwaway) = Throwaway::create() else {
+            return;
+        };
+        throwaway.import_authority("stale.pem");
+        let keychain = throwaway.keychain();
         let listed: Vec<Listed> = parse(&keychain.find(NAME).unwrap())
             .into_iter()
             .filter(|l| l.label.as_deref() == Some(NAME))
@@ -368,6 +557,6 @@ attributes:
             1
         );
         assert!(parse(&keychain.find(NAME).unwrap()).is_empty());
-        assert_eq!(search_list(), before, "the search list changed");
+        throwaway.assert_search_list_untouched();
     }
 }
