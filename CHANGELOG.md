@@ -239,10 +239,10 @@ what is still true.
 
 **Corrected**
 
-- The 0.1.3 notes said `syndeo-webkit`'s HTTP and HTTPS loads went through the
-  proxy. Plain HTTP loads failed entirely in 0.1.3, and requests for localhost
-  and loopback addresses do not go through the proxy at all. Corrected in
-  place in the 0.1.3 section.
+- The 0.1.3 and 0.1.2 notes said `syndeo-webkit`'s HTTP and HTTPS loads, or
+  its traffic generally, went through the proxy. Only its HTTPS loads did:
+  plain HTTP loads failed in both releases, and requests for localhost and
+  loopback addresses went directly. Rewritten in place in both sections.
 - The README said the keystore forgets the seed when the screen locks, on
   every platform. It does only on macOS, in a session that reports it.
 - The crate documentation of `syndeo-ipc` and `syndeo-net` said renderers
@@ -337,10 +337,12 @@ the documentation said that were not true. This fixes them and says what is true
   the command asks for `yes` itself.
 - The README, the 0.1.2 notes, and `syndeo-webkit`'s own help and log said
   every byte of its traffic went through the proxy, and nothing else. Its
-  HTTP and HTTPS loads do. What WebKit sends outside its proxy setting is not
-  covered, and WebRTC has not been measured. (Corrected in 0.1.4: plain HTTP
-  loads failed entirely in 0.1.3, and WebKit sends requests for localhost and
-  loopback addresses directly, never to the proxy.)
+  HTTPS loads did. Its plain HTTP loads failed entirely, in this release and
+  in 0.1.2: the proxy began a TLS handshake inside every tunnel. Requests for
+  localhost and loopback addresses went directly, never to the proxy. And
+  what WebKit sends outside its proxy setting was not covered; WebRTC has not
+  been measured. (Corrected in 0.1.4, which found the last three; this entry
+  first said its HTTP and HTTPS loads went through the proxy.)
 - The README, SECURITY.md and a CI comment said `syndeo-servo` was in no
   release. v0.1.1 and v0.1.2 included it; it is out of the release archives
   from v0.1.3 on.
@@ -359,16 +361,23 @@ the documentation said that were not true. This fixes them and says what is true
 
 ## 0.1.2
 
-`syndeo-webkit`: a renderer that plays video, in tabs, with its HTTP and HTTPS
-loads still going through our own cache. macOS only, and in the tarball for the
-first time. (Corrected in 0.1.3: this line first said every byte.)
+`syndeo-webkit`: a renderer that plays video, in tabs, with its HTTPS loads
+going through our own cache. macOS only, and in the tarball for the first time.
+Its plain HTTP pages failed, because the proxy expected TLS inside every
+tunnel, and its requests for localhost and loopback addresses went directly,
+never to the proxy. (Corrected in 0.1.3 and again in 0.1.4: this line first
+said every byte, then its HTTP and HTTPS loads.)
 
 Servo cannot play a video and was never going to — its script engine contains
 one mention of `MediaSource` and it is a `TODO` — so this embeds WebKit
 instead, and keeps boundary one by configuration: the web view is configured
-to send its traffic through `syndeo-proxy`, with the proxy's certificate pinned.
-(Corrected in 0.1.3. This paragraph first said the web view could not get past
-the proxy, as though a sandbox held it there; it is a configuration.)
+to send its HTTP and HTTPS traffic through `syndeo-proxy`, with the proxy's
+certificate pinned. What that covered was its HTTPS loads. Plain HTTP loads
+failed at the proxy, localhost and loopback requests went directly, and
+transports WebKit does not send through its proxy setting were not covered.
+(Corrected in 0.1.3 and 0.1.4. This paragraph first said the web view could not
+get past the proxy, as though a sandbox held it there; it is a configuration,
+with the exceptions above.)
 Measured on a YouTube watch page, sequential DASH segments through our cache:
 
     videoplayback?...&rn=15   200  1678ms
@@ -404,9 +413,12 @@ Measured on a YouTube watch page, sequential DASH segments through our cache:
 
 Unchanged and still true: Servo remains in the tree as the only configuration
 where a renderer provably opens no socket at all, and `syndeo-webkit` is the
-weaker claim — configured to send its traffic through syndeo-proxy, with the
-proxy's certificate pinned. (Corrected in 0.1.3: this line first credited a
-sandbox with keeping it there.)
+weaker claim — configured to send its HTTP and HTTPS traffic through
+syndeo-proxy, with the proxy's certificate pinned, which in this release
+covered its HTTPS loads and not its plain HTTP ones, which failed, or its
+localhost and loopback requests, which went directly. (Corrected in 0.1.3 and
+0.1.4: this line first credited a sandbox with keeping it there, and said its
+traffic generally went through the proxy.)
 
 ## 0.1.1
 
