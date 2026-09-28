@@ -12,7 +12,7 @@ use crate::protocol::SignaturePurpose;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
@@ -36,7 +36,14 @@ pub enum ConfirmationError {
     Replayed,
     #[error("the payload does not match the one the user was shown")]
     PayloadMismatch,
+    #[error("too many confirmations are outstanding; try again shortly")]
+    TooManyOutstanding,
 }
+
+/// How many used confirmations are remembered at once. Each is kept until it
+/// expires, which is at most [`CONFIRMATION_TTL`] away, so reaching this means
+/// that many signatures were confirmed inside two minutes.
+const MAX_OUTSTANDING: usize = 65_536;
 
 /// The secret shared between shell and keystore. Never written to disk, never
 /// sent to the agent.
@@ -109,14 +116,18 @@ impl Confirmation {
 /// Mints confirmations in the shell; verifies them in the keystore.
 pub struct Confirmer {
     secret: SessionSecret,
-    consumed: Mutex<HashSet<String>>,
+    /// Every confirmation already used, with when it expires. One is
+    /// forgotten only once it could no longer pass the expiry check anyway.
+    consumed: Mutex<HashMap<String, u64>>,
+    capacity: usize,
 }
 
 impl Confirmer {
     pub fn new(secret: SessionSecret) -> Self {
         Confirmer {
             secret,
-            consumed: Mutex::new(HashSet::new()),
+            consumed: Mutex::new(HashMap::new()),
+            capacity: MAX_OUTSTANDING,
         }
     }
 
@@ -169,16 +180,17 @@ impl Confirmer {
             return Err(ConfirmationError::PayloadMismatch);
         }
 
-        let mut consumed = self.consumed.lock().unwrap();
-        if !consumed.insert(confirmation.nonce.clone()) {
+        let mut consumed = self.consumed.lock().unwrap_or_else(|e| e.into_inner());
+        // Forget only what has expired: those can no longer pass the check
+        // above. Forgetting anything still valid would let it be used again.
+        consumed.retain(|_, expires_at| *expires_at >= now);
+        if consumed.contains_key(&confirmation.nonce) {
             return Err(ConfirmationError::Replayed);
         }
-        // Nonces only need to be remembered for as long as one could still be
-        // valid; anything older cannot pass the expiry check anyway.
-        if consumed.len() > 4096 {
-            consumed.clear();
-            consumed.insert(confirmation.nonce.clone());
+        if consumed.len() >= self.capacity {
+            return Err(ConfirmationError::TooManyOutstanding);
         }
+        consumed.insert(confirmation.nonce.clone(), confirmation.expires_at);
         Ok(())
     }
 
@@ -301,5 +313,65 @@ mod tests {
         let hex = secret.to_hex();
         let rendered = format!("{secret:?}");
         assert!(!rendered.contains(&hex));
+    }
+
+    fn issued(c: &Confirmer, payload: &[u8]) -> Confirmation {
+        c.issue(
+            "https://a.test",
+            SignaturePurpose::OriginLogin,
+            "Log in",
+            payload,
+        )
+    }
+
+    #[test]
+    fn a_used_confirmation_stays_used_however_many_follow_it() {
+        // The old store forgot everything past 4096, and with it the first.
+        let c = confirmer();
+        let first = issued(&c, b"first");
+        assert_eq!(c.verify(&first, b"first"), Ok(()));
+        for i in 0..4097u32 {
+            let payload = i.to_le_bytes();
+            let token = issued(&c, &payload);
+            assert_eq!(c.verify(&token, &payload), Ok(()));
+        }
+        assert_eq!(c.verify(&first, b"first"), Err(ConfirmationError::Replayed));
+    }
+
+    #[test]
+    fn used_confirmations_are_forgotten_only_once_they_expire() {
+        let c = confirmer();
+        c.consumed
+            .lock()
+            .unwrap()
+            .insert("long expired".into(), now() - 1);
+        let token = issued(&c, b"x");
+        assert_eq!(c.verify(&token, b"x"), Ok(()));
+        let kept = c.consumed.lock().unwrap();
+        assert!(!kept.contains_key("long expired"));
+        assert!(kept.contains_key(&token.nonce));
+    }
+
+    #[test]
+    fn at_capacity_a_new_confirmation_waits_rather_than_an_old_one_being_forgotten() {
+        let c = Confirmer {
+            capacity: 2,
+            ..confirmer()
+        };
+        let (a, b, third) = (issued(&c, b"a"), issued(&c, b"b"), issued(&c, b"c"));
+        assert_eq!(c.verify(&a, b"a"), Ok(()));
+        assert_eq!(c.verify(&b, b"b"), Ok(()));
+        assert_eq!(
+            c.verify(&third, b"c"),
+            Err(ConfirmationError::TooManyOutstanding)
+        );
+        // Still remembered, still refused.
+        assert_eq!(c.verify(&a, b"a"), Err(ConfirmationError::Replayed));
+
+        // Once the outstanding ones have expired there is room again.
+        for expires_at in c.consumed.lock().unwrap().values_mut() {
+            *expires_at = now() - 1;
+        }
+        assert_eq!(c.verify(&third, b"c"), Ok(()));
     }
 }
