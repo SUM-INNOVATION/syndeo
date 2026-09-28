@@ -311,13 +311,19 @@ Three limits are involved, and none stands in for another:
   cost.
 - **The whole-body ceiling**, 64 MiB, bounds how much of a response `browse`,
   the agent, the window and Servo collect to parse at all. The network process
-  streams whatever an origin sends; a response that declares a larger length
-  is refused before its body is read, one that does not is refused at the
-  piece that crosses the ceiling, and the connection is closed so the origin
-  is let go. The proxy streams, and is not bound by it.
-- **The network process's `max_body_bytes`**, also 64 MiB by default, bounds
-  only what it buffers to cache a response or to check its declared integrity.
-  A larger response still streams; it is not cached.
+  streams an ordinary response on to them as it arrives, whatever its length
+  (the exceptions are under `max_body_bytes`, next); a response that declares
+  a larger length is refused before its body is read, one that does not is
+  refused at the piece that crosses the ceiling, and the connection is closed
+  so the origin is let go. The proxy streams, and is not bound by it.
+- **The network process's `max_body_bytes`**, also 64 MiB by default, is a
+  different limit on different responses. An ordinary GET or HEAD from the
+  origin streams through however large it is, and past this limit is simply
+  not cached. A response the network process has to hold whole before it can
+  use it is buffered instead, and refused past this limit: one whose caller
+  declared its integrity, which is checked before any of it is passed on; the
+  response to any method but GET, HEAD, OPTIONS and TRACE; a revalidation
+  answered with a full body; and a background refresh.
 
 ### Measure the cache on real traffic
 

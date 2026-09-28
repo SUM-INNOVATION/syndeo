@@ -78,8 +78,11 @@ what is still true.
   with nobody to ask declines.
 - **A page cannot make Syndeo hold an unbounded body.** `syndeo browse`, the
   agent, the window and Servo collect each response whole, and the network
-  process streams whatever an origin sends, with or without a length, so an
-  origin could send until memory ran out. A whole-body fetch now accepts at
+  process streams an ordinary response on to them as it arrives, with or
+  without a length, so an origin could send until memory ran out. (The
+  responses it buffers instead — one with declared integrity, one to a method
+  other than GET, HEAD, OPTIONS or TRACE, a revalidation answered in full —
+  are refused past its `max_body_bytes` instead.) A whole-body fetch now accepts at
   most 64 MiB: a declared `Content-Length` past it is refused before any of
   the body is read, and a body without one is refused at the piece that
   crosses it. The connection is closed on refusal, which stops the network
@@ -175,9 +178,12 @@ what is still true.
   for another: the parser's budget bounds the work of parsing a body that has
   arrived; the whole-body ceiling, 64 MiB, bounds how much of a response is
   collected to be parsed at all; and the network process's `max_body_bytes`,
-  also 64 MiB by default, bounds only what it buffers to cache a response or
-  to check its declared integrity — a larger response still streams, it is
-  just not cached.
+  also 64 MiB by default, bounds what that process buffers. An ordinary GET
+  or HEAD from the origin streams through however large it is, and past the
+  limit is only left uncached. A response it must hold whole first — one with
+  declared integrity, one to a method other than GET, HEAD, OPTIONS or TRACE,
+  a revalidation answered in full, a background refresh — is refused past
+  it.
 - **Page text is grouped into blocks differently**, valid pages included.
   Each piece of text now belongs to the nearest block element around it, once.
   0.1.3 also gave a table one block holding all of its text, beside the blocks

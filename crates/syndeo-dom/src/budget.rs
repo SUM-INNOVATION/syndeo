@@ -39,9 +39,11 @@
 //! before this, by the ceiling on a whole-body fetch
 //! (`syndeo_ipc::frame::MAX_WHOLE_BODY`, 64 MiB), which refuses a larger
 //! body rather than collecting it. The network process's `max_body_bytes`
-//! is different again: it bounds only what that process buffers to cache a
-//! response or to check its declared integrity, and a larger response still
-//! streams. A body within the ceiling may still be only partly parsed.
+//! is different again. An ordinary GET or HEAD from the origin streams
+//! through past it, only uncached; a response that process must hold whole
+//! first — declared integrity, a method other than GET, HEAD, OPTIONS or
+//! TRACE, a revalidation answered in full, a background refresh — is refused
+//! past it. A body within the ceiling may still be only partly parsed.
 
 use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::states::{RawKind, ScriptEscapeKind};

@@ -20,14 +20,16 @@ pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 ///
 /// A whole-body fetch — the shell printing a page, the agent reading one, the
 /// window, Servo's loads — holds every byte of the response at once, and the
-/// network process streams whatever the origin sends, chunked or not, with no
-/// length given. Without a ceiling here an origin could send until this
-/// process ran out of memory. A caller that streams, reading the frames
+/// network process streams an ordinary response on as it arrives, chunked or
+/// not, with no length given. Without a ceiling here an origin could send
+/// until this process ran out of memory. A caller that streams, reading the frames
 /// itself, is not bound by it; nor is the proxy, which never collects a body
 /// this way.
 ///
 /// It is separate from the network process's `max_body_bytes`, which bounds
-/// only what it buffers to cache or to check integrity, and from the parser's
+/// what that process buffers — a response with declared integrity, one to an
+/// unsafe method, a revalidation answered in full, a background refresh —
+/// and only stops an ordinary response being cached; and from the parser's
 /// work budget, which bounds what parsing a body that did arrive may cost.
 pub const MAX_WHOLE_BODY: u64 = 64 * 1024 * 1024;
 
@@ -97,7 +99,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
 
     /// Every frame's bytes are wiped once they are written or read, and so is
     /// every allocation the encoding outgrew on the way (see
-    /// [`WipingBuffer`]): a keystore request can carry a passphrase of any
+    /// `WipingBuffer`): a keystore request can carry a passphrase of any
     /// length, and its JSON holds it as plainly as the message did.
     pub async fn send<T: Serialize>(&mut self, message: &T) -> Result<(), FrameError> {
         let mut buffer = WipingBuffer::new();
