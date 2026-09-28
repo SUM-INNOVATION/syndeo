@@ -34,11 +34,14 @@
 //! [`Document`](crate::Document) says so, and says how far it got. Nothing
 //! is timed, so the same page is always cut at the same place.
 //!
-//! This bounds the work of parsing a body that has already arrived. How
-//! large a body the network process accepts is a separate limit
-//! (`max_body_bytes` in `syndeo-net`, 64 MiB by default); a body within that
-//! may still be only partly parsed, and one parsed whole was not necessarily
-//! the whole response.
+//! This bounds the work of parsing a body that has already arrived, and
+//! nothing else. How much of a response arrives to be parsed is bounded
+//! before this, by the ceiling on a whole-body fetch
+//! (`syndeo_ipc::frame::MAX_WHOLE_BODY`, 64 MiB), which refuses a larger
+//! body rather than collecting it. The network process's `max_body_bytes`
+//! is different again: it bounds only what that process buffers to cache a
+//! response or to check its declared integrity, and a larger response still
+//! streams. A body within the ceiling may still be only partly parsed.
 
 use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::states::{RawKind, ScriptEscapeKind};

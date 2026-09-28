@@ -30,10 +30,10 @@ on:
 5. **Anything that makes the cache serve bytes that fail their declared
    integrity hash**, or serve one origin's response to another — or one
    client's cookie to another, or a body to a peer that no page declared.
-6. **Anything a page can do to the terminal or to parsing**: a control or
-   format character from a page reaching the terminal through `syndeo browse`
-   or the agent, or a page that costs the parser more than its fixed work
-   budget.
+6. **Anything a page can do to the terminal, to parsing or to memory**: a
+   control or format character from a page reaching the terminal through
+   `syndeo browse` or the agent, a page that costs the parser more than its
+   fixed work budget, or a response collected whole past its 64 MiB ceiling.
 
 ## What is already known, and is not a finding
 
@@ -128,6 +128,11 @@ Fixed in 0.1.4:
 - **The agent could ask for your identity at any site without anyone being
   asked**, which could link identities that are derived separately so that
   they cannot be linked. The shell now checks the origin and asks you first.
+- **A response could be as large as an origin liked.** `syndeo browse`, the
+  agent, the window and Servo collected every response whole, with no
+  ceiling, so an origin could send until memory ran out. A whole-body fetch
+  now refuses a body past 64 MiB and closes the connection, which lets the
+  origin go.
 - **Parsing a page had no bound**, so a page could hold `syndeo browse` or the
   agent for as long as it liked. Every page is now parsed within a fixed
   budget.

@@ -76,6 +76,15 @@ what is still true.
   derived per site so that they cannot be linked. The shell now checks the
   origin and asks you; the keystore is asked only if you say yes, and a run
   with nobody to ask declines.
+- **A page cannot make Syndeo hold an unbounded body.** `syndeo browse`, the
+  agent, the window and Servo collect each response whole, and the network
+  process streams whatever an origin sends, with or without a length, so an
+  origin could send until memory ran out. A whole-body fetch now accepts at
+  most 64 MiB: a declared `Content-Length` past it is refused before any of
+  the body is read, and a body without one is refused at the piece that
+  crosses it. The connection is closed on refusal, which stops the network
+  process sending and releases the origin's connection. The proxy streams
+  and is not affected.
 - **Parsing a page is bounded.** Some markup costs html5ever far more than its
   size: nesting, a tag with many attributes, repeated `<html>` tags, text
   moved out of a table. Every page is now parsed against a fixed budget of
@@ -145,8 +154,10 @@ what is still true.
   linking across directories.
 - **`--shared=false` and `--trace-requests=false` work.** Both were on with no
   way to turn them off.
-- **A page nested hundreds of thousands deep is read without recursion**, so
-  it cannot overflow the stack.
+- **A deeply nested page no longer overflows the stack.** Every walk over a
+  parsed page keeps a stack of its own instead of recursing. Hostile nesting
+  in a page is cut short by the parser's work budget, and what was parsed of
+  it is read iteratively.
 - **The installer names the right file for your shell** when the install
   directory is not on `PATH` — `.zshrc`, `.bash_profile` on macOS, `.bashrc`
   on Linux, `fish_add_path` for fish, `.profile` otherwise — and on Linux
@@ -159,10 +170,14 @@ what is still true.
 - **A page that would cost more than the parser's budget is cut short.**
   `syndeo browse` says so, and how much was parsed; `--json` adds a
   `cut_short` field, `{"parsed": <bytes>, "of": <bytes>}`, or `null` for a page
-  parsed whole; the agent and the window say so too. The budget bounds the
-  work of parsing a body that has arrived. How large a body is accepted is a
-  separate limit, the network process's, 64 MiB by default. An ordinary 16 MiB
-  page is parsed whole with room to spare.
+  parsed whole; the agent and the window say so too. An ordinary 16 MiB page is parsed whole
+  with room to spare. Three different limits are involved, and none stands in
+  for another: the parser's budget bounds the work of parsing a body that has
+  arrived; the whole-body ceiling, 64 MiB, bounds how much of a response is
+  collected to be parsed at all; and the network process's `max_body_bytes`,
+  also 64 MiB by default, bounds only what it buffers to cache a response or
+  to check its declared integrity — a larger response still streams, it is
+  just not cached.
 - **Page text is grouped into blocks differently**, valid pages included.
   Each piece of text now belongs to the nearest block element around it, once.
   0.1.3 also gave a table one block holding all of its text, beside the blocks
@@ -183,6 +198,10 @@ what is still true.
   still be served stale, or `None` when it may not be, rather than the
   directive's raw value.
 - `Document::cut_short()` and `syndeo_dom::WORK_BUDGET`.
+- `Framed::fetch` takes the connection and closes it however it returns, and
+  refuses a body past `syndeo_ipc::frame::MAX_WHOLE_BODY` with
+  `FrameError::BodyTooLarge`; `Framed::fetch_within` takes the ceiling as an
+  argument.
 - The keystore protocol gains a `SessionProtection` request and response,
   appended after every existing message; a 0.1.3 keystore closes the
   connection on it. Every existing message encodes byte for byte as in 0.1.3,

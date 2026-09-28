@@ -303,9 +303,21 @@ seconds in a release build — so
 every page is parsed against a fixed budget of work, and one that would cost
 more is parsed only as far as the budget goes. `browse` says when a page was cut
 short, and how much of it was parsed; `--json` gives the same as `cut_short`,
-which is `null` for a page parsed whole. That bounds the work of parsing a body
-that has arrived. How large a body is accepted at all is a separate limit, the
-network process's, 64 MiB by default.
+which is `null` for a page parsed whole.
+
+Three limits are involved, and none stands in for another:
+
+- **The parser's work budget** bounds what parsing a body that has arrived may
+  cost.
+- **The whole-body ceiling**, 64 MiB, bounds how much of a response `browse`,
+  the agent, the window and Servo collect to parse at all. The network process
+  streams whatever an origin sends; a response that declares a larger length
+  is refused before its body is read, one that does not is refused at the
+  piece that crosses the ceiling, and the connection is closed so the origin
+  is let go. The proxy streams, and is not bound by it.
+- **The network process's `max_body_bytes`**, also 64 MiB by default, bounds
+  only what it buffers to cache a response or to check its declared integrity.
+  A larger response still streams; it is not cached.
 
 ### Measure the cache on real traffic
 
@@ -688,7 +700,7 @@ both say so where you would meet them:
 cargo test --workspace
 ```
 
-About 470 on macOS and 450 on Linux, where the Seatbelt, keychain and WebKit
+About 475 on macOS and 455 on Linux, where the Seatbelt, keychain and WebKit
 tests do not run. Two macOS tests drive the real WebKit data store and a
 throwaway keychain, and run only where `SYNDEO_WEBKIT_UI_TEST=1` and
 `SYNDEO_KEYCHAIN_TEST=1` are set, as CI's macOS runner sets them. The RFC 9111 conformance suite,
