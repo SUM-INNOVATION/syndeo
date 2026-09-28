@@ -1019,4 +1019,28 @@ mod tests {
             ]
         );
     }
+
+    /// Signing validation and terminal display are separate, and the first is
+    /// unchanged by the second: every character the display filter replaces
+    /// or removes is one signing already refuses, or ordinary whitespace.
+    #[test]
+    fn signing_refuses_at_least_everything_the_display_filter_cleans() {
+        for c in (0..=0x10FFFFu32).filter_map(char::from_u32) {
+            let text = c.to_string();
+            let cleaned = syndeo_dom::terminal::single_line(&text);
+            if cleaned != text && !matches!(c, ' ') {
+                assert!(
+                    is_unshowable(c),
+                    "U+{:04X} is cleaned for display but accepted for signing",
+                    c as u32
+                );
+            }
+        }
+        // A newline in a description is still refused, not cleaned.
+        for c in [
+            '\n', '\r', '\t', '\u{2028}', '\u{2029}', '\u{1b}', '\u{202e}',
+        ] {
+            assert!(is_unshowable(c), "U+{:04X}", c as u32);
+        }
+    }
 }

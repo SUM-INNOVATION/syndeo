@@ -240,97 +240,25 @@ async fn browse(
         return Ok(());
     }
 
-    println!("{url}");
-    println!(
-        "  {status}  {source}  {protocol}  {elapsed_ms}ms  {}",
-        syndeo_cache::stats::human(body.len() as u64)
+    let report = syndeo_shell::browse_view::Fetch {
+        url: url.to_string(),
+        status,
+        source,
+        protocol,
+        elapsed_ms,
+        bytes: body.len(),
+        content,
+        content_type: headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone()),
+        again: second.map(|s| (s.source, s.protocol, s.elapsed_ms)),
+    };
+    print!(
+        "{}",
+        syndeo_shell::browse_view::human(&report, &document, full)
     );
-    if let Some(content) = &content {
-        println!("  content {}", &content[..16.min(content.len())]);
-    }
-    if let Some(ct) = headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-    {
-        println!("  type    {}", ct.1);
-    }
-    if let Some(second) = second {
-        println!(
-            "  again   {}  {}  {}ms",
-            second.source, second.protocol, second.elapsed_ms
-        );
-    }
-    println!();
-
-    if let Some(title) = document.title() {
-        println!("# {title}");
-        println!();
-    }
-
-    let text = document.text();
-    let shown: Vec<&str> = text.lines().take(40).collect();
-    println!("{}", shown.join("\n"));
-    if text.lines().count() > 40 {
-        println!("… {} more lines", text.lines().count() - 40);
-    }
-
-    if full {
-        let links = document.links();
-        if !links.is_empty() {
-            println!();
-            println!("links ({})", links.len());
-            for link in links.iter().take(20) {
-                println!(
-                    "  {:<60} {}",
-                    truncate(&link.url, 60),
-                    truncate(&link.text, 40)
-                );
-            }
-        }
-        let resources = document.subresources();
-        if !resources.is_empty() {
-            println!();
-            println!("subresources ({})", resources.len());
-            for resource in resources.iter().take(20) {
-                let integrity = match &resource.integrity {
-                    Some(_) => "integrity declared",
-                    None => "no integrity — origin only",
-                };
-                println!(
-                    "  {:<11} {:<50} {}",
-                    resource.kind,
-                    truncate(&resource.url, 50),
-                    integrity
-                );
-            }
-        }
-        let forms = document.forms();
-        if !forms.is_empty() {
-            println!();
-            println!("forms ({})", forms.len());
-            for form in &forms {
-                println!("  {} {}", form.method, form.action);
-                for field in &form.fields {
-                    println!(
-                        "    {:<20} {:<10}{}",
-                        field.name,
-                        field.kind,
-                        if field.required { " required" } else { "" }
-                    );
-                }
-            }
-        }
-    }
     Ok(())
-}
-
-fn truncate(s: &str, width: usize) -> String {
-    let s = s.replace('\n', " ");
-    if s.chars().count() <= width {
-        s
-    } else {
-        format!("{}…", s.chars().take(width - 1).collect::<String>())
-    }
 }
 
 // -------------------------------------------------------------------- agent

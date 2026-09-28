@@ -10,6 +10,7 @@
 //! already produced.
 
 mod extract;
+pub mod terminal;
 mod text;
 
 pub use extract::{Form, FormField, Link, Subresource};

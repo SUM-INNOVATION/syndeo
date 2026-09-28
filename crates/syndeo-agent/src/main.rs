@@ -14,6 +14,7 @@ mod tools;
 use anyhow::{bail, Result};
 use clap::Parser;
 use std::path::PathBuf;
+use syndeo_dom::terminal::{multiline, single_line};
 use syndeo_dom::Document;
 use syndeo_ipc::protocol::{NetRequest, ShellRequest, ShellResponse, SignaturePurpose};
 use syndeo_ipc::transport::{Channel, Endpoint};
@@ -183,7 +184,8 @@ async fn run_tool(
     );
     println!();
     match std::str::from_utf8(&output) {
-        Ok(text) => println!("{text}"),
+        // A tool's output is shaped by the page it was given.
+        Ok(text) => println!("{}", multiline(text)),
         Err(_) => println!("{} bytes of non-text output", output.len()),
     }
     Ok(())
@@ -196,23 +198,55 @@ async fn read(net: &Endpoint, url: &str) -> Result<()> {
     }
     let (body, source, elapsed) = fetch(net, url, None).await?;
     let document = Document::parse_bytes(&body, Some(url));
+    print!(
+        "{}",
+        page_summary(&document, url, &source, elapsed, body.len())
+    );
+    Ok(())
+}
 
-    println!("{}", document.title().unwrap_or_else(|| url.to_string()));
-    println!("  {source} in {elapsed}ms, {} bytes", body.len());
+/// What `read` prints: everything from the page made printable first — see
+/// `syndeo_dom::terminal`.
+fn page_summary(
+    document: &Document,
+    url: &str,
+    source: &str,
+    elapsed: u64,
+    bytes: usize,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let title = document.title().unwrap_or_else(|| url.to_string());
+    let _ = writeln!(out, "{}", single_line(&title));
+    let _ = writeln!(
+        out,
+        "  {} in {elapsed}ms, {bytes} bytes",
+        single_line(source)
+    );
 
     let blocks = document.blocks();
-    println!(
+    let _ = writeln!(
+        out,
         "  {} text blocks, {} links, {} subresources",
         blocks.len(),
         document.links().len(),
         document.subresources().len()
     );
 
-    println!();
+    let _ = writeln!(out);
     for block in blocks.iter().take(12) {
         match block.heading_level {
-            Some(level) => println!("{} {}", "#".repeat(level as usize), block.text),
-            None => println!("{}", truncate(&block.text, 100)),
+            Some(level) => {
+                let _ = writeln!(
+                    out,
+                    "{} {}",
+                    "#".repeat(level as usize),
+                    single_line(&block.text)
+                );
+            }
+            None => {
+                let _ = writeln!(out, "{}", truncate(&block.text, 100));
+            }
         }
     }
 
@@ -221,13 +255,16 @@ async fn read(net: &Endpoint, url: &str) -> Result<()> {
     // on a first fetch.
     let integrity = document.integrity_map();
     if !integrity.is_empty() {
-        println!();
-        println!("subresources with declared integrity, eligible for peer fetch:");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "subresources with declared integrity, eligible for peer fetch:"
+        );
         for (url, _) in &integrity {
-            println!("  {url}");
+            let _ = writeln!(out, "  {}", single_line(url));
         }
     }
-    Ok(())
+    out
 }
 
 /// Fetch a page, then fetch what it links to, and report what the cache did.
@@ -236,7 +273,12 @@ async fn crawl(net: &Endpoint, url: &str) -> Result<()> {
         bail!("crawl needs a url");
     }
     let (body, source, elapsed) = fetch(net, url, None).await?;
-    println!("{:<14} {:>6}ms  {url}", source, elapsed);
+    println!(
+        "{:<14} {:>6}ms  {}",
+        single_line(&source),
+        elapsed,
+        single_line(url)
+    );
 
     let document = Document::parse_bytes(&body, Some(url));
     let mut seen = std::collections::HashSet::new();
@@ -258,12 +300,18 @@ async fn crawl(net: &Endpoint, url: &str) -> Result<()> {
         match fetch(net, target, None).await {
             Ok((body, source, elapsed)) => println!(
                 "{:<14} {:>6}ms  {} ({} bytes)",
-                source,
+                single_line(&source),
                 elapsed,
                 truncate(target, 70),
                 body.len()
             ),
-            Err(err) => println!("{:<14} {:>8}  {}", "failed", "", err),
+            // An error can quote what the origin sent.
+            Err(err) => println!(
+                "{:<14} {:>8}  {}",
+                "failed",
+                "",
+                single_line(&err.to_string())
+            ),
         }
     }
 
@@ -273,8 +321,9 @@ async fn crawl(net: &Endpoint, url: &str) -> Result<()> {
         let (_, source, elapsed) = fetch(net, target, None).await?;
         println!();
         println!(
-            "refetch of {} → {source} in {elapsed}ms",
-            truncate(target, 60)
+            "refetch of {} → {} in {elapsed}ms",
+            truncate(target, 60),
+            single_line(&source)
         );
     }
     Ok(())
@@ -315,9 +364,9 @@ async fn identity(shell: &Endpoint, origin: &str) -> Result<()> {
             public_key,
             address,
         } => {
-            println!("origin      {origin}");
-            println!("public key  {public_key}");
-            println!("address     {address}");
+            println!("origin      {}", single_line(origin));
+            println!("public key  {}", single_line(&public_key));
+            println!("address     {}", single_line(&address));
             Ok(())
         }
         ShellResponse::Error(e) => bail!(e),
@@ -340,12 +389,12 @@ async fn request_signature(shell: &Endpoint, origin: &str, message: &str) -> Res
         ShellResponse::Signed {
             signature, address, ..
         } => {
-            println!("signed by {address}");
-            println!("{signature}");
+            println!("signed by {}", single_line(&address));
+            println!("{}", single_line(&signature));
             Ok(())
         }
         ShellResponse::Declined(reason) => {
-            println!("the shell declined: {reason}");
+            println!("the shell declined: {}", single_line(&reason));
             Ok(())
         }
         ShellResponse::Error(e) => bail!(e),
@@ -353,11 +402,41 @@ async fn request_signature(shell: &Endpoint, origin: &str, message: &str) -> Res
     }
 }
 
+/// Made printable first, then cut to `width`, so the width is counted on
+/// what is shown.
 fn truncate(s: &str, width: usize) -> String {
-    let s = s.replace('\n', " ");
+    let s = single_line(s).into_owned();
     if s.chars().count() <= width {
         s
     } else {
         format!("{}…", s.chars().take(width - 1).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod display {
+    use super::*;
+
+    #[test]
+    fn nothing_a_page_supplies_reaches_the_terminal_as_a_control() {
+        let page = "<title>T\u{1b}]52;c;cGF3bmVk\u{7}itle</title>\
+            <h1>Head\u{1b}[2Jing</h1><p>Body\u{202e} text\u{9b}31m here</p>\
+            <script src=\"/lib\u{1b}[H.js\" integrity=\"sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"></script>";
+        let document = Document::parse(page, Some("https://site.test/"));
+        let shown = page_summary(&document, "https://site.test/", "origin\u{1b}[1A", 3, 10);
+        assert!(
+            shown
+                .chars()
+                .all(|c| c == '\n' || !(c.is_control() || c == '\u{202e}')),
+            "{shown:?}"
+        );
+        assert!(shown.contains("# Head[2Jing"), "{shown}");
+        assert!(shown.contains("T]52;c;cGF3bmVkitle"), "{shown}");
+    }
+
+    #[test]
+    fn a_tool_or_error_line_cannot_carry_a_control_either() {
+        assert_eq!(multiline("ok\u{1b}]0;title\u{7}\nnext"), "ok]0;title\nnext");
+        assert_eq!(truncate("a\u{1b}[2Jb\nc", 10), "a[2Jb c");
     }
 }

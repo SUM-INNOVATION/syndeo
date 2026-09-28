@@ -9,5 +9,6 @@ description = "A headless DOM: parse, extract text and subresources, and read in
 syndeo-cache.workspace = true
 html5ever.workspace = true
 markup5ever_rcdom.workspace = true
+unicode-general-category.workspace = true
 url.workspace = true
 serde.workspace = true
