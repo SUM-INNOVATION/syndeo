@@ -44,7 +44,7 @@ enum Command {
     Stats(StatsArgs),
 }
 
-#[derive(Parser, Clone)]
+#[derive(Parser, Clone, Debug, PartialEq)]
 struct RunArgs {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:8899")]
@@ -55,11 +55,24 @@ struct RunArgs {
     /// system | dot:cloudflare | doh:cloudflare | doh:google | doh:quad9
     #[arg(long, default_value = "doh:cloudflare")]
     dns: String,
-    /// Run the cache with shared-cache semantics.
-    #[arg(long, default_value_t = true)]
+    /// Run the cache with shared-cache semantics. On unless `--shared=false`.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     shared: bool,
-    /// Log one line per request with its source and timing.
-    #[arg(long, default_value_t = true)]
+    /// Log one line per request with its source and timing. On unless
+    /// `--trace-requests=false`.
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     trace_requests: bool,
     /// Exit when whoever started this closes our stdin.
     ///
@@ -86,6 +99,11 @@ struct RunArgs {
     /// token never appears in arguments, the environment, or any log.
     #[arg(long, hide = true)]
     auth_stdin: bool,
+}
+
+/// What `syndeo-proxy` with no subcommand runs: `run`, with nothing given.
+fn bare_run() -> RunArgs {
+    RunArgs::try_parse_from(["syndeo-proxy"]).expect("run's defaults parse")
 }
 
 /// The one line `run --announce` writes to stdout, followed by the address it
@@ -190,16 +208,14 @@ async fn main() -> Result<()> {
         logs.init();
     }
 
-    match cli.command.unwrap_or(Command::Run(RunArgs {
-        listen: "127.0.0.1:8899".parse().unwrap(),
-        cache: None,
-        dns: "system".into(),
-        shared: true,
-        trace_requests: true,
-        exit_with_parent: false,
-        announce: false,
-        auth_stdin: false,
-    })) {
+    // No subcommand is `run` with every default — the same defaults, from the
+    // same definition, so the two can never drift apart again. (They had: the
+    // bare command used the system resolver while `run` used DoH.)
+    let command = match cli.command {
+        Some(command) => command,
+        None => Command::Run(bare_run()),
+    };
+    match command {
         Command::Run(args) => run(args).await,
         Command::Ca(args) => {
             let authority = CertificateAuthority::load_or_create(home().join("proxy"))?;
@@ -2055,5 +2071,39 @@ mod tests {
             "the connection was kept for another request"
         );
         assert!(origin.seen().is_empty());
+    }
+
+    // ------------------------------------------------------------ flags
+
+    fn run_args(args: &[&str]) -> RunArgs {
+        let mut all = vec!["syndeo-proxy", "run"];
+        all.extend_from_slice(args);
+        match Cli::try_parse_from(all).unwrap().command {
+            Some(Command::Run(args)) => args,
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn on_by_default_flags_can_be_turned_off_and_still_be_named_bare() {
+        let defaults = run_args(&[]);
+        assert!(defaults.shared && defaults.trace_requests);
+        assert!(run_args(&["--shared"]).shared);
+        assert!(!run_args(&["--shared=false"]).shared);
+        assert!(!run_args(&["--shared", "false"]).shared);
+        assert!(run_args(&["--trace-requests"]).trace_requests);
+        assert!(!run_args(&["--trace-requests=false"]).trace_requests);
+        // A bare flag followed by another option does not swallow it.
+        let both = run_args(&["--shared", "--dns", "system"]);
+        assert!(both.shared);
+        assert_eq!(both.dns, "system");
+        assert!(Cli::try_parse_from(["syndeo-proxy", "run", "--shared=maybe"]).is_err());
+    }
+
+    #[test]
+    fn the_bare_command_is_run_with_runs_own_defaults() {
+        assert_eq!(bare_run(), run_args(&[]));
+        assert_eq!(bare_run().dns, "doh:cloudflare");
+        assert_eq!(bare_run().listen, "127.0.0.1:8899".parse().unwrap());
     }
 }
