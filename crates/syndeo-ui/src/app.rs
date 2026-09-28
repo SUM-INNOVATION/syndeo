@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use syndeo_dom::Document;
+use syndeo_ipc::SecretString;
 use syndeo_shell::prompt::{prompt_lines, Decision, SignatureRequest};
+use zeroize::Zeroizing;
 
 /// What the worker thread has been asked to do.
 pub enum Work {
@@ -63,8 +65,10 @@ enum Modal {
     },
     Passphrase {
         label: String,
-        typed: String,
-        answer: SyncSender<Option<String>>,
+        /// What has been typed so far: wiped when the modal is closed, and
+        /// handed over, not copied, when it is submitted.
+        typed: Zeroizing<String>,
+        answer: SyncSender<Option<SecretString>>,
     },
 }
 
@@ -213,7 +217,7 @@ impl App {
                     },
                     Ask::Passphrase { label, answer } => Modal::Passphrase {
                         label,
-                        typed: String::new(),
+                        typed: Zeroizing::new(String::new()),
                         answer,
                     },
                 });
@@ -661,7 +665,7 @@ impl App {
                     ui.label(RichText::new(&label).size(12.0).color(Color32::GRAY));
                     ui.add_space(8.0);
                     let field = ui.add(
-                        egui::TextEdit::singleline(&mut typed)
+                        egui::TextEdit::singleline(&mut *typed)
                             .password(true)
                             .desired_width(f32::INFINITY),
                     );
@@ -674,7 +678,7 @@ impl App {
                             settled = Some(None);
                         }
                         if ui.button("Unseal").clicked() || entered {
-                            settled = Some(Some(typed.clone()));
+                            settled = Some(Some(SecretString::from(std::mem::take(&mut *typed))));
                         }
                     });
                 });

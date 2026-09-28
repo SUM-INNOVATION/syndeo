@@ -11,29 +11,27 @@
 //! so the terminal and the window cannot disagree about what was asked.
 
 use std::io::{BufRead, IsTerminal, Write};
+use std::sync::{Arc, Mutex};
 use syndeo_ipc::protocol::SignaturePurpose;
+use syndeo_ipc::SecretString;
 use unicode_general_category::{get_general_category, GeneralCategory};
+use zeroize::Zeroizing;
 
-/// Read a passphrase.
-///
-/// A terminal gets a hidden prompt; a pipe gets a line. Scripted runs may set
-/// `SYNDEO_PASSPHRASE`. `main` takes it out of the environment before anything
-/// else runs (see `syndeo_ipc::startup`), so nothing the shell spawns — the
-/// agent especially — can inherit it, and it is handed over here once.
-pub fn read_passphrase(label: &str) -> std::io::Result<String> {
-    if let Some(value) = syndeo_ipc::startup::take(syndeo_ipc::startup::PASSPHRASE) {
-        if !value.is_empty() {
-            return Ok(value.to_string());
-        }
-    }
+/// Read a passphrase from the person: a terminal gets a hidden prompt, a
+/// pipe gets a line. It is held as a [`SecretString`] from the moment it is
+/// read, and wiped when whoever it is handed to drops it.
+pub fn read_passphrase(label: &str) -> std::io::Result<SecretString> {
     if std::io::stdin().is_terminal() {
-        return rpassword::prompt_password(label);
+        return rpassword::prompt_password(label).map(SecretString::new);
     }
     eprint!("{label}");
     let _ = std::io::stderr().flush();
-    let mut line = String::new();
+    let mut line = Zeroizing::new(String::new());
     std::io::stdin().lock().read_line(&mut line)?;
-    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+    // Cut in place: a trimmed copy would be one more buffer to wipe.
+    let kept = line.trim_end_matches(['\n', '\r']).len();
+    line.truncate(kept);
+    Ok(line.into())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,8 +467,8 @@ pub trait Prompter: Send + Sync {
     /// Ask a yes/no question.
     fn ask(&self, title: &str, detail: &str) -> Decision;
 
-    /// Read a passphrase, to unseal the keystore.
-    fn read_passphrase(&self, label: &str) -> std::io::Result<String>;
+    /// Read a passphrase, to unseal the keystore. Wiped when dropped.
+    fn read_passphrase(&self, label: &str) -> std::io::Result<SecretString>;
 
     /// Whether there is anyone to ask at all.
     fn is_interactive(&self) -> bool {
@@ -479,8 +477,27 @@ pub trait Prompter: Send + Sync {
 }
 
 /// The terminal.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct TerminalPrompter;
+///
+/// A scripted run may set `SYNDEO_PASSPHRASE`. `main` takes it out of the
+/// environment before anything else runs (see `syndeo_ipc::startup`), so
+/// nothing the shell spawns — the agent especially — can inherit it, and
+/// gives it to the prompter it makes, which hands it over once, in place of
+/// the first prompt. Clones share it. It is wiped when it is handed over and
+/// used, or when the last clone is dropped without it having been asked for.
+#[derive(Debug, Default, Clone)]
+pub struct TerminalPrompter {
+    scripted: Arc<Mutex<Option<SecretString>>>,
+}
+
+impl TerminalPrompter {
+    /// A terminal prompter that answers its first passphrase prompt with
+    /// `scripted`, if there is one.
+    pub fn new(scripted: Option<SecretString>) -> Self {
+        TerminalPrompter {
+            scripted: Arc::new(Mutex::new(scripted.filter(|s| !s.is_empty()))),
+        }
+    }
+}
 
 impl Prompter for TerminalPrompter {
     fn ask_to_sign(&self, request: &SignatureRequest) -> Decision {
@@ -491,8 +508,16 @@ impl Prompter for TerminalPrompter {
         ask(title, detail)
     }
 
-    fn read_passphrase(&self, label: &str) -> std::io::Result<String> {
-        read_passphrase(label)
+    fn read_passphrase(&self, label: &str) -> std::io::Result<SecretString> {
+        let scripted = self
+            .scripted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        match scripted {
+            Some(scripted) => Ok(scripted),
+            None => read_passphrase(label),
+        }
     }
 
     fn is_interactive(&self) -> bool {
@@ -517,7 +542,7 @@ impl Prompter for NonInteractive {
         Decision::No
     }
 
-    fn read_passphrase(&self, _label: &str) -> std::io::Result<String> {
+    fn read_passphrase(&self, _label: &str) -> std::io::Result<SecretString> {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotConnected,
             "this run has nobody to ask for a passphrase",
@@ -574,6 +599,25 @@ fn read_yes_no() -> Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scripted passphrase answers the first prompt, from any clone, and is
+    /// then gone; `Debug` never shows it.
+    #[test]
+    fn a_scripted_passphrase_is_handed_over_once_and_never_shown() {
+        const PASS: &str = "a scripted passphrase";
+        let prompter = TerminalPrompter::new(Some(PASS.into()));
+        let clone = prompter.clone();
+        assert!(!format!("{prompter:?}").contains("scripted passphrase"));
+
+        let given = clone.read_passphrase("unused: ").unwrap();
+        assert_eq!(given.expose(), PASS);
+        // Taken from every clone at once, so the next prompt goes to the person.
+        assert!(prompter.scripted.lock().unwrap().is_none());
+
+        // An empty one is no answer at all.
+        let empty = TerminalPrompter::new(Some("".into()));
+        assert!(empty.scripted.lock().unwrap().is_none());
+    }
 
     const PURPOSE: SignaturePurpose = SignaturePurpose::Attestation;
 

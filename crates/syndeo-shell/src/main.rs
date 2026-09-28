@@ -13,7 +13,9 @@ use syndeo_ipc::confirm::{Confirmer, SessionSecret};
 use syndeo_ipc::protocol::{
     KeystoreRequest, KeystoreResponse, NetRequest, NetResponse, ShellRequest, ShellResponse,
 };
+use syndeo_ipc::startup::StartupSecrets;
 use syndeo_ipc::transport::{Channel, Endpoint, Server};
+use syndeo_ipc::SecretString;
 use syndeo_shell::prompt::{NonInteractive, Prompter, TerminalPrompter};
 use syndeo_shell::signing::{self, unseal, Consent};
 use syndeo_shell::{Shell, Supervisor};
@@ -124,16 +126,26 @@ fn home(override_path: Option<PathBuf>) -> PathBuf {
 fn main() -> Result<()> {
     // First, while this is still one thread: a scripted passphrase leaves the
     // environment before a runtime, a logger, or any child process exists to
-    // read or inherit it. It is handed over once, by `prompt::read_passphrase`.
-    syndeo_ipc::startup::capture(&[syndeo_ipc::startup::PASSPHRASE]);
+    // read or inherit it. `run` owns it from here.
+    let secrets = syndeo_ipc::startup::capture(&[syndeo_ipc::startup::PASSPHRASE]);
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| anyhow::anyhow!("starting the runtime: {err}"))?
-        .block_on(run())
+        .block_on(run(secrets))
 }
 
-async fn run() -> Result<()> {
+/// `secrets` is what `main` took out of the environment. A scripted
+/// passphrase goes to the terminal prompter, which hands it over once; it is
+/// wiped when that is dropped, used or not, which is before this returns.
+async fn run(mut secrets: StartupSecrets) -> Result<()> {
+    let terminal = TerminalPrompter::new(
+        secrets
+            .take(syndeo_ipc::startup::PASSPHRASE)
+            .map(SecretString::from),
+    );
+    drop(secrets);
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG").unwrap_or_else(|_| {
@@ -155,14 +167,14 @@ async fn run() -> Result<()> {
             json,
             twice,
         } => browse(&home, &cli.dns, &cli.peers, &url, full, json, twice).await,
-        Command::Agent { task } => agent(&home, &cli.dns, &cli.peers, &task).await,
+        Command::Agent { task } => agent(&home, &cli.dns, &cli.peers, &task, terminal).await,
         Command::Sign {
             origin,
             message,
             purpose,
             yes,
-        } => sign(&home, &origin, &message, &purpose, yes).await,
-        Command::Identity { origin } => identity(&home, &origin).await,
+        } => sign(&home, &origin, &message, &purpose, yes, terminal).await,
+        Command::Identity { origin } => identity(&home, &origin, terminal).await,
         Command::Stats { json } => stats(&home, json),
         Command::Peer { command } => match command {
             PeerCommand::Serve { listen, serve_only } => {
@@ -263,13 +275,19 @@ async fn browse(
 
 // -------------------------------------------------------------------- agent
 
-async fn agent(home: &std::path::Path, dns: &str, peers: &[String], task: &str) -> Result<()> {
+async fn agent(
+    home: &std::path::Path,
+    dns: &str,
+    peers: &[String],
+    task: &str,
+    terminal: TerminalPrompter,
+) -> Result<()> {
     let secret = SessionSecret::generate();
     let mut supervisor = Supervisor::new(home);
 
     let net = supervisor.start_net(dns, peers).await?;
     let keystore = supervisor.start_keystore(&secret).await?;
-    unseal(&keystore).await?;
+    unseal(&keystore, &terminal).await?;
 
     // The shell's own socket. This is what the agent is given; the keystore
     // endpoint stays in this process.
@@ -277,7 +295,7 @@ async fn agent(home: &std::path::Path, dns: &str, peers: &[String], task: &str) 
     // The agent's requests go in front of whoever is at the terminal. When
     // nobody is, they are declined rather than left waiting.
     let prompter: Arc<dyn Prompter> = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        Arc::new(TerminalPrompter)
+        Arc::new(terminal)
     } else {
         Arc::new(NonInteractive)
     };
@@ -308,6 +326,7 @@ async fn sign(
     message: &str,
     purpose: &str,
     typed_consent: bool,
+    terminal: TerminalPrompter,
 ) -> Result<()> {
     // Both checked before anything is started: an unknown purpose here, and
     // the request itself inside `sign_message`, which starts and unseals a
@@ -318,7 +337,7 @@ async fn sign(
     } else {
         Consent::Prompted
     };
-    let signed = signing::sign_message(home, origin, message, purpose, consent).await?;
+    let signed = signing::sign_message(home, origin, message, purpose, consent, terminal).await?;
 
     // The canonical origin, which is the one the key was derived for.
     println!("origin      {}", signed.origin);
@@ -328,16 +347,16 @@ async fn sign(
     Ok(())
 }
 
-async fn identity(home: &std::path::Path, origin: &str) -> Result<()> {
+async fn identity(home: &std::path::Path, origin: &str, terminal: TerminalPrompter) -> Result<()> {
     let secret = SessionSecret::generate();
     let mut supervisor = Supervisor::new(home);
     let keystore = supervisor.start_keystore(&secret).await?;
-    unseal(&keystore).await?;
+    unseal(&keystore, &terminal).await?;
 
     let shell = Shell::new(
         Arc::new(Confirmer::new(secret)),
         keystore,
-        Arc::new(TerminalPrompter),
+        Arc::new(terminal),
     );
     let response = shell
         .handle(ShellRequest::IdentityFor {

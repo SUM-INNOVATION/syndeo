@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use syndeo_ipc::confirm::{Confirmer, SessionSecret};
+use syndeo_ipc::startup::StartupSecrets;
 use syndeo_ipc::transport::{Endpoint, Server};
 use syndeo_keystore::{Address, Keystore, OsKeyring, WrappingKeyStore};
 use zeroize::Zeroizing;
@@ -129,15 +130,17 @@ fn main() -> Result<()> {
     // First, while this is still one thread: the session secret and any
     // scripted passphrase leave the environment before a runtime, a logger or
     // anything else exists to read or inherit them.
-    syndeo_ipc::startup::capture(&[SECRET_VAR, syndeo_keystore::passphrase::ENV_VAR]);
+    let secrets = syndeo_ipc::startup::capture(&[SECRET_VAR, syndeo_keystore::passphrase::ENV_VAR]);
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting the runtime")?
-        .block_on(run())
+        .block_on(run(secrets))
 }
 
-async fn run() -> Result<()> {
+/// `secrets` is everything `main` took out of the environment. Each command
+/// takes what it uses; the rest is wiped when this returns.
+async fn run(mut secrets: StartupSecrets) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG")
@@ -160,7 +163,8 @@ async fn run() -> Result<()> {
             // terminal, where stdin is theirs and closing it means nothing.
             syndeo_ipc::exit_when_parent_does();
 
-            let secret = syndeo_ipc::startup::take(SECRET_VAR)
+            let secret = secrets
+                .take(SECRET_VAR)
                 .and_then(|s| SessionSecret::from_hex(&s))
                 .context(
                     "no session secret; the keystore is spawned by the shell, which supplies one",
@@ -181,7 +185,9 @@ async fn run() -> Result<()> {
 
         Command::Init => {
             drop(keystore);
-            let (mnemonic, address) = init_command(&home, wrapping, read_new_passphrase)?;
+            let scripted = secrets.take(syndeo_keystore::passphrase::ENV_VAR);
+            let (mnemonic, address) =
+                init_command(&home, wrapping, || read_new_passphrase(scripted))?;
             println!();
             println!("Recovery phrase — write it down now. It is shown once and never stored.");
             println!();
@@ -207,7 +213,9 @@ async fn run() -> Result<()> {
             std::io::stdin()
                 .read_line(&mut phrase)
                 .context("reading the recovery phrase")?;
-            let passphrase = Some(read_new_passphrase()?);
+            let passphrase = Some(read_new_passphrase(
+                secrets.take(syndeo_keystore::passphrase::ENV_VAR),
+            )?);
             let address = restore(
                 &home,
                 wrapping,
@@ -258,7 +266,10 @@ async fn run() -> Result<()> {
         }
 
         Command::Identity { origin } => {
-            let passphrase = syndeo_keystore::passphrase::read("Passphrase: ")?;
+            let passphrase = syndeo_keystore::passphrase::read(
+                "Passphrase: ",
+                secrets.take(syndeo_keystore::passphrase::ENV_VAR),
+            )?;
             keystore.unseal(Some(passphrase.as_str()))?;
             let (public_key, address) = keystore.public_identity(&origin)?;
             println!(
@@ -273,8 +284,8 @@ async fn run() -> Result<()> {
     }
 }
 
-fn read_new_passphrase() -> Result<Zeroizing<String>> {
-    Ok(syndeo_keystore::passphrase::read_new()?)
+fn read_new_passphrase(scripted: Option<Zeroizing<String>>) -> Result<Zeroizing<String>> {
+    Ok(syndeo_keystore::passphrase::read_new(scripted)?)
 }
 
 #[cfg(test)]

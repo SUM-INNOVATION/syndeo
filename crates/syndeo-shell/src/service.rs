@@ -529,7 +529,7 @@ mod tests {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Decision::Yes
         }
-        fn read_passphrase(&self, _: &str) -> std::io::Result<String> {
+        fn read_passphrase(&self, _: &str) -> std::io::Result<syndeo_ipc::SecretString> {
             Err(std::io::Error::other("nobody"))
         }
         fn is_interactive(&self) -> bool {

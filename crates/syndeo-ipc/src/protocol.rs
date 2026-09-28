@@ -1,6 +1,7 @@
 //! The typed protocols. Each process speaks exactly one of these, and the shape
 //! of the enum is the boundary.
 
+use crate::secret::SecretString;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------- net process
@@ -166,14 +167,14 @@ pub enum KeystoreRequest {
     /// Whether a seed exists and whether it is currently unsealed.
     Status,
     /// First-run enrolment. Returns a recovery mnemonic exactly once.
-    Initialize { passphrase: Option<String> },
+    Initialize { passphrase: Option<SecretString> },
     /// Restore from a recovery mnemonic.
     Restore {
-        mnemonic: String,
-        passphrase: Option<String>,
+        mnemonic: SecretString,
+        passphrase: Option<SecretString>,
     },
     /// Unseal the root secret for this session.
-    Unseal { passphrase: Option<String> },
+    Unseal { passphrase: Option<SecretString> },
     /// Forget the unsealed material.
     Lock,
     /// What, right now, would make the keystore forget its seed. Added in
@@ -209,7 +210,7 @@ pub enum KeystoreResponse {
     Locked,
     /// Shown to the user once, at setup, and never written to disk.
     Initialized {
-        mnemonic: String,
+        mnemonic: SecretString,
         address: String,
     },
     Ok,
@@ -411,6 +412,16 @@ mod tests {
             },
             Q::Unseal { passphrase: None },
             Q::Lock,
+            // The same requests carrying a secret where 0.1.3 carried one,
+            // including characters JSON has to escape.
+            Q::Initialize { passphrase: None },
+            Q::Restore {
+                mnemonic: "abandon ability able".into(),
+                passphrase: Some("pa\"ss\\ ☃".into()),
+            },
+            Q::Unseal {
+                passphrase: Some("correct horse".into()),
+            },
         ];
         let responses = vec![
             R::Signature {
@@ -445,7 +456,7 @@ mod tests {
     /// byte for byte. A 0.1.3 shell or keystore on the other end of a socket
     /// reads these; changing one is a protocol break, so adding to the
     /// protocol must leave every one of them as it is.
-    const KEYSTORE_WIRE: [&str; 14] = [
+    const KEYSTORE_WIRE: [&str; 17] = [
         r#"{"SignConfirmed":{"confirmation":{"origin":"https://a.test","purpose":"OriginLogin","payload_hash":"PPPP","description_hash":"DDDD","nonce":"NNNN","issued_at":1700000000,"expires_at":1700000120,"mac":"MMMM"},"payload":"cGF5bG9hZA=="}}"#,
         r#"{"PublicIdentity":{"origin":"https://a.test"}}"#,
         r#""Status""#,
@@ -453,6 +464,9 @@ mod tests {
         r#"{"Restore":{"mnemonic":"words","passphrase":null}}"#,
         r#"{"Unseal":{"passphrase":null}}"#,
         r#""Lock""#,
+        r#"{"Initialize":{"passphrase":null}}"#,
+        r#"{"Restore":{"mnemonic":"abandon ability able","passphrase":"pa\"ss\\ ☃"}}"#,
+        r#"{"Unseal":{"passphrase":"correct horse"}}"#,
         r#"{"Signature":{"signature":"s","public_key":"k","address":"a"}}"#,
         r#"{"Identity":{"public_key":"k","address":"a"}}"#,
         r#"{"Status":{"initialized":true,"unsealed":false,"passphrase_required":true,"presence_enforced":false,"idle_timeout_secs":300,"idle_for_secs":12}}"#,
@@ -461,6 +475,9 @@ mod tests {
         r#""Ok""#,
         r#"{"Error":"e"}"#,
     ];
+
+    /// How many of [`KEYSTORE_WIRE`] are requests; the rest are responses.
+    const REQUESTS: usize = 10;
 
     fn expected_wire() -> Vec<String> {
         KEYSTORE_WIRE
@@ -486,11 +503,11 @@ mod tests {
 
         // And what 0.1.3 sends is still read, as the same message.
         let expected = expected_wire();
-        for line in &expected[..7] {
+        for line in &expected[..REQUESTS] {
             let read: super::KeystoreRequest = serde_json::from_str(line).unwrap();
             assert_eq!(&serde_json::to_string(&read).unwrap(), line);
         }
-        for line in &expected[7..] {
+        for line in &expected[REQUESTS..] {
             let read: super::KeystoreResponse = serde_json::from_str(line).unwrap();
             assert_eq!(&serde_json::to_string(&read).unwrap(), line);
         }
@@ -520,6 +537,157 @@ mod tests {
         // None of it is spelled like any message that existed before.
         for line in expected_wire() {
             assert!(!line.contains("SessionProtection"));
+        }
+    }
+
+    /// The messages that carry a secret, as 0.1.3 declared them: plain
+    /// strings. Whatever the secret holds, the wrapper encodes and decodes it
+    /// exactly as these do.
+    mod as_in_0_1_3 {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        pub enum KeystoreRequest {
+            Initialize {
+                passphrase: Option<String>,
+            },
+            Restore {
+                mnemonic: String,
+                passphrase: Option<String>,
+            },
+            Unseal {
+                passphrase: Option<String>,
+            },
+        }
+
+        #[derive(Serialize, Deserialize)]
+        pub enum KeystoreResponse {
+            Initialized { mnemonic: String, address: String },
+        }
+    }
+
+    /// Secrets chosen to exercise every way JSON writes a string: plain,
+    /// escaped, control characters, non-ASCII, astral, and empty.
+    fn awkward_secrets() -> Vec<String> {
+        let mut secrets: Vec<String> = [
+            "",
+            "pass",
+            "a \"quoted\" \\ back/slash",
+            "tab\there\nnewline\r",
+            "日本語 ☃ café",
+            "\u{1F512} astral",
+            "\u{7f}\u{80}\u{2028}\u{2029}\u{feff}",
+        ]
+        .map(String::from)
+        .to_vec();
+        secrets.push((0u8..0x20).map(char::from).collect());
+        secrets
+    }
+
+    #[test]
+    fn every_secret_bearing_message_encodes_as_in_0_1_3_whatever_it_holds() {
+        use super::{KeystoreRequest as Q, KeystoreResponse as R};
+        use as_in_0_1_3 as old;
+
+        fn same<A: serde::Serialize, B: serde::Serialize>(now: &A, then: &B) -> String {
+            let wire = serde_json::to_string(now).unwrap();
+            assert_eq!(wire, serde_json::to_string(then).unwrap());
+            wire
+        }
+
+        for secret in awkward_secrets() {
+            for passphrase in [None, Some(secret.clone())] {
+                let wire = same(
+                    &Q::Initialize {
+                        passphrase: passphrase.clone().map(Into::into),
+                    },
+                    &old::KeystoreRequest::Initialize {
+                        passphrase: passphrase.clone(),
+                    },
+                );
+                let _: old::KeystoreRequest = serde_json::from_str(&wire).unwrap();
+                let read: Q = serde_json::from_str(&wire).unwrap();
+                assert_eq!(serde_json::to_string(&read).unwrap(), wire);
+
+                let wire = same(
+                    &Q::Restore {
+                        mnemonic: secret.clone().into(),
+                        passphrase: passphrase.clone().map(Into::into),
+                    },
+                    &old::KeystoreRequest::Restore {
+                        mnemonic: secret.clone(),
+                        passphrase: passphrase.clone(),
+                    },
+                );
+                let read: Q = serde_json::from_str(&wire).unwrap();
+                assert_eq!(serde_json::to_string(&read).unwrap(), wire);
+
+                let wire = same(
+                    &Q::Unseal {
+                        passphrase: passphrase.clone().map(Into::into),
+                    },
+                    &old::KeystoreRequest::Unseal {
+                        passphrase: passphrase.clone(),
+                    },
+                );
+                let read: Q = serde_json::from_str(&wire).unwrap();
+                assert_eq!(serde_json::to_string(&read).unwrap(), wire);
+            }
+            let wire = same(
+                &R::Initialized {
+                    mnemonic: secret.clone().into(),
+                    address: "a".into(),
+                },
+                &old::KeystoreResponse::Initialized {
+                    mnemonic: secret.clone(),
+                    address: "a".into(),
+                },
+            );
+            let read: R = serde_json::from_str(&wire).unwrap();
+            assert_eq!(serde_json::to_string(&read).unwrap(), wire);
+        }
+    }
+
+    /// A request or response that carries a secret can be logged with `{:?}`
+    /// without logging the secret.
+    #[test]
+    fn debug_output_of_a_secret_bearing_message_names_no_part_of_the_secret() {
+        use super::{KeystoreRequest as Q, KeystoreResponse as R};
+        const PASS: &str = "correct horse battery staple";
+        const PHRASE: &str = "abandon ability able about above absent";
+        let shown = [
+            format!(
+                "{:?}",
+                Q::Initialize {
+                    passphrase: Some(PASS.into())
+                }
+            ),
+            format!(
+                "{:?}",
+                Q::Restore {
+                    mnemonic: PHRASE.into(),
+                    passphrase: Some(PASS.into()),
+                }
+            ),
+            format!(
+                "{:#?}",
+                Q::Unseal {
+                    passphrase: Some(PASS.into())
+                }
+            ),
+            format!(
+                "{:?}",
+                R::Initialized {
+                    mnemonic: PHRASE.into(),
+                    address: "addr".into(),
+                }
+            ),
+        ];
+        for shown in &shown {
+            assert!(shown.contains("<redacted>"), "{shown}");
+            for word in PASS.split(' ').chain(PHRASE.split(' ')) {
+                assert!(!shown.contains(word), "{word:?} in {shown}");
+            }
         }
     }
 }

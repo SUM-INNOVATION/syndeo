@@ -14,6 +14,7 @@
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use syndeo_ipc::SecretString;
 use syndeo_shell::prompt::{Decision, Prompter, SignatureRequest};
 
 /// A question waiting for the user, and where to send the answer.
@@ -29,7 +30,7 @@ pub enum Ask {
     },
     Passphrase {
         label: String,
-        answer: SyncSender<Option<String>>,
+        answer: SyncSender<Option<SecretString>>,
     },
 }
 
@@ -137,7 +138,7 @@ impl Prompter for WindowPrompter {
         )
     }
 
-    fn read_passphrase(&self, label: &str) -> std::io::Result<String> {
+    fn read_passphrase(&self, label: &str) -> std::io::Result<SecretString> {
         let (answer, receiver) = std::sync::mpsc::sync_channel(1);
         let given = self.ask_window(
             Ask::Passphrase {

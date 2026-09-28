@@ -6,6 +6,7 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 /// Largest single message we will read.
 ///
@@ -14,6 +15,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// than this still arrives. It exists so a peer cannot make us allocate on
 /// demand, which is a different question from how large the web is allowed to be.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
+
+/// What a frame is encoded into before it has to grow.
+const SMALL_FRAME: usize = 4 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
@@ -41,8 +45,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
         Framed { stream }
     }
 
+    /// Every frame's bytes are wiped once they are written or read: a
+    /// keystore request can carry a passphrase, and its JSON holds it as
+    /// plainly as the message did. A message smaller than [`SMALL_FRAME`] —
+    /// every one that carries a secret — is encoded without the buffer ever
+    /// growing, so there is no earlier, unwiped copy left behind by a
+    /// reallocation.
     pub async fn send<T: Serialize>(&mut self, message: &T) -> Result<(), FrameError> {
-        let body = serde_json::to_vec(message)?;
+        let mut body = Zeroizing::new(Vec::with_capacity(SMALL_FRAME));
+        serde_json::to_writer(&mut *body, message)?;
         if body.len() as u64 > MAX_FRAME as u64 {
             return Err(FrameError::TooLarge(body.len() as u32));
         }
@@ -67,7 +78,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
         if length > MAX_FRAME {
             return Err(FrameError::TooLarge(length));
         }
-        let mut body = vec![0u8; length as usize];
+        let mut body = Zeroizing::new(vec![0u8; length as usize]);
         self.stream.read_exact(&mut body).await?;
         Ok(serde_json::from_slice(&body)?)
     }

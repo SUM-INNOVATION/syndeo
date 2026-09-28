@@ -9,7 +9,7 @@ use std::time::Duration;
 use syndeo_ipc::confirm::Confirmer;
 use syndeo_ipc::protocol::{KeystoreRequest, KeystoreResponse, ScreenLockReport};
 use syndeo_ipc::transport::Server;
-use zeroize::Zeroizing;
+use syndeo_ipc::SecretString;
 
 /// How often the idle policy is checked. Fine enough that a locked screen takes
 /// effect promptly, coarse enough to cost nothing.
@@ -136,8 +136,10 @@ pub fn handle(
         // or `restore` at a terminal, which open the keystore directly. The
         // variants stay in the protocol so the wire format does not move; the
         // keystore is not touched, and what the request carried is scrubbed.
+        // (Both arrive as `SecretString`s, which wipe themselves when they
+        // are dropped at the end of their arm.)
         KeystoreRequest::Initialize { passphrase } => {
-            drop(passphrase.map(Zeroizing::new));
+            drop(passphrase);
             refuse_enrolment("initialize")
         }
 
@@ -145,15 +147,18 @@ pub fn handle(
             mnemonic,
             passphrase,
         } => {
-            drop(Zeroizing::new(mnemonic));
-            drop(passphrase.map(Zeroizing::new));
+            drop(mnemonic);
+            drop(passphrase);
             refuse_enrolment("restore")
         }
 
-        KeystoreRequest::Unseal { passphrase } => match keystore.unseal(passphrase.as_deref()) {
-            Ok(()) => KeystoreResponse::Ok,
-            Err(err) => refuse(err),
-        },
+        // The passphrase is wiped when this arm ends, whether it unsealed or not.
+        KeystoreRequest::Unseal { passphrase } => {
+            match keystore.unseal(passphrase.as_ref().map(SecretString::expose)) {
+                Ok(()) => KeystoreResponse::Ok,
+                Err(err) => refuse(err),
+            }
+        }
 
         KeystoreRequest::Lock => {
             keystore.lock();

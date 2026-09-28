@@ -7,7 +7,7 @@
 //! out, and the one validated request is what is shown, confirmed, signed and
 //! printed.
 
-use crate::prompt::{self, Prompter, SignatureRequest, TerminalPrompter};
+use crate::prompt::{Prompter, SignatureRequest, TerminalPrompter};
 use crate::service::Shell;
 use crate::supervisor::Supervisor;
 use anyhow::{anyhow, bail, Context, Result};
@@ -51,28 +51,32 @@ pub fn parse_purpose(purpose: &str) -> Result<SignaturePurpose> {
 /// The message is both what the request says and the bytes that are signed.
 /// It is checked first; only a request that passes starts a keystore under
 /// `home`, which is unsealed from the terminal and stopped again before this
-/// returns.
+/// returns. `prompter` asks for the passphrase and, unless consent was typed,
+/// for the signature.
 pub async fn sign_message(
     home: &Path,
     origin: &str,
     message: &str,
     purpose: SignaturePurpose,
     consent: Consent,
+    prompter: TerminalPrompter,
 ) -> Result<Signed> {
+    let unsealing = prompter.clone();
     sign_with(
         origin,
         message,
         purpose,
         consent,
-        || SupervisedKeystore::new(Supervisor::new(home)),
-        Arc::new(TerminalPrompter),
+        move || SupervisedKeystore::new(Supervisor::new(home), unsealing),
+        Arc::new(prompter),
     )
     .await
 }
 
 /// Ask the keystore what it needs, then supply it. The passphrase is read here,
-/// in the shell, and sent to the keystore — it never reaches the agent.
-pub async fn unseal(keystore: &Endpoint) -> Result<()> {
+/// in the shell, by `prompter`, and sent to the keystore — it never reaches the
+/// agent. It is wiped once it has been sent.
+pub async fn unseal(keystore: &Endpoint, prompter: &dyn Prompter) -> Result<()> {
     let mut channel = Channel::connect(keystore).await?;
     let status: KeystoreResponse = channel.call(&KeystoreRequest::Status).await?;
     let KeystoreResponse::Status {
@@ -88,7 +92,11 @@ pub async fn unseal(keystore: &Endpoint) -> Result<()> {
     }
 
     let passphrase = if passphrase_required {
-        Some(prompt::read_passphrase("Keystore passphrase: ").context("reading the passphrase")?)
+        Some(
+            prompter
+                .read_passphrase("Keystore passphrase: ")
+                .context("reading the passphrase")?,
+        )
     } else {
         None
     };
@@ -129,18 +137,23 @@ impl KeystoreProcesses for Supervisor {
     }
 }
 
-/// A keystore process, started and unsealed for one command.
-pub(crate) struct SupervisedKeystore<P> {
+/// A keystore process, started and unsealed for one command. `prompter`
+/// reads the passphrase that unseals it.
+pub(crate) struct SupervisedKeystore<P, Q> {
     processes: P,
+    prompter: Q,
 }
 
-impl<P> SupervisedKeystore<P> {
-    pub(crate) fn new(processes: P) -> Self {
-        SupervisedKeystore { processes }
+impl<P, Q> SupervisedKeystore<P, Q> {
+    pub(crate) fn new(processes: P, prompter: Q) -> Self {
+        SupervisedKeystore {
+            processes,
+            prompter,
+        }
     }
 }
 
-impl<P: KeystoreProcesses> KeystoreSession for SupervisedKeystore<P> {
+impl<P: KeystoreProcesses, Q: Prompter> KeystoreSession for SupervisedKeystore<P, Q> {
     async fn open(&mut self) -> Result<(Endpoint, SessionSecret)> {
         let secret = SessionSecret::generate();
         // A failure on either step stops whatever did start, here and now,
@@ -152,7 +165,7 @@ impl<P: KeystoreProcesses> KeystoreSession for SupervisedKeystore<P> {
                 return Err(err);
             }
         };
-        if let Err(err) = unseal(&keystore).await {
+        if let Err(err) = unseal(&keystore, &self.prompter).await {
             self.processes.shutdown().await;
             return Err(err);
         }
@@ -209,7 +222,7 @@ pub(crate) async fn sign_with<S: KeystoreSession>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prompt::Decision;
+    use crate::prompt::{Decision, NonInteractive};
     use crate::test_support::{CountingPrompter, FakeKeystore, Reply};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -487,7 +500,7 @@ mod tests {
     async fn a_keystore_that_cannot_be_unsealed_is_stopped_before_the_error_returns() {
         let fake = processes(Some(FakeKeystore::start(status(false))), false);
         let (started, stopped) = (fake.started.clone(), fake.stopped.clone());
-        let mut session = SupervisedKeystore::new(fake);
+        let mut session = SupervisedKeystore::new(fake, NonInteractive);
 
         let refused = session.open().await.err().unwrap().to_string();
 
@@ -500,7 +513,7 @@ mod tests {
     async fn a_keystore_that_fails_to_start_is_stopped_before_the_error_returns() {
         let fake = processes(None, true);
         let stopped = fake.stopped.clone();
-        let mut session = SupervisedKeystore::new(fake);
+        let mut session = SupervisedKeystore::new(fake, NonInteractive);
 
         assert!(session.open().await.is_err());
         assert_eq!(stopped.load(Ordering::SeqCst), 1);
@@ -517,7 +530,7 @@ mod tests {
             "transfer 10 SUM",
             SignaturePurpose::ChainTransaction,
             Consent::Typed,
-            || SupervisedKeystore::new(slot.lock().unwrap().take().unwrap()),
+            || SupervisedKeystore::new(slot.lock().unwrap().take().unwrap(), NonInteractive),
             CountingPrompter::new(Decision::No),
         )
         .await
@@ -539,7 +552,7 @@ mod tests {
             "transfer 10 SUM",
             SignaturePurpose::ChainTransaction,
             Consent::Typed,
-            || SupervisedKeystore::new(slot.lock().unwrap().take().unwrap()),
+            || SupervisedKeystore::new(slot.lock().unwrap().take().unwrap(), NonInteractive),
             CountingPrompter::new(Decision::Yes),
         )
         .await;

@@ -37,7 +37,7 @@ impl Prompter for CountingPrompter {
         self.answer
     }
 
-    fn read_passphrase(&self, _label: &str) -> std::io::Result<String> {
+    fn read_passphrase(&self, _label: &str) -> std::io::Result<syndeo_ipc::SecretString> {
         self.asked.fetch_add(1, Ordering::SeqCst);
         Err(std::io::Error::other("no passphrase in this test"))
     }
