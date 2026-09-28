@@ -274,7 +274,7 @@ fn serve(
 }
 
 async fn load(net: &Endpoint, url: &str) -> Result<syndeo_ipc::protocol::Fetched> {
-    let mut channel = Channel::connect(net).await?;
+    let channel = Channel::connect(net).await?;
     Ok(channel
         .fetch(&NetRequest::Fetch {
             // A page fetched at the top level is its own partition.

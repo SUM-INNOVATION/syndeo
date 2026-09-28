@@ -190,6 +190,6 @@ impl NetworkDelegate {
 }
 
 async fn fetch(net: &Endpoint, request: NetRequest) -> anyhow::Result<Fetched> {
-    let mut channel = Channel::connect(net).await?;
+    let channel = Channel::connect(net).await?;
     Ok(channel.fetch(&request).await?)
 }

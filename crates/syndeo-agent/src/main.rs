@@ -343,10 +343,10 @@ async fn fetch(
     url: &str,
     integrity: Option<String>,
 ) -> Result<(Vec<u8>, String, u64)> {
-    let mut channel = Channel::connect(net).await?;
-    // The agent summarises whole pages, so it waits for the whole body. The
-    // frames it arrives in are what stop the transport from capping how large a
-    // page it can read.
+    let channel = Channel::connect(net).await?;
+    // The agent summarises whole pages, so it waits for the whole body, up to
+    // the ceiling on what a whole-body fetch collects
+    // (`syndeo_ipc::frame::MAX_WHOLE_BODY`).
     let response = channel
         .fetch(&NetRequest::Fetch {
             // A page fetched at the top level is its own partition.

@@ -201,7 +201,7 @@ async fn browse(
     let net = supervisor.start_net(dns, peers).await?;
 
     let fetch = || async {
-        let mut channel = Channel::connect(&net).await?;
+        let channel = Channel::connect(&net).await?;
         let response = channel
             .fetch(&NetRequest::Fetch {
                 // A page fetched at the top level is its own partition.
