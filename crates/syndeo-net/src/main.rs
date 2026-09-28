@@ -56,6 +56,9 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("syndeo_net=info")),
         )
         .with_target(false)
+        // Logs go to stderr: stdout is the shell's, and a child that
+        // shares it would write into what the shell prints, --json included.
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
