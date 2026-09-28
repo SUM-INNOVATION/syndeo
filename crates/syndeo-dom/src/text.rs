@@ -70,64 +70,125 @@ pub fn readable(root: &Handle) -> String {
     normalize(&out)
 }
 
-fn render(handle: &Handle, out: &mut String) {
-    if let Some(name) = tag(handle) {
-        if SKIPPED.contains(&name.as_str()) {
-            return;
+/// One step of a traversal that also needs to know when an element ends.
+enum Step {
+    Enter(Handle),
+    /// An element's children are done.
+    Leave {
+        block: Option<usize>,
+        newline: bool,
+    },
+}
+
+/// Readable text, in one pass with a stack of its own — see [`crate::walk`]
+/// for why not the call stack.
+fn render(root: &Handle, out: &mut String) {
+    let mut pending = vec![Step::Enter(root.clone())];
+    while let Some(step) = pending.pop() {
+        let node = match step {
+            Step::Enter(node) => node,
+            Step::Leave { newline, .. } => {
+                if newline {
+                    out.push('\n');
+                }
+                continue;
+            }
+        };
+        crate::counters::visited();
+        let mut block = false;
+        if let Some(name) = tag(&node) {
+            if SKIPPED.contains(&name.as_str()) {
+                continue;
+            }
+            block = BLOCK.contains(&name.as_str());
+            if block {
+                out.push('\n');
+            }
         }
-        if BLOCK.contains(&name.as_str()) {
-            out.push('\n');
+        if let NodeData::Text { contents } = &node.data {
+            crate::counters::appended();
+            out.push_str(&contents.borrow());
         }
-    }
-    if let NodeData::Text { contents } = &handle.data {
-        out.push_str(&contents.borrow());
-    }
-    for child in handle.children.borrow().iter() {
-        render(child, out);
-    }
-    if let Some(name) = tag(handle) {
-        if BLOCK.contains(&name.as_str()) {
-            out.push('\n');
-        }
+        pending.push(Step::Leave {
+            block: None,
+            newline: block,
+        });
+        pending.extend(
+            node.children
+                .borrow()
+                .iter()
+                .rev()
+                .map(|child| Step::Enter(child.clone())),
+        );
     }
 }
 
 /// One block per block-level element that directly contains text.
+///
+/// Each piece of text belongs to the nearest block element around it, and to
+/// no other: one pass, each text node appended once. (Counting it again for
+/// every enclosing block it reached through a non-block element — a `table`
+/// through its `tbody`, a `div` through a `span` — made the result grow with
+/// depth times size, which a page could make as large as it liked.) Blocks
+/// come out in document order, each where its element opens.
 pub fn blocks(root: &Handle) -> Vec<TextBlock> {
-    let mut out = Vec::new();
-    collect_blocks(root, &mut out);
-    out
-}
-
-fn collect_blocks(handle: &Handle, out: &mut Vec<TextBlock>) {
-    if let Some(name) = tag(handle) {
-        if SKIPPED.contains(&name.as_str()) {
-            return;
-        }
-        if BLOCK.contains(&name.as_str()) {
-            let mut own = String::new();
-            for child in handle.children.borrow().iter() {
-                if tag(child)
-                    .map(|t| BLOCK.contains(&t.as_str()))
-                    .unwrap_or(false)
-                {
-                    continue;
+    let mut out: Vec<Option<TextBlock>> = Vec::new();
+    // For each open block: its slot in `out` and the text gathered so far.
+    let mut open: Vec<(usize, String)> = Vec::new();
+    let mut pending = vec![Step::Enter(root.clone())];
+    while let Some(step) = pending.pop() {
+        let node = match step {
+            Step::Enter(node) => node,
+            Step::Leave { block, .. } => {
+                if block.is_some() {
+                    let (slot, own) = open.pop().expect("a block was opened");
+                    let text = normalize(&own);
+                    if let Some(entry) = out[slot].as_mut() {
+                        entry.text = text;
+                    }
                 }
-                render(child, &mut own);
+                continue;
             }
-            let text = normalize(&own);
-            if !text.is_empty() {
-                out.push(TextBlock {
-                    element: name.clone(),
+        };
+        crate::counters::visited();
+        let mut opened = None;
+        if let Some(name) = tag(&node) {
+            if SKIPPED.contains(&name.as_str()) {
+                continue;
+            }
+            if BLOCK.contains(&name.as_str()) {
+                let slot = out.len();
+                out.push(Some(TextBlock {
                     heading_level: heading_level(&name),
-                    text,
-                });
+                    element: name,
+                    text: String::new(),
+                }));
+                open.push((slot, String::new()));
+                opened = Some(slot);
             }
         }
+        if let NodeData::Text { contents } = &node.data {
+            if let Some((_, own)) = open.last_mut() {
+                crate::counters::appended();
+                own.push_str(&contents.borrow());
+            }
+        }
+        pending.push(Step::Leave {
+            block: opened,
+            newline: false,
+        });
+        pending.extend(
+            node.children
+                .borrow()
+                .iter()
+                .rev()
+                .map(|child| Step::Enter(child.clone())),
+        );
     }
-    for child in handle.children.borrow().iter() {
-        collect_blocks(child, out);
-    }
+    out.into_iter()
+        .flatten()
+        .filter(|block| !block.text.is_empty())
+        .collect()
 }
 
 fn heading_level(name: &str) -> Option<u8> {
