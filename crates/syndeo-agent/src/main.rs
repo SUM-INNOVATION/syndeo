@@ -72,9 +72,11 @@ async fn main() -> Result<()> {
     let mut grant = sandbox::grant_for(&net_path, &shell_path);
     grant.readable.push(tool_directory.clone());
     let confinement = sandbox::confine(&grant);
-    match &confinement {
-        c if c.is_enforced() => tracing::info!(sandbox = c.describe(), "confined"),
-        c => tracing::warn!(reason = c.describe(), "not confined by the platform"),
+    match confinement.log_line() {
+        (tracing::Level::INFO, message) => {
+            tracing::info!(sandbox = confinement.describe(), "{message}")
+        }
+        (_, message) => tracing::warn!(sandbox = confinement.describe(), "{message}"),
     }
 
     let net = Endpoint::new(cli.net_socket);

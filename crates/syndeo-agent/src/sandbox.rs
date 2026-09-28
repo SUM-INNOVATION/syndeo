@@ -22,6 +22,12 @@ use std::path::{Path, PathBuf};
 pub enum Confinement {
     /// The platform is enforcing it. The description is what to print.
     Enforced(String),
+    /// The platform is enforcing some of it and not all: some of what was
+    /// asked for is not restricted. Not the same as confined, and never
+    /// reported as if it were. Only Landlock enforces partially, so only Linux
+    /// builds one.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Partial(String),
     /// It is not, and this is why. The process boundary still holds; this is
     /// reported rather than swallowed so nobody believes in a sandbox that is
     /// not there.
@@ -32,12 +38,51 @@ impl Confinement {
     pub fn describe(&self) -> &str {
         match self {
             Confinement::Enforced(what) => what,
+            Confinement::Partial(what) => what,
             Confinement::Unavailable(why) => why,
         }
     }
 
-    pub fn is_enforced(&self) -> bool {
-        matches!(self, Confinement::Enforced(_))
+    /// How to log this at start-up: the level, and the message beside the
+    /// description.
+    pub fn log_line(&self) -> (tracing::Level, &'static str) {
+        match self {
+            Confinement::Enforced(_) => (tracing::Level::INFO, "confined"),
+            Confinement::Partial(_) => (tracing::Level::WARN, "partially confined"),
+            Confinement::Unavailable(_) => (tracing::Level::WARN, "not confined by the platform"),
+        }
+    }
+}
+
+/// What a kernel whose Landlock ABI is `abi` leaves unrestricted of what this
+/// asks for, which is the ABI 4 set: files, and TCP.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn unrestricted_below(abi: u8) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if abi < 2 {
+        missing.push("renaming or linking files across directories");
+    }
+    if abi < 3 {
+        missing.push("truncating files");
+    }
+    if abi < 4 {
+        missing.push("TCP bind and connect");
+    }
+    missing
+}
+
+/// How to describe a partially enforced ruleset. The protections that are
+/// missing are named only when the kernel said which ABI it applied;
+/// otherwise nothing is guessed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn partially(effective_abi: Option<u8>) -> String {
+    match effective_abi.map(unrestricted_below) {
+        Some(missing) if !missing.is_empty() => format!(
+            "partially confined: this kernel's Landlock does not restrict {}",
+            missing.join(", ")
+        ),
+        _ => "partially confined: the kernel applied only some of the requested Landlock rules"
+            .to_string(),
     }
 }
 
@@ -209,6 +254,25 @@ mod platform {
         RulesetCreatedAttr, RulesetStatus, ABI,
     };
 
+    /// The Landlock ABI the kernel actually applied, as a level, when it said.
+    fn effective_abi(status: &landlock::LandlockStatus) -> Option<u8> {
+        let landlock::LandlockStatus::Available { effective_abi, .. } = status else {
+            return None;
+        };
+        let abi = *effective_abi;
+        Some(if abi >= ABI::V4 {
+            4
+        } else if abi >= ABI::V3 {
+            3
+        } else if abi >= ABI::V2 {
+            2
+        } else if abi >= ABI::V1 {
+            1
+        } else {
+            0
+        })
+    }
+
     pub fn confine(grant: &Grant) -> Confinement {
         // ABI v4 is the first with network restriction. Landlock's own
         // compatibility handling degrades on older kernels rather than failing,
@@ -257,10 +321,9 @@ mod platform {
             ),
             Ok(RestrictionStatus {
                 ruleset: RulesetStatus::PartiallyEnforced,
+                landlock,
                 ..
-            }) => Confinement::Enforced(
-                "Landlock: partially enforced — this kernel does not support every rule".into(),
-            ),
+            }) => Confinement::Partial(super::partially(effective_abi(&landlock))),
             Ok(_) => Confinement::Unavailable(
                 "this kernel does not support Landlock; the process boundary still holds".into(),
             ),
@@ -299,6 +362,8 @@ pub fn grant_for(net: &Path, shell: &Path) -> Grant {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// The property the sandbox exists for: after confinement, this process
     /// cannot open a socket to the outside world, cannot run another program,
     /// and cannot write a file.
@@ -386,5 +451,41 @@ mod tests {
             !dir.path().join("written").exists(),
             "the write it reported as failing actually happened"
         );
+    }
+
+    #[test]
+    fn partial_confinement_is_neither_confined_nor_unconfined() {
+        let partial = Confinement::Partial(partially(Some(3)));
+        assert!(!matches!(partial, Confinement::Enforced(_)));
+        assert_eq!(
+            partial.log_line(),
+            (tracing::Level::WARN, "partially confined")
+        );
+        assert_eq!(
+            Confinement::Enforced("x".into()).log_line(),
+            (tracing::Level::INFO, "confined")
+        );
+        assert_eq!(
+            Confinement::Unavailable("x".into()).log_line(),
+            (tracing::Level::WARN, "not confined by the platform")
+        );
+    }
+
+    #[test]
+    fn what_is_missing_is_named_only_from_the_abi_the_kernel_reported() {
+        assert_eq!(
+            partially(Some(3)),
+            "partially confined: this kernel's Landlock does not restrict TCP bind and connect"
+        );
+        assert!(partially(Some(1)).contains("truncating files"));
+        assert!(partially(Some(1)).contains("renaming or linking"));
+        assert!(unrestricted_below(4).is_empty());
+        // No ABI reported, or one with nothing missing: nothing is guessed.
+        for abi in [None, Some(4)] {
+            assert_eq!(
+                partially(abi),
+                "partially confined: the kernel applied only some of the requested Landlock rules"
+            );
+        }
     }
 }
