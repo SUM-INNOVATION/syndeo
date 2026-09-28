@@ -5,6 +5,7 @@
 
 mod auth;
 mod ca;
+mod keychain;
 mod stats;
 
 use anyhow::{Context, Result};
@@ -226,7 +227,20 @@ async fn main() -> Result<()> {
     match command {
         Command::Run(args) => run(args).await,
         Command::Ca(args) => {
-            let authority = CertificateAuthority::load_or_create(home().join("proxy"))?;
+            let dir = home().join("proxy");
+            // Nothing to untrust by is not a reason to make something: with
+            // no local authority, look for one by name instead.
+            if args.untrust
+                && untrust_without_local_ca(
+                    &dir,
+                    &keychain::Security::login()?,
+                    &keychain::Terminal,
+                    &mut std::io::stdout(),
+                )?
+            {
+                return Ok(());
+            }
+            let authority = CertificateAuthority::load_or_create(dir)?;
             if args.print {
                 print!("{}", authority.certificate_pem());
                 return Ok(());
@@ -975,6 +989,23 @@ fn text(status: StatusCode, message: &str) -> Response<Body> {
 /// keychain, so the consent is ours: nothing changes unless the user types
 /// exactly `yes`. There is no flag here to bypass it, because a browser that
 /// can silently add a root to your machine is a browser you should not run.
+/// `ca --untrust` when this home has no authority: never create one, and
+/// offer to remove any certificate carrying our name. Returns whether it
+/// handled the request, which it does exactly when there is no local
+/// certificate.
+fn untrust_without_local_ca(
+    dir: &std::path::Path,
+    keychain: &dyn keychain::Keychain,
+    ask: &dyn keychain::Ask,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<bool> {
+    if dir.join("syndeo-ca.pem").exists() {
+        return Ok(false);
+    }
+    keychain::untrust_by_name(keychain, ask, out)?;
+    Ok(true)
+}
+
 fn trust_in_login_keychain(certificate: &std::path::Path, trust: bool) -> anyhow::Result<()> {
     use std::process::Command as Exec;
 
@@ -2228,5 +2259,42 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(help.contains("--max-request-body"), "{help}");
+    }
+
+    // ------------------------------------------------ untrust with nothing local
+
+    struct Empty;
+    impl keychain::Keychain for Empty {
+        fn describe(&self) -> String {
+            "an empty test keychain".into()
+        }
+        fn find(&self, _: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        fn delete(&self, _: &str) -> anyhow::Result<()> {
+            panic!("nothing should be deleted")
+        }
+    }
+    struct Never;
+    impl keychain::Ask for Never {
+        fn confirm(&self, _: &str) -> bool {
+            panic!("nothing should be asked")
+        }
+    }
+
+    #[test]
+    fn untrusting_with_no_local_authority_creates_none() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("proxy");
+        let mut out = Vec::new();
+        assert!(untrust_without_local_ca(&dir, &Empty, &Never, &mut out).unwrap());
+        assert!(!dir.exists(), "an authority was made just to be untrusted");
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("No certificate named"));
+
+        // With a local authority the usual path applies instead.
+        CertificateAuthority::load_or_create(&dir).unwrap();
+        assert!(!untrust_without_local_ca(&dir, &Empty, &Never, &mut Vec::new()).unwrap());
     }
 }

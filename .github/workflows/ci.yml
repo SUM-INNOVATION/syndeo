@@ -72,6 +72,10 @@ jobs:
           # against the default WebKit data store, which is only acceptable on a
           # machine that is thrown away afterwards.
           SYNDEO_WEBKIT_UI_TEST: ${{ runner.os == 'macOS' && '1' || '' }}
+          # macOS only: find and delete a certificate in a throwaway keychain
+          # that the test creates, names on every command, and deletes, and
+          # which it checks leaves the user's keychain search list as it was.
+          SYNDEO_KEYCHAIN_TEST: ${{ runner.os == 'macOS' && '1' || '' }}
 
   deny:
     name: cargo-deny
