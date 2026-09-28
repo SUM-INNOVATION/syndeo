@@ -110,8 +110,8 @@ impl Supervisor {
             .spawn()
             .context("spawning the network process")?;
         self.watch(&mut child);
+        wait_ready(&mut child, endpoint.path(), "network").await?;
         self.children.push(("net".into(), child));
-        wait_for(endpoint.path()).await?;
         Ok(endpoint)
     }
 
@@ -152,8 +152,8 @@ impl Supervisor {
             .spawn()
             .context("spawning the network process")?;
         self.watch(&mut child);
+        wait_ready(&mut child, endpoint.path(), "network").await?;
         self.children.push(("net".into(), child));
-        wait_for(endpoint.path()).await?;
         Ok(endpoint)
     }
 
@@ -174,8 +174,8 @@ impl Supervisor {
             .spawn()
             .context("spawning the keystore process")?;
         self.watch(&mut child);
+        wait_ready(&mut child, endpoint.path(), "keystore").await?;
         self.children.push(("keystore".into(), child));
-        wait_for(endpoint.path()).await?;
         Ok(endpoint)
     }
 
@@ -257,15 +257,22 @@ impl Supervisor {
     }
 }
 
-/// A spawned process has to bind before anyone can connect to it.
+/// A spawned process has to bind before anyone can connect to it — and may
+/// never get that far.
 ///
 /// Waiting for the file to appear is not enough: a process killed with SIGKILL
 /// leaves its socket behind, and connecting to that gets "connection refused"
-/// rather than a wait. So the readiness check is an actual connection.
-async fn wait_for(path: &Path) -> Result<()> {
+/// rather than a wait. So readiness is an actual connection. And the child is
+/// watched at the same time: one that exits first — a missing shared library,
+/// a bad argument, a crash — is reported at once, with how it exited, instead
+/// of as a socket that never appeared ten seconds later.
+async fn wait_ready(child: &mut Child, path: &Path, name: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut last: Option<std::io::Error> = None;
     while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            bail!("{}", exited_early(name, status, cfg!(target_os = "linux")));
+        }
         match tokio::net::UnixStream::connect(path).await {
             Ok(_) => return Ok(()),
             Err(err) => last = Some(err),
@@ -276,6 +283,22 @@ async fn wait_for(path: &Path) -> Result<()> {
         Some(err) => bail!("{} never accepted a connection: {err}", path.display()),
         None => bail!("{} did not appear within ten seconds", path.display()),
     }
+}
+
+/// What to say about a child that exited before it was ready.
+fn exited_early(name: &str, status: std::process::ExitStatus, linux: bool) -> String {
+    let mut message = format!("the {name} process exited before it was ready ({status})");
+    // 127 is what the dynamic loader exits with when a shared library the
+    // binary needs is not installed — on a minimal Debian or Ubuntu, the D-Bus
+    // library the keystore's Secret Service backend links against.
+    if linux && status.code() == Some(127) {
+        message.push_str(
+            ". Exit status 127 is how the loader reports a shared library it could not \
+             load; for syndeo-keystore on Debian or Ubuntu that is usually libdbus-1-3 \
+             (apt install libdbus-1-3), and on Fedora dbus-libs",
+        );
+    }
+    message
 }
 
 /// A socket left behind by a process that was killed is worse than no socket:
@@ -318,4 +341,66 @@ fn search_path(name: &str) -> Option<PathBuf> {
                 .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
                 .unwrap_or(false)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sh(script: &str) -> Child {
+        Command::new("/bin/sh")
+            .args(["-c", script])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_service_that_exits_first_is_reported_at_once_with_its_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let err = wait_ready(&mut sh("exit 3"), &dir.path().join("never.sock"), "network")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the network process exited before it was ready"),
+            "{err}"
+        );
+        assert!(err.contains("3"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it waited for the socket instead of noticing the exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_that_binds_late_is_still_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.sock");
+        let binding = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let listener = tokio::net::UnixListener::bind(&path).unwrap();
+                let _ = listener.accept().await;
+            })
+        };
+        wait_ready(&mut sh("exec sleep 30"), &path, "keystore")
+            .await
+            .unwrap();
+        binding.await.unwrap();
+    }
+
+    #[test]
+    fn a_missing_library_on_linux_is_named() {
+        use std::os::unix::process::ExitStatusExt;
+        let loader = std::process::ExitStatus::from_raw(127 << 8);
+        let said = exited_early("keystore", loader, true);
+        assert!(said.contains("libdbus-1-3"), "{said}");
+        // Anywhere else, and for any other status, no guess is offered.
+        assert!(!exited_early("keystore", loader, false).contains("libdbus"));
+        let other = std::process::ExitStatus::from_raw(3 << 8);
+        assert!(!exited_early("keystore", other, true).contains("libdbus"));
+    }
 }
