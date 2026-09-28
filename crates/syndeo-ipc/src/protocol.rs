@@ -176,6 +176,10 @@ pub enum KeystoreRequest {
     Unseal { passphrase: Option<String> },
     /// Forget the unsealed material.
     Lock,
+    /// What, right now, would make the keystore forget its seed. Added in
+    /// 0.1.4, after every earlier request: a 0.1.3 keystore does not know it
+    /// and closes the connection, which the caller reads as "unknown".
+    SessionProtection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +214,30 @@ pub enum KeystoreResponse {
     },
     Ok,
     Error(String),
+    /// The answer to [`KeystoreRequest::SessionProtection`]: the facts, as the
+    /// keystore process finds them at the moment it is asked, for this
+    /// session rather than for the platform in general.
+    SessionProtection {
+        initialized: bool,
+        unsealed: bool,
+        /// After how many idle seconds the seed is forgotten, if ever.
+        idle_timeout_secs: Option<u64>,
+        /// Whether a suspend is noticed, by wall time jumping past monotonic
+        /// time, and ends the session.
+        sleep_detection: bool,
+        screen_lock: ScreenLockReport,
+    },
+}
+
+/// Whether this session's screen lock can be observed, and if so its state.
+///
+/// `NotReported` is the honest answer on a platform that does not say, and
+/// on one that does but not for this session — macOS with no window server,
+/// as over ssh — and it means no screen lock will forget the seed here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScreenLockReport {
+    Reported { locked: bool },
+    NotReported,
 }
 
 // -------------------------------------------------------------- agent process
@@ -465,6 +493,33 @@ mod tests {
         for line in &expected[7..] {
             let read: super::KeystoreResponse = serde_json::from_str(line).unwrap();
             assert_eq!(&serde_json::to_string(&read).unwrap(), line);
+        }
+    }
+
+    #[test]
+    fn the_session_protection_pair_is_new_and_round_trips() {
+        use super::{KeystoreRequest, KeystoreResponse, ScreenLockReport};
+        assert_eq!(
+            serde_json::to_string(&KeystoreRequest::SessionProtection).unwrap(),
+            r#""SessionProtection""#
+        );
+        let answer = KeystoreResponse::SessionProtection {
+            initialized: true,
+            unsealed: false,
+            idle_timeout_secs: None,
+            sleep_detection: true,
+            screen_lock: ScreenLockReport::Reported { locked: false },
+        };
+        let wire = serde_json::to_string(&answer).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"SessionProtection":{"initialized":true,"unsealed":false,"idle_timeout_secs":null,"sleep_detection":true,"screen_lock":{"Reported":{"locked":false}}}}"#
+        );
+        let read: KeystoreResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(serde_json::to_string(&read).unwrap(), wire);
+        // None of it is spelled like any message that existed before.
+        for line in expected_wire() {
+            assert!(!line.contains("SessionProtection"));
         }
     }
 }

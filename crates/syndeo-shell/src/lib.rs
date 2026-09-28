@@ -9,6 +9,7 @@
 //! knowing about the keystore is [`Prompter`]. Asking a human is the shell's
 //! job; *how* it asks is the front end's.
 
+pub mod doctor;
 pub mod prompt;
 pub mod service;
 pub mod signing;

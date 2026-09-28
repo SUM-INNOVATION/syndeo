@@ -7,7 +7,7 @@ use crate::keystore::{Keystore, KeystoreError};
 use std::sync::Arc;
 use std::time::Duration;
 use syndeo_ipc::confirm::Confirmer;
-use syndeo_ipc::protocol::{KeystoreRequest, KeystoreResponse};
+use syndeo_ipc::protocol::{KeystoreRequest, KeystoreResponse, ScreenLockReport};
 use syndeo_ipc::transport::Server;
 use zeroize::Zeroizing;
 
@@ -97,6 +97,23 @@ pub fn handle(
             },
             Err(err) => refuse(err),
         },
+
+        KeystoreRequest::SessionProtection => {
+            let status = keystore.status();
+            KeystoreResponse::SessionProtection {
+                initialized: status.initialized,
+                unsealed: status.unsealed,
+                idle_timeout_secs: status.idle_timeout_secs,
+                // Checked on every tick of the loop above, on every platform.
+                sleep_detection: true,
+                // Asked now, of this session: the same question the idle
+                // watch asks before it decides the screen has locked.
+                screen_lock: match crate::session::screen_is_locked() {
+                    Some(locked) => ScreenLockReport::Reported { locked },
+                    None => ScreenLockReport::NotReported,
+                },
+            }
+        }
 
         KeystoreRequest::Status => {
             let status = keystore.status();
@@ -252,5 +269,41 @@ mod tests {
             assert!(!wrapping.exists().unwrap());
             assert!(!keystore.status().initialized);
         }
+    }
+
+    #[test]
+    fn session_protection_reports_this_keystore_and_this_session() {
+        let (_dir, keystore, _) = keystore();
+        let before = handle(&keystore, &confirmer(), KeystoreRequest::SessionProtection);
+        let KeystoreResponse::SessionProtection {
+            initialized,
+            unsealed,
+            sleep_detection,
+            screen_lock,
+            ..
+        } = before
+        else {
+            panic!("not answered: {before:?}");
+        };
+        assert!(!initialized && !unsealed && sleep_detection);
+        // Whatever this machine's session says, and nothing it does not.
+        let expected = match crate::session::screen_is_locked() {
+            Some(locked) => ScreenLockReport::Reported { locked },
+            None => ScreenLockReport::NotReported,
+        };
+        assert_eq!(screen_lock, expected);
+
+        keystore.initialize(Some(PASS)).unwrap();
+        let after = handle(&keystore, &confirmer(), KeystoreRequest::SessionProtection);
+        assert!(
+            matches!(
+                after,
+                KeystoreResponse::SessionProtection {
+                    initialized: true,
+                    ..
+                }
+            ),
+            "{after:?}"
+        );
     }
 }

@@ -583,7 +583,7 @@ async fn doctor(home: &std::path::Path) -> Result<()> {
 
     let secret = SessionSecret::generate();
     let mut supervisor = Supervisor::new(home);
-    match supervisor.start_keystore(&secret).await {
+    let session = match supervisor.start_keystore(&secret).await {
         Ok(endpoint) => {
             let mut channel = Channel::connect(&endpoint).await?;
             if let KeystoreResponse::Status {
@@ -603,16 +603,19 @@ async fn doctor(home: &std::path::Path) -> Result<()> {
                     None => println!("                idle auto-lock off"),
                 }
             }
+            syndeo_shell::doctor::session_facts(&mut channel).await
         }
-        Err(err) => println!("keystore        not reachable: {err}"),
-    }
+        Err(err) => {
+            println!("keystore        not reachable: {err}");
+            syndeo_shell::doctor::SessionFacts::Unreachable
+        }
+    };
     supervisor.shutdown().await;
 
     println!();
     println!("boundaries");
-    println!("  renderers and the agent reach the network only through the net process");
-    println!("  the agent has no keystore socket and no session secret");
-    println!("  the keystore signs only what the shell confirmed, once, for one payload");
-    println!("  the seed is forgotten on idleness, on sleep, and on screen lock");
+    for line in syndeo_shell::doctor::boundaries(syndeo_shell::doctor::Platform::this(), session) {
+        println!("  {line}");
+    }
     Ok(())
 }
