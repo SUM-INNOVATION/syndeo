@@ -113,6 +113,48 @@ version_at_least() {
     [ "$have_patch" -ge "$want_patch" ]
 }
 
+# profile_for <login shell> <operating system>
+#
+# The file an `export PATH=...` line belongs in for that shell, as a user would
+# type it, or `fish` for fish, which has a command of its own for this.
+profile_for() {
+    case "${1##*/}" in
+        zsh) echo '~/.zshrc' ;;
+        # macOS Terminal opens login shells, which read .bash_profile and not
+        # .bashrc; a Linux terminal opens interactive ones, which do the reverse.
+        bash) if [ "$2" = Darwin ]; then echo '~/.bash_profile'; else echo '~/.bashrc'; fi ;;
+        fish) echo fish ;;
+        *) echo '~/.profile' ;;
+    esac
+}
+
+# keystore_check <install dir> <scratch dir>
+#
+# On Linux, whether the keystore can start at all. It links libdbus-1.so.3 for
+# the credential store, and a machine without it gets a keystore that the
+# loader refuses before main, which every later command reported only as a
+# ten-second timeout. A warning, not a failure: browsing, the proxy and the
+# window work without the keystore.
+keystore_check() {
+    [ "$(uname -s)" = Linux ] || return 0
+    status=0
+    "$1/syndeo-keystore" --version >/dev/null 2>"$2/keystore.err" || status=$?
+    [ "$status" -eq 0 ] && return 0
+    first="$(head -n 1 "$2/keystore.err")"
+    say "warning: syndeo-keystore did not start (exit ${status}): ${first:-no message}"
+    say "  Keys, signing and site identities need it; browsing does not."
+    say "  The usual cause is a missing libdbus-1.so.3. Install it with"
+    say "    sudo apt-get install libdbus-1-3     (Debian, Ubuntu)"
+    say "    sudo dnf install dbus-libs           (Fedora)"
+    say "  and check with: syndeo-keystore --version"
+    if command -v ldconfig >/dev/null 2>&1; then
+        if ! ldconfig -p 2>/dev/null | grep -q 'libdbus-1\.so\.3'; then
+            say "  (ldconfig does not list libdbus-1.so.3 on this machine.)"
+        fi
+    fi
+    say ""
+}
+
 verify() {
     # verify <tarball> <sums file> <name inside the sums file>
     # Matched as a whole field rather than by pattern: a file name has dots in
@@ -211,12 +253,19 @@ fi
 say "  installed to ${INSTALL_DIR}"
 say ""
 
+keystore_check "$INSTALL_DIR" "$work"
+
 case ":${PATH}:" in
     *":${INSTALL_DIR}:"*) ;;
     *)
         say "${INSTALL_DIR} is not on your PATH. Add it:"
         say ""
-        say "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.profile"
+        profile="$(profile_for "${SHELL:-sh}" "$(uname -s)")"
+        if [ "$profile" = fish ]; then
+            say "  fish_add_path ${INSTALL_DIR}"
+        else
+            say "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ${profile}"
+        fi
         say ""
         ;;
 esac
