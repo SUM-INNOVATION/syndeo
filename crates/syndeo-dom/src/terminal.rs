@@ -49,25 +49,35 @@ pub fn multiline(text: &str) -> Cow<'_, str> {
 }
 
 /// For anything that must stay on one line — a title, a URL, a link's text,
-/// an attribute, a table cell. Line breaks, tabs, carriage returns and the
-/// Unicode separators become spaces, every other control and format character
-/// goes, and runs of whitespace collapse to one space. Apply before
-/// truncating or padding, so widths are counted on what is shown.
+/// an attribute, a table cell. Every whitespace character, as
+/// `char::is_whitespace` has it — line breaks, tabs, the Unicode separators,
+/// no-break, em, ideographic and the other Unicode spaces — becomes an
+/// ordinary space, runs of them collapse to one, and every other control and
+/// format character goes. Apply before truncating or padding, so widths are
+/// counted on what is shown.
 pub fn single_line(text: &str) -> Cow<'_, str> {
-    let clean = !text
-        .chars()
-        .any(|c| unprintable(c) || c == '\u{2028}' || c == '\u{2029}')
-        && !text.contains("  ");
+    let mut previous_space = false;
+    let clean = text.chars().all(|c| {
+        let fine = if c == ' ' {
+            !previous_space
+        } else {
+            !c.is_whitespace() && !unprintable(c)
+        };
+        previous_space = c == ' ';
+        fine
+    });
     if clean {
         return Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len());
     let mut space = false;
     for c in text.chars() {
-        let c = match c {
-            '\n' | '\t' | '\r' | '\u{2028}' | '\u{2029}' => ' ',
-            c if unprintable(c) => continue,
-            c => c,
+        let c = if c.is_whitespace() {
+            ' '
+        } else if unprintable(c) {
+            continue;
+        } else {
+            c
         };
         if c == ' ' {
             if space {
@@ -113,6 +123,25 @@ mod tests {
         assert_eq!(multiline(text), "line one\n\tindented\nline three\nfour");
         assert_eq!(single_line(text), "line one indented line three four");
         assert!(!single_line(text).contains('\n'));
+    }
+
+    #[test]
+    fn every_kind_of_whitespace_is_one_ordinary_space_on_a_single_line() {
+        // No-break, en quad, em, thin, hair, narrow no-break, medium
+        // mathematical, ideographic, next line, line and paragraph
+        // separators, vertical tab and form feed, among ordinary ones.
+        let text = "a\u{a0}b\u{2000}\u{2003}c\u{2009}\u{200a}d\u{202f}e\u{205f}f\u{3000}g\
+                    \u{85}h\u{2028}\u{2029}i\u{b}\u{c}j \u{a0} \u{3000} k";
+        assert_eq!(single_line(text), "a b c d e f g h i j k");
+        for c in (0..=0x10ffff)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_whitespace())
+        {
+            let input = format!("x{c}{c}y");
+            assert_eq!(single_line(&input), "x y", "U+{:04X}", c as u32);
+        }
+        // Padding then lines up, because every space is one column.
+        assert_eq!(single_line("\u{3000}\u{3000}x"), " x");
     }
 
     #[test]

@@ -1090,14 +1090,16 @@ mod tests {
     }
 
     /// Signing validation and terminal display are separate, and the first is
-    /// unchanged by the second: every character the display filter replaces
-    /// or removes is one signing already refuses, or ordinary whitespace.
+    /// unchanged by the second: every character the display filter removes is
+    /// one signing already refuses. What it only turns into an ordinary space
+    /// — the Unicode spaces — shows as a space in the signing prompt too.
     #[test]
     fn signing_refuses_at_least_everything_the_display_filter_cleans() {
         for c in (0..=0x10FFFFu32).filter_map(char::from_u32) {
             let text = c.to_string();
             let cleaned = syndeo_dom::terminal::single_line(&text);
-            if cleaned != text && !matches!(c, ' ') {
+            let spaced = c.is_whitespace() && cleaned == " ";
+            if cleaned != text && !spaced {
                 assert!(
                     is_unshowable(c),
                     "U+{:04X} is cleaned for display but accepted for signing",
