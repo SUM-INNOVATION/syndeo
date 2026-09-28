@@ -16,8 +16,41 @@ use zeroize::Zeroizing;
 /// demand, which is a different question from how large the web is allowed to be.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
-/// What a frame is encoded into before it has to grow.
-const SMALL_FRAME: usize = 4 * 1024;
+/// What a frame is encoded into before it first has to grow.
+const INITIAL_FRAME: usize = 4 * 1024;
+
+/// What a frame is encoded into. It never lets go of memory it has written
+/// to without wiping it first: when it has to grow, it copies into a larger
+/// allocation and wipes the old one, all of it, before that is freed. A
+/// `Vec` left to grow by itself reallocates, and may free the old block with
+/// the message still in it, whatever size the message is.
+struct WipingBuffer(Zeroizing<Vec<u8>>);
+
+impl WipingBuffer {
+    fn new() -> Self {
+        WipingBuffer(Zeroizing::new(Vec::with_capacity(INITIAL_FRAME)))
+    }
+}
+
+impl std::io::Write for WipingBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let needed = self.0.len() + bytes.len();
+        if needed > self.0.capacity() {
+            let mut larger = Vec::with_capacity(needed.max(self.0.capacity() * 2));
+            larger.extend_from_slice(&self.0);
+            // The old allocation is wiped, spare capacity included, as it is
+            // dropped here.
+            self.0 = Zeroizing::new(larger);
+        }
+        // Within capacity, so this never reallocates.
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
@@ -45,15 +78,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
         Framed { stream }
     }
 
-    /// Every frame's bytes are wiped once they are written or read: a
-    /// keystore request can carry a passphrase, and its JSON holds it as
-    /// plainly as the message did. A message smaller than [`SMALL_FRAME`] —
-    /// every one that carries a secret — is encoded without the buffer ever
-    /// growing, so there is no earlier, unwiped copy left behind by a
-    /// reallocation.
+    /// Every frame's bytes are wiped once they are written or read, and so is
+    /// every allocation the encoding outgrew on the way (see
+    /// [`WipingBuffer`]): a keystore request can carry a passphrase of any
+    /// length, and its JSON holds it as plainly as the message did.
     pub async fn send<T: Serialize>(&mut self, message: &T) -> Result<(), FrameError> {
-        let mut body = Zeroizing::new(Vec::with_capacity(SMALL_FRAME));
-        serde_json::to_writer(&mut *body, message)?;
+        let mut buffer = WipingBuffer::new();
+        serde_json::to_writer(&mut buffer, message)?;
+        let body = buffer.0;
         if body.len() as u64 > MAX_FRAME as u64 {
             return Err(FrameError::TooLarge(body.len() as u32));
         }
