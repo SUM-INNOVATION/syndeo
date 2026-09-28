@@ -2,7 +2,10 @@
 //!
 //! Rule one of the process model: renderers never talk to the network directly.
 //! They send a [`FetchRequest`] and receive a [`FetchResponse`]. Sockets, DNS,
-//! certificates and the cache all live behind that call.
+//! certificates and the cache all live behind that call. That holds for the
+//! renderers this process serves — `syndeo-ui`, `syndeo-servo` and the agent —
+//! and not for `syndeo-webkit`, whose WebKit opens its own sockets and is only
+//! configured to go through `syndeo-proxy`.
 
 pub mod body;
 pub mod config;

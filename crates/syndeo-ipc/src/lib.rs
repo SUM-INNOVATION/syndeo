@@ -4,7 +4,11 @@
 //! rather than by convention:
 //!
 //! 1. **Renderers never talk to the network.** They hold a [`Channel`] speaking
-//!    [`NetRequest`], and nothing else. There is no socket to open.
+//!    [`NetRequest`], and nothing else. There is no socket to open. That is the
+//!    renderers this process model serves: `syndeo-ui`, `syndeo-servo` and the
+//!    agent. `syndeo-webkit` is not one of them — WebKit opens its own sockets,
+//!    configured to go through `syndeo-proxy`, and was seen to bypass it for
+//!    localhost and loopback addresses.
 //! 2. **The agent never talks to the keystore.** The agent's protocol
 //!    ([`ShellRequest`]) has no keystore variant. It can ask the shell to prompt
 //!    a human; it cannot ask for a signature directly, and it is never given the

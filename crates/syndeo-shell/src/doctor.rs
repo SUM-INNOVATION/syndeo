@@ -83,7 +83,8 @@ pub fn boundaries(platform: Platform, keystore: SessionFacts) -> Vec<String> {
     if platform == Platform::MacOs {
         lines.push(
             "syndeo-webkit is outside that: WebKit sends traffic to syndeo-proxy by its proxy \
-             setting, which does not cover every transport (see the README)"
+             setting, which does not cover every transport, and was seen to bypass it for \
+             localhost and loopback addresses (see the README)"
                 .to_string(),
         );
     }
@@ -232,6 +233,9 @@ mod tests {
         let mac = joined(Platform::MacOs, SessionFacts::Unknown);
         assert!(mac.contains("syndeo-webkit is outside that"), "{mac}");
         assert!(mac.contains("does not cover every transport"), "{mac}");
+        // Seen, not inferred: a page's requests to localhost and loopback
+        // addresses went direct, never to the proxy.
+        assert!(mac.contains("localhost and loopback"), "{mac}");
         let other = joined(Platform::Other, SessionFacts::Unknown);
         assert!(!other.contains("syndeo-webkit"), "{other}");
         for said in [mac, other] {

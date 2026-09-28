@@ -17,7 +17,9 @@ curl -fsSL https://raw.githubusercontent.com/SUM-INNOVATION/syndeo/main/install.
 It downloads the release built for your machine, checks it against the published
 `SHA256SUMS`, and puts the binaries in `~/.local/bin`. No `sudo`, and nothing
 written outside your home directory. `SYNDEO_INSTALL_DIR` moves them;
-`SYNDEO_VERSION` pins a version.
+`SYNDEO_VERSION` pins a version. If that directory is not on your `PATH`, it
+says which file to add it to for your shell. On Linux it also checks that the
+keystore can start, and says what to install if it cannot (see below).
 
 They all have to live in the same directory. The shell starts the network
 process and the keystore by looking beside itself, which is what keeps a build
@@ -43,14 +45,20 @@ unpacking one yourself does the same thing.
 - **Linux with glibc 2.35 or later** — Ubuntu 22.04, Debian 12, Fedora 36, and
   anything since. `syndeo-ui` additionally wants a Wayland or X11 session and a
   GPU that Vulkan or GL can reach.
+- **`libdbus-1.so.3` on Linux, for the keystore** — `libdbus-1-3` on Debian and
+  Ubuntu, `dbus-libs` on Fedora. A desktop install has it; a minimal server or
+  container image may not, and then the keystore cannot start at all. The
+  installer checks and says so, and `syndeo` reports a keystore that exits
+  before it is ready, rather than waiting for it.
 - **A Secret Service implementation on Linux** — gnome-keyring or KWallet —
   before `syndeo-keystore init` will work, because the wrapping key is never a
   file we wrote. Everything that is not the keystore runs headless.
 - **Windows and ChromeOS**: not yet, and tracked at
   [#17](https://github.com/SUM-INNOVATION/syndeo/issues/17).
 
-**The macOS binaries are not signed or notarized.** v0.1.3 carries no
-Developer ID signature and has not been through Apple's notary service.
+**The macOS binaries are not signed or notarized.** No release so far, v0.1.4
+included, carries a Developer ID signature or has been through Apple's notary
+service.
 Installed with the one-liner above, the binaries are not quarantined and run.
 An archive downloaded in a browser is quarantined, and Gatekeeper rejects its
 unsigned executables — use the one-liner instead. Unsigned also means the
@@ -77,8 +85,10 @@ refactorable; get them wrong and no amount of later work recovers it.
    and the renderer itself opens no socket. `syndeo-webkit` holds to something
    weaker: its web view is configured to send its HTTP and HTTPS traffic
    through `syndeo-proxy`, in front of `syndeo-net`. That is a configuration,
-   not a sandbox, and it does not cover transports WebKit sends outside its
-   proxy setting — WebRTC is the obvious one, and has not been measured.
+   not a sandbox, and it has exceptions. WebKit was seen to send requests for
+   localhost and loopback addresses directly, never to the proxy. And it does
+   not cover transports WebKit sends outside its proxy setting — WebRTC is the
+   obvious one, and has not been measured.
 2. **The agent never talks to the keystore.** `ShellRequest` has no keystore
    variant, so there is nothing to call. The agent is not told where the keystore
    listens, and it refuses to start if it finds a session secret in its
@@ -102,7 +112,7 @@ refactorable; get them wrong and no amount of later work recovers it.
 | `syndeo-shell` | the process model and the prompt, as a library, plus the `syndeo` command |
 | `syndeo-ui` | the windowed shell: winit, wgpu, egui, accesskit |
 | `syndeo-servo` | Servo embedded, with its resource loading replaced by the net process |
-| `syndeo-webkit` | WebKit embedded, configured to send its traffic through syndeo-proxy, with the proxy's certificate pinned — the one that plays video (macOS) |
+| `syndeo-webkit` | WebKit embedded, configured to send its traffic through syndeo-proxy (localhost and loopback excepted), with the proxy's certificate pinned — the one that plays video (macOS) |
 | `syndeo-proxy` | a local intercepting proxy, to measure the cache on real traffic |
 
 ## Build order
@@ -215,9 +225,17 @@ syndeo-webkit https://www.youtube.com/watch?v=wXtngLBkK4Q
 
 macOS only. This is the one that plays video: WebKit for the engine, so Media
 Source Extensions and adaptive streaming work, with its HTTP and HTTPS loads —
-the DASH segments included — going through `syndeo-proxy` into our own cache. It starts
-that proxy itself, and stops it again however it exits. The installer puts it
-beside the proxy from 0.1.3 on.
+the DASH segments included — going through `syndeo-proxy` into our own cache,
+except loads of localhost and loopback addresses, which WebKit was seen to
+make directly. It starts that proxy itself, on a port the system picks, and
+stops it again however it exits. That proxy answers only this browser: every
+request to it has to carry a credential made for this launch, which WebKit is
+given and nothing else on the machine is. The installer puts it beside the
+proxy from 0.1.3 on.
+
+Plain `http://` pages load through it from 0.1.4 on. In 0.1.3 every one of
+them failed: WebKit sends them down a `CONNECT` tunnel as plain HTTP, and the
+proxy expected TLS inside every tunnel.
 
 If you unpacked the 0.1.2 archive by hand and ran its `syndeo-webkit`, upgrade:
 that build's proxy followed redirects itself, so a page could run as the site
@@ -234,8 +252,10 @@ Servo asks the embedder about every load. WebKit will not do that —
 configured to send its traffic through syndeo-proxy, with the proxy's
 certificate pinned. That is a configuration WebKit honours for the loads it
 makes, not a sandbox Syndeo controls and not something the kernel enforces.
-Anything WebKit does not send through its proxy setting is not covered by it;
-see *Known gaps*.
+Anything WebKit does not send through its proxy setting is not covered by it:
+requests for localhost and loopback addresses, which WebKit was seen to send
+directly, are one such case, and WebRTC's transports may be another; see
+*Known gaps*.
 
 The trust step is not decoration. Caching HTTPS means terminating it, and
 WebKit validates subresources in its *networking* process, which never consults
@@ -272,6 +292,21 @@ The second fetch reports `cache`. `--full` lists links, forms, and every
 subresource with whether it declared an integrity hash — which is the same thing
 as whether it is eligible for peer fetch.
 
+Everything a page supplies is printed without its control and format
+characters, so a page cannot move the cursor, clear the screen, set the
+clipboard or reorder text in your terminal. `--json` is left as it is: JSON
+escapes those characters itself.
+
+Parsing a page is bounded. Some markup costs html5ever far more than its size —
+a one-megabyte page nested two hundred thousand deep takes html5ever alone 48
+seconds in a release build — so
+every page is parsed against a fixed budget of work, and one that would cost
+more is parsed only as far as the budget goes. `browse` says when a page was cut
+short, and how much of it was parsed; `--json` gives the same as `cut_short`,
+which is `null` for a page parsed whole. That bounds the work of parsing a body
+that has arrived. How large a body is accepted at all is a separate limit, the
+network process's, 64 MiB by default.
+
 ### Measure the cache on real traffic
 
 ```sh
@@ -285,6 +320,12 @@ syndeo-proxy run           # listens on 127.0.0.1:8899
 Every response carries `x-syndeo-source`: `cache`, `revalidated`, `origin`,
 `peer`, `stale-on-error`, or `pass-through`. Statistics are at
 `http://syndeo.local/stats` through the proxy, or `syndeo-proxy stats`.
+
+A request body larger than `--max-request-body` (64 MiB by default) is refused
+with 413 before it reaches the origin. A `syndeo-proxy run` like this one asks
+its clients for no credential, so anything on the machine that can reach
+127.0.0.1:8899 can use it while it runs; only the proxy `syndeo-webkit` starts
+for itself requires one.
 
 The proxy has a cache of its own, at `<SYNDEO_HOME>/proxy/cache` (`--cache`
 moves it), apart from the one `syndeo browse` and the other command-line tools
@@ -310,6 +351,11 @@ syndeo sign --origin https://wallet.test --message "transfer 10 SUM" \
 the confirmation, which is legitimate only because the user typed the payload;
 it is not reachable from the agent boundary.
 
+The purpose you give is shown and bound into the shell's confirmation, but it
+is not part of what is signed: the signature is a plain ed25519 signature over
+the payload, so anything verifying it cannot tell a login from a transaction.
+Changing that changes every signature, and is left for a later release.
+
 ### The agent
 
 ```sh
@@ -317,6 +363,10 @@ syndeo agent "read https://www.rust-lang.org/"
 syndeo agent "crawl https://www.rust-lang.org/"
 syndeo agent "sign https://wallet.test anything"     # goes in front of a human
 ```
+
+The agent can also ask for your identity at a site — the public key and
+address that site sees. The shell checks the origin, then asks you before the
+keystore is asked anything; a run with nobody to ask declines.
 
 ### Peer fetch
 
@@ -327,6 +377,12 @@ syndeo browse https://example.test/ --peer /ip4/10.0.0.5/tcp/4001
 
 A peer is asked only for a body the page already named by hash. No declared
 integrity, no peer request.
+
+What a node offers to peers is as narrow: only bodies it stored itself and
+has checked against a hash some page declared. A peer can ask for one by that
+hash, or by its content address; any other body is answered as one the node
+does not have. A body it got from a peer is used for the request and not kept,
+so it is not offered on.
 
 To seed rather than browse, run a node that stays up:
 
@@ -501,9 +557,20 @@ at `crates/syndeo-keystore/Syndeo.entitlements`; a real signing identity is
 required, since ad-hoc signing with that entitlement produces a binary the kernel
 kills at launch.
 
-The keystore also forgets the seed on its own: after five idle minutes, when the
-machine has slept, or when the screen has locked. A signature after that costs a
-passphrase prompt rather than the operation.
+The keystore also forgets the seed on its own, and how depends on the platform
+and the session:
+
+- **When the machine has slept**, on every platform: the keystore notices wall
+  time jumping past its monotonic clock.
+- **After five idle minutes**, the default idle timeout.
+- **When the screen locks, on macOS only, and only in a session that reports
+  it** — a graphical login. Over ssh, or run as a daemon, macOS does not report
+  the screen lock, and locking it forgets nothing. Linux does not report it at
+  all.
+
+`syndeo doctor` asks the running keystore which of these hold for it, now, and
+says only those. A signature after the seed is forgotten costs a passphrase
+prompt rather than the operation.
 
 The SLIP-0044 coin type in `derive.rs` is **pinned** at 8848 and documented as
 SUM's by declaration rather than by allocation. A committed test vector — a
@@ -529,15 +596,19 @@ Before handing a release to anyone, check the thing that was published rather
 than the thing that was built:
 
 ```sh
-ci/verify-release.sh 0.1.3
+ci/verify-release.sh 0.1.4
 ```
 
 It installs from the release with the same one-liner the README gives, into a
 throwaway directory, and then asks the installed binaries to demonstrate what
 has broken before — a cache hit that is served and then forgotten, a proxy that
-turns every Google host into a 502, binaries that cannot find each other. Every
-check in it exists because something it covers once shipped broken. It exits
-non-zero, so it can gate a release rather than decorate one.
+turns every Google host into a 502, binaries that cannot find each other, a
+`doctor` that claims protection the session does not have. Every check in it
+exists because something it covers once shipped broken. It exits non-zero, so
+it can gate a release rather than decorate one. `ci/verify-release.sh
+--self-test` checks its judgement against stand-ins, and `ci/test-install.sh`
+runs the installer against a release built on the spot; CI runs both, on Linux
+and macOS.
 
 `.github/workflows/release.yml` refuses a tag that disagrees with the workspace
 version, builds the three targets, signs and notarizes the macOS binaries when
@@ -587,7 +658,17 @@ is a set of honest limits rather than work waiting to be done:
   been measured in `syndeo-webkit`.
 - WebRTC in `syndeo-webkit` is not covered by the proxy configuration, and
   whether WebKit sends its WebRTC traffic anywhere else has not been measured.
+- `syndeo-webkit` sends requests for localhost and loopback addresses
+  directly, not through the proxy. That was observed while testing the proxy's
+  authentication, not inferred. Such requests reach local services without the
+  proxy, and are neither cached nor counted by it.
 - The proxy and `syndeo-webkit` share an unpartitioned cache.
+- A plain `syndeo-proxy run` asks for no credential; only the proxy
+  `syndeo-webkit` starts does. Neither limits how many connections it accepts.
+- Signatures do not say what they are for. The purpose is bound into the
+  shell's confirmation, not into the signature.
+- A page that would cost the parser more than its fixed budget is read only as
+  far as the budget goes, and says so.
 
 Two things are done but not *demonstrated* on an ordinary developer machine, and
 both say so where you would meet them:
@@ -595,9 +676,11 @@ both say so where you would meet them:
 - Secure Enclave presence needs a signed build (#1's binding is in the tree;
   `syndeo-keystore status` reports which side of that line you are on).
 - The agent's Landlock confinement compiles for Linux and has not been exercised
-  on a Linux kernel from here. macOS Seatbelt confinement is tested, including a
-  case that builds a fixture and holds TCP, UDP, file writes and `exec` to
-  failing.
+  on a Linux kernel from here. Where a kernel applies only part of the ruleset,
+  the agent says it is partially confined and names what that kernel cannot
+  restrict — below Landlock ABI 4, for instance, TCP. macOS Seatbelt
+  confinement is tested, including a case that builds a fixture and holds TCP,
+  UDP, file writes and `exec` to failing.
 
 ## Tests
 
@@ -605,8 +688,10 @@ both say so where you would meet them:
 cargo test --workspace
 ```
 
-About three hundred on macOS, and a dozen or so fewer on Linux, where the
-Seatbelt, keychain and WebKit tests do not run. The RFC 9111 conformance suite,
+About 470 on macOS and 450 on Linux, where the Seatbelt, keychain and WebKit
+tests do not run. Two macOS tests drive the real WebKit data store and a
+throwaway keychain, and run only where `SYNDEO_WEBKIT_UI_TEST=1` and
+`SYNDEO_KEYCHAIN_TEST=1` are set, as CI's macOS runner sets them. The RFC 9111 conformance suite,
 `crates/syndeo-cache/tests/rfc9111.rs`, files its 51 cases under the section of
 the RFC each one covers.
 

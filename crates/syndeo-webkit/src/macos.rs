@@ -20,8 +20,10 @@
 //! for the loads it makes, not a sandbox Syndeo controls and not a rule the
 //! kernel enforces. Servo's claim was "the renderer opens no socket"; this one
 //! is only that the web view is configured to use the proxy. Anything WebKit
-//! does not send through that setting is not covered by it — WebRTC's own
-//! transports are the obvious candidate, and are not yet measured.
+//! does not send through that setting is not covered by it. Requests for
+//! localhost and loopback addresses are one such case, observed: WebKit sent
+//! them directly and never to the proxy. WebRTC's own transports are another
+//! candidate, not yet measured.
 //!
 //! Caching HTTPS means terminating it, so the proxy presents certificates it
 //! issued, and two things make WebKit accept them. The authority is trusted
@@ -48,7 +50,13 @@ use wry::{WebView, WebViewBuilder};
 #[command(
     name = "syndeo-webkit",
     version,
-    about = "A renderer configured to send its traffic through syndeo-proxy, with the proxy's certificate pinned"
+    about = "A renderer configured to send its traffic through syndeo-proxy, with the proxy's certificate pinned",
+    long_about = "A renderer configured to send its traffic through syndeo-proxy, with the \
+                  proxy's certificate pinned.\n\n\
+                  The proxy is a setting WebKit honours, not a boundary Syndeo enforces. \
+                  WebKit was seen to send requests for localhost and loopback addresses \
+                  directly, never to the proxy, and transports it does not send through the \
+                  setting, such as WebRTC's, are not covered."
 )]
 struct Cli {
     /// The page to open.
@@ -71,7 +79,8 @@ struct Cli {
     #[arg(long)]
     autoplay: bool,
     /// Where the proxy is listening. The web view is configured to send its
-    /// HTTP and HTTPS traffic through it.
+    /// HTTP and HTTPS traffic through it, except for localhost and loopback
+    /// addresses, which WebKit was seen to reach directly.
     ///
     /// Optional only so the two halves can be told apart when something does
     /// not load: without it this is an ordinary web view, and if that fails too
@@ -146,7 +155,9 @@ pub fn run() -> Result<()> {
             let (host, port) = spec.rsplit_once(':').context("--proxy wants host:port")?;
             tracing::info!(
                 proxy = %spec,
-                "the web view is configured to send its HTTP and HTTPS traffic through this proxy"
+                "the web view is configured to send its HTTP and HTTPS traffic through this \
+                 proxy, except for localhost and loopback addresses, which WebKit was seen to \
+                 reach directly"
             );
             Some(proxied::ProxyTarget {
                 host: host.to_string(),
@@ -798,6 +809,11 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(
             help.contains("configured to send its HTTP and HTTPS traffic through it"),
+            "{help}"
+        );
+        // And the exception that was seen, wherever it says so.
+        assert!(
+            help.matches("localhost and loopback").count() >= 2,
             "{help}"
         );
         for overclaim in [

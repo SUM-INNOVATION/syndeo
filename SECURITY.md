@@ -28,7 +28,12 @@ on:
    filesystem posture, the wrapping key in the credential store, a process
    dump, or memory that should have been zeroized.
 5. **Anything that makes the cache serve bytes that fail their declared
-   integrity hash**, or serve one origin's response to another.
+   integrity hash**, or serve one origin's response to another — or one
+   client's cookie to another, or a body to a peer that no page declared.
+6. **Anything a page can do to the terminal or to parsing**: a control or
+   format character from a page reaching the terminal through `syndeo browse`
+   or the agent, or a page that costs the parser more than its fixed work
+   budget.
 
 ## What is already known, and is not a finding
 
@@ -36,8 +41,8 @@ These are documented limits rather than undiscovered ones. Reporting them is
 welcome as a second opinion; they are not treated as new.
 
 - **An unsigned macOS build does not enforce Secure Enclave presence**, and
-  the v0.1.3 macOS release is unsigned: no Developer ID signature, not
-  notarized. The data protection keychain needs a signed binary with a keychain
+  every macOS release so far, v0.1.4 included, is unsigned: no Developer ID
+  signature, not notarized. The data protection keychain needs a signed binary with a keychain
   access group. Without one the keystore falls back to the ordinary keychain,
   reports presence as unenforced, and makes the passphrase mandatory instead.
   `syndeo-keystore status` says which side of that line a build is on. A
@@ -47,8 +52,18 @@ welcome as a second opinion; they are not treated as new.
   that is not the same as anonymous. `syndeo-peer`'s crate documentation is
   explicit about it.
 - **The Landlock confinement is compiled but not yet exercised on a running
-  Linux kernel.** The macOS Seatbelt path is tested, including a fixture that
-  holds TCP, UDP, file writes and `exec` to failing.
+  Linux kernel.** Where a kernel applies only part of the ruleset, the agent
+  reports itself partially confined and names what that kernel cannot
+  restrict. The macOS Seatbelt path is tested, including a fixture that holds
+  TCP, UDP, file writes and `exec` to failing.
+- **A signature does not say what it is for.** The purpose a request states is
+  shown and bound into the shell's confirmation, but the signature is a plain
+  ed25519 signature over the payload, so a verifier cannot tell a login from a
+  transaction.
+- **The keystore forgets the seed on screen lock only on macOS, and only in a
+  session that reports it.** Over ssh or as a daemon, macOS does not report the
+  screen lock; Linux never does. Sleep and the idle timeout apply everywhere.
+  `syndeo doctor` says which hold for the running keystore.
 - **`syndeo-servo` is experimental, for development only, and unsafe for
   untrusted sites.** It does not enforce cross-origin reads, so a page can read
   other origins' responses, including services on the machine and its network;
@@ -65,8 +80,22 @@ welcome as a second opinion; they are not treated as new.
 - **`syndeo-webkit` is kept behind `syndeo-proxy` by configuration, not by a
   sandbox.** Its web view is configured to send its traffic through the proxy,
   with the proxy's certificate pinned. Anything WebKit does not send through
-  that setting is not covered by it; WebRTC is the obvious candidate and has
-  not been measured. WebSockets do not work through the proxy.
+  that setting is not covered by it. WebKit was seen to send requests for
+  localhost and loopback addresses directly, never to the proxy, so a page in
+  it can reach local services without the proxy seeing the request. WebRTC is
+  another candidate and has not been measured. WebSockets do not work through
+  the proxy.
+- **What can reach the local proxy.** The proxy `syndeo-webkit` starts listens
+  on a loopback port the system picks and answers only requests carrying a
+  credential generated for that launch, which is handed to it and to WebKit
+  and to nothing else; a request without it gets 407 and reaches no origin.
+  It keeps out a process that can reach the port and nothing more; it is no
+  defence against code already able to inspect the browser process itself. A
+  `syndeo-proxy run` started by hand asks for no
+  credential: anything on the machine that can reach its port, 127.0.0.1:8899
+  by default, can fetch through it, read its statistics, and have its requests
+  answered from its cache, for as long as it runs. Neither limits how many
+  connections it accepts. Request bodies are limited, to 64 MiB by default.
 - **Proxy traffic is not partitioned by site, and says it is a proxy.** The
   proxy — and so `syndeo-webkit` — has no top-level site to partition its
   cache by, and every request it forwards carries `Via: 1.1 syndeo`.
@@ -74,6 +103,45 @@ welcome as a second opinion; they are not treated as new.
   is what the recovery phrase is for.
 
 ## Fixed, and worth knowing about
+
+Fixed in 0.1.4:
+
+- **A `CONNECT` tunnel could reach an origin other than the one it named.**
+  Inside a tunnel the proxy fetched whatever absolute URL a request gave. The
+  tunnel's authority is now the only target, and a `CONNECT` without a port is
+  refused.
+- **The browser's proxy answered anything on the machine.** It listened on a
+  fixed port with no credential, and `syndeo-webkit` took whatever answered on
+  that port for its proxy. It now learns the address from the proxy itself and
+  requires a per-launch credential.
+- **Cookies were stored with cached responses** and handed to whoever asked
+  next — another client of the proxy, or the same user after the site had
+  cleared them. The cache now never stores or replays `Set-Cookie`.
+- **A peer could fetch any cached body** by its content address or by a digest
+  the store computed, including private responses, which told it where you had
+  been. Only bodies checked against a hash a page declared are served now.
+- **Declared integrity was not checked before a body was stored and shared**,
+  and cached bodies were never checked against it. Every path checks it now,
+  and a declaration with no usable hash is refused rather than ignored.
+- **Text from a page reached the terminal unfiltered**, escape sequences
+  included, through `syndeo browse` and the agent.
+- **The agent could ask for your identity at any site without anyone being
+  asked**, which could link identities that are derived separately so that
+  they cannot be linked. The shell now checks the origin and asks you first.
+- **Parsing a page had no bound**, so a page could hold `syndeo browse` or the
+  agent for as long as it liked. Every page is now parsed within a fixed
+  budget.
+- **Passphrases were left in memory** after use, in the environment of a
+  scripted run and in the shell's and keystore's handling of them. They are
+  taken out of the environment before any thread exists, and wiped after use
+  everywhere Syndeo holds them; copies made inside libraries it uses (the
+  terminal password reader, the JSON decoder's scratch buffer, the window's
+  text field) are not.
+- **`syndeo doctor` described protection the session did not have.** 0.1.3
+  printed a fixed list, screen lock included, on every platform. It now
+  reports what the running keystore says.
+
+Fixed in 0.1.3:
 
 - **0.1.2's `syndeo-webkit` let a redirect's destination run as the site that
   redirected to it.** Its proxy followed redirects itself and handed back the
