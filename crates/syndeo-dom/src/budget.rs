@@ -12,6 +12,10 @@
 //! So a page is parsed against a budget of work units, counted as html5ever
 //! does the work rather than estimated from the input:
 //!
+//! - Every byte costs one: the lookahead reads it and so does the tokenizer.
+//!   The lookahead is told how many bytes the budget has left and reads no
+//!   further, so text with no tag in it, a comment, a script, a quoted value
+//!   or a tag that never ends costs what it is read for, like anything else.
 //! - Every token the tree builder is given costs one, plus one for each
 //!   element it holds on its stack of open elements and its list of active
 //!   formatting elements, which are what its per-token scans walk, plus one
@@ -29,6 +33,12 @@
 //! When the budget is spent, the rest of the page is not parsed: the
 //! [`Document`](crate::Document) says so, and says how far it got. Nothing
 //! is timed, so the same page is always cut at the same place.
+//!
+//! This bounds the work of parsing a body that has already arrived. How
+//! large a body the network process accepts is a separate limit
+//! (`max_body_bytes` in `syndeo-net`, 64 MiB by default); a body within that
+//! may still be only partly parsed, and one parsed whole was not necessarily
+//! the whole response.
 
 use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::states::{RawKind, ScriptEscapeKind};
@@ -46,8 +56,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// The work a page may cost, in the units above. An ordinary page costs a
-/// few million; a very large one — the whole HTML standard on one page —
-/// tens of millions. At the limit, parsing takes on the order of a second.
+/// few million; an ordinary 16 MiB one, bytes included, under a third of
+/// this. At the limit, parsing takes on the order of a second.
 pub const WORK_BUDGET: u64 = 1 << 27;
 
 /// A page, parsed as far as its budget allowed.
@@ -88,14 +98,30 @@ pub(crate) fn parse(html: &str, budget: u64) -> Parsed {
         ahead.foreign = tokenizer
             .sink
             .adjusted_current_node_present_but_not_in_html_namespace();
-        let next = ahead.next_tag();
-        let (start, end, attributes) = match next {
-            Some(tag) => (tag.start, tag.end, tag.attributes),
-            None => (
+        // Every byte is read by the lookahead and then by the tokenizer, and
+        // each costs a unit: so the lookahead reads no further than the
+        // budget has units left, whatever the input holds, tag or no tag.
+        let from = ahead.position;
+        let limit = from.saturating_add(usize::try_from(meter.remaining()).unwrap_or(usize::MAX));
+        let scan = ahead.next_tag(limit);
+        meter.charge((ahead.position - from) as u64);
+        let (next, start, end, attributes) = match scan {
+            Scan::Tag(tag) => (Some(tag), tag.start, tag.end, tag.attributes),
+            Scan::End => (
+                None,
                 ahead.open_tag_start.unwrap_or(html.len()),
                 html.len(),
                 ahead.attributes,
             ),
+            Scan::Limit => {
+                // As far as the budget reached, and not into a tag that
+                // began before it.
+                let stop = ahead.open_tag_start.unwrap_or(ahead.position);
+                feed(&tokenizer, &queue, &html[given..stop]);
+                given = stop;
+                cut_at = Some(if meter.spent() { parsed } else { stop });
+                break;
+            }
         };
         // What comes before the tag: text, comments, a doctype.
         feed(&tokenizer, &queue, &html[given..start]);
@@ -134,6 +160,7 @@ pub(crate) fn parse(html: &str, budget: u64) -> Parsed {
             predicted: std::mem::take(&mut ahead.seen),
             emitted: tokenizer.sink.seen.take(),
             fed: given,
+            scanned: ahead.position,
             charged: meter.charged.get(),
         });
     }
@@ -199,6 +226,14 @@ impl Meter {
 
     fn spent(&self) -> bool {
         self.refused.get() || self.charged.get() > self.budget
+    }
+
+    /// Units left before the budget is spent.
+    fn remaining(&self) -> u64 {
+        if self.refused.get() {
+            return 0;
+        }
+        self.budget.saturating_sub(self.charged.get())
     }
 }
 
@@ -553,6 +588,17 @@ enum State {
     Plaintext,
 }
 
+/// How far [`Lookahead::next_tag`] got.
+#[derive(Debug, Clone, Copy)]
+enum Scan {
+    /// To the end of a tag.
+    Tag(Found),
+    /// To the end of the input, with no tag finished on the way.
+    End,
+    /// To the byte limit it was given, with no tag finished on the way.
+    Limit,
+}
+
 /// A tag, found ahead of the tokenizer.
 #[derive(Debug, Clone, Copy)]
 struct Found {
@@ -683,10 +729,11 @@ impl<'a> Lookahead<'a> {
         self.kind == TagKind::EndTag && self.name == self.last_start
     }
 
-    /// Read on to the end of the next tag. `None` at the end of the input,
-    /// with [`Self::open_tag_start`] and [`Self::attributes`] describing a
-    /// tag the input ended inside, if it did.
-    fn next_tag(&mut self) -> Option<Found> {
+    /// Read on to the end of the next tag, reading no character that starts
+    /// at or past `limit`. At the end of the input, [`Self::open_tag_start`]
+    /// and [`Self::attributes`] describe a tag the input ended inside, if it
+    /// did.
+    fn next_tag(&mut self, limit: usize) -> Scan {
         use RawKind::{Rawtext, Rcdata, ScriptData, ScriptDataEscaped};
         use ScriptEscapeKind::{DoubleEscaped, Escaped};
         use State as S;
@@ -700,10 +747,14 @@ impl<'a> Lookahead<'a> {
             let (at, c) = match reconsume.take() {
                 Some(held) => held,
                 None => match chars.next() {
+                    Some((offset, _)) if base + offset >= limit => {
+                        self.position = base + offset;
+                        return Scan::Limit;
+                    }
                     Some((offset, c)) => (base + offset, c),
                     None => {
                         self.position = input.len();
-                        return None;
+                        return Scan::End;
                     }
                 },
             };
@@ -751,13 +802,13 @@ impl<'a> Lookahead<'a> {
                 S::TagName => match c {
                     c if whitespace(c) => self.state = S::BeforeAttributeName,
                     '/' => self.state = S::SelfClosingStartTag,
-                    '>' => return Some(self.emit(after)),
+                    '>' => return Scan::Tag(self.emit(after)),
                     c => self.name.push(c.to_ascii_lowercase()),
                 },
                 S::BeforeAttributeName => match c {
                     c if whitespace(c) => {}
                     '/' => self.state = S::SelfClosingStartTag,
-                    '>' => return Some(self.emit(after)),
+                    '>' => return Scan::Tag(self.emit(after)),
                     c => {
                         self.begin_attribute(c);
                         self.state = S::AttributeName;
@@ -767,14 +818,14 @@ impl<'a> Lookahead<'a> {
                     c if whitespace(c) => self.state = S::AfterAttributeName,
                     '/' => self.state = S::SelfClosingStartTag,
                     '=' => self.state = S::BeforeAttributeValue,
-                    '>' => return Some(self.emit(after)),
+                    '>' => return Scan::Tag(self.emit(after)),
                     c => self.push_attribute_name(c),
                 },
                 S::AfterAttributeName => match c {
                     c if whitespace(c) => {}
                     '/' => self.state = S::SelfClosingStartTag,
                     '=' => self.state = S::BeforeAttributeValue,
-                    '>' => return Some(self.emit(after)),
+                    '>' => return Scan::Tag(self.emit(after)),
                     c => {
                         self.begin_attribute(c);
                         self.state = S::AttributeName;
@@ -784,7 +835,7 @@ impl<'a> Lookahead<'a> {
                     c if whitespace(c) => {}
                     '"' => self.state = S::DoubleQuoted,
                     '\'' => self.state = S::SingleQuoted,
-                    '>' => return Some(self.emit(after)),
+                    '>' => return Scan::Tag(self.emit(after)),
                     c => {
                         self.state = S::Unquoted;
                         reconsume = Some((at, c));
@@ -802,20 +853,20 @@ impl<'a> Lookahead<'a> {
                 }
                 S::Unquoted => match c {
                     '\t' | '\n' | '\x0C' | ' ' | '\r' => self.state = S::BeforeAttributeName,
-                    '>' => return Some(self.emit(after)),
+                    '>' => return Scan::Tag(self.emit(after)),
                     _ => {}
                 },
                 S::AfterAttributeValueQuoted => match c {
                     c if whitespace(c) => self.state = S::BeforeAttributeName,
                     '/' => self.state = S::SelfClosingStartTag,
-                    '>' => return Some(self.emit(after)),
+                    '>' => return Scan::Tag(self.emit(after)),
                     c => {
                         self.state = S::BeforeAttributeName;
                         reconsume = Some((at, c));
                     }
                 },
                 S::SelfClosingStartTag => match c {
-                    '>' => return Some(self.emit(after)),
+                    '>' => return Scan::Tag(self.emit(after)),
                     c => {
                         self.state = S::BeforeAttributeName;
                         reconsume = Some((at, c));
@@ -996,7 +1047,7 @@ impl<'a> Lookahead<'a> {
                                 self.state = S::SelfClosingStartTag;
                                 continue;
                             }
-                            '>' => return Some(self.emit(after)),
+                            '>' => return Scan::Tag(self.emit(after)),
                             _ => {}
                         }
                     }
@@ -1123,6 +1174,8 @@ pub(crate) mod test_record {
         pub emitted: Vec<Tag>,
         /// How much of the input the tokenizer was given.
         pub fed: usize,
+        /// How much of the input the lookahead read.
+        pub scanned: usize,
         /// The work charged.
         pub charged: u64,
     }
@@ -1402,6 +1455,75 @@ mod tests {
         let html = format!("{}{}", "<span>".repeat(1_000), "</div>".repeat(200_000));
         let (document, _) = hostile(&html);
         assert!(document.cut_short().is_some());
+    }
+
+    /// Input that never reaches a tag, or never finishes one, is read only
+    /// as far as the budget goes: by the lookahead and by the tokenizer.
+    #[test]
+    fn a_long_stretch_without_a_tag_is_read_only_as_far_as_the_budget_goes() {
+        const BUDGET: usize = 1 << 20;
+        let long = "word ".repeat(800_000);
+        let prefix = "<title>t</title>";
+        for (html, parsed_at_most) in [
+            (long.clone(), BUDGET),
+            (format!("{prefix}<p>{long}"), BUDGET),
+            (format!("{prefix}<p a=\"{long}"), prefix.len()),
+            (
+                format!("{prefix}<p a='x' b={}", "v".repeat(4_000_000)),
+                prefix.len(),
+            ),
+            (format!("{prefix}<p{}", "a".repeat(4_000_000)), prefix.len()),
+            (format!("{prefix}<!--{long}"), BUDGET),
+            (format!("{prefix}<script>{long}"), BUDGET),
+            (format!("{prefix}<textarea>{long}"), BUDGET),
+            // Each stretch well inside the budget; all of them together not.
+            (
+                format!("<br>{}", "word ".repeat(100_000)).repeat(20),
+                BUDGET,
+            ),
+        ] {
+            let (document, record) = hostile(&html);
+            let cut = document
+                .cut_short()
+                .unwrap_or_else(|| panic!("{:?}… parsed whole", &html[..30]));
+            assert!(cut.parsed <= parsed_at_most, "{:?}…: {cut:?}", &html[..30]);
+            assert!(
+                record.scanned <= BUDGET,
+                "{:?}…: read {}",
+                &html[..30],
+                record.scanned
+            );
+            assert!(
+                record.fed <= BUDGET,
+                "{:?}…: fed {}",
+                &html[..30],
+                record.fed
+            );
+        }
+    }
+
+    /// An ordinary page of 16 MiB — articles, headings, links, lists,
+    /// tables, attributes — is parsed whole, well inside the budget.
+    #[test]
+    fn an_ordinary_sixteen_mebibyte_page_is_parsed_whole() {
+        let section = r#"<section class="post" id="p"><h2><a href="/a/b?c=d">A heading</a></h2>
+<p class="lead">Some ordinary prose, with <em>emphasis</em>, <a href="https://example.test/x" rel="nofollow">a link</a> and <code>code</code>. It goes on for a while, as prose does, and says nothing in particular.</p>
+<ul class="list"><li><a href="/1">one</a></li><li><a href="/2">two</a></li><li><a href="/3">three</a></li></ul>
+<table class="data"><tr><th>k</th><th>v</th></tr><tr><td>a</td><td>1</td></tr><tr><td>b</td><td>2</td></tr></table>
+<figure><img src="/img/x.png" alt="a picture" width="640" height="480"><figcaption>A caption.</figcaption></figure>
+</section>
+"#;
+        let mut html =
+            String::from("<!doctype html><html><head><title>big</title></head><body><main>");
+        while html.len() < 16 * 1024 * 1024 {
+            html.push_str(section);
+        }
+        html.push_str("</main></body></html>");
+        let document = Document::parse(&html, None);
+        assert_eq!(document.cut_short(), None);
+        assert_eq!(document.title().as_deref(), Some("big"));
+        let record = test_record::take();
+        assert!(record.charged < WORK_BUDGET / 3, "{}", record.charged);
     }
 
     /// Large, but ordinary: long attribute values, a long comment, a long
