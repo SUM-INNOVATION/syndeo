@@ -101,7 +101,7 @@ pub fn run() -> Result<()> {
     // First, before anything is started: the failure without this is every page
     // refusing to load with nothing said about why, because WebKit validates
     // subresources in its networking process and that does not consult us.
-    if !authority_is_trusted() {
+    if !authority_is_trusted(&authority) {
         eprintln!(
             "The proxy's authority is not trusted yet, so every https page would be\n\
              refused with no error shown. It is a per-user certificate — no sudo, and\n\
@@ -739,19 +739,50 @@ fn start_proxy(home: &std::path::Path) -> Result<(OwnedProxy, proxied::ProxyCred
     Ok((owned, credential))
 }
 
-/// Whether our authority is in a keychain WebKit's networking process consults.
+/// Whether this home's authority — this exact certificate, by its SHA-256
+/// fingerprint — is in a keychain WebKit's networking process consults.
 ///
-/// Only a hint — it asks whether the certificate is present, not whether its
-/// trust settings are right — but it is the difference between a clear message
-/// and a window that renders nothing for no stated reason.
-fn authority_is_trusted() -> bool {
-    std::process::Command::new("/usr/bin/security")
-        .args(["find-certificate", "-c", "Syndeo Local Measurement CA"])
-        .stdout(std::process::Stdio::null())
+/// Only a hint: it asks whether the certificate is present, not whether its
+/// trust settings are right. But it is the difference between a clear message
+/// and a window that renders nothing for no stated reason, and asking by name
+/// alone was not enough for that: a certificate left behind by an earlier
+/// home, with the same name and a different key, passed, and then every https
+/// page failed silently.
+fn authority_is_trusted(authority: &std::path::Path) -> bool {
+    let Ok(pem) = std::fs::read_to_string(authority) else {
+        return false;
+    };
+    let Ok(der) = pin::der_from_pem(&pem) else {
+        return false;
+    };
+    let Ok(listing) = std::process::Command::new("/usr/bin/security")
+        .args([
+            "find-certificate",
+            "-a",
+            "-Z",
+            "-c",
+            "Syndeo Local Measurement CA",
+        ])
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .output()
+    else {
+        return false;
+    };
+    listing_includes(&String::from_utf8_lossy(&listing.stdout), &der)
+}
+
+/// Whether `security find-certificate -a -Z` output lists the certificate
+/// whose DER is `der`.
+fn listing_includes(listing: &str, der: &[u8]) -> bool {
+    use sha2::Digest;
+    let ours: String = sha2::Sha256::digest(der)
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    listing
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("SHA-256 hash:"))
+        .any(|hash| hash.trim().eq_ignore_ascii_case(&ours))
 }
 
 #[cfg(test)]
@@ -832,6 +863,31 @@ mod tests {
         }));
         assert!(unwound.is_err());
         assert!(!alive(pid.load(std::sync::atomic::Ordering::SeqCst)));
+    }
+
+    #[test]
+    fn the_authority_counts_as_present_only_by_its_own_fingerprint() {
+        use sha2::Digest;
+        let ours = b"our authority's DER";
+        let hash: String = sha2::Sha256::digest(ours)
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        let record = |sha256: &str| {
+            format!(
+                "SHA-256 hash: {sha256}\nSHA-1 hash: {}\nattributes:\n    \
+                 \"labl\"<blob>=\"Syndeo Local Measurement CA\"\n",
+                "0".repeat(40)
+            )
+        };
+        let stale = record(&"A".repeat(64));
+        assert!(
+            !listing_includes(&stale, ours),
+            "a same-named stranger passed"
+        );
+        assert!(!listing_includes("", ours));
+        assert!(listing_includes(&(stale.clone() + &record(&hash)), ours));
+        assert!(listing_includes(&record(&hash.to_lowercase()), ours));
     }
 
     #[test]

@@ -145,7 +145,7 @@ fn host_of(space: &AnyObject) -> String {
 }
 
 /// The DER inside a PEM, without pulling in a certificate parser to do it.
-fn der_from_pem(pem: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn der_from_pem(pem: &str) -> anyhow::Result<Vec<u8>> {
     use base64::Engine as _;
     let body: String = pem
         .lines()
