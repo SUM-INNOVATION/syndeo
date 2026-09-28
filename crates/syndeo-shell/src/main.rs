@@ -121,8 +121,19 @@ fn home(override_path: Option<PathBuf>) -> PathBuf {
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // First, while this is still one thread: a scripted passphrase leaves the
+    // environment before a runtime, a logger, or any child process exists to
+    // read or inherit it. It is handed over once, by `prompt::read_passphrase`.
+    syndeo_ipc::startup::capture(&[syndeo_ipc::startup::PASSPHRASE]);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| anyhow::anyhow!("starting the runtime: {err}"))?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG").unwrap_or_else(|_| {

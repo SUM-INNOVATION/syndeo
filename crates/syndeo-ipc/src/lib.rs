@@ -18,6 +18,7 @@
 pub mod confirm;
 pub mod frame;
 pub mod protocol;
+pub mod startup;
 pub mod transport;
 
 pub use confirm::{Confirmation, ConfirmationError, Confirmer, SessionSecret};

@@ -17,13 +17,13 @@ use unicode_general_category::{get_general_category, GeneralCategory};
 /// Read a passphrase.
 ///
 /// A terminal gets a hidden prompt; a pipe gets a line. Scripted runs may set
-/// `SYNDEO_PASSPHRASE`, which is read once and then removed from this process so
-/// it cannot be inherited by anything the shell spawns — the agent especially.
+/// `SYNDEO_PASSPHRASE`. `main` takes it out of the environment before anything
+/// else runs (see `syndeo_ipc::startup`), so nothing the shell spawns — the
+/// agent especially — can inherit it, and it is handed over here once.
 pub fn read_passphrase(label: &str) -> std::io::Result<String> {
-    if let Ok(value) = std::env::var("SYNDEO_PASSPHRASE") {
-        std::env::remove_var("SYNDEO_PASSPHRASE");
+    if let Some(value) = syndeo_ipc::startup::take(syndeo_ipc::startup::PASSPHRASE) {
         if !value.is_empty() {
-            return Ok(value);
+            return Ok(value.to_string());
         }
     }
     if std::io::stdin().is_terminal() {
