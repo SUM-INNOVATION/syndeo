@@ -306,6 +306,86 @@ mod tests {
         );
     }
 
+    /// Run a tool that never returns of its own accord, and require the fuel
+    /// bound to stop it. On a thread, because a tool that escapes the bound
+    /// holds whoever called it for as long as it likes, and a test should
+    /// fail rather than hang.
+    fn stopped_by_fuel(wat: &str) -> String {
+        let tool = tool(wat).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(tool.run(b"x").map(|_| ()));
+        });
+        match receiver.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Err(err)) => format!("{err:#}"),
+            Ok(Ok(())) => panic!("the tool returned; it was written never to"),
+            Err(_) => panic!("the fuel bound did not stop it within 30 seconds"),
+        }
+    }
+
+    /// RUSTSEC-2026-0315: before Wasmtime 48.0.3, a caller kept its own count
+    /// of fuel across a `call_ref` and never read back what the callee spent,
+    /// so the next time it wrote its count out — at the plain `call` here —
+    /// the callee's spending was undone, and a tool could do all its work
+    /// behind a `call_ref` and never run its fuel down.
+    #[test]
+    fn a_tool_that_spends_its_fuel_behind_call_ref_still_runs_out() {
+        let spender = r#"
+            (module
+              (type $thunk (func))
+              (memory (export "memory") 1)
+              (elem declare func $spend)
+              (func $spend (type $thunk)
+                (local $i i32)
+                (loop $spin
+                  (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                  (br_if $spin (i32.lt_u (local.get $i) (i32.const 100000)))))
+              (func $nothing)
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func (export "run") (param i32) (param i32) (result i64)
+                (loop $forever
+                  (call_ref $thunk (ref.func $spend))
+                  (call $nothing)
+                  (br $forever))
+                (i64.const 0)))
+        "#;
+        let err = stopped_by_fuel(spender);
+        assert!(
+            err.contains("all fuel consumed"),
+            "stopped, but not by its fuel: {err}"
+        );
+    }
+
+    /// RUSTSEC-2026-0315 again, by its other route: the fuel spent by a call
+    /// that threw was handed back when a `try_table` caught the exception.
+    #[test]
+    fn a_tool_that_spends_its_fuel_before_a_caught_throw_still_runs_out() {
+        let thrower = r#"
+            (module
+              (tag $done)
+              (memory (export "memory") 1)
+              (func $spend
+                (local $i i32)
+                (loop $spin
+                  (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                  (br_if $spin (i32.lt_u (local.get $i) (i32.const 100000))))
+                (throw $done))
+              (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+              (func (export "run") (param i32) (param i32) (result i64)
+                (loop $forever
+                  (block $caught
+                    (try_table (catch $done $caught)
+                      (call $spend)))
+                  (br $forever))
+                (i64.const 0)))
+        "#;
+        let err = stopped_by_fuel(thrower);
+        assert!(
+            err.contains("all fuel consumed"),
+            "stopped, but not by its fuel: {err}"
+        );
+    }
+
     #[test]
     fn a_tool_that_points_outside_its_memory_gets_nothing() {
         let liar = r#"
