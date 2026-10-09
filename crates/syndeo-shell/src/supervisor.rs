@@ -46,46 +46,27 @@ impl Supervisor {
         syndeo_ipc::transport::runtime_dir_for(&self.home)
     }
 
-    /// Sibling binaries, so a build tree and an install both work.
+    /// Sibling binaries, so a build tree, a tarball install and the macOS
+    /// package all work.
     ///
     /// The directory of the running image comes first: see [`install_dir`].
-    /// After it, the invocation path resolved and then as given, because on
-    /// macOS `current_exe` hands back a symlink on `PATH` rather than its
-    /// target. `PATH` is the last resort rather than the first: a sibling is
-    /// the binary that shipped with this one, and preferring it means a build
-    /// tree never picks up an installed copy of a different version.
+    /// For the macOS package it is the only place looked, and a sibling that
+    /// is not there is a [`RemovedByUpgrade`]: see [`is_packaged_dir`].
+    /// Anywhere else, after it, the invocation path resolved and then as
+    /// given, because on macOS `current_exe` hands back a symlink on `PATH`
+    /// rather than its target. `PATH` is the last resort rather than the
+    /// first: a sibling is the binary that shipped with this one, and
+    /// preferring it means a build tree never picks up an installed copy of a
+    /// different version.
     pub fn locate(name: &str) -> Result<PathBuf> {
-        let exe = std::env::current_exe().context("locating the running binary")?;
-        let resolved = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
-
-        let mut tried: Vec<PathBuf> = Vec::new();
-        for directory in [install_dir(), resolved.parent(), exe.parent()]
-            .into_iter()
-            .flatten()
-        {
-            let candidate = directory.join(name);
-            if tried.contains(&candidate) {
-                continue;
-            }
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-            tried.push(candidate);
-        }
-
-        if let Some(found) = search_path(name) {
-            return Ok(found);
-        }
-
-        bail!(
-            "cannot find {name}. Looked beside {} and on PATH. \
-             Every Syndeo binary has to be installed into the same directory; \
-             see the install instructions in the README.",
-            tried
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(" and ")
+        let dir = install_dir()?;
+        let exe = std::env::current_exe().ok();
+        locate_from(
+            name,
+            dir,
+            is_packaged_dir(dir),
+            exe.as_deref(),
+            std::env::var_os("PATH"),
         )
     }
 
@@ -341,18 +322,44 @@ unsafe fn libc_kill(pid: i32, signal: i32) {
 /// Resolving that link when a sibling is needed — which for the keystore can be
 /// long after start — would find whichever version it names then, and run one
 /// release's shell against another's keystore. The image path cannot move.
-pub fn install_dir() -> Option<&'static Path> {
-    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| running_image().and_then(|image| image.parent().map(Path::to_path_buf)))
-        .as_deref()
+///
+/// It is found the first time it is asked for, and every program that starts
+/// siblings asks first thing in `main`, through [`capture_install_dir`]: an
+/// upgrade removes the version it replaces, and after that the kernel can no
+/// longer say where a running image of it came from. If it could not be found
+/// then, it is an error now and for the rest of the process.
+pub fn install_dir() -> Result<&'static Path> {
+    static DIR: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    let found = DIR.get_or_init(|| {
+        let image = running_image().map_err(|err| format!("{err:#}"))?;
+        image
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("{} has no directory", image.display()))
+    });
+    match found {
+        Ok(dir) => Ok(dir),
+        Err(err) => bail!("cannot tell where this program is installed: {err}"),
+    }
+}
+
+/// [`install_dir`], found now. `main` calls it before anything else can
+/// start, so that a sibling started lazily, long after, comes from the version
+/// this process started as, or from nowhere.
+pub fn capture_install_dir() -> Result<&'static Path> {
+    install_dir()
 }
 
 /// The path of the image this process is running, as the kernel has it.
 ///
 /// On macOS `current_exe` is the path a command was started by, links and all,
-/// so the kernel is asked instead. On Linux `current_exe` reads
-/// `/proc/self/exe`, which already is the running image.
-pub fn running_image() -> Option<PathBuf> {
+/// so the kernel is asked instead, and if it cannot say, that is an error:
+/// the path the command was started by leads through `current`, which an
+/// upgrade moves to another version. It cannot say for an image whose file has
+/// been removed, which is what an upgrade does to the version it replaces. On
+/// Linux `current_exe` reads `/proc/self/exe`, which already is the running
+/// image.
+pub fn running_image() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::ffi::OsStringExt;
@@ -365,23 +372,159 @@ pub fn running_image() -> Option<PathBuf> {
         // SAFETY: the buffer is as large as the size passed, and proc_pidpath
         // writes at most that many bytes and returns how many it wrote.
         let written = unsafe { proc_pidpath(getpid(), buffer.as_mut_ptr(), buffer.len() as u32) };
-        if written > 0 {
-            buffer.truncate(written as usize);
-            return Some(PathBuf::from(std::ffi::OsString::from_vec(buffer)));
+        if written <= 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("asking the kernel which image this process runs (proc_pidpath)");
         }
+        buffer.truncate(written as usize);
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
     }
-    let exe = std::env::current_exe().ok()?;
-    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
+    #[cfg(not(target_os = "macos"))]
+    {
+        let exe = std::env::current_exe().context("locating the running binary")?;
+        Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+    }
 }
 
-/// The last resort when the sibling lookup finds nothing.
+/// Where the macOS package installs Syndeo, one directory per version.
+pub const PACKAGED_VERSIONS: &str = "/usr/local/libexec/syndeo";
+
+/// Whether `dir` is a version directory of the macOS package: directly inside
+/// [`PACKAGED_VERSIONS`], which only the package writes. The kernel may name
+/// `/usr/local` through the data volume, as
+/// `/System/Volumes/Data/usr/local`; that is the same directory.
+///
+/// The package keeps one version, and an upgrade removes the one it replaces.
+/// A process still running from that version has nowhere left to find its
+/// siblings: the invocation path, `current` and `PATH` all lead to the new
+/// version now, and starting one of its programs would pair two releases. So
+/// for a packaged process the lookup fails instead, with
+/// [`RemovedByUpgrade`].
+pub fn is_packaged_dir(dir: &Path) -> bool {
+    let (Some(parent), Some(_)) = (dir.parent(), dir.file_name()) else {
+        return false;
+    };
+    let parent = match parent.strip_prefix("/System/Volumes/Data") {
+        Ok(rest) => Path::new("/").join(rest),
+        Err(_) => parent.to_path_buf(),
+    };
+    parent == Path::new(PACKAGED_VERSIONS)
+}
+
+/// A packaged process's sibling is not in the version directory it started
+/// from: an upgrade has removed that version while this process ran.
+#[derive(Debug)]
+pub struct RemovedByUpgrade {
+    pub name: String,
+    pub dir: PathBuf,
+}
+
+impl std::fmt::Display for RemovedByUpgrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is not in {}: this version was removed during an upgrade; quit and restart Syndeo",
+            self.name,
+            self.dir.display()
+        )
+    }
+}
+
+impl std::error::Error for RemovedByUpgrade {}
+
+/// A sibling beside [`install_dir`] and nowhere else, for a program that has
+/// no other place to look. For the macOS package, missing is a
+/// [`RemovedByUpgrade`].
+pub fn beside_install_dir(name: &str) -> Result<PathBuf> {
+    let dir = install_dir()?;
+    let beside = dir.join(name);
+    if is_packaged_dir(dir) {
+        if beside.is_file() {
+            return Ok(beside);
+        }
+        return Err(RemovedByUpgrade {
+            name: name.to_string(),
+            dir: dir.to_path_buf(),
+        }
+        .into());
+    }
+    if beside.exists() {
+        return Ok(beside);
+    }
+    bail!(
+        "cannot find {name} next to this binary, in {}. Every Syndeo binary has to be \
+         installed into the same directory.",
+        dir.display()
+    )
+}
+
+/// [`Supervisor::locate`], given everything it looks at: the running image's
+/// directory, whether that is the package's, the invocation path, and `PATH`.
+fn locate_from(
+    name: &str,
+    dir: &Path,
+    packaged: bool,
+    exe: Option<&Path>,
+    path: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if packaged {
+        // This version's own directory or nothing: every other place leads
+        // to whatever version an upgrade installed since.
+        let beside = dir.join(name);
+        if beside.is_file() {
+            return Ok(beside);
+        }
+        return Err(RemovedByUpgrade {
+            name: name.to_string(),
+            dir: dir.to_path_buf(),
+        }
+        .into());
+    }
+
+    let resolved = exe.map(|exe| std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf()));
+    let mut tried: Vec<PathBuf> = Vec::new();
+    for directory in [
+        Some(dir),
+        resolved.as_deref().and_then(Path::parent),
+        exe.and_then(Path::parent),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let candidate = directory.join(name);
+        if tried.contains(&candidate) {
+            continue;
+        }
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        tried.push(candidate);
+    }
+
+    if let Some(found) = search_path(name, path) {
+        return Ok(found);
+    }
+
+    bail!(
+        "cannot find {name}. Looked beside {} and on PATH. \
+         Every Syndeo binary has to be installed into the same directory; \
+         see the install instructions in the README.",
+        tried
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" and ")
+    )
+}
+
+/// The last resort when the sibling lookup finds nothing, outside the package.
 ///
 /// Only entries that are actually executable count, so a directory of the same
 /// name on `PATH` is not mistaken for the binary.
-fn search_path(name: &str) -> Option<PathBuf> {
+fn search_path(name: &str, path: Option<std::ffi::OsString>) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
-    let path = std::env::var_os("PATH")?;
+    let path = path?;
     std::env::split_paths(&path)
         .map(|directory| directory.join(name))
         .find(|candidate| {
@@ -450,5 +593,157 @@ mod tests {
         assert!(!exited_early("keystore", loader, false).contains("libdbus"));
         let other = std::process::ExitStatus::from_raw(3 << 8);
         assert!(!exited_early("keystore", other, true).contains("libdbus"));
+    }
+
+    const SIBLINGS: [&str; 6] = [
+        "syndeo-net",
+        "syndeo-keystore",
+        "syndeo-agent",
+        "syndeo-proxy",
+        "syndeo-ui",
+        "syndeo-webkit",
+    ];
+
+    fn executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// What an upgrade from 0.0.9 to 0.0.10 leaves under `root`, laid out as
+    /// the package lays it out: 0.0.9's directory gone, 0.0.10 complete, and
+    /// `current` and every command link in `bin` leading to 0.0.10. Returns
+    /// the directory 0.0.9 was in, and `bin`.
+    fn upgraded(root: &Path) -> (PathBuf, PathBuf) {
+        let versions = root.join("libexec/syndeo");
+        let new = versions.join("0.0.10");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink("0.0.10", versions.join("current")).unwrap();
+        for name in std::iter::once("syndeo").chain(SIBLINGS) {
+            executable(&new.join(name));
+            std::os::unix::fs::symlink(format!("../libexec/syndeo/current/{name}"), bin.join(name))
+                .unwrap();
+        }
+        (versions.join("0.0.9"), bin)
+    }
+
+    #[test]
+    fn the_packaged_layout_is_a_directory_directly_inside_the_packages_own() {
+        for packaged in [
+            "/usr/local/libexec/syndeo/0.1.6",
+            "/usr/local/libexec/syndeo/0.0.9",
+            "/System/Volumes/Data/usr/local/libexec/syndeo/0.1.6",
+        ] {
+            assert!(is_packaged_dir(Path::new(packaged)), "{packaged}");
+        }
+        for not in [
+            "/usr/local/libexec/syndeo",
+            "/usr/local/libexec/syndeo/0.1.6/tools",
+            "/usr/local/libexec/syndeo/..",
+            "/usr/local/libexec/other/0.1.6",
+            "/usr/local/bin",
+            "/tmp/usr/local/libexec/syndeo/0.1.6",
+            "/Users/someone/.local/bin",
+            "/",
+        ] {
+            assert!(!is_packaged_dir(Path::new(not)), "{not}");
+        }
+    }
+
+    #[test]
+    fn a_packaged_process_whose_version_was_removed_finds_no_sibling_anywhere() {
+        let temp = tempfile::tempdir().unwrap();
+        let (gone, bin) = upgraded(temp.path());
+        let new = std::fs::canonicalize(temp.path().join("libexec/syndeo/0.0.10")).unwrap();
+        let invoked = bin.join("syndeo");
+        for name in SIBLINGS {
+            let err = locate_from(name, &gone, true, Some(&invoked), Some(bin.clone().into()))
+                .unwrap_err();
+            assert!(err.downcast_ref::<RemovedByUpgrade>().is_some(), "{err:#}");
+            let said = format!("{err:#}");
+            assert!(
+                said.contains(
+                    "this version was removed during an upgrade; quit and restart Syndeo"
+                ),
+                "{said}"
+            );
+            // What the fallbacks would have handed it: the new version's.
+            let fallback =
+                locate_from(name, &gone, false, Some(&invoked), Some(bin.clone().into())).unwrap();
+            assert!(
+                std::fs::canonicalize(&fallback).unwrap().starts_with(&new),
+                "{}",
+                fallback.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_packaged_process_takes_its_siblings_from_its_own_version_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, bin) = upgraded(temp.path());
+        let own = temp.path().join("libexec/syndeo/0.0.10");
+        for name in SIBLINGS {
+            assert_eq!(
+                locate_from(name, &own, true, None, None).unwrap(),
+                own.join(name)
+            );
+        }
+        // Partway through a removal, what is left is not enough.
+        std::fs::remove_file(own.join("syndeo-keystore")).unwrap();
+        let err = locate_from(
+            "syndeo-keystore",
+            &own,
+            true,
+            Some(&bin.join("syndeo")),
+            Some(bin.clone().into()),
+        )
+        .unwrap_err();
+        assert!(err.downcast_ref::<RemovedByUpgrade>().is_some(), "{err:#}");
+    }
+
+    #[test]
+    fn outside_the_package_the_invocation_path_and_path_are_still_looked_at() {
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("target/release");
+        let installed = temp.path().join("installed");
+        let linked = temp.path().join("linked");
+        let on_path = temp.path().join("on path");
+        for dir in [&image, &installed, &linked, &on_path] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        executable(&installed.join("syndeo"));
+        executable(&installed.join("syndeo-net"));
+        executable(&on_path.join("syndeo-agent"));
+        std::os::unix::fs::symlink(installed.join("syndeo"), linked.join("syndeo")).unwrap();
+        let invoked = linked.join("syndeo");
+        let path = std::env::join_paths([&on_path]).unwrap();
+
+        let net = locate_from(
+            "syndeo-net",
+            &image,
+            false,
+            Some(&invoked),
+            Some(path.clone()),
+        )
+        .unwrap();
+        assert_eq!(net, installed.canonicalize().unwrap().join("syndeo-net"));
+        let agent = locate_from(
+            "syndeo-agent",
+            &image,
+            false,
+            Some(&invoked),
+            Some(path.clone()),
+        )
+        .unwrap();
+        assert_eq!(agent, on_path.join("syndeo-agent"));
+        let err = locate_from("syndeo-ui", &image, false, Some(&invoked), Some(path)).unwrap_err();
+        assert!(err.downcast_ref::<RemovedByUpgrade>().is_none(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("cannot find syndeo-ui"),
+            "{err:#}"
+        );
     }
 }

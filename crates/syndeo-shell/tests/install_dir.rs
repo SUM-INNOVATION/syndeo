@@ -3,9 +3,11 @@
 //!
 //! The macOS package starts every command through
 //! `bin/<name> -> ../libexec/syndeo/current/<name>`, and an upgrade switches
-//! `current`. This test builds that chain around a copy of its own binary,
-//! starts the copy through it, switches `current` while the copy is running,
-//! and asks the copy where it lives and where its sibling is.
+//! `current`. These tests build that chain around a copy of their own binary,
+//! start the copy through it, switch `current` while the copy is running, and
+//! ask the copy where it lives and where its sibling is. On macOS they also
+//! remove the copy's version, as an upgrade does, and check what the kernel
+//! can still say about it.
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -14,6 +16,9 @@ use std::time::{Duration, Instant};
 
 /// Set on the copy: the directory it should wait in, and what to report.
 const CHILD: &str = "SYNDEO_INSTALL_DIR_TEST_CHILD";
+/// Set on the copy instead, for [`removed_child`]: the file to wait for, and
+/// whether to find its directory before waiting (`early`) or after (`late`).
+const REMOVED: &str = "SYNDEO_INSTALL_DIR_TEST_REMOVED";
 const SIBLING: &str = "syndeo-install-dir-test-sibling";
 
 /// Not a test of its own. In the copy, with [`CHILD`] set, it reports where it
@@ -131,5 +136,126 @@ fn a_command_started_through_the_links_keeps_its_own_version_when_current_moves(
         format!("{one}/{SIBLING}"),
         "the sibling came from {}, not the running version",
         two.display()
+    );
+}
+
+/// Not a test of its own. In the copy, with [`REMOVED`] set, it finds its
+/// directory before or after its version is removed, and reports what the
+/// lookups say after the removal; anywhere else it does nothing.
+#[test]
+fn removed_child() {
+    let Ok(setting) = std::env::var(REMOVED) else {
+        return;
+    };
+    let (when, go) = setting.split_once(':').unwrap();
+    if when == "early" {
+        syndeo_shell::supervisor::capture_install_dir().unwrap();
+    }
+    println!("@@waiting");
+    let go = PathBuf::from(go);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !go.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the parent never removed the version"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    match syndeo_shell::supervisor::install_dir() {
+        Ok(dir) => println!("@@install_dir {}", dir.display()),
+        Err(err) => println!("@@install_dir_error {err:#}"),
+    }
+    match syndeo_shell::supervisor::running_image() {
+        Ok(image) => println!("@@running_image {}", image.display()),
+        Err(err) => println!("@@running_image_error {err:#}"),
+    }
+    match syndeo_shell::Supervisor::locate(SIBLING) {
+        Ok(found) => println!("@@sibling {}", found.display()),
+        Err(err) => println!("@@sibling_error {err:#}"),
+    }
+}
+
+/// Start a copy through `bin/probe` with [`REMOVED`] set to `when`; once it is
+/// waiting, remove 0.0.1 entirely and switch `current` to 0.0.2, as an upgrade
+/// does; return what it reported.
+#[cfg(target_os = "macos")]
+fn run_removed(when: &str) -> (PathBuf, Vec<String>) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("install root");
+    let one = std::fs::canonicalize(version(&root, "0.0.1")).unwrap();
+    version(&root, "0.0.2");
+    switch(&root, "0.0.1");
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::os::unix::fs::symlink("../libexec/syndeo/current/probe", root.join("bin/probe")).unwrap();
+
+    let go = temp.path().join("go");
+    let mut child = Command::new(root.join("bin/probe"))
+        .args([
+            "--exact",
+            "removed_child",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(REMOVED, format!("{when}:{}", go.display()))
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut reported = Vec::new();
+    for line in lines.by_ref() {
+        let line = line.unwrap();
+        let waiting = line.contains("@@waiting");
+        reported.push(line);
+        if waiting {
+            break;
+        }
+    }
+    std::fs::remove_dir_all(&one).unwrap();
+    std::fs::remove_file(root.join("libexec/syndeo/current")).unwrap();
+    switch(&root, "0.0.2");
+    std::fs::write(&go, b"").unwrap();
+    for line in lines {
+        reported.push(line.unwrap());
+    }
+    assert!(child.wait().unwrap().success(), "{reported:#?}");
+    (one, reported)
+}
+
+#[cfg(target_os = "macos")]
+fn reported_value<'a>(reported: &'a [String], key: &str) -> Option<&'a str> {
+    reported
+        .iter()
+        .find_map(|line| line.split_once(key).map(|(_, value)| value))
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_directory_found_before_the_version_was_removed_is_kept_and_the_kernel_no_longer_says() {
+    let (one, reported) = run_removed("early");
+    assert_eq!(
+        reported_value(&reported, "@@install_dir "),
+        Some(one.display().to_string().as_str()),
+        "{reported:#?}"
+    );
+    let image = reported_value(&reported, "@@running_image_error ");
+    assert!(
+        image.is_some_and(|e| e.contains("proc_pidpath")),
+        "asked again, the kernel named an image: {reported:#?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_directory_looked_for_after_the_version_was_removed_is_an_error_not_a_guess() {
+    let (_, reported) = run_removed("late");
+    let dir = reported_value(&reported, "@@install_dir_error ");
+    assert!(
+        dir.is_some_and(|e| e.contains("proc_pidpath")),
+        "the directory was guessed: {reported:#?}"
+    );
+    assert!(
+        reported_value(&reported, "@@sibling_error ").is_some(),
+        "a sibling was found through current: {reported:#?}"
     );
 }

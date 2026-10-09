@@ -718,18 +718,14 @@ fn exited_soon(owned: &mut ProxyChild) -> Option<std::process::ExitStatus> {
 /// A sibling binary, found beside the image this process is running, as the
 /// shell finds its own (see `syndeo_shell::supervisor::install_dir`), so a
 /// build tree and an install both work and an upgrade that switches a link
-/// cannot hand this browser another release's proxy. It listens on a loopback
+/// cannot hand this browser another release's proxy. For the macOS package,
+/// whose upgrade removes the version it replaces, a missing proxy is that and
+/// nothing else is tried: quit and restart. It listens on a loopback
 /// port the system picks — never a fixed one that something else could already
 /// hold — and goes when this process goes, however that happens: see
 /// [`ProxyChild`].
 fn start_proxy(home: &std::path::Path) -> Result<(OwnedProxy, proxied::ProxyCredential)> {
-    let beside = syndeo_shell::supervisor::install_dir()
-        .map(|d| d.join("syndeo-proxy"))
-        .filter(|p| p.exists())
-        .context(
-            "cannot find syndeo-proxy next to this binary. Every Syndeo binary \
-             has to be installed into the same directory.",
-        )?;
+    let beside = syndeo_shell::supervisor::beside_install_dir("syndeo-proxy")?;
 
     let mut command = std::process::Command::new(beside);
     command

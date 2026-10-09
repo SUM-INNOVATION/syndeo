@@ -77,8 +77,8 @@ pub enum Seeded {
 /// something called `tools`.
 pub fn seed_example_tools(home: &Path) -> io::Result<Seeded> {
     match crate::supervisor::install_dir() {
-        Some(dir) => seed_from(&dir.join("tools"), home),
-        None => Ok(Seeded::NoSource),
+        Ok(dir) => seed_from(&dir.join("tools"), home),
+        Err(_) => Ok(Seeded::NoSource),
     }
 }
 

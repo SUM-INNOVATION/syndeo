@@ -128,6 +128,11 @@ fn main() -> Result<()> {
     // environment before a runtime, a logger, or any child process exists to
     // read or inherit it. `run` owns it from here.
     let secrets = syndeo_ipc::startup::capture(&[syndeo_ipc::startup::PASSPHRASE]);
+    // Then, before anything can start a sibling: the directory of the image
+    // this process runs. An upgrade that replaces this version later cannot
+    // change the answer, and for the macOS package it is the only place a
+    // sibling is looked for.
+    syndeo_shell::supervisor::capture_install_dir()?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -506,22 +511,34 @@ async fn doctor(home: &std::path::Path) -> Result<()> {
     // The first thing to go wrong in an install is a half-copied one, and the
     // symptom is a timeout somewhere much later. Say it here instead.
     let mut missing = Vec::new();
+    let mut removed = false;
     for name in ["syndeo-net", "syndeo-keystore", "syndeo-agent"] {
         match Supervisor::locate(name) {
             Ok(path) => println!("{name:<16}{}", path.display()),
-            Err(_) => {
+            Err(err) => {
                 println!("{name:<16}NOT FOUND");
+                removed |= err
+                    .downcast_ref::<syndeo_shell::supervisor::RemovedByUpgrade>()
+                    .is_some();
                 missing.push(name);
             }
         }
     }
     if !missing.is_empty() {
         println!();
-        println!(
-            "            {} is missing. Every Syndeo binary has to be",
-            missing.join(", ")
-        );
-        println!("                installed into one directory; re-run install.sh.");
+        if removed {
+            println!(
+                "            {}: this version was removed during an upgrade;",
+                missing.join(", ")
+            );
+            println!("                quit and restart Syndeo.");
+        } else {
+            println!(
+                "            {} is missing. Every Syndeo binary has to be",
+                missing.join(", ")
+            );
+            println!("                installed into one directory; re-run install.sh.");
+        }
         return Ok(());
     }
 
