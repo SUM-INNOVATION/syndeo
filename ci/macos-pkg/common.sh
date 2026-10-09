@@ -344,20 +344,24 @@ expected_files() {
     done
 }
 
-# read_receipt: sets r_present (yes or no) and r_id, r_version, r_volume and
-# r_location from the receipt on the startup volume.
+# read_receipt: sets r_present (yes or no) and r_id, r_version, r_volume,
+# r_locations (how many location: fields there are) and r_location (what
+# follows "location:", the separating space included) from the receipt on
+# the startup volume.
 read_receipt() {
     r_present=no
     r_id=''
     r_version=''
     r_volume=''
+    r_locations=0
     r_location=''
     _rr=$("$PKGUTIL" --pkg-info "$SYNDEO_ID" --volume / 2>/dev/null) || return 0
     r_present=yes
     r_id=$(printf '%s\n' "$_rr" | /usr/bin/sed -n 's/^package-id: //p')
     r_version=$(printf '%s\n' "$_rr" | /usr/bin/sed -n 's/^version: //p')
     r_volume=$(printf '%s\n' "$_rr" | /usr/bin/sed -n 's/^volume: //p')
-    r_location=$(printf '%s\n' "$_rr" | /usr/bin/sed -n 's/^location: //p')
+    r_locations=$(printf '%s\n' "$_rr" | /usr/bin/grep -c '^location:' || true)
+    r_location=$(printf '%s\n' "$_rr" | /usr/bin/sed -n 's/^location://p')
 }
 
 # check_receipt: the receipt read by read_receipt is Syndeo's, for the
@@ -371,8 +375,21 @@ check_receipt() {
         finding "the receipt's version, '$r_version', is not a version"
         return 0
     fi
-    if [ "$r_volume" != / ] || [ "$r_location" != / ]; then
-        finding "the receipt is for volume '$r_volume' at '$r_location', not / at /"
+    if [ "$r_volume" != / ]; then
+        finding "the receipt is for volume '$r_volume', not /"
+    fi
+    # pkgutil always prints one "location: %s" line, the location relative to
+    # the volume: "/" for some packages installed at its root, and nothing for
+    # this one. Only those two values after exactly that one space pass; a
+    # missing or repeated field, any other spacing and any other location are
+    # refused.
+    if [ "$r_locations" != 1 ]; then
+        finding "the receipt has $r_locations location fields, not one"
+    else
+        case "$r_location" in
+            ' ' | ' /') ;;
+            *) finding "the receipt's location is 'location:$r_location', not the volume's root" ;;
+        esac
     fi
     _cr_want=$(expected_files "$r_version" | LC_ALL=C /usr/bin/sort)
     _cr_have=$("$PKGUTIL" --files "$SYNDEO_ID" --volume / 2>/dev/null | LC_ALL=C /usr/bin/sort) || _cr_have=''

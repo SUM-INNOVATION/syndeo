@@ -464,9 +464,16 @@ st_links() {
 
 st_current() { ln -s "$1" "$D/current"; }
 
+# st_receipt V [LOCATION]: the receipt for V. LOCATION is its location lines,
+# none if empty; by default the one pkgutil prints for this package, whose
+# location relative to the volume is empty.
 st_receipt() {
-  local v="$1" n
-  printf 'package-id: com.sum.syndeo.pkg\nversion: %s\nvolume: /\nlocation: /\ninstall-time: 1\n' "$v" >"$DB/com.sum.syndeo.pkg.info"
+  local v="$1" loc="${2-location: }" n
+  {
+    printf 'package-id: com.sum.syndeo.pkg\nversion: %s\nvolume: /\n' "$v"
+    [ -z "$loc" ] || printf '%s\n' "$loc"
+    printf 'install-time: 1\n'
+  } >"$DB/com.sum.syndeo.pkg.info"
   {
     printf '%s\n' usr usr/local usr/local/bin usr/local/libexec usr/local/libexec/syndeo \
       "usr/local/libexec/syndeo/$v" "usr/local/libexec/syndeo/$v/tools" \
@@ -478,8 +485,8 @@ st_receipt() {
   } >"$DB/com.sum.syndeo.pkg.files"
 }
 
-# st_installed V: what a completed installation of V leaves.
-st_installed() { st_tree "$1"; st_links; st_current "$1"; st_receipt "$1"; }
+# st_installed V [LOCATION]: what a completed installation of V leaves.
+st_installed() { st_tree "$1"; st_links; st_current "$1"; st_receipt "$@"; }
 
 st_snap() {
   { find "$R" "$DB" -print0 | xargs -0 stat -f '%N|%HT|%u|%g|%Lp|%Mp|%Sf|%i|%z|%Y'; } | LC_ALL=C sort
@@ -534,7 +541,7 @@ st_preinstall() {
   st_new; st_installed 0.0.9; echo usr/local/extra >>"$DB/com.sum.syndeo.pkg.files"
   pre_case "10: the receipt lists other paths" 1 "does not list exactly the package's paths" 0.0.10
   st_new; st_installed 0.0.9; sed -i '' 's/^volume: \//volume: \/Volumes\/Other/' "$DB/com.sum.syndeo.pkg.info"
-  pre_case "10: the receipt is for another volume" 1 "not / at /" 0.0.10
+  pre_case "10: the receipt is for another volume" 1 "the receipt is for volume '/Volumes/Other', not /" 0.0.10
   st_new; st_installed 0.0.9; sed -i '' 's/^version: .*/version: 0.9/' "$DB/com.sum.syndeo.pkg.info"
   pre_case "10: the receipt's version is malformed" 1 "is not a version" 0.0.10
   st_new; st_installed 0.0.9; printf '%s\tcom.example.other\n' "$R/usr/local/bin/syndeo" >"$DB/claims"
@@ -704,6 +711,64 @@ st_installed_mode() {
   expect "installed: a missing command fails" eval "printf '%s' \"\$out\" | grep -q 'has 6 of the seven commands'"
 }
 
+# loc_case NAME accepted|refused LOCATION: a receipt whose location lines are
+# LOCATION, judged by every script that reads a receipt: this script's
+# installed mode, the preinstall of an upgrade, and the uninstaller.
+loc_case() {
+  local name="$1" want="$2" loc="$3" out verdict
+  st_new; st_installed 0.0.9 "$loc"
+  out="$(SYNDEO_VERIFY_ROOT="$R" SYNDEO_VERIFY_UID="$U" SYNDEO_VERIFY_GID="$G" SYNDEO_VERIFY_PKGUTIL="$C/pkgutil" \
+    bash "$here/verify-pkg.sh" installed 0.0.9 2>&1)"
+  verdict=yes
+  if [ "$want" = accepted ]; then
+    printf '%s' "$out" | grep -q '[1-9][0-9]* passed, 0 failed' || verdict=no
+  else
+    printf '%s\n' "$out" | grep 'FAIL' | grep -qE 'location fields, not one|location is .*, not the volume.s root' || verdict=no
+  fi
+  expect "location: $name: installed $want" test "$verdict" = yes
+  [ "$verdict" = yes ] || printf '%s\n' "$out" | sed 's/^/          | /'
+
+  st_render_for preinstall 0.0.10 "$C/preinstall"
+  st_run "$C/preinstall" "$C/fake.pkg" / / /
+  verdict=yes
+  [ "$changed" = no ] || verdict=no
+  if [ "$want" = accepted ]; then
+    [ "$status" = 0 ] && grep -qF "upgrading from 0.0.9 to 0.0.10" "$C/out" || verdict=no
+  else
+    [ "$status" = 1 ] && grep -qE 'location fields, not one|location is .*, not the volume.s root' "$C/out" || verdict=no
+  fi
+  expect "location: $name: preinstall $want" test "$verdict" = yes
+  [ "$verdict" = yes ] || sed 's/^/          | /' "$C/out"
+
+  st_run "$D/0.0.9/uninstall.sh"
+  verdict=yes
+  if [ "$want" = accepted ]; then
+    [ "$status" = 0 ] && grep -qF "removed Syndeo 0.0.9" "$C/out" && ! [ -f "$DB/com.sum.syndeo.pkg.info" ] || verdict=no
+  else
+    [ "$status" = 1 ] && [ "$changed" = no ] && grep -qE 'location fields, not one|location is .*, not the volume.s root' "$C/out" || verdict=no
+  fi
+  expect "location: $name: uninstall $want" test "$verdict" = yes
+  [ "$verdict" = yes ] || sed 's/^/          | /' "$C/out"
+}
+
+st_location() {
+  printf '\n  the receipt'"'"'s location field\n'
+  loc_case "empty, as pkgutil prints it for this package" accepted 'location: '
+  loc_case "/" accepted 'location: /'
+  loc_case "missing" refused ''
+  loc_case "duplicated" refused $'location: /\nlocation: /'
+  loc_case "duplicated, empty and /" refused $'location: \nlocation: /'
+  loc_case "empty, without the separating space" refused 'location:'
+  loc_case "/, without the separating space" refused 'location:/'
+  loc_case "/, after two spaces" refused 'location:  /'
+  loc_case "/, then a space" refused 'location: / '
+  loc_case "/, after a tab" refused $'location:\t/'
+  loc_case "two spaces" refused 'location:  '
+  loc_case "another directory" refused 'location: Applications/Other.app'
+  loc_case "an absolute directory" refused 'location: /usr/local'
+  loc_case "(null)" refused 'location: (null)'
+}
+
 # st_tarball DIR V: a release tarball of stand-ins, as ci/package.sh lays one out.
 st_tarball() {
   local dir="$1" v="$2" name n
@@ -779,6 +844,7 @@ self_test() {
     st_atomic
     st_uninstall
     st_installed_mode
+    st_location
     st_inspect
   else
     printf '\n  on %s: the root scripts, the package build and inspect are macOS-only (BSD stat, ls -e, mv -h, pkgbuild) and were not run\n' "$(uname -s)"

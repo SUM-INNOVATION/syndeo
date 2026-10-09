@@ -15,17 +15,24 @@ What the macOS package promises of the switch, checked as stated:
 
 The switching is the postinstall's own: a new symlink, then rename(2) over
 `current` (what `mv -h` does). --postinstall runs real postinstall scripts too.
-Lookups read `current` and the `syndeo` file through it; starts run COMMAND,
-the command link in bin/. A start counts as the transient failure only when
-exec, or the shell or env opening it, reported "No such file or directory" or
-"Invalid argument" for COMMAND itself. Anything else that fails, and any
-success that is not wholly one version, is a rejection.
+
+A lookup opens `current/syndeo` once. Only that open may fail, and only with
+ENOENT or EINVAL while switching. Which version it found is judged from that
+one descriptor alone: the path the kernel gives for it (F_GETPATH), its
+device and inode, and its bytes when the versions' bytes differ. All of them
+have to name the same version; nothing is looked up a second time.
+
+Starts run COMMAND, the command link in bin/. A start counts as the transient
+failure only when exec, or the shell or env opening it, reported "No such file
+or directory" or "Invalid argument" for COMMAND itself. Anything else that
+fails, and any success that is not wholly one version, is a rejection.
 
 How often the transient failure happened is printed, and is not judged.
 Exits 1 on any rejection, 0 otherwise.
 """
 import argparse
 import errno
+import fcntl
 import os
 import subprocess
 import sys
@@ -33,6 +40,25 @@ import threading
 import time
 
 TRANSIENT = {errno.ENOENT: "ENOENT", errno.EINVAL: "EINVAL"}
+
+# <sys/fcntl.h>: the path of the file a descriptor is open on, as the kernel
+# names it, and the same without firmlinks (/System/Volumes/Data/...).
+F_GETPATH = getattr(fcntl, "F_GETPATH", 50)
+F_GETPATH_NOFIRMLINK = 102
+MAXPATHLEN = 1024
+
+
+def fd_path(fd, command=F_GETPATH):
+    return os.fsdecode(fcntl.fcntl(fd, command, bytes(MAXPATHLEN)).split(b"\0", 1)[0])
+
+
+def fd_read(fd):
+    chunks = []
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
 
 
 def main():
@@ -59,21 +85,35 @@ def main():
     pending = os.path.join(a.private, ".current.new")
     versions = list(a.versions)
     trees = {v: os.path.join(a.private, v) for v in versions}
-    real_trees = {os.path.realpath(t) for t in trees.values()}
+    if len(set(versions)) != 2:
+        ap.error("two different versions")
     # Directories by device and inode: the kernel may name /usr/local as
     # /System/Volumes/Data/usr/local, and both are the same directory.
     tree_ids = {}
     for v in versions:
         st = os.stat(trees[v])
         tree_ids[(st.st_dev, st.st_ino)] = v
-    contents = {}
+    # Each version's syndeo, opened directly: the names the kernel gives that
+    # descriptor, the file's device and inode, and its bytes. A lookup through
+    # `current` is judged against these.
+    by_name, by_id, contents = {}, {}, {}
     for v in versions:
-        with open(os.path.join(trees[v], "syndeo"), "rb") as f:
-            contents[v] = f.read()
-    if contents[versions[0]] == contents[versions[1]]:
+        fd = os.open(os.path.join(trees[v], "syndeo"), os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            for name in (fd_path(fd), fd_path(fd, F_GETPATH_NOFIRMLINK)):
+                by_name[name] = v
+            st = os.fstat(fd)
+            by_id[(st.st_dev, st.st_ino)] = v
+            contents[v] = fd_read(fd)
+        finally:
+            os.close(fd)
+    if len(set(by_name.values())) != 2 or len(by_id) != 2:
+        ap.error("the two versions' syndeo are not two different files")
+    by_body = {body: v for v, body in contents.items()}
+    if len(by_body) != 2:
         # Copies of one build: the bytes cannot tell the trees apart, so a
-        # lookup is judged by which tree it resolved to instead.
-        contents = None
+        # lookup is judged by its name and its device and inode alone.
+        by_body = None
 
     args = ["doctor"] if a.expect_doctor else ["--version"]
 
@@ -108,33 +148,41 @@ def main():
         else:
             reject("%s after switching had stopped" % name)
 
+    through = os.path.join(current, "syndeo")
+
     def lookup():
         during = state["switching"]
         try:
-            target = os.readlink(current)
-            if target not in versions:
-                reject("current read as %r" % target)
-                return
-            if not during and target != state["final"]:
-                reject("current read as %s after switching stopped at %s" % (target, state["final"]))
-                return
-            path = os.path.join(current, "syndeo")
-            with open(path, "rb") as f:
-                body = f.read()
-            if contents is not None:
-                if body not in contents.values():
-                    reject("current/syndeo read as neither version's file")
-                    return
-            real = os.path.realpath(path)
-            if os.path.dirname(real) not in real_trees:
-                reject("current/syndeo resolved to %s" % real)
-                return
-            count("lookup ok")
+            fd = os.open(through, os.O_RDONLY | os.O_CLOEXEC)
         except OSError as e:
             if e.errno in TRANSIENT:
                 transient("lookup " + TRANSIENT[e.errno], during)
             else:
                 reject("lookup failed: %s" % e)
+            return False
+        # The open found a file. Everything below is about that file, from
+        # this descriptor; none of it may fail.
+        try:
+            name = fd_path(fd)
+            st = os.fstat(fd)
+            body = fd_read(fd) if by_body is not None else None
+        except OSError as e:
+            reject("current/syndeo was opened, but its descriptor could not be read: %s" % e)
+            return False
+        finally:
+            os.close(fd)
+        found = {by_name.get(name), by_id.get((st.st_dev, st.st_ino))}
+        if by_body is not None:
+            found.add(by_body.get(body))
+        if len(found) != 1 or None in found:
+            reject("current/syndeo opened %s (inode %d), which is not wholly one version" % (name, st.st_ino))
+            return False
+        v = found.pop()
+        if not during and v != state["final"]:
+            reject("current/syndeo opened %s's syndeo after switching stopped at %s" % (v, state["final"]))
+            return False
+        count("lookup ok %s" % v)
+        return True
 
     def judge_output(out):
         if a.expect_doctor:
@@ -170,7 +218,7 @@ def main():
                 transient("start " + TRANSIENT[e.errno], during)
             else:
                 reject("start failed: %s" % e)
-            return
+            return False
         if r.returncode != 0:
             reasons = [m for m in ("No such file or directory", "Invalid argument")
                        if ("%s: %s" % (a.command, m)) in r.stderr]
@@ -178,14 +226,16 @@ def main():
                 transient("start %s" % ("ENOENT" if reasons[0].startswith("No") else "EINVAL"), during)
             else:
                 reject("start exited %d: %s" % (r.returncode, r.stderr.strip()[:200]))
-            return
+            return False
         version, problem = judge_output(r.stdout)
         if problem:
             reject("start succeeded but %s" % problem)
-        elif not during and version != state["final"]:
+            return False
+        if not during and version != state["final"]:
             reject("a start after switching stopped ran %s, not %s" % (version, state["final"]))
-        else:
-            count("start ok %s" % version)
+            return False
+        count("start ok %s" % version)
+        return True
 
     def loop(fn, *fn_args):
         while state["switching"]:
@@ -198,6 +248,7 @@ def main():
 
     started = time.monotonic()
     switches = 0
+    last = None
     try:
         while switches < a.renames or time.monotonic() - started < a.min_seconds:
             target = versions[(switches + 1) % 2]
@@ -205,6 +256,7 @@ def main():
                 os.unlink(pending)
             os.symlink(target, pending)
             os.rename(pending, current)
+            last = target
             switches += 1
         runs = 0
         for i in range(a.postinstalls if a.postinstall else 0):
@@ -214,6 +266,7 @@ def main():
                 reject("postinstall %s exited %d: %s" % (v, r.returncode, r.stdout.strip()[-200:]))
             elif os.readlink(current) != v:
                 reject("postinstall %s returned with current at %s" % (v, os.readlink(current)))
+            last = v
             runs += 1
     finally:
         state["switching"] = False
@@ -221,13 +274,14 @@ def main():
             t.join()
 
     final = os.readlink(current)
+    if final != last:
+        reject("current ends at %s, but the last switch was to %s" % (final, last))
     state["final"] = final
-    for _ in range(a.settle_lookups):
-        lookup()
-    settled_before = sum(n for k, n in tally.items() if k.startswith("start ok"))
-    for _ in range(a.settle_launches):
-        start("settle")
-    settled = sum(n for k, n in tally.items() if k.startswith("start ok")) - settled_before
+    # Settled: every lookup and every start succeeds, as the final version.
+    looked = sum(1 for _ in range(a.settle_lookups) if lookup())
+    if looked != a.settle_lookups:
+        reject("%d of %d lookups after switching stopped did not succeed" % (a.settle_lookups - looked, a.settle_lookups))
+    settled = sum(1 for _ in range(a.settle_launches) if start("settle"))
     if settled != a.settle_launches:
         reject("%d of %d starts after switching stopped did not succeed" % (a.settle_launches - settled, a.settle_launches))
 
