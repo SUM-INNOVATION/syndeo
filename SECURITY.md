@@ -41,7 +41,7 @@ These are documented limits rather than undiscovered ones. Reporting them is
 welcome as a second opinion; they are not treated as new.
 
 - **An unsigned macOS build does not enforce Secure Enclave presence**, and
-  every macOS release so far, v0.1.4 included, is unsigned: no Developer ID
+  every macOS release so far, v0.1.5 included, is unsigned: no Developer ID
   signature, not notarized. The data protection keychain needs a signed binary with a keychain
   access group. Without one the keystore falls back to the ordinary keychain,
   reports presence as unenforced, and makes the passphrase mandatory instead.
@@ -103,6 +103,18 @@ welcome as a second opinion; they are not treated as new.
   is what the recovery phrase is for.
 
 ## Fixed, and worth knowing about
+
+Fixed in 0.1.5:
+
+- **A tool could run past its fuel, and could corrupt the runtime's
+  garbage-collected heap.** Every release up to 0.1.4 ran the agent's tools on
+  Wasmtime 48.0.2. With fuel on, as the agent has it, that version lost count
+  of the fuel a function spent when it was reached through `call_ref` or
+  threw to a `try_table` that caught it, so a tool could hold the agent for as
+  long as it liked (RUSTSEC-2026-0315). A GC reference held across a call in a
+  `try_table` might not be kept alive (RUSTSEC-2026-0326). Wasmtime 48.0.4
+  fixes both. Only tools run on Wasmtime, and either needs a hostile tool in
+  your tools directory.
 
 Fixed in 0.1.4:
 

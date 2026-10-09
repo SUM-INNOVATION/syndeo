@@ -56,7 +56,7 @@ unpacking one yourself does the same thing.
 - **Windows and ChromeOS**: not yet, and tracked at
   [#17](https://github.com/SUM-INNOVATION/syndeo/issues/17).
 
-**The macOS binaries are not signed or notarized.** No release so far, v0.1.4
+**The macOS binaries are not signed or notarized.** No release so far, v0.1.5
 included, carries a Developer ID signature or has been through Apple's notary
 service.
 Installed with the one-liner above, the binaries are not quarantined and run.
@@ -614,7 +614,7 @@ Before handing a release to anyone, check the thing that was published rather
 than the thing that was built:
 
 ```sh
-ci/verify-release.sh 0.1.4
+ci/verify-release.sh 0.1.5
 ```
 
 It installs from the release with the same one-liner the README gives, into a

@@ -11138,7 +11138,7 @@ checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 
 [[package]]
 name = "syndeo-agent"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -11156,7 +11156,7 @@ dependencies = [
 
 [[package]]
 name = "syndeo-cache"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -11176,7 +11176,7 @@ dependencies = [
 
 [[package]]
 name = "syndeo-dom"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "html5ever",
  "markup5ever_rcdom",
@@ -11188,7 +11188,7 @@ dependencies = [
 
 [[package]]
 name = "syndeo-ipc"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "hex",
@@ -11208,7 +11208,7 @@ dependencies = [
 
 [[package]]
 name = "syndeo-keystore"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -11242,7 +11242,7 @@ dependencies = [
 
 [[package]]
 name = "syndeo-net"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "bytes",
@@ -11277,7 +11277,7 @@ dependencies = [
 
 [[package]]
 name = "syndeo-peer"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "bincode",
@@ -11303,7 +11303,7 @@ dependencies = [
 
 [[package]]
 name = "syndeo-proxy"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -11333,7 +11333,7 @@ dependencies = [
 
 [[package]]
 name = "syndeo-servo"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -11351,7 +11351,7 @@ dependencies = [
 
 [[package]]
 name = "syndeo-shell"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -11375,7 +11375,7 @@ dependencies = [
 
 [[package]]
 name = "syndeo-ui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -11396,7 +11396,7 @@ dependencies = [
 
 [[package]]
 name = "syndeo-webkit"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

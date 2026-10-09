@@ -3,6 +3,62 @@
 The release workflow reads the section matching the tag and puts it in the
 release notes, so a heading here is `## <version>` and nothing else.
 
+## 0.1.5
+
+A security release. The agent runs WebAssembly tools on Wasmtime, and the
+Wasmtime every release so far has shipped, 48.0.2, let a tool run past the
+fuel that is meant to stop it, and could let one corrupt the runtime's
+garbage-collected heap. This moves Wasmtime to 48.0.4 and changes nothing
+else.
+
+**Before you upgrade**
+
+- **The macOS binaries are still not signed or notarized.** Installed with the
+  one-line installer they are not quarantined and run; an archive downloaded
+  in a browser is quarantined and Gatekeeper rejects it. Unsigned, the
+  keystore cannot reach the data protection keychain, so Secure Enclave
+  presence is not enforced and the passphrase is mandatory.
+- **Only tools are affected.** Nothing but the agent's tools runs on
+  Wasmtime, and both problems need a tool written to exploit them in your
+  tools directory (`~/.syndeo/tools`). Until you upgrade, run only tools you
+  trust.
+
+**Security**
+
+- **A tool could run past its fuel** (RUSTSEC-2026-0315,
+  GHSA-m63x-6p34-q65x). Fuel is what stops a tool that does not return. With
+  fuel on, as the agent has it, Wasmtime before 48.0.3 lost count of the fuel
+  a function spent when it was reached through `call_ref`, or when it threw
+  to a `try_table` that caught it. Both instructions are on by default, so a
+  tool could do its work that way and hold the agent for as long as it
+  liked. Two new tests give the agent such a tool, one for each route:
+  against 48.0.2 both were still running when the tests gave up at 30
+  seconds, and against 48.0.4 both run out of fuel in well under a second.
+- **A tool could corrupt Wasmtime's garbage-collected heap**
+  (RUSTSEC-2026-0326, GHSA-hw8m-q44c-ggrf). A GC reference held across a call
+  inside a `try_table` might not be kept alive, so a collection during the
+  call could leave it dangling. Syndeo builds Wasmtime with garbage
+  collection, and exceptions are on by default, so a tool could reach this.
+  No exploit was attempted, and no test here reproduces it; the fix is
+  Wasmtime's.
+- **Three more advisories, fixed by the same update, do not apply.**
+  RUSTSEC-2026-0316, -0325 and -0327 are in Wasmtime's component model, which
+  Syndeo does not build: the agent loads core modules, not components.
+
+**Changed**
+
+- Wasmtime 48.0.2 → 48.0.4, with the crates it is built from: its internal
+  crates and Pulley 48.0.2 → 48.0.4, Cranelift 0.135.2 → 0.135.4, and
+  wasmparser, wasm-encoder and wasmprinter 0.254.0 → 0.254.2 (48.0.4 asks for
+  0.254.1, which was never published). No other dependency moves.
+
+**What was and was not tested**
+
+- The two fuel tests above, against both versions of Wasmtime, on macOS; CI
+  runs them on Linux and macOS.
+- RUSTSEC-2026-0326 is not reproduced here. That it is fixed rests on
+  Wasmtime's own tests.
+
 ## 0.1.4
 
 A release of repairs, from a review of 0.1.3 after it was published. Plain
