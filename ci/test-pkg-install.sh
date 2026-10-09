@@ -829,7 +829,9 @@ system_before() {
   must "  ... $BIN is still $RUNNER:admin 0775" test "$(snap_path "$BIN")" = "$bin_before"
   must "  ... no home has a .syndeo it did not have" test "$(homes)" = "$(cat "$st/initial.homes")"
   must "  ... keychains and trust settings are as they were" test "$(security_state)" = "$(cat "$st/initial.security")"
-  printf '%s\n' "$s9" "$s10" >"$st/standins"
+  # The stand-ins' paths, for --system-after. Beside $st/standins/, the
+  # directory they are built in.
+  printf '%s\n' "$s9" "$s10" >"$st/standins.list"
 }
 
 # ------------------------------------------------------------------ user
@@ -976,7 +978,7 @@ system_after() {
   trap on_exit EXIT
   trap 'exit 130' INT TERM HUP
   local s10
-  s10="$(sed -n 2p "$st/standins")"
+  s10="$(sed -n 2p "$st/standins.list")"
 
 
   say ""
