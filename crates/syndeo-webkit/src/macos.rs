@@ -715,15 +715,15 @@ fn exited_soon(owned: &mut ProxyChild) -> Option<std::process::ExitStatus> {
 
 /// Start the proxy this browser fetches through, and wait until it says where.
 ///
-/// A sibling binary, found the way the shell finds its own, so a build tree and
-/// an install both work. It listens on a loopback port the system picks —
-/// never a fixed one that something else could already hold — and goes when
-/// this process goes, however that happens: see [`ProxyChild`].
+/// A sibling binary, found beside the image this process is running, as the
+/// shell finds its own (see `syndeo_shell::supervisor::install_dir`), so a
+/// build tree and an install both work and an upgrade that switches a link
+/// cannot hand this browser another release's proxy. It listens on a loopback
+/// port the system picks — never a fixed one that something else could already
+/// hold — and goes when this process goes, however that happens: see
+/// [`ProxyChild`].
 fn start_proxy(home: &std::path::Path) -> Result<(OwnedProxy, proxied::ProxyCredential)> {
-    let exe = std::env::current_exe().context("locating the running binary")?;
-    let resolved = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
-    let beside = resolved
-        .parent()
+    let beside = syndeo_shell::supervisor::install_dir()
         .map(|d| d.join("syndeo-proxy"))
         .filter(|p| p.exists())
         .context(

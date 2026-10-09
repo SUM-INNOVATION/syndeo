@@ -48,19 +48,25 @@ impl Supervisor {
 
     /// Sibling binaries, so a build tree and an install both work.
     ///
-    /// The invocation path is resolved before its directory is taken, because a
-    /// packaged install is commonly a symlink on `PATH` pointing into a private
-    /// directory, and on macOS `current_exe` hands back the symlink rather than
-    /// its target. `PATH` is the last resort rather than the first: a sibling is
+    /// The directory of the running image comes first: see [`install_dir`].
+    /// After it, the invocation path resolved and then as given, because on
+    /// macOS `current_exe` hands back a symlink on `PATH` rather than its
+    /// target. `PATH` is the last resort rather than the first: a sibling is
     /// the binary that shipped with this one, and preferring it means a build
     /// tree never picks up an installed copy of a different version.
     pub fn locate(name: &str) -> Result<PathBuf> {
         let exe = std::env::current_exe().context("locating the running binary")?;
         let resolved = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
 
-        let mut tried = Vec::new();
-        for directory in [resolved.parent(), exe.parent()].into_iter().flatten() {
+        let mut tried: Vec<PathBuf> = Vec::new();
+        for directory in [install_dir(), resolved.parent(), exe.parent()]
+            .into_iter()
+            .flatten()
+        {
             let candidate = directory.join(name);
+            if tried.contains(&candidate) {
+                continue;
+            }
             if candidate.exists() {
                 return Ok(candidate);
             }
@@ -324,6 +330,48 @@ unsafe fn libc_kill(pid: i32, signal: i32) {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     kill(pid, signal);
+}
+
+/// The directory of the binary this process is running, found once.
+///
+/// Siblings are looked for here first. It is where the image the kernel is
+/// running lives, not where whatever link started it pointed at the time it is
+/// asked: a packaged install starts commands through `/usr/local/bin/<name>`,
+/// which leads through `libexec/syndeo/current`, a link an upgrade switches.
+/// Resolving that link when a sibling is needed — which for the keystore can be
+/// long after start — would find whichever version it names then, and run one
+/// release's shell against another's keystore. The image path cannot move.
+pub fn install_dir() -> Option<&'static Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| running_image().and_then(|image| image.parent().map(Path::to_path_buf)))
+        .as_deref()
+}
+
+/// The path of the image this process is running, as the kernel has it.
+///
+/// On macOS `current_exe` is the path a command was started by, links and all,
+/// so the kernel is asked instead. On Linux `current_exe` reads
+/// `/proc/self/exe`, which already is the running image.
+pub fn running_image() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        extern "C" {
+            fn proc_pidpath(pid: i32, buffer: *mut u8, size: u32) -> i32;
+            fn getpid() -> i32;
+        }
+        // PROC_PIDPATHINFO_MAXSIZE.
+        let mut buffer = vec![0u8; 4 * 1024];
+        // SAFETY: the buffer is as large as the size passed, and proc_pidpath
+        // writes at most that many bytes and returns how many it wrote.
+        let written = unsafe { proc_pidpath(getpid(), buffer.as_mut_ptr(), buffer.len() as u32) };
+        if written > 0 {
+            buffer.truncate(written as usize);
+            return Some(PathBuf::from(std::ffi::OsString::from_vec(buffer)));
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
 }
 
 /// The last resort when the sibling lookup finds nothing.
