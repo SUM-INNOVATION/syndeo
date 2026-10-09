@@ -3,21 +3,22 @@
 # shellcheck disable=SC2034,SC2329
 # Syndeo's postinstall step: make the version just installed the current one.
 #
-# Installer runs it as root once every file of the version is in place. It
-# checks that the version is complete and exactly as packaged, then points
-# /usr/local/libexec/syndeo/current at it with a single rename: one switch,
-# from one complete version to another. The commands in /usr/local/bin all
-# lead through `current`, so a command that starts runs all of one version or
-# all of the other, never a mixture or a third, and one already running keeps
-# its own version to the end.
+# Installer runs it as root once every file of the version is in place, and
+# after it has removed the version this one replaces: one version is
+# installed at a time. It checks that this version is complete, exactly as
+# packaged, and the only one there, then points
+# /usr/local/libexec/syndeo/current at it with a single rename. The commands
+# in /usr/local/bin all lead through `current`, so a command that starts runs
+# this version or, before the switch, none: from the removal of the previous
+# version until this switch, commands fail to start with "No such file or
+# directory" (or, at the switch itself, "Invalid argument"). Once this step
+# returns, `current` is this version and every command starts. A Syndeo still
+# running from the removed version stops at the next program it needs, and
+# has to be quit and started again; quit Syndeo before installing.
 #
-# The rename is not seen everywhere at the same instant. A command started at
-# the very moment of the switch can fail to start, once, with "No such file
-# or directory" or "Invalid argument"; started again, it runs. Once this step
-# returns, `current` is the new version and every command starts.
-#
-# If anything is wrong it changes nothing, and the previous version stays
-# current.
+# If anything is wrong it switches nothing, and exits non-zero. Installer
+# then writes no receipt, so the receipt still names the removed version and
+# running this same package again finishes the upgrade.
 #
 # It touches nothing outside the private directory: no command link, no home,
 # no keychain, no trust setting.
@@ -56,6 +57,13 @@ fi
 refuse_if_found
 
 check_tree "$INCOMING" exact
+for entry in "$SYNDEO_DIR"/* "$SYNDEO_DIR"/.[!.]* "$SYNDEO_DIR"/..?*; do
+    is_present "$entry" || continue
+    case "${entry##*/}" in
+        "$INCOMING" | current | .current.new) ;;
+        *) finding "$entry: is still there; Syndeo $INCOMING is installed alone" ;;
+    esac
+done
 for link in current .current.new; do
     path="$SYNDEO_DIR/$link"
     is_present "$path" || continue
@@ -67,7 +75,6 @@ for link in current .current.new; do
 done
 refuse_if_found
 
-@TEST_FAULT@
 # A temporary link left by a switch that was interrupted.
 if is_present "$SYNDEO_DIR/.current.new"; then
     /bin/rm -f -- "$SYNDEO_DIR/.current.new"
@@ -80,5 +87,5 @@ if [ "$(/usr/bin/readlink "$SYNDEO_DIR/current")" != "$INCOMING" ]; then
     say "refusing: $SYNDEO_DIR/current does not point at $INCOMING after the switch"
     exit 1
 fi
-say "$INCOMING is current; a command started during the switch may have failed once, and runs if started again"
+say "$INCOMING is current. Commands did not start while the previous version was replaced; a Syndeo still running from it has to be quit and started again"
 exit 0

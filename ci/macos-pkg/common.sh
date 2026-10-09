@@ -238,6 +238,15 @@ check_tree() {
     return 0
 }
 
+# is_complete_tree VERSION: whether every file the package puts in the
+# version directory is there. What is there is for check_tree to judge.
+is_complete_tree() {
+    for _ic_n in $SYNDEO_EXECUTABLES $SYNDEO_DOCUMENTS tools tools/wordcount.wat; do
+        is_present "$SYNDEO_DIR/$1/$_ic_n" || return 1
+    done
+    return 0
+}
+
 # is_ours_link PATH NAME: a command link exactly as the package writes it.
 is_ours_link() {
     is_private "$1" 'Symbolic Link' - || return 1
@@ -264,7 +273,9 @@ scan_bin() {
 # scan_private: what the private directory holds. Sets d_present,
 # versions (space-separated), current_v and pending_v (the targets of current
 # and .current.new, or ''), and checks every version directory is at least an
-# exact subset of the package. Anything else in it is a finding.
+# exact subset of the package. Anything else in it is a finding. Whether
+# current may name a version that is not there is for each script to say:
+# after a failed upgrade it does.
 scan_private() {
     d_present=no
     versions=''
@@ -305,10 +316,13 @@ scan_private() {
                 ;;
         esac
     done
-    if [ -n "$current_v" ] && ! has_version "$current_v"; then
-        finding "$SYNDEO_DIR/current: points at $current_v, which is not installed"
-    fi
     return 0
+}
+
+# version_count: how many version directories scan_private found.
+version_count() {
+    set -- $versions
+    echo $#
 }
 
 # has_version V: whether V is one of the version directories found.
@@ -317,18 +331,6 @@ has_version() {
         *" $1 "*) return 0 ;;
     esac
     return 1
-}
-
-# newest_version: the newest of the version directories found, current
-# included, or '' if there are none.
-newest_version() {
-    _nv=''
-    for _nv_v in $versions; do
-        if [ -z "$_nv" ] || [ "$(syndeo_version_cmp "$_nv_v" "$_nv")" = gt ]; then
-            _nv=$_nv_v
-        fi
-    done
-    echo "$_nv"
 }
 
 # expected_files V: every path the receipt for V lists, as pkgutil prints them.
@@ -364,10 +366,13 @@ read_receipt() {
     r_location=$(printf '%s\n' "$_rr" | /usr/bin/sed -n 's/^location://p')
 }
 
-# check_receipt: the receipt read by read_receipt is Syndeo's, for the
+# check_receipt_meta: the receipt read by read_receipt is Syndeo's, for the
 # startup volume, for a valid version, listing exactly that version's paths,
-# and no other package claims the private directory or a command.
-check_receipt() {
+# and no other package claims the private directory or a command. It says
+# nothing about whether those paths are there: see check_receipt_installed.
+# Sets r_files, the paths the receipt lists.
+check_receipt_meta() {
+    r_files=
     if [ "$r_id" != "$SYNDEO_ID" ]; then
         finding "the receipt is for '$r_id', not $SYNDEO_ID"
     fi
@@ -395,11 +400,47 @@ check_receipt() {
     _cr_have=$("$PKGUTIL" --files "$SYNDEO_ID" --volume / 2>/dev/null | LC_ALL=C /usr/bin/sort) || _cr_have=''
     if [ "$_cr_want" != "$_cr_have" ]; then
         finding "the receipt for $r_version does not list exactly the package's paths"
+    else
+        r_files=$_cr_have
     fi
     check_claims "$SYNDEO_DIR"
     for _cr_n in $SYNDEO_NAMES; do
         check_claims "$SYNDEO_BIN/$_cr_n"
     done
+    return 0
+}
+
+# check_receipt_installed V: every path the receipt for V lists is there, as
+# the package writes it. Each is looked at itself: the parents as the
+# directories they have to be, each command as the package's own link, and
+# the version directory, whose entries check_tree judges, also finding
+# anything in it the receipt does not list. After check_receipt_meta, which
+# has found the receipt lists exactly the package's paths; none has a space.
+check_receipt_installed() {
+    _ci_v=$1
+    for _ci_p in $r_files; do
+        _ci_t="$ROOT/$_ci_p"
+        if ! is_present "$_ci_t"; then
+            finding "$_ci_t: is missing, and the receipt for $_ci_v lists it"
+            continue
+        fi
+        case "$_ci_p" in
+            usr)
+                load_meta "$_ci_t"
+                [ "$m_type" = Directory ] || finding "$_ci_t: is a ${m_type:-path that cannot be read}, not a directory"
+                ;;
+            usr/local | usr/local/libexec | usr/local/libexec/syndeo) check_strict_dir "$_ci_t" ;;
+            usr/local/bin) check_bin_dir "$_ci_t" ;;
+            usr/local/bin/*)
+                is_ours_link "$_ci_t" "${_ci_p##*/}" || finding "$_ci_t: is not a link this package writes"
+                ;;
+            "usr/local/libexec/syndeo/$_ci_v" | "usr/local/libexec/syndeo/$_ci_v"/*) ;;
+            *) finding "the receipt lists $_ci_p, which is not the package's" ;;
+        esac
+    done
+    if is_present "$SYNDEO_DIR/$_ci_v"; then
+        check_tree "$_ci_v" subset
+    fi
     return 0
 }
 

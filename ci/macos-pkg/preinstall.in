@@ -8,11 +8,28 @@
 # installation by exiting non-zero, and says why in /var/log/install.log, one
 # "syndeo preinstall: refusing: ..." line per reason.
 #
-# It installs over nothing it cannot account for. Without a receipt, every
-# Syndeo-looking path is someone else's, with one exception: an installation
-# of exactly this version that was interrupted before it finished. With a
-# receipt, the receipt, the version directories, `current` and the commands
-# have to agree, and the result may not be older than anything installed.
+# One version of Syndeo is installed at a time. When this package goes ahead,
+# Installer removes the version its receipt names, places this one, and runs
+# the postinstall, which switches `current` to it; only then does Installer
+# write the receipt. From the removal to the switch the commands do not start,
+# and a Syndeo still running from the removed version stops at the next
+# program it needs: quit Syndeo before installing. A postinstall that fails is
+# not undone, so a failed upgrade leaves the receipt naming a version that is
+# gone and this version's files in place.
+#
+# It installs over nothing it cannot account for. With V this package's
+# version and X the receipt's:
+# - no receipt and no Syndeo: install V;
+# - no receipt, and nothing but part or all of V from an installation that
+#   was interrupted: resume it;
+# - receipt X, exactly X installed and nothing else: upgrade to a newer V,
+#   reinstall the same one, or refuse an older one;
+# - receipt X = V, part of V and nothing else: repair V;
+# - receipt X, X gone, exactly one newer version W there, `current` at X or
+#   W: an upgrade to W failed. Only W's package may finish it; any other is
+#   refused until it has.
+# Anything else is refused, including more than one version, anything that is
+# not the package's, and a tree whose files are not exactly as packaged.
 set -eu
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 LC_ALL=C
@@ -85,39 +102,69 @@ if [ "$r_present" = no ]; then
         fi
     fi
 else
-    check_receipt
+    check_receipt_meta
     refuse_if_found
-    if [ "$d_present" = no ]; then
-        finding "$SYNDEO_DIR: is missing, but the receipt says $r_version is installed"
-    elif ! has_version "$r_version"; then
-        finding "$SYNDEO_DIR/$r_version: is missing, but the receipt says it is installed"
-    else
-        check_tree "$r_version" exact
-    fi
-    if [ -z "$current_v" ]; then
-        finding "$SYNDEO_DIR/current: is missing"
-    else
-        check_tree "$current_v" exact
-        if [ "$(syndeo_version_cmp "$current_v" "$r_version")" = lt ]; then
-            finding "$SYNDEO_DIR/current: points at $current_v, older than the installed $r_version"
-        fi
-    fi
     for n in $bin_foreign; do
         finding "$SYNDEO_BIN/$n: is not a link this package writes"
     done
+    if [ "$d_present" = no ]; then
+        finding "$SYNDEO_DIR: is missing, but the receipt says $r_version is installed"
+    fi
     refuse_if_found
 
-    newest=$(newest_version)
-    if [ "$(syndeo_version_cmp "$INCOMING" "$newest")" = lt ]; then
-        finding "Syndeo $newest is installed, or partly installed, and this package is the older $INCOMING. Run the newest package to finish, or uninstall first with $SYNDEO_DIR/$r_version/uninstall.sh"
-    elif [ "$INCOMING" = "$r_version" ] && [ "$INCOMING" = "$current_v" ]; then
-        decision="reinstalling $INCOMING"
-    elif [ "$INCOMING" = "$current_v" ]; then
-        decision="finishing the interrupted upgrade to $INCOMING"
-    elif has_version "$INCOMING"; then
-        decision="resuming the interrupted upgrade from $current_v to $INCOMING"
+    if has_version "$r_version"; then
+        # The receipt's version is here: it has to be the only one, current,
+        # and, unless this is the same version, complete.
+        if [ "$(version_count)" != 1 ]; then
+            finding "$SYNDEO_DIR: holds${versions}; with $r_version installed, it may hold nothing else"
+        fi
+        if [ "$current_v" != "$r_version" ]; then
+            finding "$SYNDEO_DIR/current: points at '${current_v}', not the installed $r_version"
+        fi
+        case "$pending_v" in '' | "$r_version") ;; *) finding "$SYNDEO_DIR/.current.new: points at $pending_v, not $r_version" ;; esac
+        refuse_if_found
+        case "$(syndeo_version_cmp "$INCOMING" "$r_version")" in
+            lt)
+                finding "Syndeo $r_version is installed, and this package is the older $INCOMING. Uninstall $r_version first with $SYNDEO_DIR/$r_version/uninstall.sh"
+                ;;
+            eq)
+                # The same version: what an interruption left may be repaired.
+                # scan_private has refused anything that is not exactly the
+                # package's, so only missing files and links can be wrong.
+                if is_complete_tree "$INCOMING" && [ "$bin_present" = 7 ]; then
+                    decision="reinstalling $INCOMING"
+                else
+                    decision="repairing $INCOMING"
+                fi
+                ;;
+            gt)
+                check_receipt_installed "$r_version"
+                decision="upgrading from $r_version to $INCOMING"
+                ;;
+        esac
     else
-        decision="upgrading from $current_v to $INCOMING"
+        # The receipt's version is gone. The one state that may follow: an
+        # upgrade to exactly one newer version, whose postinstall failed.
+        if [ "$(version_count)" != 1 ]; then
+            finding "$SYNDEO_DIR: the installed $r_version is gone, and it holds${versions:- nothing} rather than exactly one newer version: not a failed upgrade this package can finish"
+        else
+            failed=${versions# }
+            if [ "$(syndeo_version_cmp "$failed" "$r_version")" != gt ]; then
+                finding "$SYNDEO_DIR: the installed $r_version is gone, and $failed is not newer"
+            fi
+            case "$current_v" in
+                "$r_version" | "$failed") ;;
+                '') finding "$SYNDEO_DIR/current: is missing" ;;
+                *) finding "$SYNDEO_DIR/current: points at $current_v, neither $r_version nor $failed" ;;
+            esac
+            case "$pending_v" in '' | "$failed") ;; *) finding "$SYNDEO_DIR/.current.new: points at $pending_v, not $failed" ;; esac
+            refuse_if_found
+            if [ "$INCOMING" = "$failed" ]; then
+                decision="completing the failed upgrade from $r_version to $INCOMING"
+            else
+                finding "an upgrade from $r_version to $failed did not finish: install the Syndeo $failed package again to complete it, then this one"
+            fi
+        fi
     fi
 fi
 

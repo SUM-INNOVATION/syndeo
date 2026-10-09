@@ -3,7 +3,6 @@
     python3 -I ci/switch-stress.py --private DIR --command PATH --versions A B
         (--expect-output TEMPLATE | --expect-doctor)
         [--renames N] [--min-seconds S]
-        [--postinstall VERSION SCRIPT]... [--postinstalls N]
         [--as-user USER] [--env KEY=VALUE]... [--settle-lookups N] [--settle-launches N]
 
 What the macOS package promises of the switch, checked as stated:
@@ -14,7 +13,9 @@ What the macOS package promises of the switch, checked as stated:
   `current` names.
 
 The switching is the postinstall's own: a new symlink, then rename(2) over
-`current` (what `mv -h` does). --postinstall runs real postinstall scripts too.
+`current` (what `mv -h` does), between two complete version trees. That is
+the switch alone; a whole upgrade, which also removes the old tree, is
+ci/upgrade-stress.py's.
 
 A lookup opens `current/syndeo` once. Only that open may fail, and only with
 ENOENT or EINVAL while switching. Which version it found is judged from that
@@ -70,8 +71,6 @@ def main():
     ap.add_argument("--expect-doctor", action="store_true")
     ap.add_argument("--renames", type=int, default=10000)
     ap.add_argument("--min-seconds", type=float, default=3.0)
-    ap.add_argument("--postinstall", nargs=2, action="append", default=[], metavar=("VERSION", "SCRIPT"))
-    ap.add_argument("--postinstalls", type=int, default=0)
     ap.add_argument("--as-user")
     ap.add_argument("--env", action="append", default=[],
                     help="KEY=VALUE for each start; {thread} in VALUE becomes the starting thread's name")
@@ -258,16 +257,6 @@ def main():
             os.rename(pending, current)
             last = target
             switches += 1
-        runs = 0
-        for i in range(a.postinstalls if a.postinstall else 0):
-            v, script = a.postinstall[i % len(a.postinstall)]
-            r = subprocess.run(["/bin/sh", script, "stress", "/", "/", "/"], capture_output=True, text=True)
-            if r.returncode != 0:
-                reject("postinstall %s exited %d: %s" % (v, r.returncode, r.stdout.strip()[-200:]))
-            elif os.readlink(current) != v:
-                reject("postinstall %s returned with current at %s" % (v, os.readlink(current)))
-            last = v
-            runs += 1
     finally:
         state["switching"] = False
         for t in threads:
@@ -285,7 +274,7 @@ def main():
     if settled != a.settle_launches:
         reject("%d of %d starts after switching stopped did not succeed" % (a.settle_launches - settled, a.settle_launches))
 
-    print("switches: %d renames, %d postinstalls; current ends at %s" % (switches, runs, final))
+    print("switches: %d renames; current ends at %s" % (switches, final))
     for key in sorted(tally):
         print("%-28s %d" % (key, tally[key]))
     transients = sum(n for k, n in tally.items() if k.startswith("transient"))

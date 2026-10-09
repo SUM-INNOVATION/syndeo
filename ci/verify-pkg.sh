@@ -277,7 +277,7 @@ installed() {
     bad "receipt" "there is no receipt for $SYNDEO_ID"
     return 0
   fi
-  check_receipt
+  check_receipt_meta
   if [ "$r_version" = "$version" ] && [ "$nfindings" = 0 ]; then
     ok "$SYNDEO_ID $version, for / at /, listing exactly its paths, and no other package claims them"
   else
@@ -291,6 +291,9 @@ installed() {
   check_bin_dir "$SYNDEO_BIN"
   scan_private
   scan_bin
+  # Every path the receipt lists, there and exactly as packaged.
+  [ -n "$r_files" ] && check_receipt_installed "$r_version"
+  [ "$versions" = " $version" ] || finding "$SYNDEO_DIR: holds${versions:- no version}, not $version alone"
   [ "$current_v" = "$version" ] || finding "$SYNDEO_DIR/current: points at '$current_v', not $version"
   check_tree "$version" exact
   [ "$bin_present" = 7 ] || finding "$SYNDEO_BIN: has $bin_present of the seven commands"
@@ -298,7 +301,7 @@ installed() {
     finding "$SYNDEO_BIN/$n: is not a link the package writes"
   done
   if [ "$nfindings" = 0 ]; then
-    ok "$SYNDEO_DIR/$version is exactly the package's, current points at it, and all seven commands link through current${versions:+ (versions present:$versions)}"
+    ok "$SYNDEO_DIR/$version alone, every path the receipt lists exactly as packaged, current points at it, and all seven commands link through current"
   else
     bad "installation" "$(printf '%s' "$findings" | tr '\n' ' ')"
   fi
@@ -371,14 +374,11 @@ st_render() {
     expect "$k: no placeholder left" eval "! grep -q '@[A-Z_]*@' '$d/$k'"
     expect "$k: root '', uid 0, gid 0, /usr/sbin/pkgutil" eval "grep -qx \"ROOT=''\" '$d/$k' && grep -qx \"EXPECT_UID='0'\" '$d/$k' && grep -qx \"EXPECT_GID='0'\" '$d/$k' && grep -qx \"PKGUTIL='/usr/sbin/pkgutil'\" '$d/$k'"
     expect "$k: the comparator and the shared checks, once each" eval "[ \"\$(grep -c '^syndeo_version_cmp() {' '$d/$k')\" = 1 ] && [ \"\$(grep -c '^check_tree() {' '$d/$k')\" = 1 ]"
-    expect "$k: no test fault" eval "! grep -q 'test build' '$d/$k'"
     expect "$k: POSIX sh parses it" sh -n "$d/$k"
   done
   expect "preinstall carries the incoming version" grep -qx "INCOMING='0.1.7'" "$d/preinstall"
   expect "uninstall.sh carries its own version" grep -qx "EMBEDDED='0.1.7'" "$d/uninstall"
-  expect "a postinstall fault renders for 0.0.x" eval "'$builder' --render postinstall 0.0.3 '' 0 0 /usr/sbin/pkgutil '$d/fault' --test-fault postinstall-fails >/dev/null 2>&1 && grep -q 'test build: stopping before the switch' '$d/fault'"
-  expect "no fault for a release version" eval "! '$builder' --render postinstall 0.1.7 '' 0 0 /usr/sbin/pkgutil '$d/x' --test-fault postinstall-fails >/dev/null 2>&1"
-  expect "no fault in preinstall" eval "! '$builder' --render preinstall 0.0.3 '' 0 0 /usr/sbin/pkgutil '$d/x' --test-fault postinstall-fails >/dev/null 2>&1"
+  expect "the builder has no test fault to put in a package" eval "! '$builder' --render postinstall 0.0.3 '' 0 0 /usr/sbin/pkgutil '$d/x' --test-fault postinstall-fails >/dev/null 2>&1"
   expect "a root with a quote is refused" eval "! '$builder' --render preinstall 0.1.7 \"/tmp/it's\" 0 0 /usr/sbin/pkgutil '$d/x' >/dev/null 2>&1"
   expect "a relative pkgutil is refused" eval "! '$builder' --render preinstall 0.1.7 '' 0 0 pkgutil '$d/x' >/dev/null 2>&1"
   expect "a malformed version is refused" eval "! '$builder' --render preinstall 0.1 '' 0 0 /usr/sbin/pkgutil '$d/x' >/dev/null 2>&1"
@@ -424,7 +424,7 @@ EOF
   chmod 755 "$C/pkgutil"
 }
 
-st_render_for() { "$builder" --render "$1" "$2" "$R" "$U" "$G" "$C/pkgutil" "$3" ${4:+--test-fault "$4"} >/dev/null; }
+st_render_for() { "$builder" --render "$1" "$2" "$R" "$U" "$G" "$C/pkgutil" "$3" >/dev/null; }
 
 st_dirs() {
   mkdir -p "$D"
@@ -488,6 +488,17 @@ st_receipt() {
 # st_installed V [LOCATION]: what a completed installation of V leaves.
 st_installed() { st_tree "$1"; st_links; st_current "$1"; st_receipt "$@"; }
 
+# st_failed X W [AT]: what an upgrade from X to W whose postinstall failed
+# leaves, as measured: X's receipt, X's tree gone, W's tree and the links in
+# place, and current still at X (failed before the switch) or at AT.
+st_failed() {
+  st_installed "$1"
+  rm -rf "${D:?}/$1"
+  st_tree "$2"
+  rm "$D/current"
+  st_current "${3:-$1}"
+}
+
 st_snap() {
   { find "$R" "$DB" -print0 | xargs -0 stat -f '%N|%HT|%u|%g|%Lp|%Mp|%Sf|%i|%z|%Y'; } | LC_ALL=C sort
 }
@@ -518,52 +529,98 @@ pre_case() {
 }
 
 st_preinstall() {
-  printf '\n  preinstall: every state, read-only\n'
-  st_new; pre_case "1: nothing installed" 0 "installing 0.0.9" 0.0.9
-  st_new; rm -rf "${R:?}/usr/local"; pre_case "1: no /usr/local at all" 0 "installing 0.0.9" 0.0.9
+  printf '\n  preinstall: no receipt\n'
+  st_new; pre_case "nothing installed" 0 "installing 0.0.9" 0.0.9
+  st_new; rm -rf "${R:?}/usr/local"; pre_case "no /usr/local at all" 0 "installing 0.0.9" 0.0.9
   st_new; mkdir -p "$R/usr/local/bin"; chmod 755 "$R/usr/local/bin"; echo x >"$R/usr/local/bin/syndeo"
-  pre_case "2: a plain file at a command, no receipt" 1 "/usr/local/bin/syndeo: exists, and no Syndeo package is installed" 0.0.9
-  st_new; st_links; pre_case "2: the package's own link shapes, but no receipt" 1 "exists, and no Syndeo package is installed" 0.0.9
-  st_new; st_tree 0.0.9 subset; pre_case "3: an interrupted first install of this version" 0 "resuming an interrupted installation of 0.0.9" 0.0.9
-  st_new; st_tree 0.0.9; st_current 0.0.9; st_links; pre_case "3: interrupted after the switch, links in place" 0 "resuming an interrupted installation of 0.0.9" 0.0.9
-  st_new; st_tree 0.0.9 subset; st_current 0.0.9; pre_case "3 refused: current set, but the tree incomplete" 1 "is missing" 0.0.9
-  st_new; st_tree 0.0.8; pre_case "4: another version, no receipt" 1 "exists, and no Syndeo package is installed" 0.0.9
-  st_new; st_tree 0.0.9 subset; echo x >"$D/notes"; pre_case "4: something else in the private directory" 1 "$D/notes: is not part of Syndeo" 0.0.9
+  pre_case "refused: a plain file at a command" 1 "/usr/local/bin/syndeo: exists, and no Syndeo package is installed" 0.0.9
+  st_new; st_links; pre_case "refused: the package's own link shapes" 1 "exists, and no Syndeo package is installed" 0.0.9
+  st_new; st_tree 0.0.9 subset; pre_case "an interrupted first install of this version" 0 "resuming an interrupted installation of 0.0.9" 0.0.9
+  st_new; st_tree 0.0.9; st_current 0.0.9; st_links; pre_case "interrupted after the switch, links in place" 0 "resuming an interrupted installation of 0.0.9" 0.0.9
+  st_new; st_tree 0.0.9 subset; st_current 0.0.9; pre_case "refused: current set, but the tree incomplete" 1 "is missing" 0.0.9
+  st_new; st_tree 0.0.8; pre_case "refused: another version" 1 "exists, and no Syndeo package is installed" 0.0.9
+  st_new; st_tree 0.0.9 subset; echo x >"$D/notes"; pre_case "refused: something else in the private directory" 1 "$D/notes: is not part of Syndeo" 0.0.9
   st_new; st_tree 0.0.9 subset; st_links; rm "$R/usr/local/bin/syndeo-ui"; ln -s /tmp/elsewhere "$R/usr/local/bin/syndeo-ui"
-  pre_case "4: a foreign link beside an interrupted install" 1 "syndeo-ui: is not a link this package writes" 0.0.9
-  st_new; st_installed 0.0.9; pre_case "5: upgrade 0.0.9 to 0.0.10, numerically" 0 "upgrading from 0.0.9 to 0.0.10" 0.0.10
-  st_new; st_installed 0.0.10; pre_case "6: the same version again, exact" 0 "reinstalling 0.0.10" 0.0.10
+  pre_case "refused: a foreign link beside an interrupted install" 1 "syndeo-ui: is not a link this package writes" 0.0.9
+
+  printf '\n  preinstall: one version installed\n'
+  st_new; st_installed 0.0.9; pre_case "upgrade 0.0.9 to 0.0.10, numerically" 0 "upgrading from 0.0.9 to 0.0.10" 0.0.10
+  st_new; st_installed 0.0.10; pre_case "the same version again" 0 "reinstalling 0.0.10" 0.0.10
+  st_new; st_installed 0.0.10; rm "$D/0.0.10/README.md" "$D/0.0.10/tools/wordcount.wat"
+  pre_case "the same version, files an interruption left missing: repaired" 0 "repairing 0.0.10" 0.0.10
+  st_new; st_installed 0.0.10; rm "$R/usr/local/bin/syndeo-agent"
+  pre_case "the same version, a command link missing: repaired" 0 "repairing 0.0.10" 0.0.10
+  st_new; st_installed 0.0.10; pre_case "refused: a downgrade, 0.0.10 to 0.0.9" 1 "Syndeo 0.0.10 is installed, and this package is the older 0.0.9" 0.0.9
+  st_new; st_installed 0.0.9; rm "$D/0.0.9/README.md"
+  pre_case "refused: an upgrade from an installation missing a path the receipt lists" 1 "$D/0.0.9/README.md: is missing, and the receipt for 0.0.9 lists it" 0.0.10
+  st_new; st_installed 0.0.9; rm "$R/usr/local/bin/syndeo-agent"
+  pre_case "refused: an upgrade from an installation missing a command" 1 "/usr/local/bin/syndeo-agent: is missing, and the receipt for 0.0.9 lists it" 0.0.10
+  st_new; st_installed 0.0.9; st_tree 0.0.10
+  pre_case "refused: a second version beside the installed one" 1 "with 0.0.9 installed, it may hold nothing else" 0.0.10
   st_new; st_installed 0.0.9; st_tree 0.0.10; rm "$D/current"; st_current 0.0.10
-  pre_case "7: interrupted after the switch, before the receipt" 0 "finishing the interrupted upgrade to 0.0.10" 0.0.10
-  st_new; st_installed 0.0.9; st_tree 0.0.10 subset; pre_case "8: interrupted while the payload was written" 0 "resuming the interrupted upgrade from 0.0.9 to 0.0.10" 0.0.10
-  st_new; st_installed 0.0.10; pre_case "9: a downgrade, 0.0.10 to 0.0.9" 1 "this package is the older 0.0.9" 0.0.9
-  st_new; st_installed 0.0.9; st_tree 0.0.11 subset; pre_case "9: older than an interrupted newer install" 1 "Syndeo 0.0.11 is installed, or partly installed" 0.0.10
-  st_new; st_installed 0.0.9; echo usr/local/extra >>"$DB/com.sum.syndeo.pkg.files"
-  pre_case "10: the receipt lists other paths" 1 "does not list exactly the package's paths" 0.0.10
-  st_new; st_installed 0.0.9; sed -i '' 's/^volume: \//volume: \/Volumes\/Other/' "$DB/com.sum.syndeo.pkg.info"
-  pre_case "10: the receipt is for another volume" 1 "the receipt is for volume '/Volumes/Other', not /" 0.0.10
-  st_new; st_installed 0.0.9; sed -i '' 's/^version: .*/version: 0.9/' "$DB/com.sum.syndeo.pkg.info"
-  pre_case "10: the receipt's version is malformed" 1 "is not a version" 0.0.10
-  st_new; st_installed 0.0.9; printf '%s\tcom.example.other\n' "$R/usr/local/bin/syndeo" >"$DB/claims"
-  pre_case "10: another package claims a command" 1 "is claimed by another package, com.example.other" 0.0.10
-  st_new; st_installed 0.0.9; rm "$D/current"; pre_case "11: current is missing" 1 "$D/current: is missing" 0.0.10
-  st_new; st_installed 0.0.9; st_tree 0.0.8; rm "$D/current"; st_current 0.0.8
-  pre_case "11: current older than the receipt" 1 "points at 0.0.8, older than the installed 0.0.9" 0.0.10
+  pre_case "refused: current at a second version, the installed one still there" 1 "points at '0.0.10', not the installed 0.0.9" 0.0.10
+  st_new; st_installed 0.0.9; rm "$D/current"; pre_case "refused: current is missing" 1 "$D/current: points at '', not the installed 0.0.9" 0.0.10
   st_new; st_installed 0.0.9; rm "$D/current"; ln -s elsewhere "$D/current"
-  pre_case "11: current does not name a version" 1 "points at 'elsewhere', which is not a version" 0.0.10
-  st_new; st_installed 0.0.9; rm -rf "$D/0.0.9"; rm "$D/current"; st_current 0.0.9
-  pre_case "11: the receipt's version is gone" 1 "points at 0.0.9, which is not installed" 0.0.10
+  pre_case "refused: current does not name a version" 1 "points at 'elsewhere', which is not a version" 0.0.10
+  st_new; st_installed 0.0.9; ln -s 0.0.8 "$D/.current.new"
+  pre_case "refused: .current.new names another version" 1 ".current.new: points at 0.0.8, not 0.0.9" 0.0.10
   st_new; st_installed 0.0.9; rm "$R/usr/local/bin/syndeo-net"; echo x >"$R/usr/local/bin/syndeo-net"
-  pre_case "12: a command replaced by a file" 1 "syndeo-net: is not a link this package writes" 0.0.10
-  st_new; st_installed 0.0.10; chmod 775 "$D/0.0.10/syndeo"; pre_case "13: same version, an executable's mode changed" 1 "$D/0.0.10/syndeo: is not a Regular File" 0.0.10
-  st_new; st_installed 0.0.10; echo x >"$D/0.0.10/extra"; pre_case "13: same version, an extra file" 1 "$D/0.0.10/extra: is not part of Syndeo 0.0.10" 0.0.10
+  pre_case "refused: a command replaced by a file" 1 "syndeo-net: is not a link this package writes" 0.0.10
+  st_new; st_installed 0.0.9; echo usr/local/extra >>"$DB/com.sum.syndeo.pkg.files"
+  pre_case "refused: the receipt lists other paths" 1 "does not list exactly the package's paths" 0.0.10
+  st_new; st_installed 0.0.9; sed -i '' 's/^volume: \//volume: \/Volumes\/Other/' "$DB/com.sum.syndeo.pkg.info"
+  pre_case "refused: the receipt is for another volume" 1 "the receipt is for volume '/Volumes/Other', not /" 0.0.10
+  st_new; st_installed 0.0.9; sed -i '' 's/^version: .*/version: 0.9/' "$DB/com.sum.syndeo.pkg.info"
+  pre_case "refused: the receipt's version is malformed" 1 "is not a version" 0.0.10
+  st_new; st_installed 0.0.9; printf '%s\tcom.example.other\n' "$R/usr/local/bin/syndeo" >"$DB/claims"
+  pre_case "refused: another package claims a command" 1 "is claimed by another package, com.example.other" 0.0.10
+  st_new; st_installed 0.0.10; chmod 775 "$D/0.0.10/syndeo"; pre_case "the same version refused: an executable's mode changed" 1 "$D/0.0.10/syndeo: is not a Regular File" 0.0.10
+  st_new; st_installed 0.0.10; echo x >"$D/0.0.10/extra"; pre_case "the same version refused: an extra file" 1 "$D/0.0.10/extra: is not part of Syndeo 0.0.10" 0.0.10
+  st_new; st_installed 0.0.10; rm "$D/0.0.10/README.md"; echo x >"$D/0.0.10/extra"
+  pre_case "the same version refused: a missing file does not excuse an extra one" 1 "$D/0.0.10/extra: is not part of Syndeo 0.0.10" 0.0.10
   st_new; st_installed 0.0.10; rm "$D/0.0.10/LICENSE"; ln -s README.md "$D/0.0.10/LICENSE"
-  pre_case "13: same version, a symlink inside the tree" 1 "$D/0.0.10/LICENSE: is not a Regular File" 0.0.10
+  pre_case "the same version refused: a symlink inside the tree" 1 "$D/0.0.10/LICENSE: is not a Regular File" 0.0.10
   st_new; st_installed 0.0.10; chmod +a "everyone allow read" "$D/0.0.10/README.md"
-  pre_case "13: same version, an ACL on a file" 1 "$D/0.0.10/README.md: is not a Regular File" 0.0.10
+  pre_case "the same version refused: an ACL on a file" 1 "$D/0.0.10/README.md: is not a Regular File" 0.0.10
   st_new; st_installed 0.0.10; chflags uchg "$D/0.0.10/README.md"
-  pre_case "13: same version, a file flagged immutable" 1 "$D/0.0.10/README.md: is not a Regular File" 0.0.10
+  pre_case "the same version refused: a file flagged immutable" 1 "$D/0.0.10/README.md: is not a Regular File" 0.0.10
   chflags nouchg "$D/0.0.10/README.md"
+
+  printf '\n  preinstall: after a failed upgrade\n'
+  st_new; st_failed 0.0.9 0.0.10
+  pre_case "failed at the postinstall's entry: the same package completes it" 0 "completing the failed upgrade from 0.0.9 to 0.0.10" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10 0.0.10
+  pre_case "failed after the switch: the same package completes it" 0 "completing the failed upgrade from 0.0.9 to 0.0.10" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10; ln -s 0.0.10 "$D/.current.new"
+  pre_case "failed between the new link and the switch: completed" 0 "completing the failed upgrade from 0.0.9 to 0.0.10" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10; rm "$D/0.0.10/LICENSE" "$R/usr/local/bin/syndeo-ui"
+  pre_case "failed, a file and a command link missing: completed" 0 "completing the failed upgrade from 0.0.9 to 0.0.10" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10
+  pre_case "refused: the old version's package" 1 "an upgrade from 0.0.9 to 0.0.10 did not finish: install the Syndeo 0.0.10 package again to complete it" 0.0.9
+  st_new; st_failed 0.0.9 0.0.10
+  pre_case "refused: an older package" 1 "did not finish: install the Syndeo 0.0.10 package again" 0.0.8
+  st_new; st_failed 0.0.9 0.0.10 0.0.10
+  pre_case "refused: a newer package" 1 "did not finish: install the Syndeo 0.0.10 package again" 0.0.11
+  st_new; st_failed 0.0.10 0.0.9
+  pre_case "refused: what is left is not newer" 1 "the installed 0.0.10 is gone, and 0.0.9 is not newer" 0.0.9
+  st_new; st_failed 0.0.9 0.0.10; st_tree 0.0.11
+  pre_case "refused: two versions left" 1 "rather than exactly one newer version" 0.0.10
+  st_new; st_installed 0.0.9; rm -rf "${D:?}/0.0.9"
+  pre_case "refused: no version left at all" 1 "it holds nothing rather than exactly one newer version" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10; rm "$D/current"; st_current 0.0.8
+  pre_case "refused: current names a third version" 1 "points at 0.0.8, neither 0.0.9 nor 0.0.10" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10; rm "$D/current"
+  pre_case "refused: current is missing" 1 "$D/current: is missing" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10; ln -s 0.0.9 "$D/.current.new"
+  pre_case "refused: .current.new names the old version" 1 ".current.new: points at 0.0.9, not 0.0.10" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10; echo x >"$D/0.0.10/extra"
+  pre_case "refused: an extra file in what is left" 1 "$D/0.0.10/extra: is not part of Syndeo 0.0.10" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10; chmod 775 "$D/0.0.10/syndeo-net"
+  pre_case "refused: a file's mode changed in what is left" 1 "$D/0.0.10/syndeo-net: is not a Regular File" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10; rm "$D/0.0.10/LICENSE"; ln -s README.md "$D/0.0.10/LICENSE"
+  pre_case "refused: a symlink in what is left" 1 "$D/0.0.10/LICENSE: is not a Regular File" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10; rm "$R/usr/local/bin/syndeo-ui"; ln -s /tmp/elsewhere "$R/usr/local/bin/syndeo-ui"
+  pre_case "refused: a foreign command" 1 "syndeo-ui: is not a link this package writes" 0.0.10
 
   printf '\n  preinstall: where, and the paths around it\n'
   st_new; pre_case "another target volume" 1 "the target volume is '/Volumes/Other'" 0.0.9 /Volumes/Other
@@ -585,10 +642,10 @@ st_preinstall() {
   st_new; U=0; pre_case "/usr/local not owned by root" 1 "/usr/local: is owned by uid $(id -u), not root" 0.0.9
 }
 
-# post_case NAME EXIT TEXT VERSION [FAULT]
+# post_case NAME EXIT TEXT VERSION
 post_case() {
-  local name="$1" want="$2" text="$3" v="$4" fault="${5:-}"
-  st_render_for postinstall "$v" "$C/postinstall" "$fault"
+  local name="$1" want="$2" text="$3" v="$4"
+  st_render_for postinstall "$v" "$C/postinstall"
   /bin/sh "$C/postinstall" "$C/fake.pkg" / / / >"$C/out" 2>&1
   status=$?
   local verdict=yes
@@ -602,16 +659,19 @@ st_postinstall() {
   printf '\n  postinstall: the switch\n'
   st_new; st_tree 0.0.9; st_links; post_case "first install: current is created" 0 "0.0.9 is current" 0.0.9
   expect "  current points at 0.0.9" test "$(readlink "$D/current")" = 0.0.9
-  st_new; st_installed 0.0.9; st_tree 0.0.10; post_case "upgrade: current moves" 0 "0.0.10 is current" 0.0.10
-  expect "  current points at 0.0.10, and 0.0.9 is kept" eval "[ \"\$(readlink '$D/current')\" = 0.0.10 ] && [ -f '$D/0.0.9/syndeo' ]"
-  st_new; st_installed 0.0.9; st_tree 0.0.10; ln -s 0.0.9 "$D/.current.new"
+  st_new; st_failed 0.0.9 0.0.10
+  post_case "an upgrade, as Installer leaves it: current moves off the removed version" 0 "0.0.10 is current" 0.0.10
+  expect "  current points at 0.0.10" test "$(readlink "$D/current")" = 0.0.10
+  st_new; st_failed 0.0.9 0.0.10; ln -s 0.0.9 "$D/.current.new"
   post_case "a stale .current.new from an interrupted switch" 0 "0.0.10 is current" 0.0.10
   expect "  .current.new is gone" eval "! [ -e '$D/.current.new' ] && ! [ -L '$D/.current.new' ]"
-  st_new; st_installed 0.0.9; st_tree 0.0.10 subset; post_case "an incomplete tree is not made current" 1 "is missing" 0.0.10
+  st_new; st_failed 0.0.9 0.0.10; rm "$D/0.0.10/README.md"
+  post_case "an incomplete tree is not made current" 1 "is missing" 0.0.10
+  expect "  current still points at 0.0.9" test "$(readlink "$D/current")" = 0.0.9
+  st_new; st_installed 0.0.9; st_tree 0.0.10
+  post_case "another version still there: refused before the switch" 1 "$D/0.0.9: is still there; Syndeo 0.0.10 is installed alone" 0.0.10
   expect "  current still points at 0.0.9" test "$(readlink "$D/current")" = 0.0.9
   st_new; st_tree 0.0.9; mkdir "$D/current"; post_case "current is a directory" 1 "$D/current: is not a symlink owned by root:wheel" 0.0.9
-  st_new; st_installed 0.0.9; st_tree 0.0.10; post_case "the test fault stops before the switch" 1 "test build: stopping before the switch" 0.0.10 postinstall-fails
-  expect "  current still points at 0.0.9" test "$(readlink "$D/current")" = 0.0.9
   st_new; st_tree 0.0.9
   st_render_for postinstall 0.0.9 "$C/postinstall"
   /bin/sh "$C/postinstall" "$C/fake.pkg" / /Volumes/Other / >"$C/out" 2>&1
@@ -619,21 +679,19 @@ st_postinstall() {
   expect "postinstall: refuses another target volume" eval "[ $status = 1 ] && grep -q \"the target volume is '/Volumes/Other'\" '$C/out' && ! [ -L '$D/current' ]"
 }
 
-# The stress test of the switch, shared with ci/test-pkg-install.sh, which
-# runs it against the installed package.
+# The switch itself, under load: lookups and starts through `current` while
+# it is renamed back and forth between two complete trees. The real runner
+# measures a whole upgrade instead, in ci/test-pkg-install.sh.
 st_atomic() {
   printf '\n  the switch, under load\n'
   st_new; st_installed 0.0.8; st_tree 0.0.9
-  st_render_for postinstall 0.0.8 "$C/post-0.0.8"
-  st_render_for postinstall 0.0.9 "$C/post-0.0.9"
   local out
   out="$(python3 -I "$here/switch-stress.py" \
     --private "$D" --command "$R/usr/local/bin/syndeo" --versions 0.0.8 0.0.9 \
-    --expect-output 'syndeo {version}' --renames 10000 \
-    --postinstall 0.0.8 "$C/post-0.0.8" --postinstall 0.0.9 "$C/post-0.0.9" --postinstalls 20 2>&1)"
+    --expect-output 'syndeo {version}' --renames 10000 2>&1)"
   local status=$?
   printf '%s\n' "$out" | sed 's/^/          | /'
-  expect "10,000 renames and 20 postinstalls: only ENOENT or EINVAL while switching, every success whole, none after" test "$status" = 0
+  expect "10,000 renames: only ENOENT or EINVAL while switching, every success whole, none after" test "$status" = 0
 }
 
 # un_case NAME EXIT TEXT SCRIPT [ARG]: run an uninstaller.
@@ -649,18 +707,27 @@ un_case() {
 
 st_uninstall() {
   printf '\n  uninstall: look first, then remove\n'
-  st_new; st_installed 0.0.10; st_tree 0.0.9; ln -s 0.0.10 "$D/.current.new"
+  st_new; st_installed 0.0.10; ln -s 0.0.10 "$D/.current.new"
   mkdir -p "$R/usr/local/libexec/someone-else"; echo keep >"$R/usr/local/bin/unrelated"
-  un_case "everything, an older version and a stale .current.new included" 0 "removed Syndeo 0.0.10" "$D/0.0.10/uninstall.sh"
+  un_case "everything, a stale .current.new included" 0 "removed Syndeo 0.0.10" "$D/0.0.10/uninstall.sh"
   expect "  nothing of Syndeo left, and the receipt forgotten" eval "! [ -e '$D' ] && ! [ -L '$R/usr/local/bin/syndeo' ] && ! [ -f '$DB/com.sum.syndeo.pkg.info' ]"
   expect "  /usr/local/bin, /usr/local/libexec and what else they hold are kept" eval "[ -d '$R/usr/local/bin' ] && [ -d '$R/usr/local/libexec/someone-else' ] && [ \"\$(cat '$R/usr/local/bin/unrelated')\" = keep ]"
 
-  st_new; st_installed 0.0.9; st_tree 0.0.10; rm "$D/current"; st_current 0.0.10; st_receipt 0.0.10
-  un_case "an older version's uninstaller refuses after an upgrade" 1 "this is 0.0.9's uninstaller, and the installed package is 0.0.10" "$D/0.0.9/uninstall.sh"
-  un_case "  ... with --old-versions too" 1 "this is 0.0.9's uninstaller" "$D/0.0.9/uninstall.sh" --old-versions
+  st_new; st_failed 0.0.9 0.0.10
+  un_case "after an upgrade that failed before the switch: refused, saying to finish it" 1 "the upgrade from 0.0.9 to 0.0.10 did not finish. Install the Syndeo 0.0.10 package again" "$D/0.0.10/uninstall.sh"
+  [ "$changed" = no ] || { expect "  ... and nothing changed" false; }
+  st_new; st_failed 0.0.9 0.0.10 0.0.10
+  un_case "after an upgrade that failed after the switch: refused" 1 "the upgrade from 0.0.9 to 0.0.10 did not finish" "$D/0.0.10/uninstall.sh"
+  [ "$changed" = no ] || { expect "  ... and nothing changed" false; }
+  st_new; st_installed 0.0.10; rm "$D/0.0.10/README.md"
+  un_case "a path the receipt lists is missing: refused" 1 "$D/0.0.10/README.md: is missing, and the receipt for 0.0.10 lists it" "$D/0.0.10/uninstall.sh"
+  [ "$changed" = no ] || { expect "  ... and nothing changed" false; }
+  st_new; st_installed 0.0.10; rm "$R/usr/local/bin/syndeo-agent"
+  un_case "a command the receipt lists is missing: refused" 1 "/usr/local/bin/syndeo-agent: is missing, and the receipt for 0.0.10 lists it" "$D/0.0.10/uninstall.sh"
+  [ "$changed" = no ] || { expect "  ... and nothing changed" false; }
 
   local plant
-  for plant in tools-extra tree-extra private-file private-dir bad-version foreign-link mode acl pending; do
+  for plant in tools-extra tree-extra private-file private-dir bad-version older-version foreign-link mode acl pending; do
     st_new; st_installed 0.0.10
     case "$plant" in
       tools-extra) echo x >"$D/0.0.10/tools/extra.wat" ;;
@@ -668,6 +735,7 @@ st_uninstall() {
       private-file) echo x >"$D/notes.txt" ;;
       private-dir) mkdir "$D/backup" ;;
       bad-version) mkdir "$D/0.1" ;;
+      older-version) st_tree 0.0.9 ;;
       foreign-link) rm "$R/usr/local/bin/syndeo-ui"; ln -s /Applications/Other.app "$R/usr/local/bin/syndeo-ui" ;;
       mode) chmod 775 "$D/0.0.10/syndeo-net" ;;
       acl) chmod +a "everyone allow list" "$D/0.0.10" ;;
@@ -677,9 +745,8 @@ st_uninstall() {
     [ "$changed" = no ] || { expect "  ... and nothing changed" false; }
   done
 
-  st_new; st_installed 0.0.10; st_tree 0.0.8; st_tree 0.0.9; st_tree 0.0.11 subset
-  un_case "--old-versions" 0 "removed older versions: 0.0.8 0.0.9" "$D/0.0.10/uninstall.sh" --old-versions
-  expect "  keeps the receipt's version, current's and the newer one; removes only the older ones" eval "[ -d '$D/0.0.10' ] && [ -d '$D/0.0.11' ] && ! [ -e '$D/0.0.8' ] && ! [ -e '$D/0.0.9' ] && [ \"\$(readlink '$D/current')\" = 0.0.10 ] && [ -L '$R/usr/local/bin/syndeo' ] && [ -f '$DB/com.sum.syndeo.pkg.info' ]"
+  st_new; st_installed 0.0.10
+  un_case "--old-versions is gone" 1 "usage:" "$D/0.0.10/uninstall.sh" --old-versions
 
   st_new; st_installed 0.0.10; touch "$DB/forget-fails"
   un_case "the receipt cannot be forgotten" 2 "sudo /usr/sbin/pkgutil --forget com.sum.syndeo.pkg --volume /" "$D/0.0.10/uninstall.sh"
@@ -709,6 +776,18 @@ st_installed_mode() {
   out="$(SYNDEO_VERIFY_ROOT="$R" SYNDEO_VERIFY_UID="$U" SYNDEO_VERIFY_GID="$G" SYNDEO_VERIFY_PKGUTIL="$C/pkgutil" \
     bash "$here/verify-pkg.sh" installed 0.0.10 2>&1)"
   expect "installed: a missing command fails" eval "printf '%s' \"\$out\" | grep -q 'has 6 of the seven commands'"
+  st_new; st_installed 0.0.10; rm "$D/0.0.10/README.md"
+  out="$(SYNDEO_VERIFY_ROOT="$R" SYNDEO_VERIFY_UID="$U" SYNDEO_VERIFY_GID="$G" SYNDEO_VERIFY_PKGUTIL="$C/pkgutil" \
+    bash "$here/verify-pkg.sh" installed 0.0.10 2>&1)"
+  expect "installed: a path the receipt lists is missing fails" eval "printf '%s' \"\$out\" | grep -q 'README.md: is missing, and the receipt for 0.0.10 lists it'"
+  st_new; st_installed 0.0.10; st_tree 0.0.9
+  out="$(SYNDEO_VERIFY_ROOT="$R" SYNDEO_VERIFY_UID="$U" SYNDEO_VERIFY_GID="$G" SYNDEO_VERIFY_PKGUTIL="$C/pkgutil" \
+    bash "$here/verify-pkg.sh" installed 0.0.10 2>&1)"
+  expect "installed: a second version beside it fails" eval "printf '%s' \"\$out\" | grep -q 'not 0.0.10 alone'"
+  st_new; st_failed 0.0.9 0.0.10 0.0.10
+  out="$(SYNDEO_VERIFY_ROOT="$R" SYNDEO_VERIFY_UID="$U" SYNDEO_VERIFY_GID="$G" SYNDEO_VERIFY_PKGUTIL="$C/pkgutil" \
+    bash "$here/verify-pkg.sh" installed 0.0.10 2>&1)"
+  expect "installed: after a failed upgrade, it fails on the receipt and its missing paths" eval "printf '%s' \"\$out\" | grep -q \"version '0.0.9'\" && printf '%s' \"\$out\" | grep -q 'is missing, and the receipt for 0.0.9 lists it'"
 }
 
 # loc_case NAME accepted|refused LOCATION: a receipt whose location lines are
@@ -801,11 +880,18 @@ st_inspect() {
   out="$(bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --tarball "$d/other/syndeo-0.0.1-aarch64-apple-darwin.tar.gz" 2>&1)"
   expect "inspect: a payload that differs from the tarball fails" eval "printf '%s' \"\$out\" | grep -q 'differs from the tarball: README.md'"
 
-  mkdir -p "$d/fault"
+  mkdir -p "$d/fault" "$d/faulty"
   st_tarball "$d/fault" 0.0.2
-  "$builder" 0.0.2 "$d/fault/syndeo-0.0.2-aarch64-apple-darwin.tar.gz" "$d/fault" --test-fault postinstall-fails >/dev/null
-  out="$(bash "$here/verify-pkg.sh" inspect "$d/fault/syndeo-0.0.2-aarch64-apple-darwin.pkg" 0.0.2 --tarball "$d/fault/syndeo-0.0.2-aarch64-apple-darwin.tar.gz" 2>&1)"
-  expect "inspect: a test-fault postinstall fails" eval "printf '%s' \"\$out\" | grep -q 'postinstall — differs from the template'"
+  "$builder" 0.0.2 "$d/fault/syndeo-0.0.2-aarch64-apple-darwin.tar.gz" "$d/fault" >/dev/null
+  local w
+  for w in entry after-switch; do
+    rm -f "$d/faulty/syndeo-0.0.2-aarch64-apple-darwin.pkg"
+    bash "$here/pkg-test-fault.sh" "$d/fault/syndeo-0.0.2-aarch64-apple-darwin.pkg" "$d/faulty/syndeo-0.0.2-aarch64-apple-darwin.pkg" "$w" "$d/faulty/marker" >"$d/faulty/log" 2>&1
+    expect "pkg-test-fault.sh: a fault at $w, and nothing else changed" test "$?" = 0
+    out="$(bash "$here/verify-pkg.sh" inspect "$d/faulty/syndeo-0.0.2-aarch64-apple-darwin.pkg" 0.0.2 --tarball "$d/fault/syndeo-0.0.2-aarch64-apple-darwin.tar.gz" 2>&1)"
+    expect "inspect: a package with a test fault at $w fails" eval "printf '%s' \"\$out\" | grep -q 'postinstall — differs from the template'"
+  done
+  expect "pkg-test-fault.sh: refuses anything but a 0.0.x stand-in" eval "cp '$pkg' '$d/faulty/syndeo-0.1.7-aarch64-apple-darwin.pkg' && ! bash '$here/pkg-test-fault.sh' '$d/faulty/syndeo-0.1.7-aarch64-apple-darwin.pkg' '$d/faulty/y.pkg' entry '$d/faulty/m' >/dev/null 2>&1 && ! [ -e '$d/faulty/y.pkg' ]"
 
   # Edited packages: expanded, one thing changed, flattened again.
   edit_case() {

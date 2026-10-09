@@ -4,20 +4,18 @@
 # Remove Syndeo, installed by its macOS package.
 #
 #   sudo /bin/sh /usr/local/libexec/syndeo/<version>/uninstall.sh
-#   sudo /bin/sh /usr/local/libexec/syndeo/<version>/uninstall.sh --old-versions
 #
-# Run the copy in the version `current` points at: an older version's copy
-# refuses, so that it can never take apart a newer installation.
-#
-# It looks at everything first and changes nothing unless all of it is as
-# the package left it. Then it removes the seven command links, `current`,
-# every version's files, the version directories and the private directory
-# (directories with rmdir, so anything unexpected keeps its directory), and
-# only then forgets the receipt. Each path is looked at again just before it
-# is removed; if one has changed since, it stops there and says what is left.
-#
-# --old-versions removes only the version directories older than this one,
-# and nothing else.
+# One version is installed at a time, and only its own copy of this script,
+# the one the receipt's version carries, removes it. It looks at everything
+# first and changes nothing unless all of it is as the package left it: the
+# receipt, every path the receipt lists, exactly as packaged, `current`
+# pointing at it, and nothing else. After a failed upgrade it refuses, and
+# says to run that upgrade's package again first. Then it removes the seven
+# command links, `current`, the version's files, its directory and the
+# private directory (directories with rmdir, so anything unexpected keeps its
+# directory), and only then forgets the receipt. Each path is looked at again
+# just before it is removed; if one has changed since, it stops there and
+# says what is left.
 #
 # Never touched: homes, ~/.syndeo, keychain items, proxy trust settings, and
 # any path not named above.
@@ -38,34 +36,30 @@ PKGUTIL='@PKGUTIL@'
 
 @COMMON@
 
-mode=all
 case "$#:${1-}" in
     0:) ;;
-    1:--old-versions) mode=old ;;
     1:--help | 1:-h)
         cat <<EOF
 Syndeo $EMBEDDED, installed by its macOS package.
 
-Each version is installed whole into $SYNDEO_DIR/<version>/, and the seven
-commands in $SYNDEO_BIN lead through $SYNDEO_DIR/current. An upgrade
-switches current once, after the whole new version is in place. A command
-runs all of one version or all of the other, never a mixture, and one already
-running keeps its own version. A command started at the exact moment an
-administrator upgrades may fail to start once; run it again.
+One version is installed, whole, in $SYNDEO_DIR/$EMBEDDED/, and the seven
+commands in $SYNDEO_BIN lead to it through $SYNDEO_DIR/current. Quit Syndeo
+before installing or upgrading. An upgrade removes this version and puts the
+new one in its place: while it does, the commands do not start, and a Syndeo
+left running from this version stops at the next program it needs, saying
+it was removed during an upgrade; quit it and start it again. If an upgrade
+fails, run the same package again to finish it.
 
   sudo /bin/sh $SYNDEO_DIR/$EMBEDDED/uninstall.sh
-      Remove Syndeo: the seven commands, every version, and the receipt.
-  sudo /bin/sh $SYNDEO_DIR/$EMBEDDED/uninstall.sh --old-versions
-      Remove only the versions older than $EMBEDDED.
+      Remove Syndeo: the seven commands, this version, and the receipt.
 
-Use the copy in the version current points at. Nothing is changed unless
-everything is as the package left it. Homes, ~/.syndeo, keychain items and
-proxy trust settings are never touched.
+Nothing is changed unless everything is as the package left it. Homes,
+~/.syndeo, keychain items and proxy trust settings are never touched.
 EOF
         exit 0
         ;;
     *)
-        say "usage: sudo /bin/sh $SYNDEO_DIR/$EMBEDDED/uninstall.sh [--old-versions | --help]"
+        say "usage: sudo /bin/sh $SYNDEO_DIR/$EMBEDDED/uninstall.sh [--help]"
         exit 1
         ;;
 esac
@@ -81,10 +75,14 @@ if [ "$r_present" = no ]; then
     say "refusing: no Syndeo package is installed"
     exit 1
 fi
-check_receipt
+check_receipt_meta
 refuse_if_found
 if [ "$r_version" != "$EMBEDDED" ]; then
-    say "refusing: this is $EMBEDDED's uninstaller, and the installed package is $r_version. Run $SYNDEO_DIR/$r_version/uninstall.sh"
+    if [ -d "$SYNDEO_DIR/$EMBEDDED" ] && [ ! -e "$SYNDEO_DIR/$r_version" ] && [ ! -L "$SYNDEO_DIR/$r_version" ]; then
+        say "refusing: the upgrade from $r_version to $EMBEDDED did not finish. Install the Syndeo $EMBEDDED package again to complete it, then run this again"
+    else
+        say "refusing: this is $EMBEDDED's uninstaller, and the installed package is $r_version. Run $SYNDEO_DIR/$r_version/uninstall.sh"
+    fi
     exit 1
 fi
 
@@ -98,13 +96,16 @@ refuse_if_found
 scan_private
 scan_bin
 refuse_if_found
-if [ "$current_v" != "$EMBEDDED" ]; then
-    finding "$SYNDEO_DIR/current: points at '${current_v}', not $EMBEDDED. Run the newest package to finish its installation first"
+# Exactly the receipt's version, every path it lists as packaged, and nothing
+# else.
+check_receipt_installed "$EMBEDDED"
+if [ "$versions" != " $EMBEDDED" ]; then
+    finding "$SYNDEO_DIR: holds${versions:- no version}; only $EMBEDDED may be there"
 fi
-check_tree "$EMBEDDED" exact
-for n in $bin_foreign; do
-    finding "$SYNDEO_BIN/$n: is not a link this package writes"
-done
+if [ "$current_v" != "$EMBEDDED" ]; then
+    finding "$SYNDEO_DIR/current: points at '${current_v}', not $EMBEDDED"
+fi
+case "$pending_v" in '' | "$EMBEDDED") ;; *) finding "$SYNDEO_DIR/.current.new: points at $pending_v, not $EMBEDDED" ;; esac
 refuse_if_found
 
 # Everything that will be removed, as it is now.
@@ -113,26 +114,18 @@ remember() {
     snapshot="$snapshot
 $1	$(meta_line "$1")"
 }
-for v in $versions; do
-    for n in $SYNDEO_EXECUTABLES $SYNDEO_DOCUMENTS tools/wordcount.wat tools; do
-        if is_present "$SYNDEO_DIR/$v/$n"; then
-            remember "$SYNDEO_DIR/$v/$n"
-        fi
-    done
-    remember "$SYNDEO_DIR/$v"
+for n in $SYNDEO_EXECUTABLES $SYNDEO_DOCUMENTS tools/wordcount.wat tools; do
+    remember "$SYNDEO_DIR/$EMBEDDED/$n"
 done
-if [ "$mode" = all ]; then
-    for n in $SYNDEO_NAMES; do
-        if is_present "$SYNDEO_BIN/$n"; then
-            remember "$SYNDEO_BIN/$n"
-        fi
-    done
-    remember "$SYNDEO_DIR/current"
-    if [ -n "$pending_v" ]; then
-        remember "$SYNDEO_DIR/.current.new"
-    fi
-    remember "$SYNDEO_DIR"
+remember "$SYNDEO_DIR/$EMBEDDED"
+for n in $SYNDEO_NAMES; do
+    remember "$SYNDEO_BIN/$n"
+done
+remember "$SYNDEO_DIR/current"
+if [ -n "$pending_v" ]; then
+    remember "$SYNDEO_DIR/.current.new"
 fi
+remember "$SYNDEO_DIR"
 
 # ------------------------------------------------------------------ remove
 
@@ -180,49 +173,20 @@ remove_dir() {
     removed="$removed $1"
 }
 
-# remove_version V: its files, uninstall.sh last, then its directories.
-remove_version() {
-    for n in $SYNDEO_NAMES $SYNDEO_DOCUMENTS tools/wordcount.wat; do
-        if is_present "$SYNDEO_DIR/$1/$n"; then
-            remove_file "$SYNDEO_DIR/$1/$n"
-        fi
-    done
-    if is_present "$SYNDEO_DIR/$1/tools"; then
-        remove_dir "$SYNDEO_DIR/$1/tools"
-    fi
-    if is_present "$SYNDEO_DIR/$1/uninstall.sh"; then
-        remove_file "$SYNDEO_DIR/$1/uninstall.sh"
-    fi
-    remove_dir "$SYNDEO_DIR/$1"
-}
-
-if [ "$mode" = old ]; then
-    gone=''
-    for v in $versions; do
-        if [ "$(syndeo_version_cmp "$v" "$EMBEDDED")" = lt ]; then
-            remove_version "$v"
-            gone="$gone $v"
-        fi
-    done
-    say "removed older versions:${gone:- none}; $EMBEDDED is untouched"
-    exit 0
-fi
-
 for n in $SYNDEO_NAMES; do
-    if is_present "$SYNDEO_BIN/$n"; then
-        remove_file "$SYNDEO_BIN/$n"
-    fi
+    remove_file "$SYNDEO_BIN/$n"
 done
 remove_file "$SYNDEO_DIR/current"
 if [ -n "$pending_v" ]; then
     remove_file "$SYNDEO_DIR/.current.new"
 fi
-for v in $versions; do
-    if [ "$v" != "$EMBEDDED" ]; then
-        remove_version "$v"
-    fi
+# The version's files, uninstall.sh last, then its directories.
+for n in $SYNDEO_NAMES $SYNDEO_DOCUMENTS tools/wordcount.wat; do
+    remove_file "$SYNDEO_DIR/$EMBEDDED/$n"
 done
-remove_version "$EMBEDDED"
+remove_dir "$SYNDEO_DIR/$EMBEDDED/tools"
+remove_file "$SYNDEO_DIR/$EMBEDDED/uninstall.sh"
+remove_dir "$SYNDEO_DIR/$EMBEDDED"
 remove_dir "$SYNDEO_DIR"
 
 # Every path the receipt owns is gone; only now is it forgotten.

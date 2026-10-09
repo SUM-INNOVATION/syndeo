@@ -3,17 +3,17 @@
 #
 #   ci/package-macos-pkg.sh <version> <tarball> <out-dir>
 #   ci/package-macos-pkg.sh --render <preinstall|postinstall|uninstall> \
-#       <version> <root> <uid> <gid> <pkgutil> <out-file> [--test-fault postinstall-fails]
+#       <version> <root> <uid> <gid> <pkgutil> <out-file>
 #
 # The package installs what the tarball holds, unchanged, into
 # /usr/local/libexec/syndeo/<version>/, with uninstall.sh beside it, and links
 # each of the seven commands in /usr/local/bin to
 # ../libexec/syndeo/current/<name>. `current` is not in the payload: the
 # postinstall step switches it to the new version, once, after every file is
-# in place. That is coherent-version activation, not a gap-free one: a command
-# runs all of one version or all of the other, never a mixture, but one started
-# at the instant of the switch can fail to start once. See ci/macos-pkg/ for
-# the scripts, what each refuses, and what the switch promises.
+# in place. One version is installed at a time: on an upgrade Installer
+# removes the version the receipt names before it places this one, so the
+# commands do not start from that removal until the switch. See ci/macos-pkg/
+# for the scripts, what each refuses, and what an upgrade leaves if it fails.
 #
 # The payload is built the same way from the same tarball every time: fixed
 # modes, owners root:wheel, no extended attributes, and every timestamp the
@@ -24,10 +24,10 @@
 # package uses root '', uid 0, gid 0 and /usr/sbin/pkgutil; the self-tests in
 # ci/verify-pkg.sh use a temporary root and a stand-in pkgutil.
 #
-# --test-fault postinstall-fails builds a postinstall that stops before it
-# switches `current`, to leave the state an interrupted installation leaves.
-# Only for versions 0.0.x, which no release uses, and the package checks fail
-# any package whose scripts differ from the templates.
+# No package this builds carries anything for tests. The tests make their own
+# faulty packages from a stand-in, by changing its postinstall (see
+# ci/pkg-test-fault.sh), and the package checks fail any package whose
+# scripts differ from the templates.
 set -euo pipefail
 # Modes in the payload are set explicitly; this fixes the ones that are not,
 # such as a symlink's, so the BOM is the same whoever builds it.
@@ -46,10 +46,10 @@ die() {
     exit 1
 }
 
-# render KIND VERSION ROOT UID GID PKGUTIL OUT [FAULT]
+# render KIND VERSION ROOT UID GID PKGUTIL OUT
 render() {
-    local kind="$1" version="$2" root="$3" uid="$4" gid="$5" pkgutil="$6" out="$7" fault="${8:-}"
-    local template fault_line=''
+    local kind="$1" version="$2" root="$3" uid="$4" gid="$5" pkgutil="$6" out="$7"
+    local template
     case "$kind" in
         preinstall | postinstall) template="$templates/$kind.in" ;;
         uninstall) template="$templates/uninstall.sh.in" ;;
@@ -61,26 +61,13 @@ render() {
     [[ "$root" =~ ^(/[A-Za-z0-9._\ -]+)*$ ]] || die "unusable root '$root'"
     [[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] || die "unusable uid or gid"
     [[ "$pkgutil" =~ ^(/[A-Za-z0-9._\ -]+)+$ ]] || die "unusable pkgutil path '$pkgutil'"
-    case "$fault" in
-        '') ;;
-        postinstall-fails)
-            [ "$kind" = postinstall ] || die "postinstall-fails is a fault in postinstall"
-            case "$version" in 0.0.*) ;; *) die "a fault only in a 0.0.x test build" ;; esac
-            fault_line="say 'test build: stopping before the switch'; exit 1"
-            ;;
-        *) die "no test fault called $fault" ;;
-    esac
-    awk -v version_sh="$templates/version.sh" -v common="$templates/common.sh" -v fault="$fault_line" '
+    awk -v version_sh="$templates/version.sh" -v common="$templates/common.sh" '
         $0 == "@COMMON@" {
             while ((getline line < version_sh) > 0) print line
             close(version_sh)
             print ""
             while ((getline line < common) > 0) print line
             close(common)
-            next
-        }
-        $0 == "@TEST_FAULT@" {
-            if (fault != "") print fault
             next
         }
         { print }
@@ -97,7 +84,7 @@ render() {
 }
 
 build() {
-    local version="$1" tarball="$2" out="$3" fault="${4:-}"
+    local version="$1" tarball="$2" out="$3"
     syndeo_version_valid "$version" || die "'$version' is not a version"
     local name="syndeo-$version-aarch64-apple-darwin"
     [ "$(basename "$tarball")" = "$name.tar.gz" ] || die "expected $name.tar.gz, not $(basename "$tarball")"
@@ -153,7 +140,7 @@ $(diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") || true)"
 
     mkdir "$work/scripts" "$work/component"
     render preinstall "$version" '' 0 0 /usr/sbin/pkgutil "$work/scripts/preinstall"
-    render postinstall "$version" '' 0 0 /usr/sbin/pkgutil "$work/scripts/postinstall" "$fault"
+    render postinstall "$version" '' 0 0 /usr/sbin/pkgutil "$work/scripts/postinstall"
 
     /usr/bin/pkgbuild --quiet --root "$stage" --identifier com.sum.syndeo.pkg --version "$version" \
         --install-location / --ownership recommended --info "$templates/PackageInfo.xml" \
@@ -179,25 +166,14 @@ $(diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") || true)"
 case "${1:-}" in
     --render)
         shift
-        [ "$#" -ge 7 ] || die "--render <kind> <version> <root> <uid> <gid> <pkgutil> <out-file> [--test-fault <fault>]"
-        fault=''
-        if [ "$#" -eq 9 ] && [ "$8" = --test-fault ]; then
-            fault="$9"
-        elif [ "$#" -ne 7 ]; then
-            die "--render takes seven arguments, and --test-fault <fault> after them"
-        fi
-        render "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$fault"
+        [ "$#" -eq 7 ] || die "--render <kind> <version> <root> <uid> <gid> <pkgutil> <out-file>"
+        render "$1" "$2" "$3" "$4" "$5" "$6" "$7"
         ;;
     '' | -*)
-        die "usage: $0 <version> <tarball> <out-dir> [--test-fault postinstall-fails]"
+        die "usage: $0 <version> <tarball> <out-dir>"
         ;;
     *)
-        fault=''
-        if [ "$#" -eq 5 ] && [ "$4" = --test-fault ]; then
-            fault="$5"
-        elif [ "$#" -ne 3 ]; then
-            die "usage: $0 <version> <tarball> <out-dir> [--test-fault postinstall-fails]"
-        fi
-        build "$1" "$2" "$3" "$fault"
+        [ "$#" -eq 3 ] || die "usage: $0 <version> <tarball> <out-dir>"
+        build "$1" "$2" "$3"
         ;;
 esac
