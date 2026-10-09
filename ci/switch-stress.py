@@ -47,7 +47,8 @@ def main():
     ap.add_argument("--postinstall", nargs=2, action="append", default=[], metavar=("VERSION", "SCRIPT"))
     ap.add_argument("--postinstalls", type=int, default=0)
     ap.add_argument("--as-user")
-    ap.add_argument("--env", action="append", default=[])
+    ap.add_argument("--env", action="append", default=[],
+                    help="KEY=VALUE for each start; {thread} in VALUE becomes the starting thread's name")
     ap.add_argument("--settle-lookups", type=int, default=300)
     ap.add_argument("--settle-launches", type=int, default=50)
     a = ap.parse_args()
@@ -59,6 +60,12 @@ def main():
     versions = list(a.versions)
     trees = {v: os.path.join(a.private, v) for v in versions}
     real_trees = {os.path.realpath(t) for t in trees.values()}
+    # Directories by device and inode: the kernel may name /usr/local as
+    # /System/Volumes/Data/usr/local, and both are the same directory.
+    tree_ids = {}
+    for v in versions:
+        st = os.stat(trees[v])
+        tree_ids[(st.st_dev, st.st_ino)] = v
     contents = {}
     for v in versions:
         with open(os.path.join(trees[v], "syndeo"), "rb") as f:
@@ -68,18 +75,19 @@ def main():
         # lookup is judged by which tree it resolved to instead.
         contents = None
 
-    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": os.environ.get("HOME", "/")}
-    for kv in a.env:
-        key, _, value = kv.partition("=")
-        env[key] = value
-    if a.as_user:
-        env["HOME"] = os.path.expanduser("~" + a.as_user)
     args = ["doctor"] if a.expect_doctor else ["--version"]
-    if a.as_user:
-        launch = ["/usr/bin/sudo", "-u", a.as_user, "-H", "/usr/bin/env", "-i"]
-        launch += ["%s=%s" % kv for kv in env.items()] + [a.command] + args
-    else:
-        launch = [a.command] + args
+
+    def launch_for(thread):
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": os.environ.get("HOME", "/")}
+        for kv in a.env:
+            key, _, value = kv.partition("=")
+            env[key] = value.replace("{thread}", thread)
+        if a.as_user:
+            env["HOME"] = os.path.expanduser("~" + a.as_user)
+            command = ["/usr/bin/sudo", "-u", a.as_user, "-H", "/usr/bin/env", "-i"]
+            command += ["%s=%s" % kv for kv in env.items()] + [a.command] + args
+            return command, None
+        return [a.command] + args, env
 
     state = {"switching": True, "final": None}
     lock = threading.Lock()
@@ -138,21 +146,25 @@ def main():
             if len(dirs) != 1:
                 return None, "doctor's siblings came from %s" % (sorted(dirs) or "nowhere")
             d = dirs.pop()
-            for v in versions:
-                if os.path.realpath(d) == os.path.realpath(trees[v]):
-                    return v, None
-            return None, "doctor's siblings came from %s, neither version" % d
+            try:
+                st = os.stat(d)
+            except OSError as e:
+                return None, "doctor's siblings came from %s, which cannot be read: %s" % (d, e)
+            v = tree_ids.get((st.st_dev, st.st_ino))
+            if v is None:
+                return None, "doctor's siblings came from %s, neither version" % d
+            return v, None
         first = out.splitlines()[0] if out else ""
         for v in versions:
             if first == a.expect_output.format(version=v):
                 return v, None
         return None, "output %r is neither version's" % first
 
-    def start():
+    def start(thread):
         during = state["switching"]
+        launch, env = launch_for(thread)
         try:
-            r = subprocess.run(launch, env=None if a.as_user else env, capture_output=True,
-                               text=True, timeout=120)
+            r = subprocess.run(launch, env=env, capture_output=True, text=True, timeout=120)
         except OSError as e:
             if e.errno in TRANSIENT:
                 transient("start " + TRANSIENT[e.errno], during)
@@ -175,12 +187,12 @@ def main():
         else:
             count("start ok %s" % version)
 
-    def loop(fn):
+    def loop(fn, *fn_args):
         while state["switching"]:
-            fn()
+            fn(*fn_args)
 
     threads = [threading.Thread(target=loop, args=(lookup,)) for _ in range(2)]
-    threads += [threading.Thread(target=loop, args=(start,)) for _ in range(2)]
+    threads += [threading.Thread(target=loop, args=(start, "start%d" % i)) for i in range(2)]
     for t in threads:
         t.start()
 
@@ -214,7 +226,7 @@ def main():
         lookup()
     settled_before = sum(n for k, n in tally.items() if k.startswith("start ok"))
     for _ in range(a.settle_launches):
-        start()
+        start("settle")
     settled = sum(n for k, n in tally.items() if k.startswith("start ok")) - settled_before
     if settled != a.settle_launches:
         reject("%d of %d starts after switching stopped did not succeed" % (a.settle_launches - settled, a.settle_launches))
