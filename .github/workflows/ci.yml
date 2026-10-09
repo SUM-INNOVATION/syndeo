@@ -149,13 +149,13 @@ jobs:
       - name: Inspect the package without installing it
         run: SYNDEO_EXPECT_SIGNED=no bash ci/verify-pkg.sh inspect "$PKG" "$VERSION" --tarball "$TARBALL"
 
-      - name: Install it, through refusals, stand-ins and an interrupted upgrade (root)
+      - name: Install it, through refusals, upgrades in use, failed upgrades and their repair (root)
         run: sudo --preserve-env="$PRESERVE" bash ci/test-pkg-install.sh --system-before "$PKG" "$VERSION"
 
       - name: Use it from PATH (runner)
         run: bash ci/test-pkg-install.sh --user "$VERSION"
 
-      - name: The switch under load, refusals, the uninstaller, and removal (root)
+      - name: Reinstalls, refusals, a missing path, the uninstaller, and removal (root)
         run: sudo --preserve-env="$PRESERVE" bash ci/test-pkg-install.sh --system-after "$PKG" "$VERSION"
 
       - name: Put the runner back, whatever happened

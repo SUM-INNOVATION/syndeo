@@ -18,11 +18,20 @@
 # - an orphaned private directory is refused;
 # - an interrupted first install is resumed, then removed again;
 # - with /usr/local/bin owned by runner:admin, mode 0775, stand-in packages:
-#   - 0.0.9, then 0.0.10, the numeric upgrade. The old tree is kept and the
-#     owner and mode of /usr/local/bin are left alone;
-#   - 0.0.9's uninstaller refuses;
-#   - 0.0.11's postinstall fails, leaving an interrupted state;
-# - the real package is installed over that.
+#   - 0.0.9, then 0.0.10 and 0.0.11 while the commands are started over and
+#     over: while Installer runs they fail only with ENOENT or EINVAL, every
+#     one that starts is one whole version, and none fails afterwards. One
+#     version is left, and /usr/local/bin's owner and mode are untouched;
+#   - an older package refused;
+#   - 0.0.12, whose postinstall fails at its entry, and 0.0.13, whose
+#     postinstall fails just after its switch: each leaves the state measured
+#     on a runner, in which verify-pkg installed fails, the uninstaller
+#     refuses, an older and a newer package are refused, all changing
+#     nothing, and the same package again completes the upgrade;
+#   - 0.0.15, made of the real binaries;
+# - the real package is installed over that, while a 0.0.15 syndeo doctor,
+#   held after it found its directory, waits: afterwards every sibling it
+#   looks for is refused as removed during an upgrade, and it starts nothing.
 # It leaves the real package installed.
 #
 # --user, as runner: the commands from PATH, doctor and its siblings, the
@@ -32,14 +41,13 @@
 # settings, and the user's keychain search list is restored by a trap.
 #
 # --system-after, as root:
-# - the switch under load, with the real binaries and doctor: only ENOENT or
-#   EINVAL while switching, siblings always from one version, nothing failing
-#   afterwards;
 # - a same-version reinstall, then reinstalls refused over every kind of
 #   altered tree;
+# - a path the receipt lists, missing: verify-pkg installed fails and the
+#   uninstaller refuses, changing nothing; the same package repairs it;
 # - a downgrade refused;
-# - disagreement between current, the receipt and the commands refused;
-# - --old-versions;
+# - disagreement between current, the receipt and the commands refused, and
+#   a second version beside the installed one;
 # - the uninstaller refusing, all or nothing, with content planted in each
 #   place;
 # - a receipt that cannot be forgotten;
@@ -165,6 +173,7 @@ alter() {
     acl) undo="$value"; chmod +a "$value" "$p" ;;
     flags) undo=nouchg; chflags uchg "$p" ;;
     link) undo="$(readlink "$p")"; rm -f "$p"; ln -s "$value" "$p"; chown -h root:wheel "$p" ;;
+    aside) undo="$value"; mv "$p" "$value" ;;
   esac
   printf '%s\t%s\t%s\n' "$kind" "$p" "$undo" >>"$(ST)/altered"
 }
@@ -177,7 +186,13 @@ undo_line() {
     acl) chmod -a "$undo" "$p" ;;
     flags) chflags nouchg "$p" ;;
     link) rm -f "$p"; ln -s "$undo" "$p"; chown -h root:wheel "$p" ;;
+    aside) mv "$undo" "$p" ;;
   esac
+}
+
+# forget_last: the newest alteration is no longer the test's to undo.
+forget_last() {
+  sed '$d' "$(ST)/altered" >"$(ST)/altered.new" && mv -f "$(ST)/altered.new" "$(ST)/altered"
 }
 
 restore_last() {
@@ -281,6 +296,19 @@ commands_say() {
 }
 receipt_is() { [ "$(pkgutil --pkg-info "$ID" 2>/dev/null | sed -n 's/^version: //p')" = "$1" ]; }
 
+# commands_fail_closed: every command, started from /usr/local/bin, fails to
+# start, and only because what its link leads to is not there.
+commands_fail_closed() {
+  local n out
+  for n in $NAMES; do
+    if out="$(env -i PATH=/usr/bin:/bin "$BIN/$n" --version 2>&1)"; then return 1; fi
+    case "$out" in *"$BIN/$n: No such file or directory"*) ;; *) return 1 ;; esac
+  done
+}
+
+# alone V: the private directory holds V and current, and nothing else.
+alone() { [ "$(ls -A "$D" | tr '\n' ' ')" = "$1 current " ]; }
+
 # ------------------------------------------------------------------ installing
 
 install_count=0
@@ -339,7 +367,7 @@ installed() {
   pass "$label: installed ($text), and verify-pkg installed $version passes"
 }
 
-# standin VERSION [--test-fault F]: a package of shell stand-ins, from the real builder.
+# standin VERSION: a package of shell stand-ins, from the real builder.
 standin() {
   local v="$1" dir name n
   dir="$(ST)/standins/$v"
@@ -352,14 +380,74 @@ standin() {
   cp "$here/../README.md" "$here/../LICENSE" "$dir/src/$name/"
   cp "$here/../crates/syndeo-agent/tools/wordcount.wat" "$dir/src/$name/tools/"
   tar -C "$dir/src" --format=ustar -czf "$dir/$name.tar.gz" "$name"
-  shift
+  build_standin "$v" "$dir"
+}
+
+# build_standin V DIR: the package for DIR/syndeo-V-aarch64-apple-darwin.tar.gz.
+build_standin() {
+  local v="$1" dir="$2" repo
   # The checkout is the runner's and this is root: git would refuse it.
-  local repo
   repo="$(cd "$here/.." && pwd)"
   SOURCE_DATE_EPOCH="$(git -c safe.directory="$repo" -C "$repo" log -1 --format=%ct)" \
-    "$here/package-macos-pkg.sh" "$v" "$dir/$name.tar.gz" "$dir" "$@" >/dev/null ||
+    "$here/package-macos-pkg.sh" "$v" "$dir/syndeo-$v-aarch64-apple-darwin.tar.gz" "$dir" >/dev/null ||
     fail "building the stand-in $v"
-  printf '%s' "$dir/$name.pkg"
+  printf '%s' "$dir/syndeo-$v-aarch64-apple-darwin.pkg"
+}
+
+# real_standin V PKG VERSION: a stand-in package for V whose seven commands
+# are the real binaries in PKG, the package of VERSION.
+real_standin() {
+  local v="$1" pkg="$2" real="$3" dir name n from
+  dir="$(ST)/standins/$v"
+  name="syndeo-$v-aarch64-apple-darwin"
+  expand_payload "$pkg" "$(ST)/real-payload"
+  from="$(ST)/real-payload/syndeo.pkg/Payload/usr/local/libexec/syndeo/$real"
+  mkdir -p "$dir/src/$name/tools"
+  for n in $NAMES; do
+    cp "$from/$n" "$dir/src/$name/$n" || fail "copying the real $n"
+    chmod 755 "$dir/src/$name/$n"
+  done
+  cp "$here/../README.md" "$here/../LICENSE" "$dir/src/$name/"
+  cp "$here/../crates/syndeo-agent/tools/wordcount.wat" "$dir/src/$name/tools/"
+  tar -C "$dir/src" --format=ustar -czf "$dir/$name.tar.gz" "$name"
+  build_standin "$v" "$dir"
+}
+
+# fault_pkg PKG entry|after-switch: PKG, a stand-in, with a test fault in its
+# postinstall that fails the first run only (ci/pkg-test-fault.sh).
+fault_pkg() {
+  local pkg="$1" where="$2" dir
+  dir="$(ST)/faults/$where"
+  mkdir -p "$dir"
+  bash "$here/pkg-test-fault.sh" "$pkg" "$dir/$(basename "$pkg")" "$where" "$(ST)/logs/postinstall-fault-$where" >&2 ||
+    fail "making the $where fault"
+  printf '%s' "$dir/$(basename "$pkg")"
+}
+
+# failed_upgrade LABEL PKG X W AT OLDER NEWER: install PKG, a faulty W, over
+# X. It fails and leaves what was measured: X's receipt, X gone, W in place,
+# current at AT. Everything that must refuse that state does, changing
+# nothing, OLDER and NEWER packages included; then PKG again completes it.
+failed_upgrade() {
+  local label="$1" pkg="$2" x="$3" w="$4" at="$5" older="$6" newer="$7" before
+  if install "$label" "$pkg"; then fail "$label: the faulty package installed"; fi
+  said "syndeo postinstall: test fault" || { sed 's/^/      | /' "$last_log.install-log"; fail "$label: it did not stop on its test fault"; }
+  must "$label: Installer left the receipt at $x, $x gone, $w in place, current -> $at" eval "receipt_is $x && alone $w && current_is $at"
+  if [ "$at" = "$x" ]; then
+    must "  ... every command fails to start, only because it is not there" commands_fail_closed
+  else
+    must "  ... every command runs $w" commands_say "$w"
+  fi
+  must "  ... verify-pkg installed fails: the receipt is $x's, and the paths it lists are missing" eval \
+    "! bash '$here/verify-pkg.sh' installed $w >'$(ST)/logs/$label.verify' 2>&1 && grep -q 'is missing, and the receipt for $x lists it' '$(ST)/logs/$label.verify'"
+  before="$(package_state)"
+  must "  ... $w's uninstaller refuses, saying to finish the upgrade" eval \
+    "! /bin/sh '$D/$w/uninstall.sh' >'$(ST)/logs/$label.uninstall' 2>&1 && grep -q 'the upgrade from $x to $w did not finish' '$(ST)/logs/$label.uninstall'"
+  must "  ... changing nothing" test "$(package_state)" = "$before"
+  refused "$label-older-package" "$older" "an upgrade from $x to $w did not finish: install the Syndeo $w package again"
+  refused "$label-newer-package" "$newer" "an upgrade from $x to $w did not finish: install the Syndeo $w package again"
+  installed "$label-the-same-package-again" "$pkg" "completing the failed upgrade from $x to $w" "$w"
+  must "  ... $w alone, with its receipt, current, the links and every command" eval "alone $w && receipt_is $w && current_is $w && commands_say $w"
 }
 
 # tree V [subset]: plant a version tree owned and moded as the package lays
@@ -409,10 +497,11 @@ cleanup() {
   [ -d "$st" ] || { say "cleanup: nothing was recorded"; return 0; }
   say ""
   say "cleanup"
-  # Processes the user step started, if any are left.
-  if [ -f "$(US)/pids" ]; then
-    while read -r p; do kill "$p" 2>/dev/null; done <"$(US)/pids"
-  fi
+  # Processes the steps started, if any are left.
+  for p in "$(US)/pids" "$st/pids"; do
+    [ -f "$p" ] || continue
+    while read -r pid; do kill "$pid" 2>/dev/null; done <"$p"
+  done
   # The user's keychain search list and the throwaway keychain.
   if [ -f "$(US)/keychain-list" ]; then
     # shellcheck disable=SC2046
@@ -460,13 +549,17 @@ cleanup() {
       rm -f "$D/current"; ln -s "$v" "$D/current"; chown -h root:wheel "$D/current"
     fi
     "$here/package-macos-pkg.sh" --render uninstall "$v" '' 0 0 /usr/sbin/pkgutil "$st/uninstall.expected" >/dev/null
-    if cmp -s "$st/uninstall.expected" "$D/$v/uninstall.sh"; then
-      /bin/sh "$D/$v/uninstall.sh" || problems="$problems; the package's uninstaller did not finish"
+    if cmp -s "$st/uninstall.expected" "$D/$v/uninstall.sh" && /bin/sh "$D/$v/uninstall.sh"; then
+      :
     else
-      problems="$problems; $D/$v/uninstall.sh is not the repository's, so it was not run"
+      # A failed upgrade, or a step that stopped halfway: the uninstaller
+      # refuses those by design, or is not the repository's to run.
+      say "cleanup: the package's own uninstaller did not remove it; removing what the package put down"
+      remove_leftovers
     fi
   elif present "$D"; then
-    problems="$problems; $D is there with no receipt"
+    say "cleanup: $D is there with no receipt; removing what the package put down"
+    remove_leftovers
   fi
   # A planted path that no longer exists has nothing left to restore: the
   # package took it over, and its uninstaller removed it.
@@ -499,6 +592,38 @@ cleanup() {
     return 1
   fi
   say "cleanup: the runner is as it was: no receipt, no payload, no keychain or trust change, every parent the same"
+  return 0
+}
+
+# remove_leftovers: what the package put down, in whatever state a stopped
+# step left it, when its uninstaller cannot remove it: the seven links if they
+# are the package's, `current` and `.current.new`, version directories holding
+# only the package's names, the private directory, and the receipt. Anything
+# else is left, for the checks that follow to report.
+remove_leftovers() {
+  local n p v
+  for n in $NAMES; do
+    p="$BIN/$n"
+    if [ -L "$p" ] && [ "$(readlink "$p")" = "../libexec/syndeo/current/$n" ]; then rm -f "${p:?}"; fi
+  done
+  if [ -d "$D" ] && [ ! -L "$D" ]; then
+    for p in "$D/current" "$D/.current.new"; do
+      if [ -L "$p" ]; then rm -f "${p:?}"; fi
+    done
+    for v in "$D"/*; do
+      [ -d "$v" ] && [ ! -L "$v" ] || continue
+      case "${v##*/}" in '' | *[!0-9.]*) continue ;; esac
+      for n in $NAMES uninstall.sh README.md LICENSE tools/wordcount.wat; do
+        if [ -f "$v/$n" ] && [ ! -L "$v/$n" ]; then rm -f "${v:?}/${n:?}"; fi
+      done
+      if [ -d "$v/tools" ] && [ ! -L "$v/tools" ]; then rmdir "${v:?}/tools" 2>/dev/null; fi
+      rmdir "${v:?}" 2>/dev/null
+    done
+    rmdir "${D:?}" 2>/dev/null
+  fi
+  if pkgutil --pkg-info "$ID" >/dev/null 2>&1; then
+    pkgutil --forget "$ID" --volume / >/dev/null 2>&1
+  fi
   return 0
 }
 
@@ -635,36 +760,72 @@ system_before() {
   must "  ... and its uninstaller removes it entirely" pristine
 
   say ""
-  say "stand-ins: an upgrade, an old uninstaller, an interrupted upgrade"
-  local s9 s10 s11
+  say "stand-ins: upgrades with the commands in use, two failed upgrades, and their repair"
+  local s9 s10 s11 s12 s13 s14 f12 f13
   s9="$(standin 0.0.9)" || fail "building the stand-in 0.0.9"
   s10="$(standin 0.0.10)" || fail "building the stand-in 0.0.10"
-  s11="$(standin 0.0.11 --test-fault postinstall-fails)" || fail "building the stand-in 0.0.11"
+  s11="$(standin 0.0.11)" || fail "building the stand-in 0.0.11"
+  s12="$(standin 0.0.12)" || fail "building the stand-in 0.0.12"
+  s13="$(standin 0.0.13)" || fail "building the stand-in 0.0.13"
+  s14="$(standin 0.0.14)" || fail "building the stand-in 0.0.14"
+  f12="$(fault_pkg "$s12" entry)" || fail "building 0.0.12 with a fault at its postinstall's entry"
+  f13="$(fault_pkg "$s13" after-switch)" || fail "building 0.0.13 with a fault just after its switch"
   alter owner "$BIN" "$RUNNER:admin"
   alter mode "$BIN" 775
-  local bin_before
+  local bin_before out status
   bin_before="$(snap_path "$BIN")"
   installed standin-0.0.9 "$s9" "installing 0.0.9" 0.0.9
   must "  ... $BIN is still $RUNNER:admin 0775: overwrite-permissions=\"false\" held" test "$(snap_path "$BIN")" = "$bin_before"
-  installed standin-0.0.10 "$s10" "upgrading from 0.0.9 to 0.0.10" 0.0.10
-  must "  ... the upgrade kept 0.0.9's tree" test -x "$D/0.0.9/syndeo"
-  must "  ... and the receipt lists only 0.0.10's paths" eval "! pkgutil --files $ID | grep -q 0.0.9"
+
+  say ""
+  say "upgrades, with the commands started over and over"
+  out="$(python3 -I "$here/upgrade-stress.py" --private "$D" --command "$BIN/syndeo" --from 0.0.9 \
+    --install 0.0.10 "$s10" --install 0.0.11 "$s11" --expect-output 'syndeo {version}' \
+    --expect-file $'#!/bin/sh\necho "syndeo {version}"\n' --log "$st/logs/upgrade-stress" 2>&1)"
+  status=$?
+  printf '%s\n' "$out" | tee "$st/logs/upgrade-stress" | sed 's/^/      | /'
+  must "0.0.9 to 0.0.10 to 0.0.11: while Installer ran, failures only ENOENT or EINVAL and every start one whole version; none afterwards" test "$status" = 0
+  bash "$here/verify-pkg.sh" installed 0.0.11 >"$st/logs/after-upgrade-stress" 2>&1 ||
+    { sed 's/^/      | /' "$st/logs/after-upgrade-stress"; fail "after the upgrades, the installation is not exactly 0.0.11"; }
+  must "  ... 0.0.11 alone, and verify-pkg installed 0.0.11 passes" alone 0.0.11
   must "  ... $BIN is still $RUNNER:admin 0775" test "$(snap_path "$BIN")" = "$bin_before"
-  local before
-  before="$(package_state)"
-  must "0.0.9's uninstaller refuses after the upgrade" eval "! /bin/sh '$D/0.0.9/uninstall.sh' >'$st/logs/old-uninstaller' 2>&1 && grep -q \"this is 0.0.9's uninstaller\" '$st/logs/old-uninstaller'"
-  must "  ... and with --old-versions" eval "! /bin/sh '$D/0.0.9/uninstall.sh' --old-versions >>'$st/logs/old-uninstaller' 2>&1"
-  must "  ... changing nothing" test "$(package_state)" = "$before"
-  if install standin-0.0.11-fault "$s11"; then fail "the fault build installed"; fi
-  must "an interrupted upgrade (0.0.11's postinstall stops before the switch): receipt and current still 0.0.10" eval "receipt_is 0.0.10 && current_is 0.0.10 && [ -x '$D/0.0.11/syndeo' ]"
-  must "  ... and every command still runs 0.0.10" commands_say 0.0.10
-  plant link "$D/.current.new" 0.0.10
+  refused older-package "$s10" "Syndeo 0.0.11 is installed, and this package is the older 0.0.10"
+
+  say ""
+  say "an upgrade whose postinstall fails at its entry, before the switch"
+  failed_upgrade fault-at-entry "$f12" 0.0.11 0.0.12 0.0.11 "$s11" "$s13"
+
+  say ""
+  say "an upgrade whose postinstall fails just after its switch"
+  failed_upgrade fault-after-switch "$f13" 0.0.12 0.0.13 0.0.13 "$s12" "$s14"
+
+  say ""
+  say "a running syndeo across an upgrade, with the real binaries"
+  local r15 late
+  r15="$(real_standin 0.0.15 "$pkg" "$version")" || fail "building 0.0.15 from the real binaries"
+  install real-binaries-0.0.15 "$r15" || { sed 's/^/      | /' "$last_log.installer" "$last_log.install-log"; fail "installing 0.0.15"; }
+  said "upgrading from 0.0.13 to 0.0.15" || { sed 's/^/      | /' "$last_log.install-log"; fail "0.0.15 installed, but not as an upgrade from 0.0.13"; }
+  must "0.0.15, the real binaries: alone, with its receipt and current" eval "alone 0.0.15 && receipt_is 0.0.15 && current_is 0.0.15"
+  python3 -I "$here/late-lookup.py" --command "$BIN/syndeo" --user "$RUNNER" --home "$st/late-home" \
+    --private "$D" --old 0.0.15 --new "$version" --held "$st/late.held" --go "$st/late.go" >"$st/logs/late-lookup" 2>&1 &
+  late=$!
+  echo "$late" >>"$st/pids"
+  for _ in $(seq 1 600); do
+    [ -f "$st/late.held" ] && break
+    kill -0 "$late" 2>/dev/null || break
+    sleep 0.1
+  done
+  [ -f "$st/late.held" ] || { sed 's/^/      | /' "$st/logs/late-lookup"; fail "the 0.0.15 syndeo doctor was not held"; }
+  pass "a 0.0.15 syndeo doctor runs, held after it found its directory and before it looked for any sibling"
 
   say ""
   say "the real package, over all of that"
-  installed real "$pkg" "upgrading from 0.0.10 to $version" "$version"
-  forget_plant "$D/.current.new"
-  must "  ... the stale .current.new is gone, and 0.0.9, 0.0.10 and 0.0.11 are kept" eval "! present '$D/.current.new' && [ -d '$D/0.0.9' ] && [ -d '$D/0.0.10' ] && [ -d '$D/0.0.11' ]"
+  installed real "$pkg" "upgrading from 0.0.15 to $version" "$version"
+  : >"$st/late.go"
+  wait "$late"
+  status=$?
+  sed 's/^/      | /' "$st/logs/late-lookup"
+  must "the 0.0.15 doctor, after the upgrade: every sibling it looked for refused as removed during an upgrade, and nothing started" test "$status" = 0
   must "  ... $BIN is still $RUNNER:admin 0775" test "$(snap_path "$BIN")" = "$bin_before"
   must "  ... no home has a .syndeo it did not have" test "$(homes)" = "$(cat "$st/initial.homes")"
   must "  ... keychains and trust settings are as they were" test "$(security_state)" = "$(cat "$st/initial.security")"
@@ -817,37 +978,6 @@ system_after() {
   local s10
   s10="$(sed -n 2p "$st/standins")"
 
-  say ""
-  say "the switch under load, with the real binaries"
-  # A second complete tree of the same build, to switch to and from.
-  local copy=0.0.98 n
-  plant dir "$D/$copy"
-  plant dir "$D/$copy/tools"
-  for n in $NAMES uninstall.sh; do
-    cp -p "$D/$version/$n" "$D/$copy/$n"
-    printf '%s\t%s\n' "$D/$copy/$n" "$(meta "$D/$copy/$n")" >>"$st/planted"
-  done
-  for n in README.md LICENSE tools/wordcount.wat; do
-    cp -p "$D/$version/$n" "$D/$copy/$n"
-    printf '%s\t%s\n' "$D/$copy/$n" "$(meta "$D/$copy/$n")" >>"$st/planted"
-  done
-  mkdir -p "$st/stress-home"
-  chown "$RUNNER" "$st/stress-home"
-  expand_payload "$pkg" "$st/payload"
-  out="$(python3 -I "$here/switch-stress.py" --private "$D" --command "$BIN/syndeo" --versions "$version" "$copy" \
-    --expect-doctor --as-user "$RUNNER" --env "SYNDEO_HOME=$st/stress-home/{thread}" --renames 2000 --min-seconds 20 \
-    --postinstall "$version" "$st/payload/syndeo.pkg/Scripts/postinstall" --postinstalls 5 \
-    --settle-lookups 200 --settle-launches 5 2>&1)"
-  local status=$?
-  printf '%s\n' "$out" | tee "$st/logs/switch-stress" | sed 's/^/      | /'
-  must "only ENOENT or EINVAL while switching; doctor's siblings always from one version; nothing failing afterwards" test "$status" = 0
-  must "  ... current ends at $version" current_is "$version"
-  for n in README.md LICENSE tools/wordcount.wat $NAMES uninstall.sh; do
-    unplant "$D/$copy/$n"
-  done
-  unplant "$D/$copy/tools"
-  unplant "$D/$copy"
-  bash "$here/verify-pkg.sh" installed "$version" >"$st/logs/after-stress" 2>&1 || fail "the installation is not exactly $version after the stress test"
 
   say ""
   say "the same version again"
@@ -876,39 +1006,48 @@ system_after() {
   restore_last
 
   say ""
+  say "a path the receipt lists, missing"
+  mkdir -p "$st/aside"
+  alter aside "$D/$version/README.md" "$st/aside/README.md"
+  must "verify-pkg installed fails, naming it" eval \
+    "! bash '$here/verify-pkg.sh' installed '$version' >'$st/logs/missing-path.verify' 2>&1 && grep -q '$D/$version/README.md: is missing, and the receipt for $version lists it' '$st/logs/missing-path.verify'"
+  before="$(package_state)"
+  must "the uninstaller refuses, naming it" eval \
+    "! /bin/sh '$D/$version/uninstall.sh' >'$st/logs/missing-path.uninstall' 2>&1 && grep -q '$D/$version/README.md: is missing, and the receipt for $version lists it' '$st/logs/missing-path.uninstall'"
+  must "  ... changing nothing" test "$(package_state)" = "$before"
+  installed repair "$pkg" "repairing $version" "$version"
+  # The package put it back; the copy set aside is the test's to delete.
+  forget_last
+  rm -f "$st/aside/README.md"
+  rmdir "$st/aside"
+
+  say ""
   say "downgrades and disagreement"
   refused downgrade "$s10" "this package is the older 0.0.10"
   alter link "$D/current" 0.0.10
-  refused current-older-than-the-receipt "$pkg" "points at 0.0.10, older than the installed $version"
+  refused current-at-another-version "$pkg" "points at '0.0.10', not the installed $version"
   restore_last
   alter link "$BIN/syndeo-ui" /Applications/Foreign.app/Contents/MacOS/foreign
   refused foreign-command-with-a-receipt "$pkg" "$BIN/syndeo-ui: is not a link this package writes"
   restore_last
   bash "$here/verify-pkg.sh" installed "$version" >"$st/logs/after-refusals" 2>&1 || fail "the installation changed during the refusals"
 
-  say ""
-  say "--old-versions"
-  plant dir "$D/9.9.9"
-  plant file "$D/9.9.9/syndeo" "#!/bin/sh
-" root:wheel 755
-  /bin/sh "$D/$version/uninstall.sh" --old-versions >"$st/logs/old-versions" 2>&1 ||
-    { sed 's/^/      | /' "$st/logs/old-versions"; fail "--old-versions"; }
-  must "--old-versions removes 0.0.9, 0.0.10 and 0.0.11, and keeps $version, current and the newer 9.9.9" eval \
-    "! present '$D/0.0.9' && ! present '$D/0.0.10' && ! present '$D/0.0.11' && [ -d '$D/$version' ] && current_is '$version' && [ -d '$D/9.9.9' ] && receipt_is '$version'"
-  unplant "$D/9.9.9/syndeo"
-  unplant "$D/9.9.9"
+  plant dir "$D/0.0.99"
+  refused a-second-version "$pkg" "with $version installed, it may hold nothing else"
+  unplant "$D/0.0.99"
 
   say ""
   say "the uninstaller, all or nothing"
   local what
   plant dir "$LIBEXEC/someone-else"
-  for what in tools-extra tree-extra private-file private-dir bad-version foreign-command mode acl pending; do
+  for what in tools-extra tree-extra private-file private-dir bad-version second-version foreign-command mode acl pending; do
     case "$what" in
       tools-extra) plant file "$D/$version/tools/extra.wat" "x" ;;
       tree-extra) plant file "$D/$version/notes.txt" "x" ;;
       private-file) plant file "$D/notes.txt" "x" ;;
       private-dir) plant dir "$D/backup" ;;
       bad-version) plant dir "$D/0.1" ;;
+      second-version) plant dir "$D/0.0.99" ;;
       foreign-command) alter link "$BIN/syndeo-ui" /Applications/Foreign.app/Contents/MacOS/foreign ;;
       mode) alter mode "$D/$version/syndeo-agent" 775 ;;
       acl) alter acl "$D/$version" "everyone allow list" ;;
@@ -926,6 +1065,7 @@ system_after() {
       private-file) unplant "$D/notes.txt" ;;
       private-dir) unplant "$D/backup" ;;
       bad-version) unplant "$D/0.1" ;;
+      second-version) unplant "$D/0.0.99" ;;
       pending) unplant "$D/.current.new" ;;
       *) restore_last ;;
     esac
