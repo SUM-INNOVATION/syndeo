@@ -27,6 +27,7 @@ use std::sync::Arc;
 use syndeo_ipc::protocol::{KeystoreRequest, KeystoreResponse, NetRequest, NetResponse};
 use syndeo_ipc::transport::{Channel, Endpoint, Server};
 use syndeo_shell::prompt::Prompter;
+use syndeo_shell::supervisor::InstallDir;
 use syndeo_shell::{Shell, Supervisor};
 
 #[derive(Parser)]
@@ -66,6 +67,10 @@ fn home(override_path: Option<PathBuf>) -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    // First, before anything can start a sibling: the directory of the image
+    // this process runs, which its siblings come from and which no upgrade
+    // can change after this. The supervisor cannot be made without it.
+    let install = syndeo_shell::supervisor::capture_install_dir()?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG")
@@ -94,7 +99,7 @@ fn main() -> Result<()> {
 
     let prompter = Arc::new(WindowPrompter::new(ask_sender, closed.clone()));
     let session = runtime
-        .block_on(Session::start(&home, &cli, prompter.clone()))
+        .block_on(Session::start(install, &home, &cli, prompter.clone()))
         .context("bringing up the process model")?;
 
     let net = session.net.clone();
@@ -154,8 +159,13 @@ struct Session {
 }
 
 impl Session {
-    async fn start(home: &std::path::Path, cli: &Cli, prompter: Arc<dyn Prompter>) -> Result<Self> {
-        let mut supervisor = Supervisor::new(home);
+    async fn start(
+        install: InstallDir,
+        home: &std::path::Path,
+        cli: &Cli,
+        prompter: Arc<dyn Prompter>,
+    ) -> Result<Self> {
+        let mut supervisor = Supervisor::new(home, install);
         let net = supervisor.start_net(&cli.dns, &cli.peers).await?;
 
         if cli.no_keys {

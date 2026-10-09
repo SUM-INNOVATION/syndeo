@@ -74,12 +74,14 @@ pub enum Seeded {
 }
 
 /// Give `home` the tools installed beside this binary, unless it already has
-/// something called `tools`.
-pub fn seed_example_tools(home: &Path) -> io::Result<Seeded> {
-    match crate::supervisor::install_dir() {
-        Ok(dir) => seed_from(&dir.join("tools"), home),
-        Err(_) => Ok(Seeded::NoSource),
-    }
+/// something called `tools`. `install` is what `main` captured: there is no
+/// seeding before that, and so no mistaking an uncaptured directory for one
+/// without tools.
+pub fn seed_example_tools(
+    install: crate::supervisor::InstallDir,
+    home: &Path,
+) -> io::Result<Seeded> {
+    seed_from(&install.path().join("tools"), home)
 }
 
 /// [`seed_example_tools`], from `source` rather than the installed directory.

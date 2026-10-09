@@ -21,9 +21,10 @@ mod pin;
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
     // Before anything starts: the directory of the image this process runs,
-    // where its proxy is looked for. See syndeo_shell::supervisor::install_dir.
-    syndeo_shell::supervisor::capture_install_dir()?;
-    macos::run()
+    // where its proxy is looked for and nowhere else. The proxy cannot be
+    // started without it. See syndeo_shell::supervisor::InstallDir.
+    let install = syndeo_shell::supervisor::capture_install_dir()?;
+    macos::run(install)
 }
 
 #[cfg(not(target_os = "macos"))]

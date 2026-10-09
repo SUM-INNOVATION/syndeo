@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 /// Set on the copy: the directory it should wait in, and what to report.
 const CHILD: &str = "SYNDEO_INSTALL_DIR_TEST_CHILD";
 /// Set on the copy instead, for [`removed_child`]: the file to wait for, and
-/// whether to find its directory before waiting (`early`) or after (`late`).
+/// whether to capture its directory before waiting (`early`), only after
+/// (`late`), or only after, having asked for it uncaptured first
+/// (`uncaptured`).
 const REMOVED: &str = "SYNDEO_INSTALL_DIR_TEST_REMOVED";
 const SIBLING: &str = "syndeo-install-dir-test-sibling";
 
@@ -30,6 +32,8 @@ fn child() {
         return;
     };
     let go = PathBuf::from(go);
+    // As `main` does, first.
+    let install = syndeo_shell::supervisor::capture_install_dir().unwrap();
     println!(
         "@@before {}",
         syndeo_shell::supervisor::running_image()
@@ -55,10 +59,7 @@ fn child() {
         "@@install_dir {}",
         syndeo_shell::supervisor::install_dir().unwrap().display()
     );
-    println!(
-        "@@sibling {}",
-        syndeo_shell::Supervisor::locate(SIBLING).unwrap().display()
-    );
+    println!("@@sibling {}", install.locate(SIBLING).unwrap().display());
 }
 
 /// `root/libexec/syndeo/<version>/` holding a copy of this test binary and a
@@ -139,17 +140,23 @@ fn a_command_started_through_the_links_keeps_its_own_version_when_current_moves(
     );
 }
 
-/// Not a test of its own. In the copy, with [`REMOVED`] set, it finds its
+/// Not a test of its own. In the copy, with [`REMOVED`] set, it captures its
 /// directory before or after its version is removed, and reports what the
 /// lookups say after the removal; anywhere else it does nothing.
 #[test]
 fn removed_child() {
+    use syndeo_shell::supervisor::{capture_install_dir, install_dir, running_image};
     let Ok(setting) = std::env::var(REMOVED) else {
         return;
     };
     let (when, go) = setting.split_once(':').unwrap();
-    if when == "early" {
-        syndeo_shell::supervisor::capture_install_dir().unwrap();
+    let early = (when == "early").then(|| capture_install_dir().unwrap());
+    if when == "uncaptured" {
+        // Asked for before any capture, with the image still in place.
+        match install_dir() {
+            Ok(dir) => println!("@@uncaptured {}", dir.display()),
+            Err(err) => println!("@@uncaptured_error {err:#}"),
+        }
     }
     println!("@@waiting");
     let go = PathBuf::from(go);
@@ -161,17 +168,20 @@ fn removed_child() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    match syndeo_shell::supervisor::install_dir() {
+    if early.is_none() {
+        // Only now, after the removal.
+        match capture_install_dir() {
+            Ok(install) => println!("@@captured {}", install.path().display()),
+            Err(err) => println!("@@capture_error {err:#}"),
+        }
+    }
+    match install_dir() {
         Ok(dir) => println!("@@install_dir {}", dir.display()),
         Err(err) => println!("@@install_dir_error {err:#}"),
     }
-    match syndeo_shell::supervisor::running_image() {
+    match running_image() {
         Ok(image) => println!("@@running_image {}", image.display()),
         Err(err) => println!("@@running_image_error {err:#}"),
-    }
-    match syndeo_shell::Supervisor::locate(SIBLING) {
-        Ok(found) => println!("@@sibling {}", found.display()),
-        Err(err) => println!("@@sibling_error {err:#}"),
     }
 }
 
@@ -247,15 +257,35 @@ fn a_directory_found_before_the_version_was_removed_is_kept_and_the_kernel_no_lo
 
 #[cfg(target_os = "macos")]
 #[test]
-fn a_directory_looked_for_after_the_version_was_removed_is_an_error_not_a_guess() {
+fn a_directory_captured_after_the_version_was_removed_is_an_error_not_a_guess() {
     let (_, reported) = run_removed("late");
-    let dir = reported_value(&reported, "@@install_dir_error ");
+    let captured = reported_value(&reported, "@@capture_error ");
     assert!(
-        dir.is_some_and(|e| e.contains("proc_pidpath")),
+        captured.is_some_and(|e| e.contains("proc_pidpath")),
         "the directory was guessed: {reported:#?}"
     );
+    let after = reported_value(&reported, "@@install_dir_error ");
     assert!(
-        reported_value(&reported, "@@sibling_error ").is_some(),
-        "a sibling was found through current: {reported:#?}"
+        after.is_some_and(|e| e.contains("proc_pidpath")),
+        "install_dir does not say the capture failed: {reported:#?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn asked_for_before_capture_it_is_a_mistake_said_and_nothing_is_looked_up() {
+    let (_, reported) = run_removed("uncaptured");
+    assert_eq!(
+        reported_value(&reported, "@@uncaptured_error "),
+        Some(syndeo_shell::supervisor::NOT_CAPTURED),
+        "{reported:#?}"
+    );
+    // Had install_dir captured anything, from the kernel or from
+    // current_exe, it would have been 0.0.1, while it was there, and the
+    // capture after the removal would have returned it. It is an error.
+    let captured = reported_value(&reported, "@@capture_error ");
+    assert!(
+        captured.is_some_and(|e| e.contains("proc_pidpath")),
+        "something was captured before the capture: {reported:#?}"
     );
 }

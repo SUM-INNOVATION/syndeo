@@ -9,7 +9,7 @@
 
 use crate::prompt::{Prompter, SignatureRequest, TerminalPrompter};
 use crate::service::Shell;
-use crate::supervisor::Supervisor;
+use crate::supervisor::{InstallDir, Supervisor};
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::Path;
 use std::sync::Arc;
@@ -54,6 +54,7 @@ pub fn parse_purpose(purpose: &str) -> Result<SignaturePurpose> {
 /// returns. `prompter` asks for the passphrase and, unless consent was typed,
 /// for the signature.
 pub async fn sign_message(
+    install: InstallDir,
     home: &Path,
     origin: &str,
     message: &str,
@@ -67,7 +68,7 @@ pub async fn sign_message(
         message,
         purpose,
         consent,
-        move || SupervisedKeystore::new(Supervisor::new(home), unsealing),
+        move || SupervisedKeystore::new(Supervisor::new(home, install), unsealing),
         Arc::new(prompter),
     )
     .await

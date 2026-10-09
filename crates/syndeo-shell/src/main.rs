@@ -18,6 +18,7 @@ use syndeo_ipc::transport::{Channel, Endpoint, Server};
 use syndeo_ipc::SecretString;
 use syndeo_shell::prompt::{NonInteractive, Prompter, TerminalPrompter};
 use syndeo_shell::signing::{self, unseal, Consent};
+use syndeo_shell::supervisor::InstallDir;
 use syndeo_shell::{Shell, Supervisor};
 
 #[derive(Parser)]
@@ -131,19 +132,19 @@ fn main() -> Result<()> {
     // Then, before anything can start a sibling: the directory of the image
     // this process runs. An upgrade that replaces this version later cannot
     // change the answer, and for the macOS package it is the only place a
-    // sibling is looked for.
-    syndeo_shell::supervisor::capture_install_dir()?;
+    // sibling is looked for. Nothing that starts one can be made without it.
+    let install = syndeo_shell::supervisor::capture_install_dir()?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| anyhow::anyhow!("starting the runtime: {err}"))?
-        .block_on(run(secrets))
+        .block_on(run(secrets, install))
 }
 
 /// `secrets` is what `main` took out of the environment. A scripted
 /// passphrase goes to the terminal prompter, which hands it over once; it is
 /// wiped when that is dropped, used or not, which is before this returns.
-async fn run(mut secrets: StartupSecrets) -> Result<()> {
+async fn run(mut secrets: StartupSecrets, install: InstallDir) -> Result<()> {
     let terminal = TerminalPrompter::new(
         secrets
             .take(syndeo_ipc::startup::PASSPHRASE)
@@ -166,7 +167,7 @@ async fn run(mut secrets: StartupSecrets) -> Result<()> {
     std::fs::create_dir_all(&home)?;
     // The example tools, the first time a home has none. Never a reason for
     // the command itself to fail.
-    match syndeo_shell::tools::seed_example_tools(&home) {
+    match syndeo_shell::tools::seed_example_tools(install, &home) {
         Ok(outcome) => tracing::debug!(?outcome, "example tools"),
         Err(err) => tracing::debug!(%err, "the example tools were not seeded"),
     }
@@ -177,29 +178,40 @@ async fn run(mut secrets: StartupSecrets) -> Result<()> {
             full,
             json,
             twice,
-        } => browse(&home, &cli.dns, &cli.peers, &url, full, json, twice).await,
-        Command::Agent { task } => agent(&home, &cli.dns, &cli.peers, &task, terminal).await,
+        } => {
+            browse(
+                install, &home, &cli.dns, &cli.peers, &url, full, json, twice,
+            )
+            .await
+        }
+        Command::Agent { task } => {
+            agent(install, &home, &cli.dns, &cli.peers, &task, terminal).await
+        }
         Command::Sign {
             origin,
             message,
             purpose,
             yes,
-        } => sign(&home, &origin, &message, &purpose, yes, terminal).await,
-        Command::Identity { origin } => identity(&home, &origin, terminal).await,
+        } => sign(install, &home, &origin, &message, &purpose, yes, terminal).await,
+        Command::Identity { origin } => identity(install, &home, &origin, terminal).await,
         Command::Stats { json } => stats(&home, json),
         Command::Peer { command } => match command {
             PeerCommand::Serve { listen, serve_only } => {
-                peer_serve(&home, &cli.dns, &cli.peers, &listen, serve_only).await
+                peer_serve(install, &home, &cli.dns, &cli.peers, &listen, serve_only).await
             }
-            PeerCommand::Status { json } => peer_status(&home, &cli.dns, &cli.peers, json).await,
+            PeerCommand::Status { json } => {
+                peer_status(install, &home, &cli.dns, &cli.peers, json).await
+            }
         },
-        Command::Doctor => doctor(&home).await,
+        Command::Doctor => doctor(install, &home).await,
     }
 }
 
 // ------------------------------------------------------------------- browse
 
+#[allow(clippy::too_many_arguments)]
 async fn browse(
+    install: InstallDir,
     home: &std::path::Path,
     dns: &str,
     peers: &[String],
@@ -208,7 +220,7 @@ async fn browse(
     json: bool,
     twice: bool,
 ) -> Result<()> {
-    let mut supervisor = Supervisor::new(home);
+    let mut supervisor = Supervisor::new(home, install);
     let net = supervisor.start_net(dns, peers).await?;
 
     let fetch = || async {
@@ -290,6 +302,7 @@ async fn browse(
 // -------------------------------------------------------------------- agent
 
 async fn agent(
+    install: InstallDir,
     home: &std::path::Path,
     dns: &str,
     peers: &[String],
@@ -297,7 +310,7 @@ async fn agent(
     terminal: TerminalPrompter,
 ) -> Result<()> {
     let secret = SessionSecret::generate();
-    let mut supervisor = Supervisor::new(home);
+    let mut supervisor = Supervisor::new(home, install);
 
     let net = supervisor.start_net(dns, peers).await?;
     let keystore = supervisor.start_keystore(&secret).await?;
@@ -335,6 +348,7 @@ async fn agent(
 // --------------------------------------------------------------------- sign
 
 async fn sign(
+    install: InstallDir,
     home: &std::path::Path,
     origin: &str,
     message: &str,
@@ -351,7 +365,8 @@ async fn sign(
     } else {
         Consent::Prompted
     };
-    let signed = signing::sign_message(home, origin, message, purpose, consent, terminal).await?;
+    let signed =
+        signing::sign_message(install, home, origin, message, purpose, consent, terminal).await?;
 
     // The canonical origin, which is the one the key was derived for.
     println!("origin      {}", signed.origin);
@@ -361,9 +376,14 @@ async fn sign(
     Ok(())
 }
 
-async fn identity(home: &std::path::Path, origin: &str, terminal: TerminalPrompter) -> Result<()> {
+async fn identity(
+    install: InstallDir,
+    home: &std::path::Path,
+    origin: &str,
+    terminal: TerminalPrompter,
+) -> Result<()> {
     let secret = SessionSecret::generate();
-    let mut supervisor = Supervisor::new(home);
+    let mut supervisor = Supervisor::new(home, install);
     let keystore = supervisor.start_keystore(&secret).await?;
     unseal(&keystore, &terminal).await?;
 
@@ -398,13 +418,14 @@ async fn identity(home: &std::path::Path, origin: &str, terminal: TerminalPrompt
 
 /// Join the swarm and stay in it.
 async fn peer_serve(
+    install: InstallDir,
     home: &std::path::Path,
     dns: &str,
     peers: &[String],
     listen: &[String],
     serve_only: bool,
 ) -> Result<()> {
-    let mut supervisor = Supervisor::new(home);
+    let mut supervisor = Supervisor::new(home, install);
     let net = supervisor
         .start_peer_node(dns, peers, listen, serve_only)
         .await?;
@@ -435,12 +456,13 @@ async fn peer_serve(
 }
 
 async fn peer_status(
+    install: InstallDir,
     home: &std::path::Path,
     dns: &str,
     peers: &[String],
     json: bool,
 ) -> Result<()> {
-    let mut supervisor = Supervisor::new(home);
+    let mut supervisor = Supervisor::new(home, install);
     let net = supervisor.start_peer_node(dns, peers, &[], false).await?;
     let status = peer_status_value(&net).await?;
     supervisor.shutdown().await;
@@ -504,7 +526,7 @@ fn stats(home: &std::path::Path, json: bool) -> Result<()> {
 
 // ------------------------------------------------------------------- doctor
 
-async fn doctor(home: &std::path::Path) -> Result<()> {
+async fn doctor(install: InstallDir, home: &std::path::Path) -> Result<()> {
     println!("version         {}", env!("CARGO_PKG_VERSION"));
     println!("home            {}", home.display());
 
@@ -513,7 +535,7 @@ async fn doctor(home: &std::path::Path) -> Result<()> {
     let mut missing = Vec::new();
     let mut removed = false;
     for name in ["syndeo-net", "syndeo-keystore", "syndeo-agent"] {
-        match Supervisor::locate(name) {
+        match install.locate(name) {
             Ok(path) => println!("{name:<16}{}", path.display()),
             Err(err) => {
                 println!("{name:<16}NOT FOUND");
@@ -555,7 +577,7 @@ async fn doctor(home: &std::path::Path) -> Result<()> {
     }
 
     let secret = SessionSecret::generate();
-    let mut supervisor = Supervisor::new(home);
+    let mut supervisor = Supervisor::new(home, install);
     let session = match supervisor.start_keystore(&secret).await {
         Ok(endpoint) => {
             let mut channel = Channel::connect(&endpoint).await?;

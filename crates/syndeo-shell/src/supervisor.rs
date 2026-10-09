@@ -15,6 +15,9 @@ use tokio::process::{Child, Command};
 
 pub struct Supervisor {
     home: PathBuf,
+    /// Where this process's own version is installed; every sibling comes
+    /// from what this says.
+    install: InstallDir,
     children: Vec<(String, Child)>,
     /// The writing ends of each child's parent-watch pipe.
     ///
@@ -27,9 +30,12 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(home: impl Into<PathBuf>) -> Self {
+    /// `install` is what `main` captured, first thing, with
+    /// [`capture_install_dir`]: no supervisor exists without it.
+    pub fn new(home: impl Into<PathBuf>, install: InstallDir) -> Self {
         Supervisor {
             home: home.into(),
+            install,
             children: Vec::new(),
             watches: Vec::new(),
         }
@@ -46,36 +52,12 @@ impl Supervisor {
         syndeo_ipc::transport::runtime_dir_for(&self.home)
     }
 
-    /// Sibling binaries, so a build tree, a tarball install and the macOS
-    /// package all work.
-    ///
-    /// The directory of the running image comes first: see [`install_dir`].
-    /// For the macOS package it is the only place looked, and a sibling that
-    /// is not there is a [`RemovedByUpgrade`]: see [`is_packaged_dir`].
-    /// Anywhere else, after it, the invocation path resolved and then as
-    /// given, because on macOS `current_exe` hands back a symlink on `PATH`
-    /// rather than its target. `PATH` is the last resort rather than the
-    /// first: a sibling is the binary that shipped with this one, and
-    /// preferring it means a build tree never picks up an installed copy of a
-    /// different version.
-    pub fn locate(name: &str) -> Result<PathBuf> {
-        let dir = install_dir()?;
-        let exe = std::env::current_exe().ok();
-        locate_from(
-            name,
-            dir,
-            is_packaged_dir(dir),
-            exe.as_deref(),
-            std::env::var_os("PATH"),
-        )
-    }
-
     /// The network process. Every other process reaches the outside world
     /// through this one.
     pub async fn start_net(&mut self, dns: &str, peers: &[String]) -> Result<Endpoint> {
         let endpoint = Endpoint::new(self.runtime_dir().join("net.sock"));
         clear_stale(endpoint.path());
-        let mut command = Command::new(Self::locate("syndeo-net")?);
+        let mut command = Command::new(self.install.locate("syndeo-net")?);
         command
             .arg("--socket")
             .arg(endpoint.path())
@@ -113,7 +95,7 @@ impl Supervisor {
     ) -> Result<Endpoint> {
         let endpoint = Endpoint::new(self.runtime_dir().join("net.sock"));
         clear_stale(endpoint.path());
-        let mut command = Command::new(Self::locate("syndeo-net")?);
+        let mut command = Command::new(self.install.locate("syndeo-net")?);
         command
             .arg("--socket")
             .arg(endpoint.path())
@@ -149,7 +131,7 @@ impl Supervisor {
     pub async fn start_keystore(&mut self, secret: &SessionSecret) -> Result<Endpoint> {
         let endpoint = Endpoint::new(self.runtime_dir().join("keystore.sock"));
         clear_stale(endpoint.path());
-        let mut child = Command::new(Self::locate("syndeo-keystore")?)
+        let mut child = Command::new(self.install.locate("syndeo-keystore")?)
             .arg("serve")
             .arg("--socket")
             .arg(endpoint.path())
@@ -168,7 +150,7 @@ impl Supervisor {
 
     /// The agent. Note precisely what it is given, and what it is not.
     pub fn start_agent(&mut self, net: &Endpoint, shell: &Endpoint, task: &str) -> Result<()> {
-        let mut child = Command::new(Self::locate("syndeo-agent")?)
+        let mut child = Command::new(self.install.locate("syndeo-agent")?)
             .arg("--net-socket")
             .arg(net.path())
             .arg("--shell-socket")
@@ -313,7 +295,10 @@ unsafe fn libc_kill(pid: i32, signal: i32) {
     kill(pid, signal);
 }
 
-/// The directory of the binary this process is running, found once.
+/// The directory of the binary this process is running, as `main` captured
+/// it, first thing, with [`capture_install_dir`]: the only way to have one.
+/// A [`Supervisor`] cannot be made without one, nor the example tools seeded,
+/// so a program that starts siblings and does not capture does not compile.
 ///
 /// Siblings are looked for here first. It is where the image the kernel is
 /// running lives, not where whatever link started it pointed at the time it is
@@ -321,16 +306,88 @@ unsafe fn libc_kill(pid: i32, signal: i32) {
 /// which leads through `libexec/syndeo/current`, a link an upgrade switches.
 /// Resolving that link when a sibling is needed — which for the keystore can be
 /// long after start — would find whichever version it names then, and run one
-/// release's shell against another's keystore. The image path cannot move.
-///
-/// It is found the first time it is asked for, and every program that starts
-/// siblings asks first thing in `main`, through [`capture_install_dir`]: an
-/// upgrade removes the version it replaces, and after that the kernel can no
-/// longer say where a running image of it came from. If it could not be found
-/// then, it is an error now and for the rest of the process.
-pub fn install_dir() -> Result<&'static Path> {
-    static DIR: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
-    let found = DIR.get_or_init(|| {
+/// release's shell against another's keystore. The image path cannot move, and
+/// it has to be found before an upgrade removes it: after that the kernel can
+/// no longer say where a running image came from.
+#[derive(Debug, Clone, Copy)]
+pub struct InstallDir {
+    dir: &'static Path,
+}
+
+impl InstallDir {
+    pub fn path(self) -> &'static Path {
+        self.dir
+    }
+
+    /// Sibling binaries, so a build tree, a tarball install and the macOS
+    /// package all work.
+    ///
+    /// This directory comes first. For the macOS package it is the only place
+    /// looked, and a sibling that is not there is a [`RemovedByUpgrade`]: see
+    /// [`is_packaged_dir`]. Anywhere else, after it, the invocation path
+    /// resolved and then as given, because on macOS `current_exe` hands back a
+    /// symlink on `PATH` rather than its target. `PATH` is the last resort
+    /// rather than the first: a sibling is the binary that shipped with this
+    /// one, and preferring it means a build tree never picks up an installed
+    /// copy of a different version.
+    pub fn locate(self, name: &str) -> Result<PathBuf> {
+        let exe = std::env::current_exe().ok();
+        locate_from(
+            name,
+            self.dir,
+            is_packaged_dir(self.dir),
+            exe.as_deref(),
+            std::env::var_os("PATH"),
+        )
+    }
+
+    /// A sibling in this directory and nowhere else, for a program that has no
+    /// other place to look. For the macOS package, missing is a
+    /// [`RemovedByUpgrade`].
+    pub fn beside(self, name: &str) -> Result<PathBuf> {
+        beside_from(name, self.dir, is_packaged_dir(self.dir))
+    }
+}
+
+/// [`InstallDir::beside`], given the directory and whether it is the
+/// package's.
+fn beside_from(name: &str, dir: &Path, packaged: bool) -> Result<PathBuf> {
+    let beside = dir.join(name);
+    if packaged {
+        if beside.is_file() {
+            return Ok(beside);
+        }
+        return Err(RemovedByUpgrade {
+            name: name.to_string(),
+            dir: dir.to_path_buf(),
+        }
+        .into());
+    }
+    if beside.exists() {
+        return Ok(beside);
+    }
+    bail!(
+        "cannot find {name} next to this binary, in {}. Every Syndeo binary has to be \
+         installed into the same directory.",
+        dir.display()
+    )
+}
+
+/// What [`capture_install_dir`] found, once, for the life of the process.
+static CAPTURED: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+
+/// What [`install_dir`] says when asked before `main` captured anything. That
+/// is a mistake in the program, and it is said, never covered over by looking.
+pub const NOT_CAPTURED: &str =
+    "the install directory was asked for before main captured it with capture_install_dir()";
+
+/// Find the directory of the image this process runs, keep it, and hand back
+/// the [`InstallDir`] everything that starts a sibling needs. The only code
+/// that looks; call it first thing in `main`. Called again, it says the same.
+/// If the kernel cannot say where the image is, that is an error, now and for
+/// the rest of the process.
+pub fn capture_install_dir() -> Result<InstallDir> {
+    let found = CAPTURED.get_or_init(|| {
         let image = running_image().map_err(|err| format!("{err:#}"))?;
         image
             .parent()
@@ -338,16 +395,20 @@ pub fn install_dir() -> Result<&'static Path> {
             .ok_or_else(|| format!("{} has no directory", image.display()))
     });
     match found {
-        Ok(dir) => Ok(dir),
+        Ok(dir) => Ok(InstallDir { dir }),
         Err(err) => bail!("cannot tell where this program is installed: {err}"),
     }
 }
 
-/// [`install_dir`], found now. `main` calls it before anything else can
-/// start, so that a sibling started lazily, long after, comes from the version
-/// this process started as, or from nowhere.
-pub fn capture_install_dir() -> Result<&'static Path> {
-    install_dir()
+/// The directory [`capture_install_dir`] found. It only reads what was
+/// captured: before the capture it is [`NOT_CAPTURED`], and it never looks
+/// for itself, at `current_exe`, the kernel or anything else.
+pub fn install_dir() -> Result<&'static Path> {
+    match CAPTURED.get() {
+        None => bail!(NOT_CAPTURED),
+        Some(Ok(dir)) => Ok(dir),
+        Some(Err(err)) => bail!("cannot tell where this program is installed: {err}"),
+    }
 }
 
 /// The path of the image this process is running, as the kernel has it.
@@ -432,33 +493,7 @@ impl std::fmt::Display for RemovedByUpgrade {
 
 impl std::error::Error for RemovedByUpgrade {}
 
-/// A sibling beside [`install_dir`] and nowhere else, for a program that has
-/// no other place to look. For the macOS package, missing is a
-/// [`RemovedByUpgrade`].
-pub fn beside_install_dir(name: &str) -> Result<PathBuf> {
-    let dir = install_dir()?;
-    let beside = dir.join(name);
-    if is_packaged_dir(dir) {
-        if beside.is_file() {
-            return Ok(beside);
-        }
-        return Err(RemovedByUpgrade {
-            name: name.to_string(),
-            dir: dir.to_path_buf(),
-        }
-        .into());
-    }
-    if beside.exists() {
-        return Ok(beside);
-    }
-    bail!(
-        "cannot find {name} next to this binary, in {}. Every Syndeo binary has to be \
-         installed into the same directory.",
-        dir.display()
-    )
-}
-
-/// [`Supervisor::locate`], given everything it looks at: the running image's
+/// [`InstallDir::locate`], given everything it looks at: the running image's
 /// directory, whether that is the package's, the invocation path, and `PATH`.
 fn locate_from(
     name: &str,
@@ -678,6 +713,73 @@ mod tests {
                 fallback.display()
             );
         }
+    }
+
+    #[test]
+    fn a_removed_packaged_version_says_exactly_to_quit_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let (gone, bin) = upgraded(temp.path());
+        let err =
+            locate_from("syndeo-net", &gone, true, Some(&bin.join("syndeo")), None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "syndeo-net is not in {}: this version was removed during an upgrade; quit and restart Syndeo",
+                gone.display()
+            )
+        );
+        let err = beside_from("syndeo-proxy", &gone, true).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "syndeo-proxy is not in {}: this version was removed during an upgrade; quit and restart Syndeo",
+                gone.display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_packaged_version_moved_away_after_capture_is_not_followed_anywhere() {
+        // The version is complete when captured, then moved whole out of
+        // place, as Installer moves what it replaces into its trash, while
+        // `current`, the invocation path and PATH all offer a sibling.
+        let temp = tempfile::tempdir().unwrap();
+        let (captured, bin) = upgraded(temp.path());
+        std::fs::create_dir_all(&captured).unwrap();
+        for name in SIBLINGS {
+            executable(&captured.join(name));
+        }
+        let trash = temp.path().join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        std::fs::rename(&captured, trash.join("0.0.9")).unwrap();
+        let path = std::env::join_paths([trash.join("0.0.9"), bin.clone()]).unwrap();
+        for name in SIBLINGS {
+            let err = locate_from(
+                name,
+                &captured,
+                true,
+                Some(&bin.join("syndeo")),
+                Some(path.clone()),
+            )
+            .unwrap_err();
+            assert!(err.downcast_ref::<RemovedByUpgrade>().is_some(), "{err:#}");
+            assert!(beside_from(name, &captured, true)
+                .unwrap_err()
+                .downcast_ref::<RemovedByUpgrade>()
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn beside_outside_the_package_is_this_directory_or_a_plain_error() {
+        let temp = tempfile::tempdir().unwrap();
+        executable(&temp.path().join("syndeo-proxy"));
+        assert_eq!(
+            beside_from("syndeo-proxy", temp.path(), false).unwrap(),
+            temp.path().join("syndeo-proxy")
+        );
+        let err = beside_from("syndeo-ui", temp.path(), false).unwrap_err();
+        assert!(err.downcast_ref::<RemovedByUpgrade>().is_none(), "{err:#}");
     }
 
     #[test]

@@ -89,7 +89,7 @@ struct Cli {
     proxy: Option<String>,
 }
 
-pub fn run() -> Result<()> {
+pub fn run(install: syndeo_shell::supervisor::InstallDir) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG")
@@ -127,7 +127,7 @@ pub fn run() -> Result<()> {
     // this the browser is two commands and a path, which is two more than a
     // browser should need. It lives exactly as long as this binding.
     let (owned, credential) = if cli.proxy.is_none() {
-        let (owned, credential) = start_proxy(&home)?;
+        let (owned, credential) = start_proxy(install, &home)?;
         (Some(owned), Some(credential))
     } else {
         (None, None)
@@ -716,7 +716,7 @@ fn exited_soon(owned: &mut ProxyChild) -> Option<std::process::ExitStatus> {
 /// Start the proxy this browser fetches through, and wait until it says where.
 ///
 /// A sibling binary, found beside the image this process is running, as the
-/// shell finds its own (see `syndeo_shell::supervisor::install_dir`), so a
+/// shell finds its own (see `syndeo_shell::supervisor::InstallDir`), so a
 /// build tree and an install both work and an upgrade that switches a link
 /// cannot hand this browser another release's proxy. For the macOS package,
 /// whose upgrade removes the version it replaces, a missing proxy is that and
@@ -724,8 +724,11 @@ fn exited_soon(owned: &mut ProxyChild) -> Option<std::process::ExitStatus> {
 /// port the system picks — never a fixed one that something else could already
 /// hold — and goes when this process goes, however that happens: see
 /// [`ProxyChild`].
-fn start_proxy(home: &std::path::Path) -> Result<(OwnedProxy, proxied::ProxyCredential)> {
-    let beside = syndeo_shell::supervisor::beside_install_dir("syndeo-proxy")?;
+fn start_proxy(
+    install: syndeo_shell::supervisor::InstallDir,
+    home: &std::path::Path,
+) -> Result<(OwnedProxy, proxied::ProxyCredential)> {
+    let beside = install.beside("syndeo-proxy")?;
 
     let mut command = std::process::Command::new(beside);
     command

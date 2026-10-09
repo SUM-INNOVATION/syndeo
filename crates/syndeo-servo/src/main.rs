@@ -35,6 +35,10 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
 fn main() -> Result<()> {
+    // First, before anything can start a sibling: the directory of the image
+    // this process runs, which its siblings come from and which no upgrade
+    // can change after this. The supervisor cannot be made without it.
+    let install = syndeo_shell::supervisor::capture_install_dir()?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("SYNDEO_LOG")
@@ -67,7 +71,7 @@ fn main() -> Result<()> {
         .context("starting the runtime")?;
 
     // The network process, exactly as every other front end starts it.
-    let mut supervisor = syndeo_shell::Supervisor::new(&home);
+    let mut supervisor = syndeo_shell::Supervisor::new(&home, install);
     let net = runtime
         .block_on(supervisor.start_net(&cli.dns, &[]))
         .context("starting the network process")?;
