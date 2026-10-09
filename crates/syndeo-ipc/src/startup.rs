@@ -192,9 +192,11 @@ mod tests {
                 first.starts_with("let secrets = syndeo_ipc::startup::capture("),
                 "{binary}: the first thing main does is {first:?}"
             );
-            // And what was captured goes to `run`, which owns it from there.
+            // And what was captured goes to `run`, first, which owns it from
+            // there. The shell also hands it where it is installed.
             assert!(
-                body.contains(".block_on(run(secrets))"),
+                body.contains(".block_on(run(secrets))")
+                    || body.contains(".block_on(run(secrets, "),
                 "{binary}: main does not hand the captured secrets to run"
             );
         }
