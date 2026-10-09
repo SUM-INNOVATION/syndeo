@@ -1,0 +1,126 @@
+#!/bin/sh
+# The shared helpers below are embedded whole; each script uses only some.
+# shellcheck disable=SC2034,SC2329
+# Syndeo's preinstall check.
+#
+# Installer runs it as root, after the person installing has authenticated
+# and before anything is copied. It reads, and writes nothing: it stops the
+# installation by exiting non-zero, and says why in /var/log/install.log, one
+# "syndeo preinstall: refusing: ..." line per reason.
+#
+# It installs over nothing it cannot account for. Without a receipt, every
+# Syndeo-looking path is someone else's, with one exception: an installation
+# of exactly this version that was interrupted before it finished. With a
+# receipt, the receipt, the version directories, `current` and the commands
+# have to agree, and the result may not be older than anything installed.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+LC_ALL=C
+export PATH LC_ALL
+umask 022
+# Unset, IFS splits on space, tab and newline, whatever the caller set.
+unset IFS CDPATH ENV BASH_ENV
+
+SCRIPT=preinstall
+INCOMING='@VERSION@'
+ROOT='@ROOT@'
+EXPECT_UID='@EXPECT_UID@'
+EXPECT_GID='@EXPECT_GID@'
+PKGUTIL='@PKGUTIL@'
+
+@COMMON@
+
+# Where and on what.
+if [ "${3-}" != / ]; then
+    finding "the target volume is '${3-}': Syndeo installs only on the startup disk"
+fi
+if [ "$(/usr/bin/uname -m)" != arm64 ]; then
+    finding "this Mac is not Apple Silicon"
+fi
+if ! syndeo_version_valid "$INCOMING"; then
+    finding "this package's own version, '$INCOMING', is not a version"
+fi
+refuse_if_found
+
+# The paths themselves, whatever owns them.
+check_strict_dir "$SYNDEO_LOCAL"
+check_strict_dir "$SYNDEO_LIBEXEC"
+check_bin_dir "$SYNDEO_BIN"
+refuse_if_found
+scan_bin
+scan_private
+read_receipt
+refuse_if_found
+
+decision=''
+if [ "$r_present" = no ]; then
+    if [ "$d_present" = no ]; then
+        if [ "$bin_present" = 0 ]; then
+            decision="installing $INCOMING"
+        else
+            for n in $SYNDEO_NAMES; do
+                if is_present "$SYNDEO_BIN/$n"; then
+                    finding "$SYNDEO_BIN/$n: exists, and no Syndeo package is installed"
+                fi
+            done
+        fi
+    else
+        # The one state without a receipt that may be resumed: this version,
+        # partly or wholly in place, nothing else, and only its own links.
+        resumable=yes
+        [ "$versions" = " $INCOMING" ] || resumable=no
+        case "$current_v" in '' | "$INCOMING") ;; *) resumable=no ;; esac
+        case "$pending_v" in '' | "$INCOMING") ;; *) resumable=no ;; esac
+        [ -z "$bin_foreign" ] || resumable=no
+        if [ "$resumable" = yes ] && [ "$current_v" = "$INCOMING" ]; then
+            check_tree "$INCOMING" exact
+        fi
+        if [ "$resumable" = yes ]; then
+            decision="resuming an interrupted installation of $INCOMING"
+        else
+            finding "$SYNDEO_DIR: exists, and no Syndeo package is installed; it holds${versions:- nothing}${current_v:+, current -> $current_v}${pending_v:+, .current.new -> $pending_v}"
+            for n in $bin_foreign; do
+                finding "$SYNDEO_BIN/$n: is not a link this package writes"
+            done
+        fi
+    fi
+else
+    check_receipt
+    refuse_if_found
+    if [ "$d_present" = no ]; then
+        finding "$SYNDEO_DIR: is missing, but the receipt says $r_version is installed"
+    elif ! has_version "$r_version"; then
+        finding "$SYNDEO_DIR/$r_version: is missing, but the receipt says it is installed"
+    else
+        check_tree "$r_version" exact
+    fi
+    if [ -z "$current_v" ]; then
+        finding "$SYNDEO_DIR/current: is missing"
+    else
+        check_tree "$current_v" exact
+        if [ "$(syndeo_version_cmp "$current_v" "$r_version")" = lt ]; then
+            finding "$SYNDEO_DIR/current: points at $current_v, older than the installed $r_version"
+        fi
+    fi
+    for n in $bin_foreign; do
+        finding "$SYNDEO_BIN/$n: is not a link this package writes"
+    done
+    refuse_if_found
+
+    newest=$(newest_version)
+    if [ "$(syndeo_version_cmp "$INCOMING" "$newest")" = lt ]; then
+        finding "Syndeo $newest is installed, or partly installed, and this package is the older $INCOMING. Run the newest package to finish, or uninstall first with $SYNDEO_DIR/$r_version/uninstall.sh"
+    elif [ "$INCOMING" = "$r_version" ] && [ "$INCOMING" = "$current_v" ]; then
+        decision="reinstalling $INCOMING"
+    elif [ "$INCOMING" = "$current_v" ]; then
+        decision="finishing the interrupted upgrade to $INCOMING"
+    elif has_version "$INCOMING"; then
+        decision="resuming the interrupted upgrade from $current_v to $INCOMING"
+    else
+        decision="upgrading from $current_v to $INCOMING"
+    fi
+fi
+
+refuse_if_found
+say "$decision"
+exit 0

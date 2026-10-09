@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Handed to pkgbuild as its info template. Installer applies a payload's directory
+  modes and owners to directories that already exist unless this is false,
+  and /usr/local/bin, /usr/local and /usr/local/libexec are in the payload:
+  without it, installing would reset a /usr/local/bin a person owns.
+-->
+<pkg-info overwrite-permissions="false"/>

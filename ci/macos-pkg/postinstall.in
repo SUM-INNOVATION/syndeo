@@ -1,0 +1,84 @@
+#!/bin/sh
+# The shared helpers below are embedded whole; each script uses only some.
+# shellcheck disable=SC2034,SC2329
+# Syndeo's postinstall step: make the version just installed the current one.
+#
+# Installer runs it as root once every file of the version is in place. It
+# checks that the version is complete and exactly as packaged, then points
+# /usr/local/libexec/syndeo/current at it with a single rename: one switch,
+# from one complete version to another. The commands in /usr/local/bin all
+# lead through `current`, so a command that starts runs all of one version or
+# all of the other, never a mixture or a third, and one already running keeps
+# its own version to the end.
+#
+# The rename is not seen everywhere at the same instant. A command started at
+# the very moment of the switch can fail to start, once, with "No such file
+# or directory" or "Invalid argument"; started again, it runs. Once this step
+# returns, `current` is the new version and every command starts.
+#
+# If anything is wrong it changes nothing, and the previous version stays
+# current.
+#
+# It touches nothing outside the private directory: no command link, no home,
+# no keychain, no trust setting.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+LC_ALL=C
+export PATH LC_ALL
+umask 022
+# Unset, IFS splits on space, tab and newline, whatever the caller set.
+unset IFS CDPATH ENV BASH_ENV
+
+SCRIPT=postinstall
+INCOMING='@VERSION@'
+ROOT='@ROOT@'
+EXPECT_UID='@EXPECT_UID@'
+EXPECT_GID='@EXPECT_GID@'
+PKGUTIL='@PKGUTIL@'
+
+@COMMON@
+
+if [ "${3-}" != / ]; then
+    finding "the target volume is '${3-}': Syndeo installs only on the startup disk"
+fi
+if ! syndeo_version_valid "$INCOMING"; then
+    finding "this package's own version, '$INCOMING', is not a version"
+fi
+refuse_if_found
+
+check_strict_dir "$SYNDEO_LOCAL"
+check_strict_dir "$SYNDEO_LIBEXEC"
+if is_present "$SYNDEO_DIR"; then
+    check_strict_dir "$SYNDEO_DIR"
+else
+    finding "$SYNDEO_DIR: is missing"
+fi
+refuse_if_found
+
+check_tree "$INCOMING" exact
+for link in current .current.new; do
+    path="$SYNDEO_DIR/$link"
+    is_present "$path" || continue
+    if ! is_private "$path" 'Symbolic Link' -; then
+        finding "$path: is not a symlink owned by root:wheel"
+    elif ! syndeo_version_valid "$(/usr/bin/readlink "$path")"; then
+        finding "$path: does not point at a version"
+    fi
+done
+refuse_if_found
+
+@TEST_FAULT@
+# A temporary link left by a switch that was interrupted.
+if is_present "$SYNDEO_DIR/.current.new"; then
+    /bin/rm -f -- "$SYNDEO_DIR/.current.new"
+fi
+/bin/ln -s "$INCOMING" "$SYNDEO_DIR/.current.new"
+# -h: rename over `current` itself, not into the directory it points at.
+/bin/mv -h -f "$SYNDEO_DIR/.current.new" "$SYNDEO_DIR/current"
+
+if [ "$(/usr/bin/readlink "$SYNDEO_DIR/current")" != "$INCOMING" ]; then
+    say "refusing: $SYNDEO_DIR/current does not point at $INCOMING after the switch"
+    exit 1
+fi
+say "$INCOMING is current; a command started during the switch may have failed once, and runs if started again"
+exit 0
