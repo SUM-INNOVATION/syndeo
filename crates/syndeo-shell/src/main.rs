@@ -159,6 +159,12 @@ async fn run(mut secrets: StartupSecrets) -> Result<()> {
     let cli = Cli::parse();
     let home = home(cli.home);
     std::fs::create_dir_all(&home)?;
+    // The example tools, the first time a home has none. Never a reason for
+    // the command itself to fail.
+    match syndeo_shell::tools::seed_example_tools(&home) {
+        Ok(outcome) => tracing::debug!(?outcome, "example tools"),
+        Err(err) => tracing::debug!(%err, "the example tools were not seeded"),
+    }
 
     match cli.command {
         Command::Browse {

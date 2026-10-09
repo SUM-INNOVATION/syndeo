@@ -15,6 +15,7 @@ pub mod prompt;
 pub mod service;
 pub mod signing;
 pub mod supervisor;
+pub mod tools;
 
 #[cfg(test)]
 mod test_support;
