@@ -1,0 +1,65 @@
+# Diagnostic only, and only on the branch that carries it: what Installer
+# does to Syndeo's package when it upgrades it, and when an upgrade's
+# postinstall fails before or just after it switches `current`. It runs before
+# the package's recovery rules are redesigned around that. It uses stand-in
+# packages (0.0.x) only, builds no release package, reads no secret, and keeps
+# only logs.
+name: macOS package upgrade diagnostic
+
+on:
+  push:
+    branches: [diag/pkg-upgrade]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pkg-upgrade-diagnostic
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 3
+
+jobs:
+  diagnose:
+    name: macOS package upgrade diagnostic (disposable runner)
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      SYNDEO_ALLOW_SYSTEM_INSTALL_TEST: "yes"
+      PRESERVE: SYNDEO_ALLOW_SYSTEM_INSTALL_TEST,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_WORKSPACE
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: This workflow reads no secrets and no environment
+        shell: bash
+        run: |
+          if grep -nE 'secrets\.|^[[:space:]]*environment:' .github/workflows/pkg-upgrade-diagnostic.yml; then
+            echo "::error::the diagnostic must not reference secrets or an environment"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pkg-upgrade-diagnostic
+
+      # The stand-in `syndeo`: it asks the shell's own Supervisor::locate.
+      - name: Build the probe
+        run: cargo build --release --locked --example locate_probe -p syndeo-shell
+
+      - name: Upgrade, fail, and run the same package again (root)
+        run: sudo --preserve-env="$PRESERVE" bash ci/diagnose-pkg-upgrade.sh --run "$GITHUB_WORKSPACE/target/release/examples/locate_probe"
+
+      - name: Put the runner back, whatever happened
+        if: always()
+        run: sudo --preserve-env="$PRESERVE" bash ci/diagnose-pkg-upgrade.sh --cleanup
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-upgrade-diagnostic-logs
+          path: ${{ runner.temp }}/syndeo-pkg-test/logs/
+          if-no-files-found: warn

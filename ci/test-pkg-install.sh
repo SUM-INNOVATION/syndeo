@@ -952,6 +952,8 @@ system_after() {
 }
 
 case "${1:-}" in
+  # ci/diagnose-pkg-upgrade.sh borrows the helpers above.
+  --source-only) return 0 ;;
   --system-before) [ "$#" = 3 ] || refuse "--system-before <pkg> <version>"; system_before "$2" "$3" ;;
   --user) [ "$#" = 2 ] || refuse "--user <version>"; user "$2" ;;
   --system-after) [ "$#" = 3 ] || refuse "--system-after <pkg> <version>"; system_after "$2" "$3" ;;
