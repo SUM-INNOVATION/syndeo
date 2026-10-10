@@ -384,6 +384,100 @@ st_render() {
   expect "a malformed version is refused" eval "! '$builder' --render preinstall 0.1 '' 0 0 /usr/sbin/pkgutil '$d/x' >/dev/null 2>&1"
 }
 
+# st_said_run DUMP-LINES INSTALL-LOG-LINES TEXT [TRIES [LATE-LINE]]: said()
+# from ci/test-pkg-install.sh, on an installer dump and an install.log made
+# here. Prints yes or no, then what said() recorded.
+st_said_run() {
+  local d
+  # Its own directory each time: this runs in a command substitution, where
+  # no counter would carry over.
+  d="$(mktemp -d "$T/said.XXXXXX")"
+  printf '%s' "$1" >"$d/7-x.installer"
+  printf '%s' "$2" >"$d/install.log"
+  if [ -n "${5:-}" ]; then
+    ( sleep 1; printf '%s\n' "$5" >>"$d/install.log" ) &
+  fi
+  bash -c '
+    . "$1" --source-only
+    INSTALL_LOG="$2"
+    SAID_TRIES="$4"
+    last_log="$3"
+    last_before=0
+    if said "$5"; then echo yes; else echo no; fi
+    cat "$3.said"
+  ' _ "$here/test-pkg-install.sh" "$d/install.log" "$d/7-x" "${4:-2}" "$3"
+  wait
+}
+
+# What ci/test-pkg-install.sh takes as evidence of what a package's scripts
+# said, which otherwise only a real install exercises: every installer it, or
+# upgrade-stress.py, runs is asked for -dumplog, whose output is kept per
+# invocation; said() looks there first, for the line however installer
+# prefixes it, and then in what /var/log/install.log gains, allowing for it to
+# be late.
+st_harness() {
+  printf '\n  the install test: what a package said\n'
+  local runs out first ok d
+  runs="$(grep -nE '(^|[^-[:alnum:]_./])(/usr/sbin/)?installer +-' "$here/test-pkg-install.sh" | grep -vE '^[0-9]+: *#')"
+  ok=no
+  if [ -n "$runs" ] && ! printf '%s\n' "$runs" | grep -qv -- ' -dumplog '; then ok=yes; fi
+  expect "test-pkg-install.sh runs installer, and always with -dumplog" test "$ok" = yes
+  runs="$(grep -n 'a\.installer,' "$here/upgrade-stress.py")"
+  ok=no
+  if [ -n "$runs" ] && ! printf '%s\n' "$runs" | grep -qv -- '"-dumplog"'; then ok=yes; fi
+  expect "upgrade-stress.py runs installer, and always with -dumplog" test "$ok" = yes
+
+  local decision='syndeo preinstall: upgrading from 0.0.13 to 0.0.15'
+  local prefixed="2026-10-10 00:53:34+00 runner package_script_service[42591]: ./preinstall: $decision"
+
+  out="$(st_said_run "installer: Package name is Syndeo 0.0.15
+$prefixed
+installer: The upgrade was successful.
+" "" "$decision")"
+  first="$(printf '%s\n' "$out" | sed -n 1p)"
+  ok=no
+  if [ "$first" = yes ] && printf '%s\n' "$out" | grep -qF "in the -dumplog output: $decision"; then ok=yes; fi
+  expect "said() finds a prefixed decision line in the invocation's -dumplog output, with nothing in install.log" test "$ok" = yes
+
+  out="$(st_said_run "installer: The upgrade was successful.
+" "$prefixed
+" "$decision")"
+  first="$(printf '%s\n' "$out" | sed -n 1p)"
+  ok=no
+  if [ "$first" = yes ] && printf '%s\n' "$out" | grep -qF "in /var/log/install.log, on try 1: $decision"; then ok=yes; fi
+  expect "said() falls back to what install.log gained" test "$ok" = yes
+
+  out="$(st_said_run "installer: The upgrade was successful.
+" "" "$decision" 10 "$prefixed")"
+  first="$(printf '%s\n' "$out" | sed -n 1p)"
+  ok=no
+  if [ "$first" = yes ] && printf '%s\n' "$out" | grep -qF "in /var/log/install.log" && ! printf '%s\n' "$out" | grep -qF "on try 1:"; then ok=yes; fi
+  expect "said() waits for a line install.log delivers late" test "$ok" = yes
+
+  out="$(st_said_run "installer: Package name is Syndeo 0.0.15
+./preinstall: syndeo preinstall: upgrading from 0.0.12 to 0.0.15
+" "" "$decision")"
+  first="$(printf '%s\n' "$out" | sed -n 1p)"
+  ok=no
+  if [ "$first" = no ] && printf '%s\n' "$out" | grep -qF "in neither: $decision"; then ok=yes; fi
+  expect "said() finds nothing when neither has the decision, and says so" test "$ok" = yes
+
+  d="$T/said-delta"
+  mkdir -p "$d"
+  printf '%s\n' 'before 1' 'before 2' "$prefixed" 'other line' >"$d/install.log"
+  bash -c '
+    . "$1" --source-only
+    INSTALL_LOG="$2"
+    last_log="$3"
+    last_before=2
+    log_lines
+  ' _ "$here/test-pkg-install.sh" "$d/install.log" "$d/7-x"
+  ok=no
+  if [ "$(cat "$d/7-x.install-log")" = "$(printf '%s\n' "$prefixed" 'other line')" ] &&
+    [ "$(cat "$d/7-x.install-log.filtered")" = "$prefixed" ]; then ok=yes; fi
+  expect "log_lines keeps all install.log gained, whole, and filters only a copy" test "$ok" = yes
+}
+
 # --- macOS: the root scripts, under a temporary root ------------------------
 
 # st_new: a fresh case. C is its directory; R the root, with a space in it,
@@ -924,6 +1018,7 @@ self_test() {
   st_versions
   mkdir -p "$T/render"
   st_render "$T/render"
+  st_harness
   if [ "$(uname -s)" = Darwin ]; then
     st_preinstall
     st_postinstall

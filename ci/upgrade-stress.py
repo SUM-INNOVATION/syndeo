@@ -7,7 +7,8 @@
         [--installer PATH]
 
 Run as root, on a disposable runner, with VERSION installed. Each --install
-is an upgrade, `installer -pkg PKG -target /`, run in turn. What the package
+is an upgrade, `installer -dumplog -pkg PKG -target /`, run in turn, with all it
+prints kept by --log. What the package
 promises of an upgrade, checked as stated:
 - while an install runs, a lookup through `current`, or a command started
   through it, either fails with ENOENT or EINVAL, because the commands are
@@ -196,7 +197,8 @@ def main():
         for i, (v, pkg) in enumerate(a.install, 1):
             state["phase"] = ("installing", i)
             began = time.monotonic()
-            r = subprocess.run([a.installer, "-pkg", pkg, "-target", "/"], capture_output=True, text=True)
+            r = subprocess.run([a.installer, "-dumplog", "-pkg", pkg, "-target", "/"],
+                               capture_output=True, text=True)
             timings.append((v, time.monotonic() - began))
             if a.log:
                 with open("%s-%s.installer" % (a.log, v), "w") as f:
