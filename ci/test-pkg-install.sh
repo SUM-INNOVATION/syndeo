@@ -824,6 +824,7 @@ system_before() {
   : >"$st/late.go"
   wait "$late"
   status=$?
+  reaped "$st/pids" "$late"
   sed 's/^/      | /' "$st/logs/late-lookup"
   must "the 0.0.15 doctor, after the upgrade: every sibling it looked for refused as removed during an upgrade, and nothing started" test "$status" = 0
   must "  ... $BIN is still $RUNNER:admin 0775" test "$(snap_path "$BIN")" = "$bin_before"
@@ -841,6 +842,10 @@ user_finish() {
   trap - EXIT INT TERM HUP
   local us problems=""
   us="$(US)"
+  # agent_tools's descriptor and FIFO, if it stopped between opening and
+  # closing them.
+  exec 9<&- 2>/dev/null
+  if [ -p "$us/agent-stdin.fifo" ]; then rm -f "${us:?}/agent-stdin.fifo"; fi
   if [ -f "$us/pids" ]; then
     while read -r p; do kill "$p" 2>/dev/null; done <"$us/pids"
   fi
@@ -859,6 +864,37 @@ user_finish() {
     say "user cleanup: keychain search list restored, throwaway keychain deleted, processes stopped"
   fi
   exit "$status"
+}
+
+# agent_tools TOOLS: `syndeo-agent --task tools` on TOOLS, from /usr/local/bin.
+# Sets agent_out to what it said and agent_status to how it exited.
+#
+# The agent takes end-of-file on its stdin to mean that whoever started it is
+# gone (syndeo_ipc::exit_when_parent_does), and exits at once, saying
+# nothing; a CI step's stdin is already at end-of-file. It is given what the
+# shell gives it: a pipe whose other end stays open while it runs. Here that is
+# a private FIFO, opened read and write on descriptor 9, so the open never
+# waits and no timer or helper process holds it. The descriptor is closed and
+# the FIFO removed however the agent did; user_finish does both again.
+agent_tools() {
+  local fifo
+  fifo="$(US)/agent-stdin.fifo"
+  agent_out=''
+  agent_status=1
+  mkfifo -m 600 "$fifo" || return 1
+  exec 9<>"$fifo"
+  agent_out="$(clean_env syndeo-agent --net-socket "$(US)/net.sock" --shell-socket "$(US)/shell.sock" \
+    --task tools --tools "$1" 2>&1 <&9 9<&-)"
+  agent_status=$?
+  exec 9<&-
+  rm -f "${fifo:?}"
+}
+
+# reaped FILE PID: PID has been waited for, so it is no longer this test's to
+# kill; a pid left in FILE could name someone else's process by the time a
+# cleanup reads it.
+reaped() {
+  awk -v pid="$2" '$0 != pid' "$1" >"$1.new" && mv -f "$1.new" "$1"
 }
 
 # clean_env ...: a command from /usr/local/bin with nothing of the step's
@@ -895,7 +931,7 @@ wait_child() {
 }
 
 user() {
-  local version="$1" us h out n child pid
+  local version="$1" us h out n child pid ready
   guard_runner
   [ "$(id -u)" != 0 ] && [ "$(id -un)" = "$RUNNER" ] || refuse "run --user as $RUNNER, not root"
   receipt_is "$version" || refuse "Syndeo $version is not installed"
@@ -924,8 +960,12 @@ user() {
   must "the keystore starts and answers" eval "printf '%s\n' \"\$out\" | grep -qE '^keystore .*initialized'"
   must "the first run seeded $h/tools/wordcount.wat: $RUNNER's, 0644, a regular file, the installed bytes" eval \
     "[ -d '$h/tools' ] && [ ! -L '$h/tools/wordcount.wat' ] && [ -f '$h/tools/wordcount.wat' ] && [ \"\$(stat -f '%Su %Lp' '$h/tools/wordcount.wat')\" = '$RUNNER 644' ] && cmp -s '$h/tools/wordcount.wat' '$D/$version/tools/wordcount.wat'"
-  out="$(clean_env syndeo-agent --net-socket "$us/net.sock" --shell-socket "$us/shell.sock" --task tools --tools "$h/tools" 2>&1)"
-  must "the agent lists wordcount as ready" eval "printf '%s\n' \"\$out\" | grep -qE 'wordcount +ready'"
+  agent_tools "$h/tools"
+  printf '%s\n' "$agent_out" >"$us/agent.log"
+  ready=no
+  if [ "$agent_status" = 0 ] && grep -qE 'wordcount +ready' "$us/agent.log"; then ready=yes; fi
+  must "the agent lists wordcount as ready" test "$ready" = yes
+  must "  ... and its stdin FIFO is closed and gone" eval "! present '$us/agent-stdin.fifo' && ! { : >&9; } 2>/dev/null"
   printf '(module)\n' >"$h/tools/wordcount.wat"
   SYNDEO_HOME="$h" clean_env syndeo doctor >/dev/null 2>&1
   must "an edited tool is not overwritten" test "$(cat "$h/tools/wordcount.wat")" = "(module)"
@@ -946,6 +986,7 @@ user() {
   child="$(wait_child "$pid" syndeo-net)" || { sed 's/^/      | /' "$us/peer.log"; fail "syndeo peer serve started no syndeo-net"; }
   must "a long-running syndeo started from $BIN runs syndeo-net from $D/$version" runs_from "$child" "$D/$version/syndeo-net"
   kill "$pid"; wait "$pid" 2>/dev/null
+  reaped "$us/pids" "$pid"
 
   say ""
   say "syndeo-webkit's proxy, with a throwaway keychain"
@@ -963,6 +1004,7 @@ user() {
   child="$(wait_child "$pid" syndeo-proxy)" || { sed 's/^/      | /' "$us/webkit.log"; fail "syndeo-webkit started no syndeo-proxy"; }
   must "syndeo-webkit started from $BIN runs syndeo-proxy from $D/$version" runs_from "$child" "$D/$version/syndeo-proxy"
   kill "$pid"; wait "$pid" 2>/dev/null
+  reaped "$us/pids" "$pid"
   for _ in $(seq 1 50); do kill -0 "$child" 2>/dev/null || break; sleep 0.2; done
   must "  ... and the proxy goes when the browser does" eval "! kill -0 $child 2>/dev/null"
 }
