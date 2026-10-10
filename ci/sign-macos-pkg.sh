@@ -19,10 +19,14 @@
 #  6. expand it once more, and require the same again;
 #  7. require Gatekeeper to accept it as Notarized Developer ID, from the
 #     Installer identity.
-# On any failure <signed.pkg> is removed, so nothing half-done can be shipped.
-# Whatever happens, the keychain is deleted, the user keychain search list is
-# put back as it was, and the certificate, the notary key and the expansions
-# are removed.
+# Before it changes anything it reads the user keychain search list, and stops
+# if it cannot. Whatever happens after that, cleanup attempts all of: putting
+# that list back, deleting its keychain, removing its working directory (the
+# certificate, the notary key and the expansions), and reading the list back
+# to check it is exactly as it was. If any of those fails, that is a failure
+# too, even of a package otherwise signed. On any failure <signed.pkg> is
+# removed, so nothing half-done can be shipped, and the exit status is the
+# first failure's.
 #
 # The secrets it uses: MACOS_INSTALLER_CERTIFICATE_P12_BASE64,
 # MACOS_INSTALLER_CERTIFICATE_PASSWORD, MACOS_INSTALLER_SIGNING_IDENTITY,
@@ -59,6 +63,18 @@ manifest() {
   )
 }
 
+# search_list TEXT: what `security list-keychains` printed, one keychain per
+# line, without its indentation and quotes.
+search_list() {
+  local line
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line#\"}"
+    line="${line%\"}"
+    [ -z "$line" ] || printf '%s\n' "$line"
+  done <<<"$1"
+}
+
 # same_as_unsigned STEP DIR: DIR, an expansion, is exactly the unsigned one.
 same_as_unsigned() {
   manifest "$2" >"$work/$1.manifest"
@@ -80,28 +96,34 @@ sign() {
   [ ! -e "$out" ] && [ ! -L "$out" ] || die "$out exists"
   local identity="$MACOS_INSTALLER_SIGNING_IDENTITY"
 
-  umask 077
-  work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sign-macos-pkg.XXXXXX")"
-  keychain="$work/installer.keychain-db"
+  # The search list as it is, read before anything is changed or made, to
+  # put back and check whatever happens. If it cannot be read, nothing has
+  # been changed, and nothing is.
+  local listing line
+  listing="$(security list-keychains -d user)" || die "could not read the keychain search list; nothing was changed"
+  saved_list="$(search_list "$listing")"
   saved=()
+  while IFS= read -r line; do
+    [ -z "$line" ] || saved+=("$line")
+  done <<<"$saved_list"
+
+  umask 077
+  work=''
+  keychain=''
+  keychain_made=no
   succeeded=no
   trap cleanup EXIT
   trap 'exit 130' INT TERM HUP
+  work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sign-macos-pkg.XXXXXX")"
+  keychain="$work/installer.keychain-db"
 
   pkgutil --expand-full "$unsigned" "$work/unsigned" >/dev/null || die "1. could not expand $unsigned"
   manifest "$work/unsigned" >"$work/unsigned.manifest"
   say "1. expanded the unsigned package: $(wc -l <"$work/unsigned.manifest" | tr -d ' ') paths"
 
-  # The search list as it was, to put back whatever happens.
-  local line
-  while IFS= read -r line; do
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line#\"}"
-    line="${line%\"}"
-    [ -z "$line" ] || saved+=("$line")
-  done < <(security list-keychains -d user)
   local password
   password="$(openssl rand -hex 32)"
+  keychain_made=yes
   security create-keychain -p "$password" "$keychain" >/dev/null
   security set-keychain-settings -lut 21600 "$keychain" >/dev/null
   security unlock-keychain -p "$password" "$keychain" >/dev/null
@@ -111,7 +133,7 @@ sign() {
     -T /usr/bin/productsign >/dev/null || die "2. could not import the Installer certificate"
   rm -f "$work/installer.p12"
   security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
-  security list-keychains -d user -s "$keychain" "${saved[@]}"
+  security list-keychains -d user -s "$keychain" ${saved[@]+"${saved[@]}"}
   productsign --sign "$identity" --keychain "$keychain" --timestamp "$unsigned" "$out" >/dev/null ||
     die "2. productsign failed"
   say "2. signed with the Installer identity"
@@ -162,17 +184,35 @@ sign() {
   say "signed, notarized and stapled: $out"
 }
 
+# cleanup: every step attempted, whatever failed before it; any of them
+# failing is a failure, and the first failure's status is kept.
 cleanup() {
-  local status=$?
-  if [ "${#saved[@]}" -gt 0 ]; then
-    security list-keychains -d user -s "${saved[@]}" >/dev/null 2>&1 || true
+  local status=$? failed='' now
+  # No step may stop the ones after it.
+  set +e
+  if ! security list-keychains -d user -s ${saved[@]+"${saved[@]}"} >/dev/null 2>&1; then
+    failed="$failed putting the keychain search list back;"
   fi
-  if [ -e "$keychain" ]; then
-    security delete-keychain "$keychain" >/dev/null 2>&1 || true
+  if [ "$keychain_made" = yes ] || { [ -n "$keychain" ] && [ -e "$keychain" ]; }; then
+    security delete-keychain "$keychain" >/dev/null 2>&1 || failed="$failed deleting the temporary keychain;"
   fi
-  rm -rf "${work:?}"
+  if [ -n "$work" ]; then
+    rm -rf "$work" 2>/dev/null || true
+    [ ! -e "$work" ] || failed="$failed removing the working directory;"
+  fi
+  if now="$(security list-keychains -d user 2>/dev/null)"; then
+    [ "$(search_list "$now")" = "$saved_list" ] || failed="$failed the keychain search list is not as it was;"
+  else
+    failed="$failed reading the keychain search list back;"
+  fi
+  if [ -n "$failed" ]; then
+    printf 'sign-macos-pkg: cleanup failed:%s\n' "$failed" >&2
+    succeeded=no
+    [ "$status" != 0 ] || status=1
+  fi
   if [ "$succeeded" != yes ]; then
-    rm -f "${out:?}"
+    rm -f "${out:?}" 2>/dev/null || true
+    [ ! -e "$out" ] || printf 'sign-macos-pkg: could not remove %s\n' "$out" >&2
     [ "$status" != 0 ] || status=1
   fi
   exit "$status"
@@ -189,8 +229,25 @@ write_standins() {
 #!/bin/bash
 echo "security $1" >>"$STANDIN_CALLS"
 case "$1" in
+  # Reading prints the list as security does; setting replaces it. From the
+  # second setting on, which is cleanup's, the case may make it fail, or
+  # succeed while leaving another list.
   list-keychains)
-    if [ "${4:-}" = -s ]; then shift 4; printf '%s\n' "$@" >"$STANDIN_LIST"; else sed 's/.*/    "&"/' "$STANDIN_LIST"; fi ;;
+    if [ "${4:-}" = -s ]; then
+      shift 4
+      n=$(( $(cat "$STANDIN_LIST.sets" 2>/dev/null || echo 0) + 1 ))
+      echo "$n" >"$STANDIN_LIST.sets"
+      if [ "$n" -ge 2 ]; then
+        case "${STANDIN_RESTORE:-works}" in
+          fails) exit 1 ;;
+          wrong) printf '%s\n' /Users/runner/Library/Keychains/login.keychain-db >"$STANDIN_LIST"; exit 0 ;;
+        esac
+      fi
+      if [ "$#" = 0 ]; then : >"$STANDIN_LIST"; else printf '%s\n' "$@" >"$STANDIN_LIST"; fi
+    else
+      [ "${STANDIN_LIST_READ:-works}" = works ] || exit 1
+      sed 's/.*/    "&"/' "$STANDIN_LIST"
+    fi ;;
   create-keychain) : >"${@: -1}" ;;
   # As security does, deleting a keychain also takes it off the search list;
   # unless the case says deleting fails.
@@ -215,6 +272,8 @@ EOF
 case "$1 $2" in
   "notarytool submit")
     echo "xcrun notarytool submit" >>"$STANDIN_CALLS"
+    # An interruption while it waits: the signer is sent TERM.
+    if [ "${STANDIN_NOTARY:-}" = interrupted ]; then kill -TERM "$PPID"; exit 1; fi
     [ "$(cat "$5")" = "notary-key" ] || exit 1
     printf '{"id":"4f1d0e3a-0000-4000-8000-000000000001","status":"%s","message":"Processing complete"}\n' "${STANDIN_NOTARY:-Accepted}"
     [ "${STANDIN_NOTARY:-Accepted}" = Accepted ] ;;
@@ -291,16 +350,27 @@ self_test() {
 
   # sign_case LABEL WANT-STATUS WANT-CALLS WANT-TEXT [NAME=VALUE...]: signing
   # the unsigned package exits WANT-STATUS, calls exactly WANT-CALLS (the
-  # tools other than security, in order, comma-separated), says WANT-TEXT,
+  # tools other than security, in order, comma-separated), says WANT-TEXT
+  # (each of them, if it is several separated by |),
   # leaves the signed package only on success, never prints a secret, and
-  # always puts the keychain search list back and leaves nothing behind.
+  # leaves nothing behind. Once it has made a keychain, cleanup attempts
+  # every step: the list put back, the keychain deleted, and the list read
+  # back last. The list ends as it began, unless list_may_change is yes,
+  # for a case that breaks putting it back. initial_list=empty starts it
+  # empty.
+  list_may_change=no
+  initial_list=two
   sign_case() {
     local label="$1" want="$2" calls="$3" text="$4" status out verdict=yes got
     shift 4
     rm -rf "$T/run"
     mkdir -p "$T/run/temp"
     : >"$T/run/calls"
-    printf '%s\n' /Users/runner/Library/Keychains/login.keychain-db "/Library/Keychains/System.keychain" >"$T/run/list"
+    if [ "$initial_list" = empty ]; then
+      : >"$T/run/list"
+    else
+      printf '%s\n' /Users/runner/Library/Keychains/login.keychain-db "/Library/Keychains/System.keychain" >"$T/run/list"
+    fi
     cp "$T/run/list" "$T/run/list.before"
     out="$(env -i PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$T/run" RUNNER_TEMP="$T/run/temp" \
       STANDIN_CALLS="$T/run/calls" STANDIN_LIST="$T/run/list" STANDIN_ORIGIN="$identity" \
@@ -308,14 +378,23 @@ self_test() {
     got="$({ grep -v '^security' "$T/run/calls" || true; } | paste -sd, -)"
     [ "$status" = "$want" ] || verdict=no
     [ "$got" = "$calls" ] || verdict=no
-    printf '%s' "$out" | grep -qF -- "$text" || verdict=no
+    local t
+    while IFS= read -r -d '|' t; do
+      printf '%s' "$out" | grep -qF -- "$t" || verdict=no
+    done <<<"$text|"
     if printf '%s' "$out" | grep -qE 'SECRETVALUE|U0VDUkVU|notary-key'; then verdict=no; fi
-    cmp -s "$T/run/list" "$T/run/list.before" || verdict=no
+    if [ "$list_may_change" != yes ]; then cmp -s "$T/run/list" "$T/run/list.before" || verdict=no; fi
     [ -z "$(ls -A "$T/run/temp")" ] || verdict=no
+    if grep -qx 'security create-keychain' "$T/run/calls"; then
+      # Every cleanup step attempted: the list set back after the keychain
+      # was added to it, the keychain deleted, and the list read back last.
+      [ "$(grep -cx 'security list-keychains' "$T/run/calls")" -ge 4 ] &&
+        sed -n '/^security create-keychain$/,$p' "$T/run/calls" | grep -qx 'security delete-keychain' &&
+        [ "$(tail -n 1 "$T/run/calls")" = 'security list-keychains' ] || verdict=no
+    fi
     if [ "$want" = 0 ]; then
       [ -f "$T/run/signed.pkg" ] || verdict=no
-      # The keychain was made, used and deleted.
-      grep -qx 'security create-keychain' "$T/run/calls" && [ "$(tail -n 1 "$T/run/calls")" = 'security delete-keychain' ] || verdict=no
+      grep -qx 'security create-keychain' "$T/run/calls" || verdict=no
     else
       [ ! -e "$T/run/signed.pkg" ] || verdict=no
     fi
@@ -333,8 +412,34 @@ self_test() {
   printf '\n  signing the package, in order, with stand-ins for the tools\n'
   sign_case "a consistent signed configuration: expand, sign, compare, notarize, staple, validate, compare, Gatekeeper" \
     0 "$all" "signed, notarized and stapled" SYNDEO_EXPECT_SIGNED=yes "${good[@]}"
-  sign_case "deleting the keychain fails: the search list is put back all the same" \
-    0 "$all" "signed, notarized and stapled" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_DELETE=fails
+
+  printf '\n  the keychain search list, and cleanup\n'
+  sign_case "the search list cannot be read: stopped before any keychain or output" \
+    1 "" "could not read the keychain search list; nothing was changed" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_LIST_READ=fails
+  sign_case "putting the search list back fails: fatal, though it signed; the package removed" \
+    1 "$all" "cleanup failed: putting the keychain search list back;" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_RESTORE=fails
+  sign_case "deleting the keychain fails: fatal, though it signed; the package removed, the list put back" \
+    1 "$all" "cleanup failed: deleting the temporary keychain;" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_DELETE=fails
+  list_may_change=yes
+  sign_case "both fail: both reported, the list found wrong, the package removed" \
+    1 "$all" "cleanup failed: putting the keychain search list back; deleting the temporary keychain; the keychain search list is not as it was;" \
+    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_RESTORE=fails STANDIN_DELETE=fails
+  sign_case "putting the list back says it worked, but leaves another list: caught, the package removed" \
+    1 "$all" "cleanup failed: the keychain search list is not as it was;" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_RESTORE=wrong
+  list_may_change=no
+  initial_list=empty
+  sign_case "an empty search list to begin with: signed, and left empty" \
+    0 "$all" "signed, notarized and stapled" SYNDEO_EXPECT_SIGNED=yes "${good[@]}"
+  initial_list=two
+  sign_case "an earlier failure, then a failing cleanup: both said, cleanup finished" \
+    1 "pkgutil --expand-full,productsign,pkgutil --expand-full,xcrun notarytool submit,xcrun notarytool log" \
+    "4. notarization ended 'Invalid', not Accepted|cleanup failed: deleting the temporary keychain;" \
+    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_NOTARY=Invalid STANDIN_DELETE=fails
+  sign_case "interrupted while notarizing, and deleting fails: exit 130 kept, cleanup finished" \
+    130 "pkgutil --expand-full,productsign,pkgutil --expand-full,xcrun notarytool submit" \
+    "cleanup failed: deleting the temporary keychain;" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_NOTARY=interrupted STANDIN_DELETE=fails
+
+  printf '\n  the configuration, and each step failing\n'
   sign_case "SYNDEO_EXPECT_SIGNED=no: refused before any tool runs" \
     1 "" "SYNDEO_EXPECT_SIGNED is not yes" SYNDEO_EXPECT_SIGNED=no
   local n v partial
