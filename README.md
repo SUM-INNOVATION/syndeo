@@ -8,7 +8,7 @@ swapped, shared, or fed from a peer without anything above it noticing.
 
 ## Install
 
-macOS on Apple Silicon, or Linux on x86_64 or arm64:
+For one user, on macOS on Apple Silicon, or Linux on x86_64 or arm64:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/SUM-INNOVATION/syndeo/main/install.sh | sh
@@ -19,7 +19,9 @@ It downloads the release built for your machine, checks it against the published
 written outside your home directory. `SYNDEO_INSTALL_DIR` moves them;
 `SYNDEO_VERSION` pins a version. If that directory is not on your `PATH`, it
 says which file to add it to for your shell. On Linux it also checks that the
-keystore can start, and says what to install if it cannot (see below).
+keystore can start, and says what to install if it cannot (see below). For the
+whole Mac there is also to be an installer package, which no release has yet;
+see [below](#for-the-whole-mac-the-installer-package).
 
 They all have to live in the same directory. The shell starts the network
 process and the keystore by looking beside itself, which is what keeps a build
@@ -56,12 +58,12 @@ unpacking one yourself does the same thing.
 - **Windows and ChromeOS**: not yet, and tracked at
   [#17](https://github.com/SUM-INNOVATION/syndeo/issues/17).
 
-**The macOS binaries are not signed or notarized.** No release so far, v0.1.5
-included, carries a Developer ID signature or has been through Apple's notary
-service.
+**The macOS binaries are ad-hoc signed, with no Developer ID, and not
+notarized.** No release so far, v0.1.5 included, carries a Developer ID
+signature or has been through Apple's notary service.
 Installed with the one-liner above, the binaries are not quarantined and run.
 An archive downloaded in a browser is quarantined, and Gatekeeper rejects its
-unsigned executables — use the one-liner instead. Unsigned also means the
+executables, which have no Developer ID — use the one-liner instead. Unsigned also means the
 keystore cannot reach the data protection keychain, so Secure Enclave presence
 (Touch ID) is not enforced: the keystore uses the ordinary login keychain, and
 the passphrase is mandatory. `syndeo-keystore status` reports which of the two
@@ -73,6 +75,100 @@ a build is in.
 curl -fsSLO https://github.com/SUM-INNOVATION/syndeo/releases/latest/download/SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
 ```
+
+### For the whole Mac: the installer package
+
+**No release has the package yet, v0.1.5 included.** What follows applies from
+the first release that does. With `<version>` that release's version:
+
+```sh
+curl -fsSLO https://github.com/SUM-INNOVATION/syndeo/releases/download/v<version>/syndeo-<version>-aarch64-apple-darwin.pkg
+curl -fsSLO https://github.com/SUM-INNOVATION/syndeo/releases/download/v<version>/SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+sudo installer -pkg syndeo-<version>-aarch64-apple-darwin.pkg -target /
+```
+
+- **What it installs.** Everything is root-owned, under `/usr/local`:
+  - the version, whole, in `/usr/local/libexec/syndeo/<version>/`, with its
+    uninstaller beside it;
+  - `/usr/local/libexec/syndeo/current`, pointing at that version;
+  - the seven commands in `/usr/local/bin`, as links through `current`.
+
+  It needs an administrator, Apple Silicon and macOS 13 or later, and installs
+  only on the startup disk.
+- **Its two scripts.**
+  - The preinstall writes nothing. It checks that everything it would install
+    over is Syndeo's own, exactly as its package left it, and refuses
+    otherwise: a command in `/usr/local/bin` it did not put there, a Syndeo
+    directory with no package receipt, a second version, files that are not
+    as packaged, or a package older than the one installed.
+  - The postinstall checks that the new version is complete and the only one,
+    then switches `current` to it with one rename.
+
+  Installer itself says only that the installation failed. The preinstall
+  says why, one `syndeo preinstall: refusing: …` line per reason. Installer
+  normally records those lines in `/var/log/install.log`, but they are not
+  guaranteed to appear there.
+- **Where it will not install.**
+  - `/usr/local` and `/usr/local/libexec` have to be root's, and writable by
+    nobody else.
+  - `/usr/local/bin` may belong to a person, as it does on a Mac that once
+    ran Homebrew on Intel. It may be writable by the admin or wheel group, but
+    not by everyone, not through an access control list, not locked, and not
+    a symbolic link.
+  - A `/usr/local` owned by a user is refused by design.
+- **Upgrading.** One version is installed at a time, so quit Syndeo before
+  installing or upgrading.
+  - An upgrade removes the previous version before it places the new one, and
+    the commands do not start until `current` has switched. On a CI runner
+    that took about 0.3 s; that is a measurement, not a promise.
+  - A Syndeo left running from the replaced version stops at the next program
+    it needs, saying "this version was removed during an upgrade; quit and
+    restart Syndeo".
+  - If an upgrade fails, Installer undoes nothing. Install the same package
+    again to finish it. Until then every other package, older or newer, is
+    refused, and so is the uninstaller.
+- **Downgrading is refused.** Uninstall first, then install the older package.
+- **Removing it:**
+
+  ```sh
+  sudo /bin/sh /usr/local/libexec/syndeo/<version>/uninstall.sh
+  ```
+
+  `--help` says what it does. It changes nothing unless everything is exactly
+  as the package left it. Then it removes the seven commands, the version and
+  the receipt. It never touches homes, `~/.syndeo`, keychain items or proxy
+  trust settings.
+
+  If it removed everything but could not forget the receipt, it exits 2 and
+  prints the command that finishes the job:
+
+  ```sh
+  sudo /usr/sbin/pkgutil --forget com.sum.syndeo.pkg --volume /
+  ```
+- **Signing.**
+  - The package is unsigned while there is no Developer ID Installer
+    identity, which is true of every release so far.
+  - The binaries in it are ad-hoc signed, with no Developer ID, and not
+    notarized.
+  - Downloaded with `curl`, as above, it is not quarantined and installs.
+  - Opened from a browser download, Gatekeeper is expected to reject it.
+- **What was tested.** Every pull request builds the package from the release
+  tarball, inspects it, and installs it for real on a disposable
+  GitHub-hosted macOS 15 runner. The test covers:
+  - refusals, and upgrades while the commands are being started;
+  - both kinds of failed upgrade, and their repair;
+  - a Syndeo running across an upgrade;
+  - reinstalls and the uninstaller;
+  - the runner put back afterwards.
+
+  The first run to pass all of it was
+  [38012208859](https://github.com/SUM-INNOVATION/syndeo/actions/runs/38012208859).
+- **What was not tested:**
+  - installing from Finder;
+  - Gatekeeper on a browser download;
+  - the refusal of Intel Macs and of macOS before 13, which rests on the
+    package's metadata alone, with no such runners to try it on.
 
 ## The three boundaries
 
@@ -629,14 +725,36 @@ runs the installer against a release built on the spot; CI runs both, on Linux
 and macOS.
 
 `.github/workflows/release.yml` refuses a tag that disagrees with the workspace
-version, builds the three targets, signs and notarizes the macOS binaries when
-the signing secrets are present, and publishes the tarballs with a `SHA256SUMS`
-covering them. The secrets it reads are named and explained at the top of
-[`ci/sign-macos.sh`](ci/sign-macos.sh); without them the build still produces
-working tarballs and says in the log that it did not sign them. They are not
-set today, which is why the macOS binaries are unsigned. `ci/verify-release.sh`
-checks the signing state against `SYNDEO_EXPECT_SIGNED`, `no` by default, and
-fails a release that is not what it says.
+version, and builds the three targets and the macOS installer package.
+- **One job sees the signing secrets.** The macOS build alone declares the
+  protected `release-macos` environment, so every release run waits for that
+  environment's reviewers. That environment has to exist, with its reviewers,
+  before the first run: GitHub creates a missing one unprotected.
+- **Signing is all or nothing.**
+  [`ci/check-signing-config.sh`](ci/check-signing-config.sh) reads the
+  environment's `SYNDEO_EXPECT_SIGNED` and the ten secrets it names, and
+  refuses any half-configured state.
+  - Signed, `ci/sign-macos.sh` signs and notarizes the binaries, and
+    `ci/sign-macos-pkg.sh` signs, notarizes and staples the package.
+  - Unsigned, neither runs.
+  - The secrets are not set today, which is why the macOS binaries have no
+    Developer ID and the package is unsigned.
+- **The package** is built from the macOS tarball, inspected against what was
+  decided (`ci/verify-pkg.sh inspect`), and installed and removed on a fresh
+  runner.
+- **Publishing.** Exactly the three tarballs and the package, with one
+  `SHA256SUMS` over them, go into a draft release. The draft's assets are
+  downloaded back and checked against what was built, and its notes against
+  what they should say. Only then is it published.
+- **A `workflow_dispatch` run is a dry run.** It does all of this, but
+  rehearses the publication on a draft it deletes, and publishes nothing.
+- **Checks on every pull request.** `ci/check-workflows.py` checks that no
+  pull request can see a secret, and that release.yml keeps them to that one
+  job.
+
+`ci/verify-release.sh` checks the signing state of the installed binaries
+against `SYNDEO_EXPECT_SIGNED`, `no` by default, and fails a release that is
+not what it says.
 
 ## Licensing
 

@@ -5,8 +5,9 @@
 #
 # Installer runs it as root, after the person installing has authenticated
 # and before anything is copied. It reads, and writes nothing: it stops the
-# installation by exiting non-zero, and says why in /var/log/install.log, one
-# "syndeo preinstall: refusing: ..." line per reason.
+# installation by exiting non-zero, and says why, one "syndeo preinstall:
+# refusing: ..." line per reason. Installer normally records those lines in
+# /var/log/install.log, but does not guarantee they appear there.
 #
 # One version of Syndeo is installed at a time. When this package goes ahead,
 # Installer removes the version its receipt names, places this one, and runs

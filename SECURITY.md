@@ -41,13 +41,25 @@ These are documented limits rather than undiscovered ones. Reporting them is
 welcome as a second opinion; they are not treated as new.
 
 - **An unsigned macOS build does not enforce Secure Enclave presence**, and
-  every macOS release so far, v0.1.5 included, is unsigned: no Developer ID
-  signature, not notarized. The data protection keychain needs a signed binary with a keychain
+  every macOS release so far, v0.1.5 included, is unsigned: ad-hoc signed,
+  with no Developer ID, and not notarized. The data protection keychain needs a signed binary with a keychain
   access group. Without one the keystore falls back to the ordinary keychain,
   reports presence as unenforced, and makes the passphrase mandatory instead.
   `syndeo-keystore status` says which side of that line a build is on. A
   browser-downloaded archive is quarantined and Gatekeeper rejects it; the
   one-line installer is not quarantined.
+- **The macOS installer package runs two scripts as root, and is unsigned.**
+  No release has it yet.
+  - Its preinstall refuses to install over anything it cannot account for.
+    The reason is normally recorded in `/var/log/install.log`, but is not
+    guaranteed to appear there.
+  - One version is installed at a time. An upgrade leaves the commands
+    unavailable for a moment, and a Syndeo left running from the replaced
+    version stops at the next program it needs.
+  - Gatekeeper is expected to reject the unsigned package when it comes from
+    a browser download. The documented route downloads it with `curl` and
+    checks it against `SHA256SUMS`.
+  - Installing it from Finder is untested.
 - **A peer learns which hashes you want, and when.** It never learns a URL, and
   that is not the same as anonymous. `syndeo-peer`'s crate documentation is
   explicit about it.
