@@ -30,11 +30,18 @@
 # comparator and the rendering of the scripts are checked. --self-test
 # decisions checks only what the scripts say in each real-runner scenario.
 #
-# Knobs:
-#   SYNDEO_EXPECT_SIGNED  no (default): the package carries no signature and
-#                         Gatekeeper rejects it, and no executable carries a
-#                         Developer ID. yes is judged by the signing step, which
-#                         is not part of this script yet, so it is refused.
+# Knobs, for inspect:
+#   SYNDEO_EXPECT_SIGNED  no (default, and what empty means): the package
+#                         carries no signature and Gatekeeper rejects it, and no
+#                         executable carries a Developer ID. yes: every
+#                         executable is Developer ID Application of
+#                         MACOS_TEAM_ID, with the hardened runtime and a secure
+#                         timestamp, and only syndeo-keystore has entitlements,
+#                         exactly its keychain access group; the package is
+#                         Developer ID Installer of that team, chained to Apple
+#                         Root CA, its notarization ticket stapled, and
+#                         Gatekeeper accepts it as Notarized Developer ID.
+#   MACOS_TEAM_ID         with yes, the team every signature has to be of.
 #
 # Exits non-zero if any check fails.
 set -uo pipefail
@@ -78,10 +85,13 @@ xp() { xmllint --xpath "$2" "$1" 2>/dev/null; }
 
 inspect() {
   local pkg="$1" version="$2" tarball="$3"
-  local expect="${SYNDEO_EXPECT_SIGNED:-no}" name w full dist info scripts payload tree f n out
+  local expect="${SYNDEO_EXPECT_SIGNED:-no}" team='' name w full dist info scripts payload tree f n out
   case "$expect" in
     no) ;;
-    yes) echo "SYNDEO_EXPECT_SIGNED=yes is judged by the signing step, which is not part of this script yet" >&2; return 2 ;;
+    yes)
+      team="${MACOS_TEAM_ID:-}"
+      [[ "$team" =~ $TEAM_RE ]] || { echo "SYNDEO_EXPECT_SIGNED=yes needs MACOS_TEAM_ID, ten capital letters and digits" >&2; return 2; }
+      ;;
     *) echo "SYNDEO_EXPECT_SIGNED must be yes or no, not '$expect'" >&2; return 2 ;;
   esac
   name="syndeo-$version-aarch64-apple-darwin"
@@ -227,6 +237,10 @@ inspect() {
     bad "versions" "$problems"
   fi
 
+  if [ "$expect" = yes ]; then
+    signed_state "$pkg" "$tree" "$team"
+    return 0
+  fi
   note "signing (expected: none)"
   # Captured first: pkgutil exits non-zero for an unsigned package, which
   # pipefail would otherwise report as the check failing.
@@ -256,6 +270,91 @@ inspect() {
     ok "no executable carries a Developer ID; ad-hoc signed:${adhoc:- none}"
   else
     bad "executables" "a Developer ID signature on:$problems"
+  fi
+}
+
+# A team identifier: ten capital letters and digits, whatever the locale.
+TEAM_RE='^[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10}$'
+
+# entitlements_are XML GROUP: XML, what codesign printed as the entitlements,
+# is exactly keychain-access-groups = [GROUP], or, with GROUP empty, nothing.
+entitlements_are() {
+  python3 -I -c '
+import plistlib, sys
+data, group = sys.argv[1], sys.argv[2]
+have = plistlib.loads(data.encode()) if data.strip() else {}
+want = {"keychain-access-groups": [group]} if group else {}
+sys.exit(0 if have == want else 1)
+' "$1" "$2" 2>/dev/null
+}
+
+# developer_id KIND VALUE TEAM: VALUE is "Developer ID KIND: <name> (TEAM)".
+developer_id() {
+  [[ "$2" =~ ^Developer\ ID\ $1:\ .+\ \(([ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10})\)$ ]] && [ "${BASH_REMATCH[1]}" = "$3" ]
+}
+
+# signed_state PKG TREE TEAM: what a signed release has to be, checked on the
+# package and on the executables in its payload, which inspect has already
+# found byte-identical to the tarball's.
+signed_state() {
+  local pkg="$1" tree="$2" team="$3" n out first last group entitled problems chain
+  note "signing (expected: Developer ID of $team, notarized and stapled)"
+  for n in $NAMES; do
+    problems=""
+    codesign --verify --strict "$tree/$n" >/dev/null 2>&1 || problems="$problems does not verify;"
+    out="$(codesign -dv --verbose=4 "$tree/$n" 2>&1)"
+    first="$(printf '%s\n' "$out" | sed -n 's/^Authority=//p' | head -n 1)"
+    last="$(printf '%s\n' "$out" | sed -n 's/^Authority=//p' | tail -n 1)"
+    developer_id Application "$first" "$team" || problems="$problems signed by '${first:-nobody}';"
+    [ "$last" = "Apple Root CA" ] || problems="$problems not chained to Apple Root CA;"
+    printf '%s\n' "$out" | grep -qx "TeamIdentifier=$team" ||
+      problems="$problems TeamIdentifier '$(printf '%s\n' "$out" | sed -n 's/^TeamIdentifier=//p')';"
+    printf '%s\n' "$out" | grep -qE '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' || problems="$problems no hardened runtime;"
+    printf '%s\n' "$out" | grep -q '^Timestamp=' || problems="$problems no secure timestamp;"
+    group=''
+    entitled="no entitlements"
+    if [ "$n" = syndeo-keystore ]; then
+      group="$team.com.sum.syndeo.keystore"
+      entitled="keychain-access-groups [$group] and nothing else"
+    fi
+    entitlements_are "$(codesign -d --entitlements - --xml "$tree/$n" 2>/dev/null)" "$group" ||
+      problems="$problems entitlements are not: $entitled;"
+    if [ -z "$problems" ]; then
+      ok "$n: Developer ID Application of $team, hardened runtime, secure timestamp, $entitled"
+    else
+      bad "$n" "${problems# }"
+    fi
+  done
+
+  # Captured whole: pkgutil exits non-zero for a package it does not trust.
+  out="$(pkgutil --check-signature "$pkg" 2>&1 | sed 's/^[[:space:]]*//')"
+  chain="$(printf '%s\n' "$out" | sed -n 's/^[0-9][0-9]*\. //p')"
+  first="$(printf '%s\n' "$chain" | head -n 1)"
+  last="$(printf '%s\n' "$chain" | tail -n 1)"
+  problems=""
+  printf '%s\n' "$out" | grep -qx 'Status: signed by a developer certificate issued by Apple for distribution' ||
+    problems="$problems $(printf '%s\n' "$out" | grep -m1 '^Status:' || echo 'no status');"
+  developer_id Installer "$first" "$team" || problems="$problems signed by '${first:-nobody}';"
+  [ "$last" = "Apple Root CA" ] || problems="$problems chained to '${last:-nothing}', not Apple Root CA;"
+  printf '%s\n' "$out" | grep -q '^Signed with a trusted timestamp' || problems="$problems no trusted timestamp;"
+  if [ -z "$problems" ]; then
+    ok "the package: Developer ID Installer of $team, chained to Apple Root CA, with a trusted timestamp"
+  else
+    bad "package signature" "${problems# }"
+  fi
+  if xcrun stapler validate "$pkg" >/dev/null 2>&1; then
+    ok "its notarization ticket is stapled, and validates"
+  else
+    bad "notarization ticket" "stapler validate fails"
+  fi
+  out="$(spctl -a -vv -t install "$pkg" 2>&1)" && problems='' || problems=" rejected;"
+  printf '%s\n' "$out" | grep -qxF "$pkg: accepted" || problems="${problems:- not accepted;}"
+  printf '%s\n' "$out" | grep -qx 'source=Notarized Developer ID' || problems="$problems $(printf '%s\n' "$out" | grep -m1 '^source=' || echo 'no source');"
+  printf '%s\n' "$out" | grep -qxF "origin=$first" || problems="$problems from another origin;"
+  if [ -z "$problems" ]; then
+    ok "Gatekeeper accepts it: Notarized Developer ID, from the same Installer identity"
+  else
+    bad "Gatekeeper" "${problems# }"
   fi
 }
 
@@ -1170,8 +1269,107 @@ st_inspect() {
   cp "$pkg" "$d/renamed.pkg"
   out="$(bash "$here/verify-pkg.sh" inspect "$d/renamed.pkg" 0.0.1 --tarball "$tgz" 2>&1)"
   expect "inspect: a misnamed package fails" eval "printf '%s' \"\$out\" | grep -q 'renamed.pkg is not syndeo-0.0.1-aarch64-apple-darwin.pkg'"
-  out="$(SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --tarball "$tgz" 2>&1)"
-  expect "inspect: SYNDEO_EXPECT_SIGNED=yes is refused until signing is checked" eval "printf '%s' \"\$out\" | grep -q 'judged by the signing step'"
+  st_signed "$pkg" "$tgz"
+}
+
+# st_signed PKG TARBALL: inspect's judgement of a signed release, with
+# stand-ins for codesign, pkgutil --check-signature, xcrun stapler and spctl
+# that report what a signed, notarized and stapled package would, each case
+# changing one thing.
+st_signed() {
+  local pkg="$1" tgz="$2" bin="$T/signed-bin" out status
+  mkdir -p "$bin"
+  cat >"$bin/codesign" <<'EOF'
+#!/bin/bash
+path="${@: -1}"; n="${path##*/}"; team=AB12CD34EF
+[ "$n" != "${STANDIN_OTHER_TEAM:-}" ] || team=ZZ99ZZ99ZZ
+case "$1" in
+  --verify) [ "$n" != "${STANDIN_UNVERIFIED:-}" ] ;;
+  -dv)
+    flags='0x10000(runtime)'
+    [ "$n" != "${STANDIN_NO_RUNTIME:-}" ] || flags='0x0(none)'
+    {
+      echo "Executable=$path"
+      echo "CodeDirectory v=20500 size=1 flags=$flags hashes=1+7 location=embedded"
+      echo "Authority=Developer ID Application: Example Org ($team)"
+      echo "Authority=Developer ID Certification Authority"
+      echo "Authority=Apple Root CA"
+      if [ "$n" = "${STANDIN_NO_TIMESTAMP:-}" ]; then echo "Signed Time=10 Oct 2026 at 12:00:00"; else echo "Timestamp=10 Oct 2026 at 12:00:00"; fi
+      echo "TeamIdentifier=$team"
+    } >&2 ;;
+  -d)
+    group=''
+    [ "$n" != syndeo-keystore ] || group="${STANDIN_KEYSTORE_GROUP:-$team.com.sum.syndeo.keystore}"
+    [ "$n" != "${STANDIN_ENTITLED:-}" ] || group="$team.com.sum.syndeo.keystore"
+    [ -n "$group" ] || exit 0
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>keychain-access-groups</key><array><string>%s</string></array>%s</dict></plist>\n' \
+      "$group" "${STANDIN_KEYSTORE_EXTRA:-}" ;;
+esac
+EOF
+  cat >"$bin/pkgutil" <<'EOF'
+#!/bin/bash
+[ "$1" = --check-signature ] || exec /usr/sbin/pkgutil "$@"
+printf 'Package "%s":\n' "${2##*/}"
+printf '   Status: %s\n' "${STANDIN_PKG_STATUS:-signed by a developer certificate issued by Apple for distribution}"
+printf '   Notarization: trusted by the Apple notary service\n'
+printf '   Signed with a trusted timestamp on: 2026-10-10 12:00:00 +0000\n'
+printf '   Certificate Chain:\n'
+printf '    1. %s\n       Expires: 2031-10-10 12:00:00 +0000\n' "${STANDIN_PKG_SIGNER:-Developer ID Installer: Example Org (AB12CD34EF)}"
+printf '    2. Developer ID Certification Authority\n'
+printf '    3. %s\n' "${STANDIN_PKG_ROOT:-Apple Root CA}"
+EOF
+  cat >"$bin/xcrun" <<'EOF'
+#!/bin/bash
+[ "$1 $2" = "stapler validate" ] && [ "${STANDIN_STAPLED:-yes}" = yes ]
+EOF
+  cat >"$bin/spctl" <<'EOF'
+#!/bin/bash
+if [ "${STANDIN_SPCTL:-accepted}" = accepted ]; then
+  printf '%s: accepted\nsource=%s\norigin=%s\n' "${@: -1}" "${STANDIN_SOURCE:-Notarized Developer ID}" "${STANDIN_ORIGIN:-Developer ID Installer: Example Org (AB12CD34EF)}" >&2
+else
+  printf '%s: rejected\n' "${@: -1}" >&2; exit 3
+fi
+EOF
+  chmod 755 "$bin"/*
+
+  # signed_case LABEL FAILS TEXT [NAME=VALUE...]: inspect, expecting a signed
+  # release of AB12CD34EF, fails exactly FAILS checks, one of them saying TEXT
+  # (with FAILS 0, it passes).
+  signed_case() {
+    local label="$1" fails="$2" text="$3"
+    shift 3
+    out="$(env "$@" PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF \
+      bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --tarball "$tgz" 2>&1)"
+    if [ "$fails" = 0 ]; then
+      expect "signed inspect: $label" eval "printf '%s' \"\$out\" | grep -q '[1-9][0-9]* passed, 0 failed'"
+    else
+      expect "signed inspect: $label" eval "printf '%s' \"\$out\" | grep -q ' passed, $fails failed' && printf '%s' \"\$out\" | grep 'FAIL' | grep -qF -- \"\$text\""
+    fi
+    printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
+  }
+  printf '\n  this script: inspect, of a signed release, against stand-ins for the signing tools\n'
+  signed_case "Developer ID throughout, the keystore alone entitled, notarized and stapled: passes" 0 ""
+  signed_case "one executable of another team" 1 "syndeo-net — signed by 'Developer ID Application: Example Org (ZZ99ZZ99ZZ)'; TeamIdentifier 'ZZ99ZZ99ZZ';" STANDIN_OTHER_TEAM=syndeo-net
+  signed_case "one executable that does not verify" 1 "syndeo-ui — does not verify;" STANDIN_UNVERIFIED=syndeo-ui
+  signed_case "one executable without the hardened runtime" 1 "syndeo-agent — no hardened runtime;" STANDIN_NO_RUNTIME=syndeo-agent
+  signed_case "one executable without a secure timestamp" 1 "syndeo-proxy — no secure timestamp;" STANDIN_NO_TIMESTAMP=syndeo-proxy
+  signed_case "the keystore's access group of another team" 1 "syndeo-keystore — entitlements are not: keychain-access-groups [AB12CD34EF.com.sum.syndeo.keystore] and nothing else;" STANDIN_KEYSTORE_GROUP=ZZ99ZZ99ZZ.com.sum.syndeo.keystore
+  signed_case "the keystore with one entitlement more" 1 "syndeo-keystore — entitlements are not: keychain-access-groups [AB12CD34EF.com.sum.syndeo.keystore] and nothing else;" "STANDIN_KEYSTORE_EXTRA=<key>com.apple.security.get-task-allow</key><true/>"
+  signed_case "the access group on another executable" 1 "syndeo-agent — entitlements are not: no entitlements;" STANDIN_ENTITLED=syndeo-agent
+  signed_case "the package signed by another team" 1 "package signature — signed by 'Developer ID Installer: Other Org (ZZ99ZZ99ZZ)';" "STANDIN_PKG_SIGNER=Developer ID Installer: Other Org (ZZ99ZZ99ZZ)" "STANDIN_ORIGIN=Developer ID Installer: Other Org (ZZ99ZZ99ZZ)"
+  signed_case "the package signed with the Application identity" 1 "package signature — signed by 'Developer ID Application:" "STANDIN_PKG_SIGNER=Developer ID Application: Example Org (AB12CD34EF)" "STANDIN_ORIGIN=Developer ID Application: Example Org (AB12CD34EF)"
+  signed_case "the package not chained to Apple Root CA" 1 "chained to 'Someone Root', not Apple Root CA;" "STANDIN_PKG_ROOT=Someone Root"
+  signed_case "the package trusted, but not for distribution" 1 "package signature — Status: signed by a certificate trusted by macOS;" "STANDIN_PKG_STATUS=signed by a certificate trusted by macOS"
+  signed_case "no stapled ticket" 1 "notarization ticket — stapler validate fails" STANDIN_STAPLED=no
+  signed_case "Gatekeeper: Developer ID, not notarized" 1 "Gatekeeper — source=Developer ID;" "STANDIN_SOURCE=Developer ID"
+  signed_case "Gatekeeper: from another origin" 1 "Gatekeeper — from another origin;" "STANDIN_ORIGIN=Developer ID Installer: Example Org (ZZ99ZZ99ZZ)"
+  signed_case "Gatekeeper rejects it" 1 "Gatekeeper — rejected;" STANDIN_SPCTL=rejected
+  out="$(PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=no bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --tarball "$tgz" 2>&1)"
+  expect "inspect: SYNDEO_EXPECT_SIGNED=no, of a package that is signed: fails" eval "printf '%s' \"\$out\" | grep -q 'a Developer ID signature on: syndeo'"
+  out="$(env -u MACOS_TEAM_ID SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --tarball "$tgz" 2>&1)" && status=0 || status=$?
+  expect "inspect: SYNDEO_EXPECT_SIGNED=yes without MACOS_TEAM_ID is refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs MACOS_TEAM_ID'"
+  out="$(SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=ab12cd34ef bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --tarball "$tgz" 2>&1)" && status=0 || status=$?
+  expect "inspect: SYNDEO_EXPECT_SIGNED=yes with a malformed MACOS_TEAM_ID is refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs MACOS_TEAM_ID'"
 }
 
 self_test() {

@@ -52,6 +52,11 @@ jobs:
       # The macOS package's root scripts, under a temporary root, and the
       # switch under load; on Linux, the version grammar and the rendering.
       - run: bash ci/verify-pkg.sh --self-test
+      # The signing configuration gate, every partial and contradictory state
+      # of it; and the package's signing order, with stand-ins for the tools
+      # (macOS only). A pull request never signs anything.
+      - run: bash ci/check-signing-config.sh --self-test
+      - run: bash ci/sign-macos-pkg.sh --self-test
       # Nothing a pull request runs may see a signing or notarization secret.
       - name: This workflow reads no secrets and no environment
         shell: bash
