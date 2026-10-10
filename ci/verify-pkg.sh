@@ -3,6 +3,9 @@
 #
 #   ci/verify-pkg.sh inspect <pkg> <version> --tarball <tarball>
 #   ci/verify-pkg.sh installed <version> [--commands-say <version>]
+#   ci/verify-pkg.sh release sums <dir> <version>
+#   ci/verify-pkg.sh release check <draft-dir> <version> --against <dir> \
+#       [--notes <expected> <draft's>]
 #   ci/verify-pkg.sh --self-test [decisions]
 #
 # inspect looks inside a package without installing it:
@@ -22,6 +25,14 @@
 # version tree, `current`, the seven command links, and each command's
 # --version as started from /usr/local/bin. --commands-say is for a stand-in
 # package made of other binaries, which report their own version.
+#
+# release is what release.yml checks a release's assets with. sums requires
+# <dir> to hold exactly the three tarballs and the package of <version> and
+# nothing else, nothing missing, duplicated or of another version, and writes
+# SHA256SUMS over them in a fixed order. check requires a draft's assets, as
+# downloaded back, to be exactly those five, each byte-identical to what was
+# built, with a SHA256SUMS that verifies, and, given --notes, the draft's
+# notes to be the expected ones.
 #
 # --self-test checks the package's three root scripts, and this script's own
 # judgement, against stand-ins in temporary directories, as an ordinary user.
@@ -355,6 +366,84 @@ signed_state() {
     ok "Gatekeeper accepts it: Notarized Developer ID, from the same Installer identity"
   else
     bad "Gatekeeper" "${problems# }"
+  fi
+}
+
+# ------------------------------------------------------------------ release
+
+# release_assets V: the four payload assets of V, in SHA256SUMS's order: the
+# three tarballs, then the package.
+release_assets() {
+  printf '%s\n' "syndeo-$1-aarch64-apple-darwin.tar.gz" "syndeo-$1-aarch64-unknown-linux-gnu.tar.gz" \
+    "syndeo-$1-x86_64-unknown-linux-gnu.tar.gz" "syndeo-$1-aarch64-apple-darwin.pkg"
+}
+
+# exactly DIR NAMES: DIR holds the regular, non-empty files NAMES (one per
+# line), and nothing else.
+exactly() {
+  local dir="$1" want="$2" have f problems=""
+  have="$(cd "$dir" && ls -A | LC_ALL=C sort)"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '%s\n' "$want" | grep -qxF -- "$f" || problems="$problems unexpected $f;"
+  done <<<"$have"
+  while IFS= read -r f; do
+    if [ ! -e "$dir/$f" ]; then
+      problems="$problems missing $f;"
+    elif [ -L "$dir/$f" ] || [ ! -f "$dir/$f" ] || [ ! -s "$dir/$f" ]; then
+      problems="$problems $f is not a non-empty regular file;"
+    fi
+  done <<<"$want"
+  if [ -z "$problems" ]; then
+    ok "exactly:$(printf '%s\n' "$want" | sed 's/^/ /' | tr -d '\n')"
+  else
+    bad "assets" "${problems# }"
+  fi
+}
+
+release_sums() {
+  local dir="$1" v="$2" want
+  syndeo_version_valid "$v" || { echo "release: '$v' is not a version" >&2; return 2; }
+  want="$(release_assets "$v")"
+  note "the release's assets, before SHA256SUMS"
+  exactly "$dir" "$want"
+  [ "$fail" -eq 0 ] || return 1
+  (cd "$dir" && printf '%s\n' "$want" | while IFS= read -r f; do shasum -a 256 -- "$f"; done) >"$dir/SHA256SUMS.new" &&
+    mv "$dir/SHA256SUMS.new" "$dir/SHA256SUMS"
+  ok "SHA256SUMS written over the four, in order"
+  sed 's/^/      /' "$dir/SHA256SUMS"
+}
+
+release_check() {
+  local draft="$1" v="$2" built="$3" want_notes="${4:-}" have_notes="${5:-}" want f listed
+  syndeo_version_valid "$v" || { echo "release: '$v' is not a version" >&2; return 2; }
+  want="$(release_assets "$v")"
+  note "the draft's assets, downloaded back"
+  exactly "$draft" "$(printf '%s\nSHA256SUMS\n' "$want" | LC_ALL=C sort)"
+  for f in $want SHA256SUMS; do
+    [ -f "$draft/$f" ] || continue
+    if cmp -s "$draft/$f" "$built/$f"; then
+      ok "$f: $(wc -c <"$draft/$f" | tr -d ' ') bytes, identical to what was built"
+    else
+      bad "$f" "differs from what was built ($(wc -c <"$draft/$f" | tr -d ' ') bytes, built $(wc -c <"$built/$f" 2>/dev/null | tr -d ' ') bytes)"
+    fi
+  done
+  if [ -f "$draft/SHA256SUMS" ]; then
+    listed="$(sed 's/^[0-9a-f]\{64\}  //' "$draft/SHA256SUMS")"
+    if [ "$listed" = "$want" ] && [ "$(grep -cE '^[0-9a-f]{64}  ' "$draft/SHA256SUMS")" = 4 ] &&
+      (cd "$draft" && shasum -a 256 -c SHA256SUMS >/dev/null 2>&1); then
+      ok "SHA256SUMS lists the four, in order, and every one verifies"
+    else
+      bad "SHA256SUMS" "does not list exactly the four, in order, or one does not verify"
+    fi
+  fi
+  if [ -n "$want_notes" ]; then
+    note "the draft's notes"
+    if [ "$(cat "$want_notes")" = "$(cat "$have_notes" 2>/dev/null)" ]; then
+      ok "exactly the notes ci/release-notes.sh wrote"
+    else
+      bad "notes" "differ from the expected: $(diff <(cat "$want_notes") <(cat "$have_notes" 2>/dev/null) | grep '^[<>]' | head -3 | tr '\n' ' ')"
+    fi
   fi
 }
 
@@ -1381,6 +1470,7 @@ self_test() {
   mkdir -p "$T/render"
   st_render "$T/render"
   st_harness
+  st_release
   if [ "$(uname -s)" = Darwin ]; then
     st_preinstall
     st_postinstall
@@ -1395,6 +1485,97 @@ self_test() {
   fi
   printf '\n  %d cases, %d wrong\n\n' "$cases" "$wrong"
   [ "$wrong" -eq 0 ]
+}
+
+# st_release: the release's assets and notes, as release.yml checks them,
+# against stand-in assets.
+st_release() {
+  printf '\n  this script: the assets and notes of a release\n'
+  local d="$T/release" v=0.9.1 f out status
+  # rel ARGS...: this script's release mode; sets out and status.
+  rel() { out="$(bash "$here/verify-pkg.sh" release "$@" 2>&1)" && status=0 || status=$?; }
+  fresh() {
+    rm -rf "$d"
+    mkdir -p "$d/dist"
+    for f in $(release_assets "$v"); do printf '%s\n' "$f" >"$d/dist/$f"; done
+  }
+
+  fresh
+  rel sums "$d/dist" "$v"
+  expect "sums: the four assets of the version: SHA256SUMS written, in order" eval \
+    "[ $status = 0 ] && [ \"\$(sed 's/^[0-9a-f]*  //' '$d/dist/SHA256SUMS')\" = \"\$(release_assets $v)\" ] && (cd '$d/dist' && shasum -a 256 -c SHA256SUMS >/dev/null)"
+  fresh; rm "$d/dist/syndeo-$v-aarch64-unknown-linux-gnu.tar.gz"
+  rel sums "$d/dist" "$v"
+  expect "sums: a tarball missing: refused, nothing written" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'missing syndeo-$v-aarch64-unknown-linux-gnu.tar.gz' && [ ! -e '$d/dist/SHA256SUMS' ]"
+  fresh; mv "$d/dist/syndeo-$v-x86_64-unknown-linux-gnu.tar.gz" "$d/dist/syndeo-0.9.0-x86_64-unknown-linux-gnu.tar.gz"
+  rel sums "$d/dist" "$v"
+  expect "sums: one of another version: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected syndeo-0.9.0-x86_64-unknown-linux-gnu.tar.gz' && printf '%s' \"\$out\" | grep -q 'missing syndeo-$v-x86_64'"
+  fresh; echo extra >"$d/dist/syndeo-$v-x86_64-apple-darwin.tar.gz"
+  rel sums "$d/dist" "$v"
+  expect "sums: an extra asset: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected syndeo-$v-x86_64-apple-darwin.tar.gz'"
+  fresh; echo old >"$d/dist/SHA256SUMS"
+  rel sums "$d/dist" "$v"
+  expect "sums: a SHA256SUMS already there: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected SHA256SUMS'"
+  fresh; : >"$d/dist/syndeo-$v-aarch64-apple-darwin.pkg"
+  rel sums "$d/dist" "$v"
+  expect "sums: an empty package: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'pkg is not a non-empty regular file'"
+  fresh; rm "$d/dist/syndeo-$v-aarch64-apple-darwin.pkg"; mkdir "$d/dist/syndeo-$v-aarch64-apple-darwin.pkg"
+  rel sums "$d/dist" "$v"
+  expect "sums: a directory for the package: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'pkg is not a non-empty regular file'"
+  fresh
+  rel sums "$d/dist" 0.9
+  expect "sums: a malformed version: refused" test "$status" = 2
+
+  # draft V: what was built, with SHA256SUMS, and the draft downloaded from it.
+  draft() {
+    fresh
+    bash "$here/verify-pkg.sh" release sums "$d/dist" "$v" >/dev/null 2>&1
+    cp -R "$d/dist" "$d/draft"
+    bash "$here/release-notes.sh" "$v" no >"$d/notes.md"
+    cp "$d/notes.md" "$d/draft-notes.md"
+  }
+  draft
+  rel check "$d/draft" "$v" --against "$d/dist" --notes "$d/notes.md" "$d/draft-notes.md"
+  expect "check: the draft as built, with its notes: passes" test "$status" = 0
+  draft; printf '\n\n' >>"$d/draft-notes.md"
+  rel check "$d/draft" "$v" --against "$d/dist" --notes "$d/notes.md" "$d/draft-notes.md"
+  expect "check: notes that differ only in trailing blank lines: pass" test "$status" = 0
+  draft; rm "$d/draft/syndeo-$v-aarch64-apple-darwin.pkg"
+  rel check "$d/draft" "$v" --against "$d/dist"
+  expect "check: the package missing from the draft: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'missing syndeo-$v-aarch64-apple-darwin.pkg'"
+  draft; echo stale >"$d/draft/syndeo-0.9.0-aarch64-apple-darwin.pkg"
+  rel check "$d/draft" "$v" --against "$d/dist"
+  expect "check: a stale asset in the draft: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected syndeo-0.9.0-aarch64-apple-darwin.pkg'"
+  draft; printf 'syndeo-%s-aarch64-apple-darwin.tar.gx\n' "$v" >"$d/draft/syndeo-$v-aarch64-apple-darwin.tar.gz"
+  rel check "$d/draft" "$v" --against "$d/dist"
+  expect "check: an asset changed in one byte, same size: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'syndeo-$v-aarch64-apple-darwin.tar.gz — differs from what was built'"
+  draft
+  for f in "$d/dist/SHA256SUMS" "$d/draft/SHA256SUMS"; do
+    printf '%s\n' "$(sed -n 1p "$f")" "$(sed -n 3p "$f")" "$(sed -n 2p "$f")" "$(sed -n 4p "$f")" >"$f.new" && mv "$f.new" "$f"
+  done
+  rel check "$d/draft" "$v" --against "$d/dist"
+  expect "check: SHA256SUMS out of order, though it verifies: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'SHA256SUMS — does not list exactly the four'"
+  draft
+  for f in "$d/dist/SHA256SUMS" "$d/draft/SHA256SUMS"; do sed -i.bak '1s/^./0/;1s/^0/f/' "$f" && rm "$f.bak"; done
+  rel check "$d/draft" "$v" --against "$d/dist"
+  expect "check: a SHA256SUMS that does not verify: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'SHA256SUMS — does not list exactly the four'"
+  draft; bash "$here/release-notes.sh" "$v" yes >"$d/draft-notes.md"
+  rel check "$d/draft" "$v" --against "$d/dist" --notes "$d/notes.md" "$d/draft-notes.md"
+  expect "check: notes claiming signing for an unsigned build: fail" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'notes — differ from the expected'"
+
+  out="$(bash "$here/release-notes.sh" "$v" no)"
+  expect "notes, unsigned: both routes, the package's exact name, and the signing state as it is" eval "printf '%s' \"\$out\" | grep -qF 'install.sh | sh' &&
+    printf '%s' \"\$out\" | grep -qF 'sudo installer -pkg syndeo-$v-aarch64-apple-darwin.pkg -target /' &&
+    printf '%s' \"\$out\" | grep -qF 'shasum -a 256 -c SHA256SUMS --ignore-missing' &&
+    printf '%s' \"\$out\" | grep -qF 'sudo /bin/sh /usr/local/libexec/syndeo/$v/uninstall.sh' &&
+    printf '%s' \"\$out\" | grep -qF 'ad-hoc signed, with no Developer ID, and not notarized' &&
+    printf '%s' \"\$out\" | grep -qF 'The installer package is unsigned' && ! printf '%s' \"\$out\" | grep -qF 'stapled'"
+  out="$(bash "$here/release-notes.sh" "$v" yes)"
+  expect "notes, signed: Developer ID and notarized, the package's ticket stapled, and no unsigned claim" eval "printf '%s' \"\$out\" | grep -qF 'signed with a Developer ID and notarized' &&
+    printf '%s' \"\$out\" | grep -qF 'ticket stapled' && ! printf '%s' \"\$out\" | grep -qF 'unsigned' && ! printf '%s' \"\$out\" | grep -qF 'ad-hoc'"
+  out="$(bash "$here/release-notes.sh" 0.1.5 no)"
+  expect "notes: the CHANGELOG's section for the version, when it has one" eval "printf '%s' \"\$out\" | grep -qF 'Wasmtime 48.0.2 → 48.0.4'"
+  expect "notes: a malformed version, or signed neither yes nor no, is refused" eval "! bash '$here/release-notes.sh' 0.1 no >/dev/null 2>&1 && ! bash '$here/release-notes.sh' 0.1.5 maybe >/dev/null 2>&1"
 }
 
 # self_test_decisions: only st_decisions, for runs that change one message.
@@ -1427,6 +1608,21 @@ case "${1:-}" in
     report
     [ "$fail" -eq 0 ]
     ;;
+  release)
+    case "${2:-}:$#" in
+      sums:4) release_sums "$3" "$4" ;;
+      check:6 | check:9)
+        [ "$5" = --against ] && { [ "$#" = 6 ] || [ "${7:-}" = --notes ]; } ||
+          { echo "usage: $0 release check <draft-dir> <version> --against <dir> [--notes <expected> <draft's>]" >&2; exit 2; }
+        release_check "$3" "$4" "$6" "${8:-}" "${9:-}"
+        ;;
+      *) echo "usage: $0 release sums <dir> <version> | release check <draft-dir> <version> --against <dir> [--notes <expected> <draft's>]" >&2; exit 2 ;;
+    esac
+    status=$?
+    [ "$status" = 2 ] && exit 2
+    report
+    [ "$fail" -eq 0 ]
+    ;;
   installed)
     # --commands-say: for a stand-in version made of other binaries, what
     # those report instead.
@@ -1439,5 +1635,5 @@ case "${1:-}" in
     report
     [ "$fail" -eq 0 ]
     ;;
-  *) echo "usage: $0 inspect <pkg> <version> --tarball <tarball> | installed <version> [--commands-say <version>] | --self-test [decisions]" >&2; exit 2 ;;
+  *) echo "usage: $0 inspect <pkg> <version> --tarball <tarball> | installed <version> [--commands-say <version>] | release sums|check ... | --self-test [decisions]" >&2; exit 2 ;;
 esac

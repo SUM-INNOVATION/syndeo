@@ -2,8 +2,21 @@
 #
 #   git tag v0.1.0 && git push origin v0.1.0
 #
-# Produces one tarball per platform, a SHA256SUMS file covering all of them, and
-# a GitHub release holding the lot. install.sh reads exactly those names.
+# Produces one tarball per platform, the macOS installer package built from
+# the macOS tarball, a SHA256SUMS file covering those four, and a GitHub
+# release holding the five. install.sh reads exactly those names.
+#
+# A workflow_dispatch run is a dry run. It builds, signs if configured, checks
+# and installs everything a tag would, and rehearses the publication on a
+# draft named dryrun-<run id>, which it checks and deletes. It never publishes
+# anything, and it never creates a tag.
+#
+# Signing is all or nothing, decided by the release-macos environment: its
+# SYNDEO_EXPECT_SIGNED variable and its ten secrets, which
+# ci/check-signing-config.sh reads before anything is signed. Only build-macos
+# declares that environment, so it alone sees them, and every run waits there
+# for the environment's reviewers. ci/check-workflows.py, run on every pull
+# request, keeps it so.
 name: Release
 
 on:
@@ -15,8 +28,10 @@ on:
         description: "Version to build, without the leading v (a dry run; nothing is published)"
         required: true
 
+# Read-only, unless a job says otherwise: only the two that make a release
+# do, and neither of them sees a secret.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -51,7 +66,7 @@ jobs:
           fi
           echo "version=$wanted" >> "$GITHUB_OUTPUT"
 
-  build:
+  build-linux:
     name: ${{ matrix.target }}
     needs: verify
     runs-on: ${{ matrix.runner }}
@@ -59,8 +74,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: aarch64-apple-darwin
-            runner: macos-15
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
@@ -71,7 +84,6 @@ jobs:
       # Built on 22.04 rather than the newest image on purpose: the glibc a
       # binary is linked against is the oldest one it will run on.
       - name: System libraries
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
@@ -92,33 +104,7 @@ jobs:
             -p syndeo-shell -p syndeo-net -p syndeo-keystore \
             -p syndeo-agent -p syndeo-proxy -p syndeo-ui
 
-      # macOS only, because it embeds WKWebView. Built separately for the same
-      # reason it is packaged separately: on Linux this crate is a stub that
-      # exists to explain itself, and building it there compiles nothing worth
-      # shipping.
-      - name: Build the WebKit renderer
-        if: runner.os == 'macOS'
-        run: |
-          cargo build --release --locked --target ${{ matrix.target }} \
-            -p syndeo-webkit
-
-      # A no-op when the signing secrets are not set, so a fork and a first
-      # release both still produce usable tarballs. ci/sign-macos.sh says which
-      # it did.
-      - name: Sign and notarize
-        if: runner.os == 'macOS'
-        env:
-          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-          TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
-          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
-          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-        run: ./ci/sign-macos.sh "target/${{ matrix.target }}/release"
-
       - name: Package
-        id: package
         shell: bash
         run: ./ci/package.sh "${{ needs.verify.outputs.version }}" "${{ matrix.target }}"
 
@@ -128,46 +114,290 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  publish:
-    name: publish
-    needs: [verify, build]
-    if: needs.verify.outputs.publish == 'true'
-    runs-on: ubuntu-22.04
+  # The only job that sees a signing secret, and it waits for release-macos's
+  # reviewers first. In order: the configuration gate; the binaries built,
+  # then signed and notarized if the gate says so; the tarball; the package
+  # from that tarball, then signed, notarized and stapled if the gate says
+  # so; and the package inspected against what the gate decided.
+  build-macos:
+    name: aarch64-apple-darwin, and the installer package
+    needs: verify
+    runs-on: macos-15
+    environment: release-macos
+    outputs:
+      signed: ${{ steps.gate.outputs.signed }}
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The signing configuration, all or nothing
+        id: gate
+        env:
+          SYNDEO_EXPECT_SIGNED: ${{ vars.SYNDEO_EXPECT_SIGNED }}
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_INSTALLER_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_P12_BASE64 }}
+          MACOS_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PASSWORD }}
+          MACOS_INSTALLER_SIGNING_IDENTITY: ${{ secrets.MACOS_INSTALLER_SIGNING_IDENTITY }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: ./ci/check-signing-config.sh --github-output
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-aarch64-apple-darwin
+
+      # syndeo-webkit embeds WKWebView, so it exists on macOS and nowhere
+      # else. Built separately for the same reason it is packaged separately:
+      # on Linux that crate is a stub that exists to explain itself.
+      - name: Build
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin \
+            -p syndeo-shell -p syndeo-net -p syndeo-keystore \
+            -p syndeo-agent -p syndeo-proxy -p syndeo-ui
+          cargo build --release --locked --target aarch64-apple-darwin \
+            -p syndeo-webkit
+
+      - name: Sign and notarize the binaries
+        if: steps.gate.outputs.signed == 'yes'
+        env:
+          CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: ./ci/sign-macos.sh "target/aarch64-apple-darwin/release"
+
+      # The package is built from the tarball, so the two hold the same
+      # binaries; inspect checks that byte for byte.
+      - name: The tarball, and the package built from it
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./ci/package.sh "$VERSION" aarch64-apple-darwin
+          ./ci/package-macos-pkg.sh "$VERSION" "dist/syndeo-$VERSION-aarch64-apple-darwin.tar.gz" "$RUNNER_TEMP/unsigned"
+
+      - name: Sign, notarize and staple the package
+        if: steps.gate.outputs.signed == 'yes'
+        env:
+          SYNDEO_EXPECT_SIGNED: ${{ vars.SYNDEO_EXPECT_SIGNED }}
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_INSTALLER_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_P12_BASE64 }}
+          MACOS_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_PASSWORD }}
+          MACOS_INSTALLER_SIGNING_IDENTITY: ${{ secrets.MACOS_INSTALLER_SIGNING_IDENTITY }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: ./ci/sign-macos-pkg.sh "$RUNNER_TEMP/unsigned/syndeo-$VERSION-aarch64-apple-darwin.pkg" "dist/syndeo-$VERSION-aarch64-apple-darwin.pkg"
+
+      - name: The package, unsigned, as the gate decided
+        if: steps.gate.outputs.signed == 'no'
+        run: mv "$RUNNER_TEMP/unsigned/syndeo-$VERSION-aarch64-apple-darwin.pkg" dist/
+
+      - name: Inspect the package without installing it
+        env:
+          SYNDEO_EXPECT_SIGNED: ${{ steps.gate.outputs.signed }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          bash ci/verify-pkg.sh inspect "dist/syndeo-$VERSION-aarch64-apple-darwin.pkg" "$VERSION" \
+            --tarball "dist/syndeo-$VERSION-aarch64-apple-darwin.tar.gz"
+
+      # ci/sign-macos.sh leaves its keychain in the search list, and its
+      # certificate and notary key behind if it fails part-way.
+      - name: Remove what signing the binaries left, whatever happened
+        if: always()
+        run: |
+          keychain="$RUNNER_TEMP/syndeo-signing.keychain-db"
+          if [ -e "$keychain" ]; then security delete-keychain "$keychain"; fi
+          rm -rf "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/notarize.zip" \
+            "$RUNNER_TEMP/notarize" "$RUNNER_TEMP/Syndeo.entitlements" "$RUNNER_TEMP/unsigned"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: syndeo-aarch64-apple-darwin
+          path: |
+            dist/syndeo-${{ env.VERSION }}-aarch64-apple-darwin.tar.gz
+            dist/syndeo-${{ env.VERSION }}-aarch64-apple-darwin.pkg
+          if-no-files-found: error
+
+  # The package as built, installed for real on a runner that has never seen
+  # it, through the same guarded test every pull request runs, and the runner
+  # put back. Only its logs are kept.
+  pkg-install:
+    name: the package, installed and removed on a fresh runner
+    needs: [verify, build-macos]
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      SYNDEO_ALLOW_SYSTEM_INSTALL_TEST: "yes"
+      PRESERVE: SYNDEO_ALLOW_SYSTEM_INSTALL_TEST,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_WORKSPACE
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          name: syndeo-aarch64-apple-darwin
+          path: dist
+      - name: The package
+        run: echo "PKG=$GITHUB_WORKSPACE/dist/syndeo-$VERSION-aarch64-apple-darwin.pkg" >> "$GITHUB_ENV"
+
+      - name: Install it, through refusals, upgrades in use, failed upgrades and their repair (root)
+        run: sudo --preserve-env="$PRESERVE" bash ci/test-pkg-install.sh --system-before "$PKG" "$VERSION"
+
+      - name: Use it from PATH (runner)
+        run: bash ci/test-pkg-install.sh --user "$VERSION"
+
+      - name: Reinstalls, refusals, a missing path, the uninstaller, and removal (root)
+        run: sudo --preserve-env="$PRESERVE" bash ci/test-pkg-install.sh --system-after "$PKG" "$VERSION"
+
+      - name: Put the runner back, whatever happened
+        if: always()
+        run: sudo --preserve-env="$PRESERVE" bash ci/test-pkg-install.sh --cleanup
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-package-logs
+          path: |
+            ${{ runner.temp }}/syndeo-pkg-test/logs/
+            ${{ runner.temp }}/syndeo-pkg-user/*.log
+            ${{ runner.temp }}/syndeo-pkg-user/doctor
+          if-no-files-found: warn
+
+  # Exactly the three tarballs and the package, named for this version, and
+  # one SHA256SUMS over them, so install.sh fetches one checksum list and not
+  # one per platform. Dry runs too.
+  checksums:
+    name: checksums
+    needs: [verify, build-linux, build-macos]
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: syndeo-*
           path: dist
           merge-multiple: true
+      - name: Exactly the four assets, and SHA256SUMS over them
+        run: bash ci/verify-pkg.sh release sums dist "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
 
-      # One file covering every tarball, so install.sh fetches one checksum
-      # list and not one per platform.
-      - name: Checksums
+  # A tag's release: a draft first, then its assets downloaded back and
+  # checked against what was built, and its notes against what they should
+  # say; only then is it published. If any of that fails, the draft stays a
+  # draft and nothing is public.
+  publish:
+    name: publish
+    needs: [verify, build-macos, pkg-install, checksums]
+    if: needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      SIGNED: ${{ needs.build-macos.outputs.signed }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: A draft first
         run: |
           set -euo pipefail
-          cd dist
-          sha256sum -- *.tar.gz | tee SHA256SUMS
-
-      - name: Release
-        env:
-          GH_TOKEN: ${{ github.token }}
+          bash ci/release-notes.sh "$VERSION" "$SIGNED" > "$RUNNER_TEMP/notes.md"
+          gh release create "v$VERSION" \
+            "dist/syndeo-$VERSION-aarch64-apple-darwin.tar.gz" \
+            "dist/syndeo-$VERSION-aarch64-unknown-linux-gnu.tar.gz" \
+            "dist/syndeo-$VERSION-x86_64-unknown-linux-gnu.tar.gz" \
+            "dist/syndeo-$VERSION-aarch64-apple-darwin.pkg" \
+            dist/SHA256SUMS \
+            --draft --verify-tag --title "v$VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+      - name: The draft, downloaded and checked
         run: |
           set -euo pipefail
-          version="${{ needs.verify.outputs.version }}"
-          notes=$(mktemp)
-          {
-            echo "## Install"
-            echo
-            echo '```sh'
-            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/v${version}/install.sh | sh"
-            echo '```'
-            echo
-            echo "macOS on Apple Silicon, and Linux on x86_64 or arm64."
-            echo "Verify a download against \`SHA256SUMS\` before running it."
-            echo
-            if [ -f CHANGELOG.md ]; then
-              awk "/^## ${version}\$/{f=1;next} /^## /{f=0} f" CHANGELOG.md
-            fi
-          } > "$notes"
-          gh release create "v${version}" dist/*.tar.gz dist/SHA256SUMS \
-            --title "v${version}" --notes-file "$notes" --verify-tag
+          gh release view "v$VERSION" --json isDraft --jq .isDraft | grep -qx true
+          gh release download "v$VERSION" --dir "$RUNNER_TEMP/draft"
+          gh release view "v$VERSION" --json body --jq .body > "$RUNNER_TEMP/draft-notes.md"
+          bash ci/verify-pkg.sh release check "$RUNNER_TEMP/draft" "$VERSION" --against dist \
+            --notes "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/draft-notes.md"
+      - name: Published, only now
+        run: gh release edit "v$VERSION" --draft=false --latest
+
+  # A dry run's rehearsal of the same: a draft named dryrun-<run id>, made
+  # and checked exactly as publish does, then deleted. It is never published,
+  # so its tag is never created; the last step fails if either remains.
+  rehearse:
+    name: rehearse the draft (dry run, never published)
+    needs: [verify, build-macos, pkg-install, checksums]
+    if: needs.verify.outputs.publish != 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      SIGNED: ${{ needs.build-macos.outputs.signed }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: dryrun-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: A draft that is never published
+        run: |
+          set -euo pipefail
+          bash ci/release-notes.sh "$VERSION" "$SIGNED" > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" \
+            "dist/syndeo-$VERSION-aarch64-apple-darwin.tar.gz" \
+            "dist/syndeo-$VERSION-aarch64-unknown-linux-gnu.tar.gz" \
+            "dist/syndeo-$VERSION-x86_64-unknown-linux-gnu.tar.gz" \
+            "dist/syndeo-$VERSION-aarch64-apple-darwin.pkg" \
+            dist/SHA256SUMS \
+            --draft --target "$GITHUB_SHA" --title "$TAG (dry run of v$VERSION, never published)" \
+            --notes-file "$RUNNER_TEMP/notes.md"
+      - name: The draft, downloaded and checked as publish checks it
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json isDraft --jq .isDraft | grep -qx true
+          gh release download "$TAG" --dir "$RUNNER_TEMP/draft"
+          gh release view "$TAG" --json body --jq .body > "$RUNNER_TEMP/draft-notes.md"
+          bash ci/verify-pkg.sh release check "$RUNNER_TEMP/draft" "$VERSION" --against dist \
+            --notes "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/draft-notes.md"
+      - name: Deleted, whatever happened, and nothing left
+        if: always()
+        run: |
+          set -uo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::the dry-run draft $TAG is still there"
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::a tag $TAG exists; a dry run must never create one"
+            exit 1
+          fi
+          echo "the dry-run draft $TAG is deleted, and no tag $TAG exists"
