@@ -19,9 +19,9 @@ It downloads the release built for your machine, checks it against the published
 written outside your home directory. `SYNDEO_INSTALL_DIR` moves them;
 `SYNDEO_VERSION` pins a version. If that directory is not on your `PATH`, it
 says which file to add it to for your shell. On Linux it also checks that the
-keystore can start, and says what to install if it cannot (see below). For the
-whole Mac there is also to be an installer package, which no release has yet;
-see [below](#for-the-whole-mac-the-installer-package).
+keystore can start, and says what to install if it cannot (see below). From
+v0.1.6 there is also an installer package, for the whole Mac; see
+[below](#for-the-whole-mac-the-installer-package).
 
 They all have to live in the same directory. The shell starts the network
 process and the keystore by looking beside itself, which is what keeps a build
@@ -58,9 +58,8 @@ unpacking one yourself does the same thing.
 - **Windows and ChromeOS**: not yet, and tracked at
   [#17](https://github.com/SUM-INNOVATION/syndeo/issues/17).
 
-**The macOS binaries are ad-hoc signed, with no Developer ID, and not
-notarized.** No release so far, v0.1.5 included, carries a Developer ID
-signature or has been through Apple's notary service.
+**macOS releases through v0.1.6 are ad-hoc signed, without Developer ID or
+notarization.**
 Installed with the one-liner above, the binaries are not quarantined and run.
 An archive downloaded in a browser is quarantined, and Gatekeeper rejects its
 executables, which have no Developer ID — use the one-liner instead. Unsigned also means the
@@ -78,8 +77,8 @@ shasum -a 256 -c SHA256SUMS --ignore-missing
 
 ### For the whole Mac: the installer package
 
-**No release has the package yet, v0.1.5 included.** What follows applies from
-the first release that does. With `<version>` that release's version:
+**v0.1.6 is the first release to include the installer package.** With
+`<version>` the release's version, v0.1.6 or later:
 
 ```sh
 curl -fsSLO https://github.com/SUM-INNOVATION/syndeo/releases/download/v<version>/syndeo-<version>-aarch64-apple-darwin.pkg
@@ -147,10 +146,10 @@ sudo installer -pkg syndeo-<version>-aarch64-apple-darwin.pkg -target /
   sudo /usr/sbin/pkgutil --forget com.sum.syndeo.pkg --volume /
   ```
 - **Signing.**
-  - The package is unsigned while there is no Developer ID Installer
-    identity, which is true of every release so far.
-  - The binaries in it are ad-hoc signed, with no Developer ID, and not
-    notarized.
+  - The v0.1.6 package is unsigned. A package is signed only by a release
+    built with a Developer ID Installer identity.
+  - The binaries in it are ad-hoc signed, without Developer ID or
+    notarization.
   - Downloaded with `curl`, as above, it is not quarantined and installs.
   - Opened from a browser download, Gatekeeper is expected to reject it.
 - **What was tested.** Every pull request builds the package from the release
@@ -710,7 +709,7 @@ Before handing a release to anyone, check the thing that was published rather
 than the thing that was built:
 
 ```sh
-ci/verify-release.sh 0.1.5
+ci/verify-release.sh 0.1.6
 ```
 
 It installs from the release with the same one-liner the README gives, into a
@@ -737,8 +736,8 @@ version, and builds the three targets and the macOS installer package.
   - Signed, `ci/sign-macos.sh` signs and notarizes the binaries, and
     `ci/sign-macos-pkg.sh` signs, notarizes and staples the package.
   - Unsigned, neither runs.
-  - The secrets are not set today, which is why the macOS binaries have no
-    Developer ID and the package is unsigned.
+  - v0.1.6 is built with `SYNDEO_EXPECT_SIGNED=no` and no signing secrets,
+    so its binaries have no Developer ID and its package is unsigned.
 - **The package** is built from the macOS tarball, inspected against what was
   decided (`ci/verify-pkg.sh inspect`), and installed and removed on a fresh
   runner.

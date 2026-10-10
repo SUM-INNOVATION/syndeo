@@ -41,15 +41,15 @@ These are documented limits rather than undiscovered ones. Reporting them is
 welcome as a second opinion; they are not treated as new.
 
 - **An unsigned macOS build does not enforce Secure Enclave presence**, and
-  every macOS release so far, v0.1.5 included, is unsigned: ad-hoc signed,
-  with no Developer ID, and not notarized. The data protection keychain needs a signed binary with a keychain
+  macOS releases through v0.1.6 are ad-hoc signed, without Developer ID or
+  notarization. The data protection keychain needs a signed binary with a keychain
   access group. Without one the keystore falls back to the ordinary keychain,
   reports presence as unenforced, and makes the passphrase mandatory instead.
   `syndeo-keystore status` says which side of that line a build is on. A
   browser-downloaded archive is quarantined and Gatekeeper rejects it; the
   one-line installer is not quarantined.
-- **The macOS installer package runs two scripts as root, and is unsigned.**
-  No release has it yet.
+- **The macOS installer package runs two scripts as root.** v0.1.6 is the
+  first release to include the package, and the v0.1.6 package is unsigned.
   - Its preinstall refuses to install over anything it cannot account for.
     The reason is normally recorded in `/var/log/install.log`, but is not
     guaranteed to appear there.
