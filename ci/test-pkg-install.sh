@@ -540,9 +540,6 @@ cleanup() {
   done
   # The package, by its own uninstaller, once it is checked to be the one the
   # repository renders.
-  for f in "/var/db/receipts/$ID.plist" "/var/db/receipts/$ID.bom"; do
-    [ -e "$f" ] && chflags nouchg "$f"
-  done
   if pkgutil --pkg-info "$ID" >/dev/null 2>&1; then
     v="$(pkgutil --pkg-info "$ID" | sed -n 's/^version: //p')"
     if [ -d "$D/$v" ] && ! current_is "$v"; then
@@ -657,7 +654,7 @@ system_before() {
   say "Installing $pkg ($version) on this runner. Package identifier $ID. It will write:"
   pkgutil --payload-files "$pkg" | sed 's|^\.|  |'
   say "and it will plant and alter, then restore, entries in /usr/local, $BIN, $LIBEXEC and $D,"
-  say "a disk image mounted at $ALT, and the receipt files under /var/db/receipts."
+  say "and a disk image mounted at $ALT."
 
   parents >"$st/initial.parents"
   security_state >"$st/initial.security"
@@ -1117,19 +1114,40 @@ system_after() {
 
   say ""
   say "a receipt that cannot be forgotten"
-  local f
-  for f in "/var/db/receipts/$ID.plist" "/var/db/receipts/$ID.bom"; do
-    [ -e "$f" ] || fail "no $f"
-    alter flags "$f" uchg
-  done
-  /bin/sh "$D/$version/uninstall.sh" >"$st/logs/forget-fails" 2>&1
+  # The fault is injected into a scratch copy of this version's uninstaller,
+  # never into what is installed: the copy is the same template rendered with
+  # PKGUTIL naming a test-only stand-in, which fails exactly the uninstaller's
+  # forget and hands every other call, unchanged, to the real pkgutil. Neither
+  # is part of any package.
+  local fake="$st/pkgutil-forget-fails" scratch="$st/uninstall-forget-fails.sh" n gone
+  cat >"$fake" <<'FAKE'
+#!/bin/sh
+# Test only, written by ci/test-pkg-install.sh: fails the one call that
+# forgets Syndeo's receipt, and is the real pkgutil for every other.
+if [ "$#" -eq 4 ] && [ "$1" = --forget ] && [ "$2" = com.sum.syndeo.pkg ] && [ "$3" = --volume ] && [ "$4" = / ]; then
+    echo "pkgutil-forget-fails (test only): not forgetting com.sum.syndeo.pkg" >&2
+    exit 1
+fi
+exec /usr/sbin/pkgutil "$@"
+FAKE
+  chown root:wheel "$fake" && chmod 755 "$fake" || fail "setting up $fake"
+  must "the test's stand-in pkgutil is root:wheel, writable by root alone" test "$(stat -f '%Su:%Sg %Lp' "$fake")" = "root:wheel 755"
+  "$here/package-macos-pkg.sh" --render uninstall "$version" '' 0 0 "$fake" "$scratch" >/dev/null || fail "rendering the scratch uninstaller"
+  must "the scratch uninstaller differs from the installed one only in its PKGUTIL" \
+    test "$(diff "$D/$version/uninstall.sh" "$scratch" | grep '^[<>]')" = "< PKGUTIL='/usr/sbin/pkgutil'
+> PKGUTIL='$fake'"
+  /bin/sh "$scratch" >"$st/logs/forget-fails" 2>&1
   status=$?
-  must "exit 2 and the exact command to finish" eval "[ $status = 2 ] && grep -qF 'sudo /usr/sbin/pkgutil --forget $ID --volume /' '$st/logs/forget-fails'"
-  must "  ... every file gone, the receipt still there" eval "! present '$D' && ! present '$BIN/syndeo' && receipt_is '$version'"
-  restore_last
-  restore_last
-  /usr/sbin/pkgutil --forget "$ID" --volume / >/dev/null || fail "the printed command did not finish"
+  must "exit 2, and the exact command to finish" eval \
+    "[ $status = 2 ] && grep -qxF 'syndeo uninstall:     sudo /usr/sbin/pkgutil --forget $ID --volume /' '$st/logs/forget-fails'"
+  gone=yes
+  present "$D" && gone=no
+  for n in $NAMES; do present "$BIN/$n" && gone=no; done
+  must "  ... every payload path gone, and the receipt still there" eval "[ $gone = yes ] && receipt_is '$version'"
+  # The command it printed, exactly as printed.
+  sudo /usr/sbin/pkgutil --forget "$ID" --volume / >/dev/null || fail "the printed command did not finish"
   must "  ... and the printed command finishes it" pristine
+  rm -f "${fake:?}" "${scratch:?}"
   must "$LIBEXEC/someone-else is still there" test -d "$LIBEXEC/someone-else"
   unplant "$LIBEXEC/someone-else"
   must "no home has a .syndeo it did not have" test "$(homes)" = "$(cat "$st/initial.homes")"
