@@ -192,7 +192,11 @@ case "$1" in
   list-keychains)
     if [ "${4:-}" = -s ]; then shift 4; printf '%s\n' "$@" >"$STANDIN_LIST"; else sed 's/.*/    "&"/' "$STANDIN_LIST"; fi ;;
   create-keychain) : >"${@: -1}" ;;
-  delete-keychain) rm -f "$2"; grep -vxF "$2" "$STANDIN_LIST" >"$STANDIN_LIST.new" || true; mv "$STANDIN_LIST.new" "$STANDIN_LIST" ;;
+  # As security does, deleting a keychain also takes it off the search list;
+  # unless the case says deleting fails.
+  delete-keychain)
+    [ "${STANDIN_DELETE:-works}" = works ] || exit 1
+    rm -f "$2"; grep -vxF "$2" "$STANDIN_LIST" >"$STANDIN_LIST.new" || true; mv "$STANDIN_LIST.new" "$STANDIN_LIST" ;;
   import) [ -s "$2" ] || exit 1 ;;
 esac
 exit 0
@@ -329,6 +333,8 @@ self_test() {
   printf '\n  signing the package, in order, with stand-ins for the tools\n'
   sign_case "a consistent signed configuration: expand, sign, compare, notarize, staple, validate, compare, Gatekeeper" \
     0 "$all" "signed, notarized and stapled" SYNDEO_EXPECT_SIGNED=yes "${good[@]}"
+  sign_case "deleting the keychain fails: the search list is put back all the same" \
+    0 "$all" "signed, notarized and stapled" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_DELETE=fails
   sign_case "SYNDEO_EXPECT_SIGNED=no: refused before any tool runs" \
     1 "" "SYNDEO_EXPECT_SIGNED is not yes" SYNDEO_EXPECT_SIGNED=no
   local n v partial
