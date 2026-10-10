@@ -725,10 +725,11 @@ and macOS.
 
 `.github/workflows/release.yml` refuses a tag that disagrees with the workspace
 version, and builds the three targets and the macOS installer package.
-- **One job sees the signing secrets.** The macOS build alone declares the
-  protected `release-macos` environment, so every release run waits for that
-  environment's reviewers. That environment has to exist, with its reviewers,
-  before the first run: GitHub creates a missing one unprotected.
+- **One job sees the signing configuration.** The macOS build alone declares
+  the `release-macos` environment, which holds `SYNDEO_EXPECT_SIGNED` and any
+  signing secrets, so no other job sees them. The environment is that
+  boundary, not an approval gate: it has no required reviewers and no wait
+  timer, and a release run waits for no one.
 - **Signing is all or nothing.**
   [`ci/check-signing-config.sh`](ci/check-signing-config.sh) reads the
   environment's `SYNDEO_EXPECT_SIGNED` and the ten secrets it names, and

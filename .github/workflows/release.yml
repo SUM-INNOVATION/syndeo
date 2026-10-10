@@ -14,9 +14,10 @@
 # Signing is all or nothing, decided by the release-macos environment: its
 # SYNDEO_EXPECT_SIGNED variable and its ten secrets, which
 # ci/check-signing-config.sh reads before anything is signed. Only build-macos
-# declares that environment, so it alone sees them, and every run waits there
-# for the environment's reviewers. ci/check-workflows.py, run on every pull
-# request, keeps it so.
+# declares that environment, so it alone sees them. The environment is that
+# boundary and nothing more: it has no required reviewers and no wait timer,
+# so no run waits for anyone there. ci/check-workflows.py, run on every pull
+# request, keeps the boundary.
 name: Release
 
 on:
@@ -114,8 +115,9 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  # The only job that sees a signing secret, and it waits for release-macos's
-  # reviewers first. In order: the configuration gate; the binaries built,
+  # The only job that sees a signing secret, as the only one that declares
+  # release-macos, which scopes the signing configuration to it and does not
+  # wait for anyone. In order: the configuration gate; the binaries built,
   # then signed and notarized if the gate says so; the tarball; the package
   # from that tarball, then signed, notarized and stapled if the gate says
   # so; and the package inspected against what the gate decided.

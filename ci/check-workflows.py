@@ -8,8 +8,9 @@ ci.yml runs on every pull request, so it may reference no `secrets.` and no
 hand a fork's code the repository's secrets.
 
 release.yml holds the signing and notarization secrets, and only one job may
-see them: the macOS build, which declares the protected release-macos
-environment and so waits for its reviewers. Checked:
+see them: the macOS build, the one job that declares the release-macos
+environment. The environment scopes the signing configuration to that job; it
+is not an approval gate. Checked:
 - it runs on tags and workflow_dispatch, never on a pull request or another
   workflow's run;
 - nothing outside the jobs reads a secret or the signing configuration;
@@ -231,18 +232,18 @@ def check_release(text):
         found.append("release.yml: the top-level token is not read-only (permissions: contents: read)")
     for name, lines in jobs.items():
         envs = [(n, c.strip()) for n, c in lines if ENV_KEY.match(c)]
-        protected = any(c == "environment: release-macos" for _, c in envs)
+        scoped = any(c == "environment: release-macos" for _, c in envs)
         for n, c in envs:
             if c != "environment: release-macos" or name != "build-macos":
                 found.append("release.yml:%d %s declares %r; only build-macos may, as release-macos" % (n, name, c))
         for n, c in lines:
-            if (SECRETS.search(c) or "vars.SYNDEO_EXPECT_SIGNED" in c) and not protected:
+            if (SECRETS.search(c) or "vars.SYNDEO_EXPECT_SIGNED" in c) and not scoped:
                 found.append("release.yml:%d %s reads a secret or the signing configuration without the release-macos environment" % (n, name))
             if "--draft=false" in c:
                 cond = [x.strip() for _, x in lines if x.startswith("    if:")]
                 if cond != ["if: needs.verify.outputs.publish == 'true'"]:
                     found.append("release.yml:%d %s publishes a release without running only for a tag" % (n, name))
-        if protected:
+        if scoped:
             if any(c.strip() == "contents: write" for _, c in lines):
                 found.append("release.yml: %s has the secrets and a token that can write" % name)
             gate = [n for n, c in lines if "ci/check-signing-config.sh" in c]
@@ -416,7 +417,7 @@ def main():
         print("check-workflows: %s" % f)
     if found:
         return 1
-    print("check-workflows: ci.yml reads no secret and no environment; in release.yml only build-macos, behind release-macos, does, "
+    print("check-workflows: ci.yml reads no secret and no environment; in release.yml only build-macos, the job that declares release-macos, does, "
           "and it runs the gate before signing; every release is created a draft, publish checks it before making it public, "
           "and rehearse only deletes its own")
     return 0

@@ -98,8 +98,8 @@ what it installs, are unchanged.
     and removes it on a fresh runner before anything is published.
   - It publishes exactly the three tarballs, the package and `SHA256SUMS`, and
     a draft is checked against what was built before it is made public.
-  - Signing is all or nothing, from a protected environment; this release is
-    not signed.
+  - Signing is all or nothing, and its configuration reaches only the macOS
+    build job; this release is not signed.
   - `SHA256SUMS` now also lists the package. The install script reads only
     its own tarball's line.
 

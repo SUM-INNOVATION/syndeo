@@ -8,8 +8,8 @@
 # and so reports platform presence as unenforced. `syndeo-keystore status` says
 # which of the two a user is running.
 #
-# Secrets this reads, all of them secrets of the protected release-macos
-# environment, which release.yml gives to its macOS build alone, and only
+# Secrets this reads, all of them secrets of the release-macos environment,
+# which release.yml gives to its macOS build alone, and only
 # after ci/check-signing-config.sh has found all ten consistent:
 #
 #   MACOS_CERTIFICATE_P12_BASE64  Developer ID Application certificate and key,

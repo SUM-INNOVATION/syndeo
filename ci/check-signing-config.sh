@@ -8,8 +8,8 @@
 # unset means (an undefined `vars.` value reaches a workflow as empty). Any
 # other value is refused.
 #
-# The ten signing and notarization secrets, which exist only in the protected
-# release-macos environment:
+# The ten signing and notarization secrets, which belong only to the
+# release-macos environment, and so only to the one job that declares it:
 #
 #   MACOS_CERTIFICATE_P12_BASE64            Developer ID Application, .p12, base64
 #   MACOS_CERTIFICATE_PASSWORD              its export password

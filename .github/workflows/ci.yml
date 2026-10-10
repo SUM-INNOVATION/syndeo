@@ -58,8 +58,8 @@ jobs:
       - run: bash ci/check-signing-config.sh --self-test
       - run: bash ci/sign-macos-pkg.sh --self-test
       # Where the signing secrets may go: nowhere in this workflow, and in
-      # release.yml only to the macOS build, behind the release-macos
-      # environment, after the configuration gate.
+      # release.yml only to the macOS build, the one job that declares the
+      # release-macos environment, after the configuration gate.
       - run: python3 -I ci/check-workflows.py
       - run: python3 -I ci/check-workflows.py --self-test
       # Nothing a pull request runs may see a signing or notarization secret.
