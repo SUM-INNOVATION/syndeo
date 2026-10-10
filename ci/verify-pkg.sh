@@ -2,8 +2,8 @@
 # Check Syndeo's macOS installer package, before and after it is installed.
 #
 #   ci/verify-pkg.sh inspect <pkg> <version> --tarball <tarball>
-#   ci/verify-pkg.sh installed <version>
-#   ci/verify-pkg.sh --self-test
+#   ci/verify-pkg.sh installed <version> [--commands-say <version>]
+#   ci/verify-pkg.sh --self-test [decisions]
 #
 # inspect looks inside a package without installing it:
 # - the name;
@@ -20,13 +20,15 @@
 # installed checks what an installation left on this Mac, with the same checks
 # the package's own scripts make: the receipt, the private directory, the
 # version tree, `current`, the seven command links, and each command's
-# --version as started from /usr/local/bin.
+# --version as started from /usr/local/bin. --commands-say is for a stand-in
+# package made of other binaries, which report their own version.
 #
 # --self-test checks the package's three root scripts, and this script's own
 # judgement, against stand-ins in temporary directories, as an ordinary user.
 # The scripts are macOS root scripts, written for BSD stat, ls and mv, so
 # their behaviour is checked on macOS only. On Linux the version grammar, the
-# comparator and the rendering of the scripts are checked.
+# comparator and the rendering of the scripts are checked. --self-test
+# decisions checks only what the scripts say in each real-runner scenario.
 #
 # Knobs:
 #   SYNDEO_EXPECT_SIGNED  no (default): the package carries no signature and
@@ -260,7 +262,7 @@ inspect() {
 # ------------------------------------------------------------------ installed
 
 installed() {
-  local version="$1" n out
+  local version="$1" says="${2:-$1}" n out
   # The same checks the package's scripts make, from the same file. The
   # SYNDEO_VERIFY_* knobs exist for the self-test, which installs nothing.
   ROOT="${SYNDEO_VERIFY_ROOT:-}"
@@ -310,10 +312,10 @@ installed() {
   local problems=""
   for n in $NAMES; do
     out="$(env -i PATH=/usr/bin:/bin HOME="${HOME:-/}" "$SYNDEO_BIN/$n" --version 2>&1 | head -n 1)"
-    [ "$out" = "$n $version" ] || problems="$problems $n says '$out';"
+    [ "$out" = "$n $says" ] || problems="$problems $n says '$out';"
   done
   if [ -z "$problems" ]; then
-    ok "all seven report $version"
+    ok "all seven report $says"
   else
     bad "versions" "$problems"
   fi
@@ -384,9 +386,10 @@ st_render() {
   expect "a malformed version is refused" eval "! '$builder' --render preinstall 0.1 '' 0 0 /usr/sbin/pkgutil '$d/x' >/dev/null 2>&1"
 }
 
-# st_said_run DUMP-LINES INSTALL-LOG-LINES TEXT [TRIES [LATE-LINE]]: said()
-# from ci/test-pkg-install.sh, on an installer dump and an install.log made
-# here. Prints yes or no, then what said() recorded.
+# st_said_run DUMP-LINES INSTALL-LOG-LINES TEXT [TRIES [LATE-LINE]]:
+# note_said() from ci/test-pkg-install.sh, on an installer dump and an
+# install.log made here. Prints its status, what it printed, and what it
+# appended to LOG.said, one per line.
 st_said_run() {
   local d
   # Its own directory each time: this runs in a command substitution, where
@@ -403,21 +406,24 @@ st_said_run() {
     SAID_TRIES="$4"
     last_log="$3"
     last_before=0
-    if said "$5"; then echo yes; else echo no; fi
+    where="$(note_said "$5")"
+    echo "status $?"
+    echo "$where"
     cat "$3.said"
   ' _ "$here/test-pkg-install.sh" "$d/install.log" "$d/7-x" "${4:-2}" "$3"
   wait
 }
 
-# What ci/test-pkg-install.sh takes as evidence of what a package's scripts
-# said, which otherwise only a real install exercises: every installer it, or
+# What ci/test-pkg-install.sh does with what a package's scripts say, which
+# otherwise only a real install exercises. Every installer it, or
 # upgrade-stress.py, runs is asked for -dumplog, whose output is kept per
-# invocation; said() looks there first, for the line however installer
-# prefixes it, and then in what /var/log/install.log gains, allowing for it to
-# be late.
+# invocation. note_said() looks there first, for the line however installer
+# prefixes it, then in what /var/log/install.log gains, allowing for it to be
+# late; and it decides nothing: a line seen nowhere is recorded as such, and
+# the run goes on, judged on what is installed.
 st_harness() {
-  printf '\n  the install test: what a package said\n'
-  local runs out first ok d
+  printf '\n  the install test: what a package said, noted\n'
+  local runs out ok d
   runs="$(grep -nE '(^|[^-[:alnum:]_./])(/usr/sbin/)?installer +-' "$here/test-pkg-install.sh" | grep -vE '^[0-9]+: *#')"
   ok=no
   if [ -n "$runs" ] && ! printf '%s\n' "$runs" | grep -qv -- ' -dumplog '; then ok=yes; fi
@@ -426,6 +432,9 @@ st_harness() {
   ok=no
   if [ -n "$runs" ] && ! printf '%s\n' "$runs" | grep -qv -- '"-dumplog"'; then ok=yes; fi
   expect "upgrade-stress.py runs installer, and always with -dumplog" test "$ok" = yes
+  ok=no
+  if ! grep -nE '(^|[^_[:alnum:]])said "' "$here/test-pkg-install.sh" | grep -qv 'note_said'; then ok=yes; fi
+  expect "test-pkg-install.sh decides nothing on a logged line: only note_said remains" test "$ok" = yes
 
   local decision='syndeo preinstall: upgrading from 0.0.13 to 0.0.15'
   local prefixed="2026-10-10 00:53:34+00 runner package_script_service[42591]: ./preinstall: $decision"
@@ -434,33 +443,34 @@ st_harness() {
 $prefixed
 installer: The upgrade was successful.
 " "" "$decision")"
-  first="$(printf '%s\n' "$out" | sed -n 1p)"
   ok=no
-  if [ "$first" = yes ] && printf '%s\n' "$out" | grep -qF "in the -dumplog output: $decision"; then ok=yes; fi
-  expect "said() finds a prefixed decision line in the invocation's -dumplog output, with nothing in install.log" test "$ok" = yes
+  if [ "$(printf '%s\n' "$out" | sed -n 2p)" = "seen in the -dumplog output" ] &&
+    printf '%s\n' "$out" | grep -qxF "seen in the -dumplog output: $decision"; then ok=yes; fi
+  expect "note_said() sees a prefixed line in the invocation's -dumplog output, with nothing in install.log" test "$ok" = yes
 
   out="$(st_said_run "installer: The upgrade was successful.
 " "$prefixed
 " "$decision")"
-  first="$(printf '%s\n' "$out" | sed -n 1p)"
   ok=no
-  if [ "$first" = yes ] && printf '%s\n' "$out" | grep -qF "in /var/log/install.log, on try 1: $decision"; then ok=yes; fi
-  expect "said() falls back to what install.log gained" test "$ok" = yes
+  if [ "$(printf '%s\n' "$out" | sed -n 2p)" = "seen in /var/log/install.log, on read 1" ]; then ok=yes; fi
+  expect "note_said() falls back to what install.log gained" test "$ok" = yes
 
   out="$(st_said_run "installer: The upgrade was successful.
 " "" "$decision" 10 "$prefixed")"
-  first="$(printf '%s\n' "$out" | sed -n 1p)"
   ok=no
-  if [ "$first" = yes ] && printf '%s\n' "$out" | grep -qF "in /var/log/install.log" && ! printf '%s\n' "$out" | grep -qF "on try 1:"; then ok=yes; fi
-  expect "said() waits for a line install.log delivers late" test "$ok" = yes
+  case "$(printf '%s\n' "$out" | sed -n 2p)" in
+    "seen in /var/log/install.log, on read 1") ;;
+    "seen in /var/log/install.log, on read "*) ok=yes ;;
+  esac
+  expect "note_said() waits a while for a line install.log delivers late" test "$ok" = yes
 
   out="$(st_said_run "installer: Package name is Syndeo 0.0.15
 ./preinstall: syndeo preinstall: upgrading from 0.0.12 to 0.0.15
 " "" "$decision")"
-  first="$(printf '%s\n' "$out" | sed -n 1p)"
   ok=no
-  if [ "$first" = no ] && printf '%s\n' "$out" | grep -qF "in neither: $decision"; then ok=yes; fi
-  expect "said() finds nothing when neither has the decision, and says so" test "$ok" = yes
+  if [ "$(printf '%s\n' "$out" | sed -n 1p)" = "status 0" ] && [ "$(printf '%s\n' "$out" | sed -n 2p)" = "not seen" ] &&
+    printf '%s\n' "$out" | grep -qxF "not seen: $decision"; then ok=yes; fi
+  expect "note_said() records a line seen nowhere, and does not fail" test "$ok" = yes
 
   d="$T/said-delta"
   mkdir -p "$d"
@@ -942,6 +952,160 @@ st_location() {
   loc_case "(null)" refused 'location: (null)'
 }
 
+# decision_case NAME KIND VERSION EXIT LINE [TARGET]: the KIND script
+# (preinstall or postinstall), rendered for VERSION and run on the state this
+# case has set up, exits EXIT and prints LINE, exactly, as one whole line; a
+# preinstall changes nothing.
+decision_case() {
+  local name="$1" kind="$2" v="$3" want="$4" line="$5" target="${6:-/}"
+  st_render_for "$kind" "$v" "$C/$kind"
+  st_run "$C/$kind" "$C/fake.pkg" / "$target" /
+  local verdict=yes
+  [ "$status" = "$want" ] || verdict=no
+  grep -qxF -- "$line" "$C/out" || verdict=no
+  if [ "$kind" = preinstall ] && [ "$changed" != no ]; then verdict=no; fi
+  decided="$decided $name"
+  expect "decision: $name" test "$verdict" = yes
+  if [ "$verdict" != yes ]; then
+    printf '          | wanted exit %s and: %s\n' "$want" "$line"
+    printf '          | got exit %s:\n' "$status"
+    sed 's/^/          | /' "$C/out"
+  fi
+}
+
+# fault_case NAME X W WHERE AT: a failed upgrade from X to W through the
+# test-only fault ci/pkg-test-fault.sh adds to W's postinstall, at WHERE. Its
+# first run says exactly that it is failing, exits 1 and leaves current at AT;
+# its second goes through and makes W current.
+fault_case() {
+  local name="$1" x="$2" w="$3" where="$4" at="$5" verdict=yes
+  st_new; st_failed "$x" "$w"
+  st_render_for postinstall "$w" "$C/postinstall"
+  bash "$here/pkg-test-fault.sh" --script "$C/postinstall" "$where" "$C/fault" || verdict=no
+  /bin/sh "$C/postinstall" "$C/fake.pkg" / / / >"$C/out" 2>&1
+  status=$?
+  [ "$status" = 1 ] || verdict=no
+  grep -qxF "syndeo postinstall: test fault $where: failing this first run" "$C/out" || verdict=no
+  [ "$(readlink "$D/current")" = "$at" ] || verdict=no
+  /bin/sh "$C/postinstall" "$C/fake.pkg" / / / >"$C/out2" 2>&1 || verdict=no
+  grep -qxF "syndeo postinstall: $w is current. Commands did not start while the previous version was replaced; a Syndeo still running from it has to be quit and started again" "$C/out2" || verdict=no
+  [ "$(readlink "$D/current")" = "$w" ] || verdict=no
+  decided="$decided $name"
+  expect "decision: $name" test "$verdict" = yes
+  [ "$verdict" = yes ] || sed 's/^/          | /' "$C/out" "$C/out2"
+}
+
+# What each package script says in the real-runner test, ci/test-pkg-install.sh,
+# asserted here exactly and as the script runs, from the same templates under
+# a temporary root. The runner gates on what the installation is before and
+# after, not on these lines: Installer normally records them in
+# /var/log/install.log, but does not guarantee they appear there. Each case
+# is named after the runner scenario it stands for.
+st_decisions() {
+  printf '\n  the decisions the real-runner test relies on, said exactly\n'
+  local p='syndeo preinstall: refusing:' other g label missing
+  decided=''
+
+  # --system-before
+  st_new; mkdir -p "$R/usr/local/bin"; chmod 755 "$R/usr/local/bin"; echo foreign >"$R/usr/local/bin/syndeo"
+  decision_case "foreign-file" preinstall 0.1.5 1 "$p $R/usr/local/bin/syndeo: exists, and no Syndeo package is installed"
+  st_new; mkdir -p "$R/usr/local/bin"; chmod 755 "$R/usr/local/bin"; echo foreign >"$C/foreign-target"; ln -s "$C/foreign-target" "$R/usr/local/bin/syndeo-net"
+  decision_case "foreign-link" preinstall 0.1.5 1 "$p $R/usr/local/bin/syndeo-net: exists, and no Syndeo package is installed"
+  st_new; mkdir -p "$R/usr/local/bin"; chmod 755 "$R/usr/local/bin"; ln -s ../libexec/other/syndeo-proxy "$R/usr/local/bin/syndeo-proxy"
+  decision_case "foreign-dangling-link" preinstall 0.1.5 1 "$p $R/usr/local/bin/syndeo-proxy: exists, and no Syndeo package is installed"
+  st_new; mkdir -p "$R/usr/local/bin/syndeo-ui"; chmod 755 "$R/usr/local/bin"
+  decision_case "foreign-directory" preinstall 0.1.5 1 "$p $R/usr/local/bin/syndeo-ui: exists, and no Syndeo package is installed"
+  st_new; mkdir -p "$R/usr/local/bin"; chmod 755 "$R/usr/local/bin"; ln -s ../libexec/syndeo/current/syndeo-agent "$R/usr/local/bin/syndeo-agent"
+  decision_case "package-shaped-link-without-receipt" preinstall 0.1.5 1 "$p $R/usr/local/bin/syndeo-agent: exists, and no Syndeo package is installed"
+  st_new; mkdir -p "$R/usr/local/bin"; chmod 777 "$R/usr/local/bin"
+  decision_case "bin-world-writable" preinstall 0.1.5 1 "$p $R/usr/local/bin: can be written by everyone (mode 777)"
+  st_new; mkdir -p "$R/usr/local/bin"; chmod 755 "$R/usr/local/bin"; chmod +a "everyone allow add_file" "$R/usr/local/bin"
+  decision_case "bin-acl" preinstall 0.1.5 1 "$p $R/usr/local/bin: has an access control list"
+  st_new; mkdir -p "$R/usr/local/libexec"; chmod 775 "$R/usr/local/libexec"
+  decision_case "libexec-group-writable" preinstall 0.1.5 1 "$p $R/usr/local/libexec: can be written by its group or by everyone (mode 775)"
+  st_new; mkdir -p "$R/usr/local/libexec" "$C/elsewhere"; chmod 755 "$R/usr/local/libexec"; ln -s "$C/elsewhere" "$D"
+  decision_case "private-directory-is-a-link" preinstall 0.1.5 1 "$p $D: is a Symbolic Link, not a directory"
+  st_new; st_tree 0.0.7; st_current 0.0.7
+  decision_case "orphan" preinstall 0.1.5 1 "$p $D: exists, and no Syndeo package is installed; it holds 0.0.7, current -> 0.0.7"
+  st_new; st_tree 0.1.5 subset
+  decision_case "resume" preinstall 0.1.5 0 "syndeo preinstall: resuming an interrupted installation of 0.1.5"
+  st_new
+  decision_case "standin-0.0.9" preinstall 0.0.9 0 "syndeo preinstall: installing 0.0.9"
+  st_new; st_installed 0.0.11
+  decision_case "older-package" preinstall 0.0.10 1 "$p Syndeo 0.0.11 is installed, and this package is the older 0.0.10. Uninstall 0.0.11 first with $D/0.0.11/uninstall.sh"
+  fault_case "fault-at-entry" 0.0.11 0.0.12 entry 0.0.11
+  st_new; st_failed 0.0.11 0.0.12
+  decision_case "fault-at-entry-older-package" preinstall 0.0.11 1 "$p an upgrade from 0.0.11 to 0.0.12 did not finish: install the Syndeo 0.0.12 package again to complete it, then this one"
+  st_new; st_failed 0.0.11 0.0.12
+  decision_case "fault-at-entry-newer-package" preinstall 0.0.13 1 "$p an upgrade from 0.0.11 to 0.0.12 did not finish: install the Syndeo 0.0.12 package again to complete it, then this one"
+  st_new; st_failed 0.0.11 0.0.12
+  decision_case "fault-at-entry-the-same-package-again" preinstall 0.0.12 0 "syndeo preinstall: completing the failed upgrade from 0.0.11 to 0.0.12"
+  fault_case "fault-after-switch" 0.0.12 0.0.13 after-switch 0.0.13
+  st_new; st_failed 0.0.12 0.0.13 0.0.13
+  decision_case "fault-after-switch-older-package" preinstall 0.0.12 1 "$p an upgrade from 0.0.12 to 0.0.13 did not finish: install the Syndeo 0.0.13 package again to complete it, then this one"
+  st_new; st_failed 0.0.12 0.0.13 0.0.13
+  decision_case "fault-after-switch-newer-package" preinstall 0.0.14 1 "$p an upgrade from 0.0.12 to 0.0.13 did not finish: install the Syndeo 0.0.13 package again to complete it, then this one"
+  st_new; st_failed 0.0.12 0.0.13 0.0.13
+  decision_case "fault-after-switch-the-same-package-again" preinstall 0.0.13 0 "syndeo preinstall: completing the failed upgrade from 0.0.12 to 0.0.13"
+  st_new; st_installed 0.0.13
+  decision_case "real-binaries-0.0.15" preinstall 0.0.15 0 "syndeo preinstall: upgrading from 0.0.13 to 0.0.15"
+  st_new; st_installed 0.0.15
+  decision_case "real" preinstall 0.1.5 0 "syndeo preinstall: upgrading from 0.0.15 to 0.1.5"
+
+  # --system-after
+  st_new; st_installed 0.1.5
+  decision_case "reinstall" preinstall 0.1.5 0 "syndeo preinstall: reinstalling 0.1.5"
+  st_new; st_installed 0.1.5; chmod 775 "$D/0.1.5/syndeo-net"
+  decision_case "reinstall-over-a-changed-mode" preinstall 0.1.5 1 "$p $D/0.1.5/syndeo-net: is not a Regular File owned by root:wheel with mode 755 and nothing else (found Regular File $U:$G 775 special 0 flags -)"
+  # The runner gives README.md to another owner; a test that is not root
+  # changes its group instead, which the same check refuses with the same
+  # message.
+  st_new; st_installed 0.1.5
+  other=''
+  for g in $(id -G); do
+    if [ "$g" != "$G" ]; then other="$g"; break; fi
+  done
+  if [ -n "$other" ] && chgrp "$other" "$D/0.1.5/README.md" 2>/dev/null; then
+    decision_case "reinstall-over-a-changed-owner" preinstall 0.1.5 1 "$p $D/0.1.5/README.md: is not a Regular File owned by root:wheel with mode 644 and nothing else (found Regular File $U:$other 644 special 0 flags -)"
+  else
+    expect "decision: reinstall-over-a-changed-owner (needs a second group to set up)" false
+  fi
+  st_new; st_installed 0.1.5; echo extra >"$D/0.1.5/notes.txt"
+  decision_case "reinstall-over-an-extra-file" preinstall 0.1.5 1 "$p $D/0.1.5/notes.txt: is not part of Syndeo 0.1.5"
+  st_new; st_installed 0.1.5; ln -s ../README.md "$D/0.1.5/tools/linked.wat"
+  decision_case "reinstall-over-an-internal-symlink" preinstall 0.1.5 1 "$p $D/0.1.5/tools/linked.wat: is not part of Syndeo 0.1.5"
+  st_new; st_installed 0.1.5; chmod +a "everyone allow read" "$D/0.1.5/README.md"
+  decision_case "reinstall-over-an-acl" preinstall 0.1.5 1 "$p $D/0.1.5/README.md: is not a Regular File owned by root:wheel with mode 644 and nothing else (found Regular File $U:$G 644 special 0 flags -)"
+  st_new; st_installed 0.1.5; chflags uchg "$D/0.1.5/README.md"
+  decision_case "reinstall-over-an-immutable-file" preinstall 0.1.5 1 "$p $D/0.1.5/README.md: is not a Regular File owned by root:wheel with mode 644 and nothing else (found Regular File $U:$G 644 special 0 flags uchg)"
+  chflags nouchg "$D/0.1.5/README.md"
+  st_new; st_installed 0.1.5; rm "$D/0.1.5/README.md"
+  decision_case "repair" preinstall 0.1.5 0 "syndeo preinstall: repairing 0.1.5"
+  st_new; st_installed 0.1.5
+  decision_case "downgrade" preinstall 0.0.10 1 "$p Syndeo 0.1.5 is installed, and this package is the older 0.0.10. Uninstall 0.1.5 first with $D/0.1.5/uninstall.sh"
+  st_new; st_installed 0.1.5; rm "$D/current"; ln -s 0.0.10 "$D/current"
+  decision_case "current-at-another-version" preinstall 0.1.5 1 "$p $D/current: points at '0.0.10', not the installed 0.1.5"
+  st_new; st_installed 0.1.5; rm "$R/usr/local/bin/syndeo-ui"; ln -s /Applications/Foreign.app/Contents/MacOS/foreign "$R/usr/local/bin/syndeo-ui"
+  decision_case "foreign-command-with-a-receipt" preinstall 0.1.5 1 "$p $R/usr/local/bin/syndeo-ui: is not a link this package writes"
+  st_new; st_installed 0.1.5; mkdir "$D/0.0.99"; chmod 755 "$D/0.0.99"
+  decision_case "a-second-version" preinstall 0.1.5 1 "$p $D: holds 0.0.99 0.1.5; with 0.1.5 installed, it may hold nothing else"
+
+  # Every install the runner makes whose outcome a script decides has its
+  # case above, named after it: each literal label of refused, installed and
+  # install, and each failed_upgrade with the three it makes. The install on
+  # another volume is Installer's own refusal; no script runs.
+  missing=''
+  for label in $(
+    {
+      grep -oE '^[[:space:]]*(refused|installed|install) [a-z0-9][a-z0-9.-]*' "$here/test-pkg-install.sh" | awk '{print $2}'
+      grep -oE '^[[:space:]]*failed_upgrade [a-z0-9][a-z0-9.-]*' "$here/test-pkg-install.sh" | awk '{print $2; print $2 "-older-package"; print $2 "-newer-package"; print $2 "-the-same-package-again"}'
+    } | sort -u
+  ); do
+    case " $decided " in *" $label "*) ;; *) missing="$missing $label" ;; esac
+  done
+  expect "every runner install a script decides has its case here${missing:+ (missing:$missing)}" test -z "$missing"
+}
+
 # st_tarball DIR V: a release tarball of stand-ins, as ci/package.sh lays one out.
 st_tarball() {
   local dir="$1" v="$2" name n
@@ -1026,6 +1190,7 @@ self_test() {
     st_uninstall
     st_installed_mode
     st_location
+    st_decisions
     st_inspect
   else
     printf '\n  on %s: the root scripts, the package build and inspect are macOS-only (BSD stat, ls -e, mv -h, pkgbuild) and were not run\n' "$(uname -s)"
@@ -1034,8 +1199,26 @@ self_test() {
   [ "$wrong" -eq 0 ]
 }
 
+# self_test_decisions: only st_decisions, for runs that change one message.
+self_test_decisions() {
+  T="$(mktemp -d)"
+  trap 'chflags -R nouchg "$T" 2>/dev/null; rm -rf "$T"' EXIT
+  st_n=0
+  [ "$(uname -s)" = Darwin ] || { echo "the decisions are checked on macOS only" >&2; return 2; }
+  st_decisions
+  printf '\n  %d cases, %d wrong\n\n' "$cases" "$wrong"
+  [ "$wrong" -eq 0 ]
+}
+
 case "${1:-}" in
-  --self-test) self_test; exit ;;
+  --self-test)
+    case "${2:-}" in
+      '') self_test ;;
+      decisions) self_test_decisions ;;
+      *) echo "usage: $0 --self-test [decisions]" >&2; exit 2 ;;
+    esac
+    exit
+    ;;
   inspect)
     [ "$#" = 5 ] && [ "$4" = --tarball ] || { echo "usage: $0 inspect <pkg> <version> --tarball <tarball>" >&2; exit 2; }
     inspect_work="$(mktemp -d)"
@@ -1047,10 +1230,16 @@ case "${1:-}" in
     [ "$fail" -eq 0 ]
     ;;
   installed)
-    [ "$#" = 2 ] || { echo "usage: $0 installed <version>" >&2; exit 2; }
-    installed "$2"
+    # --commands-say: for a stand-in version made of other binaries, what
+    # those report instead.
+    if [ "$#" = 4 ] && [ "$3" = --commands-say ]; then
+      installed "$2" "$4"
+    else
+      [ "$#" = 2 ] || { echo "usage: $0 installed <version> [--commands-say <version>]" >&2; exit 2; }
+      installed "$2"
+    fi
     report
     [ "$fail" -eq 0 ]
     ;;
-  *) echo "usage: $0 inspect <pkg> <version> --tarball <tarball> | installed <version> | --self-test" >&2; exit 2 ;;
+  *) echo "usage: $0 inspect <pkg> <version> --tarball <tarball> | installed <version> [--commands-say <version>] | --self-test [decisions]" >&2; exit 2 ;;
 esac

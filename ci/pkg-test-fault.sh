@@ -2,6 +2,7 @@
 # Make a faulty copy of a stand-in package, for the tests only.
 #
 #   ci/pkg-test-fault.sh <pkg> <out-pkg> <entry|after-switch> <marker>
+#   ci/pkg-test-fault.sh --script <postinstall> <entry|after-switch> <marker>
 #
 # The copy is <pkg> with one block added to its postinstall, before its first
 # command (entry) or just after it switches `current` (after-switch), and
@@ -14,6 +15,10 @@
 # Only 0.0.x stand-ins, which no release uses, and the package checks fail
 # any package whose scripts differ from the templates. The builder itself has
 # no way to make one.
+#
+# --script adds the same block, in place, to a postinstall rendered for the
+# self-test's temporary root, so that what the block says can be checked
+# directly, without installing anything.
 set -euo pipefail
 
 die() {
@@ -21,23 +26,9 @@ die() {
   exit 1
 }
 
-[ "$#" = 4 ] || die "usage: $0 <pkg> <out-pkg> <entry|after-switch> <marker>"
-pkg="$1"
-out="$2"
-where="$3"
-marker="$4"
-case "$where" in entry | after-switch) ;; *) die "no fault at '$where'" ;; esac
-case "$(basename "$pkg")" in syndeo-0.0.*-aarch64-apple-darwin.pkg) ;; *) die "only a 0.0.x stand-in" ;; esac
-case "$marker" in /*) ;; *) die "the marker has to be absolute" ;; esac
-[[ "$marker" =~ ^[A-Za-z0-9._/-]+$ ]] || die "the marker has to be a plain path"
-[ -e "$out" ] && die "$out exists"
-
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-pkgutil --expand "$pkg" "$work/expanded" || die "expanding $pkg"
-script="$work/expanded/syndeo.pkg/Scripts/postinstall"
-cp -p "$script" "$work/postinstall.original"
-python3 -I - "$script" "$where" "$marker" <<'PYEOF' || die "changing the postinstall"
+# insert_fault SCRIPT WHERE MARKER: add the block to the postinstall SCRIPT.
+insert_fault() {
+  python3 -I - "$1" "$2" "$3" <<'PYEOF' || die "changing the postinstall"
 import os
 import sys
 
@@ -69,6 +60,42 @@ with open(tmp, "w") as f:
 os.chmod(tmp, 0o755)
 os.rename(tmp, path)
 PYEOF
+}
+
+check_where_and_marker() {
+  case "$1" in entry | after-switch) ;; *) die "no fault at '$1'" ;; esac
+  case "$2" in /*) ;; *) die "the marker has to be absolute" ;; esac
+  [[ "$2" =~ ^[A-Za-z0-9._/-]+$ ]] || die "the marker has to be a plain path"
+}
+
+if [ "${1:-}" = --script ]; then
+  [ "$#" = 4 ] || die "usage: $0 --script <postinstall> <entry|after-switch> <marker>"
+  check_where_and_marker "$3" "$4"
+  [ -f "$2" ] || die "no $2"
+  original="$(mktemp)"
+  trap 'rm -f "$original"' EXIT
+  cp -p "$2" "$original"
+  insert_fault "$2" "$3" "$4"
+  [ "$(diff "$original" "$2" | grep -c '^>')" = 7 ] || die "the postinstall gained more than the block"
+  [ "$(diff "$original" "$2" | grep -c '^<')" = 0 ] || die "the postinstall lost a line"
+  exit 0
+fi
+
+[ "$#" = 4 ] || die "usage: $0 <pkg> <out-pkg> <entry|after-switch> <marker>"
+pkg="$1"
+out="$2"
+where="$3"
+marker="$4"
+check_where_and_marker "$where" "$marker"
+case "$(basename "$pkg")" in syndeo-0.0.*-aarch64-apple-darwin.pkg) ;; *) die "only a 0.0.x stand-in" ;; esac
+[ -e "$out" ] && die "$out exists"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+pkgutil --expand "$pkg" "$work/expanded" || die "expanding $pkg"
+script="$work/expanded/syndeo.pkg/Scripts/postinstall"
+cp -p "$script" "$work/postinstall.original"
+insert_fault "$script" "$where" "$marker"
 pkgutil --flatten "$work/expanded" "$out" || die "flattening $out"
 
 # Nothing but the postinstall differs from the package it was made from.

@@ -311,11 +311,11 @@ alone() { [ "$(ls -A "$D" | tr '\n' ' ')" = "$1 current " ]; }
 
 # ------------------------------------------------------------------ installing
 
-# The system's installer log, and how many half-second tries said() gives it:
-# it is written asynchronously, and a line can arrive late. The self-test
-# points both at its own.
+# The system's installer log, and how many half-second reads note_said()
+# gives it: it is written asynchronously, a line can arrive late, and one may
+# not arrive at all. The self-test points both at its own.
 INSTALL_LOG=/var/log/install.log
-SAID_TRIES=60
+SAID_TRIES=10
 
 # install LABEL PKG [TARGET]: installer(8), with -dumplog, so that its own
 # detailed log comes back with this invocation, on stderr. Everything it
@@ -347,26 +347,60 @@ log_lines() {
   grep -E 'syndeo (preinstall|postinstall)|installer\[' "$last_log.install-log" >"$last_log.install-log.filtered" || true
 }
 
-# said TEXT: the last install's scripts said TEXT. Looked for first in what
-# installer printed for that invocation alone, with -dumplog; then in what
-# /var/log/install.log gained, read again for a while, since that log can be
-# late. Which of them held it, if either, is written to LOG.said.
-said() {
-  local try
+# note_said TEXT: whether the last install's scripts are seen to have said
+# TEXT, for the record and nothing else. Looked for in what installer printed
+# for that invocation (-dumplog, which on macOS 15 carries installer's own
+# lines but not the scripts'), then in what /var/log/install.log gained, read
+# again for a few seconds. Installer normally records a script's lines there,
+# but does not guarantee it, so no test is decided on this: the installs are
+# judged by their status and by what is installed before and after, and every
+# line a script says here is asserted directly by ci/verify-pkg.sh's
+# st_decisions. Appends where it was seen to LOG.said, and prints it.
+note_said() {
+  local try where='not seen'
   if grep -qF -- "$1" "$last_log.installer"; then
-    printf 'in the -dumplog output: %s\n' "$1" >>"$last_log.said"
-    return 0
+    where='seen in the -dumplog output'
+  else
+    for try in $(seq 1 "$SAID_TRIES"); do
+      log_lines
+      if grep -qF -- "$1" "$last_log.install-log"; then
+        where="seen in /var/log/install.log, on read $try"
+        break
+      fi
+      sleep 0.5
+    done
   fi
-  for try in $(seq 1 "$SAID_TRIES"); do
-    log_lines
-    if grep -qF -- "$1" "$last_log.install-log"; then
-      printf 'in /var/log/install.log, on try %s: %s\n' "$try" "$1" >>"$last_log.said"
-      return 0
-    fi
-    sleep 0.5
-  done
-  printf 'in neither: %s\n' "$1" >>"$last_log.said"
-  return 1
+  printf '%s: %s\n' "$where" "$1" >>"$last_log.said"
+  printf '%s' "$where"
+}
+
+# before_is DECISION: the package's state is the one the preinstall decides
+# DECISION on, as ci/macos-pkg/preinstall.in's matrix reads it.
+before_is() {
+  local x v
+  case "$1" in
+    "installing "*) pristine ;;
+    "resuming an interrupted installation of "*)
+      v="${1##* }"
+      ! pkgutil --pkg-info "$ID" >/dev/null 2>&1 && [ "$(ls -A "$D" 2>/dev/null)" = "$v" ]
+      ;;
+    "upgrading from "*)
+      x="${1#upgrading from }"
+      x="${x%% *}"
+      receipt_is "$x" && alone "$x" && current_is "$x"
+      ;;
+    "reinstalling "* | "repairing "*)
+      v="${1##* }"
+      receipt_is "$v" && alone "$v" && current_is "$v"
+      ;;
+    "completing the failed upgrade from "*)
+      x="${1#completing the failed upgrade from }"
+      v="${x##* }"
+      x="${x%% *}"
+      receipt_is "$x" && alone "$v" && { current_is "$x" || current_is "$v"; }
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 # evidence: what the last install's scripts and installer are known to have
@@ -375,26 +409,32 @@ evidence() {
   grep -hE 'syndeo (preinstall|postinstall)|installer' "$last_log.installer" "$last_log.install-log" 2>/dev/null | sed 's/^/      | /'
 }
 
-# refused LABEL PKG TEXT: the install fails, the package says TEXT, and
-# nothing of Syndeo's changed.
+# refused LABEL PKG TEXT: the install fails, and nothing of Syndeo's changed.
+# TEXT, the preinstall's reason, is asserted by ci/verify-pkg.sh's
+# st_decisions; here it is only noted.
 refused() {
-  local label="$1" pkg="$2" text="$3" before
+  local label="$1" pkg="$2" text="$3" before seen
   before="$(package_state)"
   if install "$label" "$pkg"; then
     fail "$label: the install succeeded"
   fi
-  said "$text" || { evidence; fail "$label: refused, but not saying \"$text\""; }
-  [ "$(package_state)" = "$before" ] || fail "$label: refused, but something changed"
-  pass "$label: refused, saying \"$text\", nothing changed"
+  seen="$(note_said "$text")"
+  [ "$(package_state)" = "$before" ] || { evidence; fail "$label: refused, but something changed"; }
+  pass "$label: refused, nothing changed (\"$text\": $seen)"
 }
 
+# installed LABEL PKG DECISION VERSION: from the state the preinstall decides
+# DECISION on, the install succeeds and leaves exactly VERSION. DECISION
+# itself is asserted by ci/verify-pkg.sh's st_decisions; here it is only
+# noted.
 installed() {
-  local label="$1" pkg="$2" text="$3" version="$4"
+  local label="$1" pkg="$2" text="$3" version="$4" seen
+  before_is "$text" || fail "$label: before installing, the package is not in the state that \"$text\" is decided on"
   install "$label" "$pkg" || { sed 's/^/      | /' "$last_log.installer" "$last_log.install-log"; fail "$label: the install failed"; }
-  said "$text" || { evidence; fail "$label: installed, but the preinstall did not say \"$text\""; }
+  seen="$(note_said "$text")"
   bash "$here/verify-pkg.sh" installed "$version" >"$last_log.verify" 2>&1 ||
     { sed 's/^/      | /' "$last_log.verify"; fail "$label: the installation is not exactly $version"; }
-  pass "$label: installed ($text), and verify-pkg installed $version passes"
+  pass "$label: installed from the state \"$text\" is decided on, and verify-pkg installed $version passes ($seen)"
 }
 
 # standin VERSION: a package of shell stand-ins, from the real builder.
@@ -460,8 +500,9 @@ fault_pkg() {
 # nothing, OLDER and NEWER packages included; then PKG again completes it.
 failed_upgrade() {
   local label="$1" pkg="$2" x="$3" w="$4" at="$5" older="$6" newer="$7" before
+  must "$label: before, $x alone, with its receipt and current" eval "receipt_is $x && alone $x && current_is $x"
   if install "$label" "$pkg"; then fail "$label: the faulty package installed"; fi
-  said "syndeo postinstall: test fault" || { evidence; fail "$label: it did not stop on its test fault"; }
+  note_said "syndeo postinstall: test fault" >/dev/null
   must "$label: Installer left the receipt at $x, $x gone, $w in place, current -> $at" eval "receipt_is $x && alone $w && current_is $at"
   if [ "$at" = "$x" ]; then
     must "  ... every command fails to start, only because it is not there" commands_fail_closed
@@ -830,9 +871,13 @@ system_before() {
   say "a running syndeo across an upgrade, with the real binaries"
   local r15 late
   r15="$(real_standin 0.0.15 "$pkg" "$version")" || fail "building 0.0.15 from the real binaries"
+  before_is "upgrading from 0.0.13 to 0.0.15" || fail "before 0.0.15, the package is not 0.0.13 alone"
   install real-binaries-0.0.15 "$r15" || { sed 's/^/      | /' "$last_log.installer" "$last_log.install-log"; fail "installing 0.0.15"; }
-  said "upgrading from 0.0.13 to 0.0.15" || { evidence; fail "0.0.15 installed, but not as an upgrade from 0.0.13"; }
-  must "0.0.15, the real binaries: alone, with its receipt and current" eval "alone 0.0.15 && receipt_is 0.0.15 && current_is 0.0.15"
+  note_said "upgrading from 0.0.13 to 0.0.15" >/dev/null
+  # Its commands are the real ones, which report the real version.
+  bash "$here/verify-pkg.sh" installed 0.0.15 --commands-say "$version" >"$last_log.verify" 2>&1 ||
+    { sed 's/^/      | /' "$last_log.verify"; fail "the installation is not exactly 0.0.15"; }
+  must "0.0.15, the real binaries: alone, its receipt, tree, links and current exact (verify-pkg installed)" eval "alone 0.0.15 && receipt_is 0.0.15 && current_is 0.0.15"
   python3 -I "$here/late-lookup.py" --command "$BIN/syndeo" --user "$RUNNER" --home "$st/late-home" \
     --private "$D" --old 0.0.15 --new "$version" --held "$st/late.held" --go "$st/late.go" >"$st/logs/late-lookup" 2>&1 &
   late=$!
