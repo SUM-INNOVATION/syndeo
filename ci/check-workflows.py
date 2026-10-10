@@ -19,8 +19,16 @@ environment and so waits for its reviewers. Checked:
 - that job cannot write to the repository: the token everything runs with
   is read-only at the top, and it does not raise it;
 - in that job, ci/check-signing-config.sh runs before anything signs;
-- a release is made public (`--draft=false`) only in a job that runs for a
-  tag, after its draft has been checked.
+- only publish and rehearse raise the token to `contents: write`, and
+  nothing asks for write-all;
+- publish and rehearse each need exactly verify, build-macos, pkg-install
+  and checksums;
+- every `gh release create` makes a draft (`--draft`), and publish's names
+  its tag with `--verify-tag`;
+- only publish makes a release public (`--draft=false`), only for a tag,
+  and only after `verify-pkg.sh release check` has checked its draft;
+- rehearse publishes nothing, and its `if: always()` step deletes its draft
+  and then fails if either the draft or a tag of its name remains.
 
 The workflows are read line by line, as they are written here: two-space
 indentation, jobs as `  name:` under `jobs:`. Anything it cannot place is a
@@ -84,6 +92,119 @@ def blocks(text):
     return top, jobs, order
 
 
+def joined(lines):
+    """A job's commands, continuation lines joined: [(first line, text)]."""
+    out, buf, start = [], [], None
+    for n, c in lines:
+        if not buf:
+            start = n
+        stripped = c.rstrip()
+        if stripped.endswith("\\"):
+            buf.append(stripped[:-1].strip())
+            continue
+        buf.append(c.strip())
+        out.append((start, " ".join(x for x in buf if x)))
+        buf = []
+    if buf:
+        out.append((start, " ".join(x for x in buf if x)))
+    return out
+
+
+def steps(lines):
+    """A job's steps, each the [(line, code)] from its `      - ` on."""
+    result, cur, inside = [], None, False
+    for n, c in lines:
+        if c.startswith("    steps:"):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if re.match(r"^    \S", c):
+            inside = False
+            continue
+        if c.startswith("      - "):
+            cur = [(n, c)]
+            result.append(cur)
+        elif cur is not None:
+            cur.append((n, c))
+    return result
+
+
+def needs_of(lines):
+    """The jobs a job needs, sorted, or None if not written as [a, b]."""
+    for n, c in lines:
+        m = re.match(r"^    needs:\s*(.*)$", c)
+        if m:
+            v = m.group(1).strip()
+            if v.startswith("[") and v.endswith("]"):
+                return sorted(x.strip() for x in v[1:-1].split(",") if x.strip())
+            return None
+    return []
+
+
+DRAFT = re.compile(r"(?<!\S)--draft(?!\S)")
+PUBLISHES = re.compile(r"--draft[= ]false|draft=false|\"draft\":\s*false|gh release edit")
+RELEASE_NEEDS = ["build-macos", "checksums", "pkg-install", "verify"]
+
+
+def check_publication(jobs):
+    """The draft-first publication, and the dry run's rehearsal of it."""
+    found = []
+    for name, lines in jobs.items():
+        if any(c.strip() == "contents: write" for _, c in lines) and name not in ("publish", "rehearse"):
+            found.append("release.yml: %s raises the token to contents: write; only publish and rehearse may" % name)
+        if any("write-all" in c for _, c in lines):
+            found.append("release.yml: %s asks for write-all" % name)
+        for n, cmd in joined(lines):
+            if "gh release create" in cmd and not DRAFT.search(cmd):
+                found.append("release.yml:%d %s creates a release that is not a draft" % (n, name))
+            if PUBLISHES.search(cmd) and name != "publish":
+                found.append("release.yml:%d %s publishes a release; only publish may" % (n, name))
+    for name in ("publish", "rehearse"):
+        if name not in jobs:
+            found.append("release.yml: no %s job" % name)
+            continue
+        needs = needs_of(jobs[name])
+        if needs != RELEASE_NEEDS:
+            found.append("release.yml: %s needs %s, not exactly verify, build-macos, pkg-install and checksums"
+                         % (name, "something it does not write as [a, b]" if needs is None else (needs or "nothing")))
+    if "publish" in jobs:
+        cmds = joined(jobs["publish"])
+        creates = [c for _, c in cmds if "gh release create" in c]
+        if not creates or any("--verify-tag" not in c for c in creates):
+            found.append("release.yml: publish creates its draft without --verify-tag")
+        checks = [n for n, c in cmds if "verify-pkg.sh release check" in c]
+        public = [n for n, c in cmds if "--draft=false" in c]
+        if not checks:
+            found.append("release.yml: publish never checks its draft with verify-pkg.sh release check")
+        elif any(n < min(checks) for n in public):
+            found.append("release.yml:%d publish makes the release public before checking its draft" % min(public))
+    if "rehearse" in jobs:
+        cleanup = [st for st in steps(jobs["rehearse"])
+                   if any(c.strip() == "if: always()" for _, c in st)
+                   and any('gh release delete "$TAG"' in c for _, c in st)]
+        if not cleanup:
+            found.append("release.yml: rehearse has no if: always() step that deletes its draft")
+        else:
+            cmds = [c for _, c in joined(cleanup[0])]
+
+            def after(i, needle):
+                for j in range(i + 1, len(cmds)):
+                    if needle in cmds[j]:
+                        return j
+                return None
+            d = after(-1, 'gh release delete "$TAG"')
+            v = after(d, 'gh release view "$TAG"')
+            e1 = after(v, "exit 1") if v is not None else None
+            t = after(e1, "git/ref/tags/$TAG") if e1 is not None else None
+            e2 = after(t, "exit 1") if t is not None else None
+            if None in (v, e1):
+                found.append("release.yml: rehearse's cleanup does not fail when its draft remains after deleting it")
+            if None in (t, e2):
+                found.append("release.yml: rehearse's cleanup does not fail when a tag of its draft's name exists")
+    return found
+
+
 def check_release(text):
     found = []
     top, jobs, _ = blocks(text)
@@ -132,6 +253,7 @@ def check_release(text):
                 found.append("release.yml:%d %s signs before ci/check-signing-config.sh has run" % (min(signs), name))
     if "build-macos" not in jobs:
         found.append("release.yml: no build-macos job")
+    found += check_publication(jobs)
     return found
 
 
@@ -218,7 +340,62 @@ def self_test(directory):
                    "      - uses: actions/checkout@v4\n      - name: Sign first\n        run: ./ci/sign-macos.sh target\n")
     case("a signing step before the gate", ci, moved, "signs before ci/check-signing-config.sh")
     case("a release made public outside the tag-only job", ci,
-         add_to_job(rel, "rehearse", "    # then\n    steps:\n      - run: gh release edit x --draft=false"), "publishes a release without running only for a tag")
+         in_job(rel, "rehearse", "      - name: Deleted, whatever happened, and nothing left\n",
+                "      - run: gh release edit x --draft=false\n      - name: Deleted, whatever happened, and nothing left\n"),
+         "publishes a release without running only for a tag")
+
+    print("\n  release.yml's publication, changed")
+    needs = "    needs: [verify, build-macos, pkg-install, checksums]"
+    for name in ("publish", "rehearse"):
+        for dep in ("verify", "build-macos", "pkg-install", "checksums"):
+            fewer = "    needs: [%s]" % ", ".join(d for d in ("verify", "build-macos", "pkg-install", "checksums") if d != dep)
+            case("%s without %s among its needs" % (name, dep), ci, in_job(rel, name, needs, fewer),
+                 "%s needs" % name)
+        case("%s needing build-linux as well" % name, ci,
+             in_job(rel, name, needs, "    needs: [verify, build-linux, build-macos, pkg-install, checksums]"), "%s needs" % name)
+    case("publish's release not created as a draft", ci, in_job(rel, "publish", "--draft --verify-tag", "--verify-tag"),
+         "publish creates a release that is not a draft")
+    case("rehearse's release not created as a draft", ci, in_job(rel, "rehearse", "--draft --target", "--target"),
+         "rehearse creates a release that is not a draft")
+    case("publish's draft created without --verify-tag", ci, in_job(rel, "publish", "--draft --verify-tag", "--draft"),
+         "without --verify-tag")
+    a, b = job(rel, "publish")
+    text = rel[a:b]
+    check_at = text.index("      - name: The draft, downloaded and checked\n")
+    public_at = text.index("      - name: Published, only now\n")
+    reordered = text[:check_at] + text[public_at:] + text[check_at:public_at]
+    case("publish made public before its draft is checked", ci, rel[:a] + reordered + rel[b:],
+         "public before checking its draft")
+    case("publish's check of its draft removed", ci,
+         in_job(rel, "publish", "bash ci/verify-pkg.sh release check", "true"), "never checks its draft")
+    case("rehearse's cleanup not run always", ci, in_job(rel, "rehearse", "        if: always()\n", ""),
+         "no if: always() step that deletes its draft")
+    case("rehearse's cleanup not deleting the draft", ci, in_job(rel, "rehearse", 'gh release delete "$TAG" --yes', "true"),
+         "no if: always() step that deletes its draft")
+    gone = ('          if gh release view "$TAG" >/dev/null 2>&1; then\n'
+            '            echo "::error::the dry-run draft $TAG is still there"\n'
+            '            exit 1\n'
+            '          fi\n')
+    case("rehearse's cleanup not checking the draft is gone", ci, in_job(rel, "rehearse", gone, ""),
+         "does not fail when its draft remains")
+    tag = ('          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then\n'
+           '            echo "::error::a tag $TAG exists; a dry run must never create one"\n'
+           '            exit 1\n'
+           '          fi\n')
+    case("rehearse's cleanup not checking for a tag", ci, in_job(rel, "rehearse", tag, ""),
+         "does not fail when a tag of its draft's name exists")
+    case("rehearse's cleanup finding the tag but not failing", ci,
+         in_job(rel, "rehearse", tag, tag.replace("exit 1", "exit 0")),
+         "does not fail when a tag of its draft's name exists")
+    case("rehearse made to publish its draft", ci,
+         in_job(rel, "rehearse", "      - name: Deleted, whatever happened, and nothing left\n",
+                '      - name: Publish\n        run: gh release edit "$TAG" --draft=false --latest\n'
+                "      - name: Deleted, whatever happened, and nothing left\n"),
+         "rehearse publishes a release; only publish may")
+    for name in ("verify", "build-linux", "pkg-install", "checksums"):
+        case("%s given a token that can write" % name, ci, add_to_job(rel, name, "    permissions:\n      contents: write"),
+             "%s raises the token to contents: write" % name)
+    case("a job asking for write-all", ci, add_to_job(rel, "checksums", "    permissions: write-all"), "asks for write-all")
     print("\n  %d cases, %d wrong\n" % (cases, wrong))
     return wrong == 0
 
@@ -239,7 +416,9 @@ def main():
         print("check-workflows: %s" % f)
     if found:
         return 1
-    print("check-workflows: ci.yml reads no secret and no environment; in release.yml only build-macos, behind release-macos, does, and it runs the gate before signing")
+    print("check-workflows: ci.yml reads no secret and no environment; in release.yml only build-macos, behind release-macos, does, "
+          "and it runs the gate before signing; every release is created a draft, publish checks it before making it public, "
+          "and rehearse only deletes its own")
     return 0
 
 
