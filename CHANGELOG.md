@@ -3,6 +3,133 @@
 The release workflow reads the section matching the tag and puts it in the
 release notes, so a heading here is `## <version>` and nothing else.
 
+## 0.1.6
+
+The first release with a macOS installer package, which installs Syndeo for
+the whole Mac rather than for one user. The per-user install script, and
+what it installs, are unchanged.
+
+**Before you upgrade**
+
+- **The macOS binaries are still ad-hoc signed, with no Developer ID, and not
+  notarized, and the package is unsigned.** Installed with the one-line
+  script, or with the package downloaded by `curl` as below, nothing is
+  quarantined. Opened from a browser download, Gatekeeper is expected to
+  reject either. Unsigned, the keystore cannot reach the data protection
+  keychain, so Secure Enclave presence is not enforced and the passphrase is
+  mandatory.
+- **With the package, quit Syndeo before installing or upgrading.** One
+  version is installed at a time, and an upgrade removes the one it replaces.
+
+**Added**
+
+- **The installer package**, `syndeo-0.1.6-aarch64-apple-darwin.pkg`, beside
+  the three tarballs and listed in `SHA256SUMS`:
+
+  ```sh
+  curl -fsSLO https://github.com/SUM-INNOVATION/syndeo/releases/download/v0.1.6/syndeo-0.1.6-aarch64-apple-darwin.pkg
+  curl -fsSLO https://github.com/SUM-INNOVATION/syndeo/releases/download/v0.1.6/SHA256SUMS
+  shasum -a 256 -c SHA256SUMS --ignore-missing
+  sudo installer -pkg syndeo-0.1.6-aarch64-apple-darwin.pkg -target /
+  ```
+
+  - **What it installs.** Everything is root-owned, under `/usr/local`:
+    - the version, in `/usr/local/libexec/syndeo/0.1.6/`, with its
+      uninstaller beside it;
+    - `/usr/local/libexec/syndeo/current`, pointing at that version;
+    - the seven commands in `/usr/local/bin`, as links through `current`.
+
+    It needs Apple Silicon, macOS 13 or later and an administrator, and
+    installs only on the startup disk.
+  - **A preinstall script** refuses to install over anything it cannot
+    account for:
+    - a command in `/usr/local/bin` it did not put there;
+    - a Syndeo directory with no package receipt;
+    - a second version;
+    - files that are not as packaged;
+    - a package older than the one installed;
+    - parent directories it does not trust. `/usr/local` and
+      `/usr/local/libexec` have to be root's and writable by nobody else.
+      `/usr/local/bin` may belong to a person and be writable by the admin or
+      wheel group, but not by everyone, not through an access control list,
+      not locked, and not a symbolic link.
+
+    Installer itself says only that the installation failed. The reasons are
+    `syndeo preinstall: refusing: …` lines, which Installer normally records
+    in `/var/log/install.log`, but does not guarantee to.
+  - **A postinstall script** checks that the new version is complete and the
+    only one, then switches `current` to it with one rename.
+  - **Upgrades.** An upgrade removes the previous version before it places
+    the new one, and the commands do not start until `current` has switched:
+    about 0.3 s on a CI runner, which is a measurement, not a promise.
+    - If an upgrade fails, Installer undoes nothing. Install the same package
+      again to finish it; until then every other package, and the
+      uninstaller, is refused.
+    - Downgrades are refused: uninstall first.
+  - **Removal:** `sudo /bin/sh /usr/local/libexec/syndeo/0.1.6/uninstall.sh`.
+    It changes nothing unless everything is as the package left it. It never
+    touches homes, `~/.syndeo`, keychain items or proxy trust settings. If it
+    removed everything but could not forget the receipt, it exits 2 and
+    prints the command that finishes the job:
+    `sudo /usr/sbin/pkgutil --forget com.sum.syndeo.pkg --volume /`.
+
+**Changed**
+
+- **A program finds its siblings from the binary the kernel is running,** not
+  from the link that started it. It looks once, first thing in `main`, so a
+  command started through a link that later changes keeps to its own
+  version.
+- **A Syndeo left running across a package upgrade stops rather than mixing
+  versions.** Once an upgrade has removed the version a process came from,
+  its next sibling start fails with "this version was removed during an
+  upgrade; quit and restart Syndeo", and `syndeo doctor` says the version was
+  removed. It never falls back to `current`, the path it was started by, or
+  `PATH`. Outside `/usr/local/libexec/syndeo`, a build tree or a tarball
+  install, lookups are as before.
+- **The shell seeds the tools directory on first run,** as the user running
+  it, when `<home>/tools` does not exist, so that a package installed as root
+  never writes into a home.
+  - The directory appears whole or not at all.
+  - Nothing that already exists is replaced: an empty `tools` directory is how
+    to decline.
+  - The per-user install script still copies the tools when it installs.
+- **The release workflow:**
+  - It builds the package from the macOS tarball, inspects it, and installs
+    and removes it on a fresh runner before anything is published.
+  - It publishes exactly the three tarballs, the package and `SHA256SUMS`, and
+    a draft is checked against what was built before it is made public.
+  - Signing is all or nothing, from a protected environment; this release is
+    not signed.
+  - `SHA256SUMS` now also lists the package. The install script reads only
+    its own tarball's line.
+
+**What was and was not tested**
+
+- **Every pull request** builds the package from the release tarball, and
+  inspects it without installing: its contents, its scripts byte for byte,
+  every path's owner and mode, the payload against the tarball, and its
+  signing state. It then installs it for real on a disposable GitHub-hosted
+  macOS 15 runner:
+  - refusals, and upgrades while the commands are being started;
+  - both kinds of failed upgrade, and their repair;
+  - a running Syndeo held across an upgrade;
+  - reinstalls, and the uninstaller, including a receipt that cannot be
+    forgotten;
+  - the runner put back afterwards.
+
+  Run 38094853210 passed all of it, on the commit before this version
+  change.
+- **Signing** is checked only against stand-ins for Apple's tools. No
+  Developer ID identity exists, and this release is not signed.
+- **The release workflow** is not run by pull requests. They check its steps
+  with self-tests, and its permissions and publication order with a workflow
+  lint.
+- **Not tested:**
+  - installing from Finder;
+  - Gatekeeper on a browser download;
+  - the refusal of Intel Macs and of macOS before 13, which rests on the
+    package's metadata alone.
+
 ## 0.1.5
 
 A security release. The agent runs WebAssembly tools on Wasmtime, and the
