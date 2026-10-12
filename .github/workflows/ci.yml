@@ -122,6 +122,12 @@ jobs:
           # that the test creates, names on every command, and deletes, and
           # which it checks leaves the user's keychain search list as it was.
           SYNDEO_KEYCHAIN_TEST: ${{ runner.os == 'macOS' && '1' || '' }}
+          # macOS only: the keystore as shipped, without a keychain access
+          # group, against the real ordinary keychain — one generic-password
+          # item under a service name of its own, written, read and deleted in
+          # the default keychain, which is only acceptable on a machine that is
+          # thrown away afterwards.
+          SYNDEO_KEYSTORE_KEYCHAIN_TEST: ${{ runner.os == 'macOS' && '1' || '' }}
 
   macos-package:
     name: macOS package (installed and removed on a disposable runner)

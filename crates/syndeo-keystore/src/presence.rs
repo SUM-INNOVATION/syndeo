@@ -18,16 +18,23 @@
 //!   that exact payload. This is enforced always, by the confirmation MAC in
 //!   `syndeo-ipc`, and it is a property of our own code.
 //!
-//! **Why platform presence may still be off.** The attributes only mean anything
-//! in macOS's *data protection* keychain, and that is only reachable by a binary
-//! signed with a keychain access group entitlement. A `cargo build` binary is
-//! not, so it gets `errSecMissingEntitlement`, falls back to the ordinary
-//! keychain, and reports presence as unenforced. To turn it on, sign the
-//! keystore binary with an entitlements file granting `keychain-access-groups`
-//! — `crates/syndeo-keystore/Syndeo.entitlements`, and with a real signing
-//! identity, since ad-hoc signing with that entitlement produces a binary the
-//! kernel kills at launch. Nothing in the code changes, [`available`] starts
-//! returning true, and [`policy`] relaxes the passphrase requirement on its own.
+//! **Why platform presence is off in every build Syndeo ships.** The attributes
+//! only mean anything in macOS's *data protection* keychain, and a process
+//! reaches that only with a `keychain-access-groups` entitlement. That
+//! entitlement is restricted: macOS honours it only where a provisioning
+//! profile authorises it, and kills at launch a process whose signature claims
+//! it without one — Developer ID signed or ad hoc alike, as the signed 0.1.6
+//! dry run showed. A standalone executable cannot embed a profile; it would
+//! have to be wrapped in an app-like bundle with a Developer ID provisioning
+//! profile for its own App ID (Apple's TN3125, "Inside Code Signing:
+//! Provisioning Profiles").
+//!
+//! Syndeo's binaries are standalone executables, and are signed without any
+//! entitlement. So the keystore, signed or not, gets `errSecMissingEntitlement`
+//! here, keeps its wrapping key in the ordinary keychain, and reports presence
+//! as unenforced. The enclave path stays written and [`available`] still asks
+//! the operating system rather than assuming, so a wrapped build — separate
+//! work, not started — would turn it on without anything here changing.
 //!
 //! Where platform presence is not enforced, the rule is that the passphrase
 //! stops being optional. [`policy`] is what implements that.

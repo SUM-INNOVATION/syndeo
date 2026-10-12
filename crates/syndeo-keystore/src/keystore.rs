@@ -714,6 +714,49 @@ mod tests {
         ));
     }
 
+    /// The shipped keystore's whole path, against the real ordinary keychain:
+    /// no keychain access group, so presence is unenforced, and the passphrase
+    /// is required to set up, required to unseal, and has to be the right one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn without_the_entitlement_the_passphrase_guards_setup_and_unsealing() {
+        use crate::wrapping::default_keychain;
+        if !default_keychain::allowed() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let wrapping = default_keychain::throwaway();
+        let _erased = default_keychain::Erased(wrapping.clone());
+        let keystore = Keystore::open(dir.path(), wrapping).unwrap();
+
+        let status = keystore.status();
+        assert!(!status.presence_enforced);
+        assert!(status.passphrase_required);
+        assert!(matches!(
+            keystore.initialize(None),
+            Err(KeystoreError::PassphraseRequired)
+        ));
+
+        keystore.initialize(Some(PASS)).unwrap();
+        let status = keystore.status();
+        assert!(status.initialized);
+        assert!(
+            !status.presence_enforced,
+            "an ordinary-keychain key reported as gated"
+        );
+        assert!(status.passphrase_required);
+
+        keystore.lock();
+        assert!(matches!(
+            keystore.unseal(None),
+            Err(KeystoreError::PassphraseRequired)
+        ));
+        assert!(keystore.unseal(Some("not the passphrase")).is_err());
+        assert!(!keystore.status().unsealed);
+        keystore.unseal(Some(PASS)).unwrap();
+        assert!(keystore.status().unsealed);
+    }
+
     // ---- idle auto-lock ---------------------------------------------------
 
     /// A keystore whose clocks the test moves by hand.

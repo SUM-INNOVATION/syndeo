@@ -11,11 +11,12 @@
 //!   enrolled. The fallback is the operating system's, so there is no path
 //!   through it that we wrote.
 //!
-//! Both require the *data protection* keychain on macOS, which in turn requires
-//! the binary to be signed with a keychain access group. An unsigned build gets
-//! `errSecMissingEntitlement` here, falls back to the ordinary keychain, and
-//! reports presence as unenforced — which is the honest answer, and is what
-//! keeps the passphrase mandatory on that build.
+//! Both require the *data protection* keychain on macOS, which a process
+//! reaches only with a keychain access group entitlement that a provisioning
+//! profile authorises (see [`crate::presence`]). Syndeo's standalone binaries
+//! carry no entitlement, signed or not, so they get `errSecMissingEntitlement`
+//! here, fall back to the ordinary keychain, and report presence as unenforced
+//! — which is the honest answer, and is what keeps the passphrase mandatory.
 
 #![cfg(target_os = "macos")]
 
@@ -245,7 +246,7 @@ impl EnclaveItem {
 fn describe(status: i32) -> String {
     let meaning = match status {
         -34018 => {
-            " (missing entitlement: this binary is not signed with a keychain access group, \
+            " (missing entitlement: this binary has no keychain access group, \
                     so the data protection keychain is not available to it)"
         }
         -25291 => " (no keychain is available)",

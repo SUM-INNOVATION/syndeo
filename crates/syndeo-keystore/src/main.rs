@@ -239,19 +239,15 @@ async fn run(mut secrets: StartupSecrets) -> Result<()> {
                 println!();
                 if cfg!(target_os = "macos") {
                     println!(
-                        "The Secure Enclave is not gating the wrapping key on this build.\n\
-                         The binding is there; the data protection keychain it needs is\n\
-                         only reachable from a binary signed with a keychain access group:\n\
+                        "The Secure Enclave is not gating the wrapping key on this build:\n\
+                         the key is in the ordinary keychain. The data protection keychain\n\
+                         that would gate it is only reachable with a keychain access group\n\
+                         entitlement, which macOS honours only where a provisioning profile\n\
+                         authorises it. A standalone binary cannot carry a profile, and one\n\
+                         signed with the entitlement anyway is killed at launch, so Syndeo's\n\
+                         binaries are signed without it.\n\
                          \n\
-                         \x20 codesign --force --sign \"Apple Development: you\" \\\n\
-                         \x20   --entitlements crates/syndeo-keystore/Syndeo.entitlements \\\n\
-                         \x20   target/release/syndeo-keystore\n\
-                         \n\
-                         It has to be a real signing identity. Ad-hoc signing (--sign -)\n\
-                         with this entitlement gets the process killed at launch, because\n\
-                         the access group has no team prefix behind it.\n\
-                         \n\
-                         Until then the passphrase is mandatory rather than optional, and\n\
+                         So the passphrase is mandatory rather than optional, and\n\
                          per-signature consent rests on shell confirmation of each payload."
                     );
                 } else {

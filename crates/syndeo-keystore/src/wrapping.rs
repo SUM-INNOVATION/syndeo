@@ -10,9 +10,10 @@
 //! `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` and a `SecAccessControl`
 //! requiring user presence, so Touch ID is enforced by the operating system
 //! rather than by us. That needs the data protection keychain, which needs a
-//! signed binary with a keychain access group; a build without one falls back to
-//! the ordinary keychain and says so, which is what keeps the passphrase
-//! mandatory there.
+//! keychain access group entitlement backed by a provisioning profile. Syndeo's
+//! standalone binaries have none, signed or not, so they fall back to the
+//! ordinary keychain and say so, which is what keeps the passphrase mandatory
+//! (see [`crate::presence`]).
 
 use zeroize::Zeroizing;
 
@@ -195,8 +196,9 @@ impl WrappingKeyStore for OsKeyring {
 
     /// Both places a key could be, whichever this build would write to.
     ///
-    /// A signed build writes to the enclave and an unsigned one to the ordinary
-    /// keychain, and either may run against a machine the other enrolled, so
+    /// A build that can enrol in the enclave writes there and every other build
+    /// to the ordinary keychain — every build Syndeo ships today is the latter —
+    /// and either may run against a machine the other enrolled, so
     /// asking only where this build would write could miss the key it is about
     /// to orphan. The enclave is asked even when this build cannot enrol there,
     /// and whatever it answers other than "no such item" is an error, not
@@ -276,5 +278,120 @@ impl WrappingKeyStore for InMemoryKeyStore {
 
     fn presence_enforced(&self) -> bool {
         false
+    }
+}
+
+/// For tests that need the real ordinary keychain, which is the user's default
+/// keychain: one generic-password item, under a service name of its own, is
+/// written, read and deleted. Only where `SYNDEO_KEYSTORE_KEYCHAIN_TEST=1` —
+/// CI sets it on a macOS runner thrown away afterwards — and nowhere else, so
+/// running the suite on a developer's Mac leaves their keychain alone.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod default_keychain {
+    use super::{OsKeyring, WrappingKeyStore};
+    use std::sync::Arc;
+
+    pub fn allowed() -> bool {
+        let allowed = std::env::var_os("SYNDEO_KEYSTORE_KEYCHAIN_TEST").is_some_and(|v| v == "1");
+        if !allowed {
+            eprintln!(
+                "skipped: writes to the default keychain; set SYNDEO_KEYSTORE_KEYCHAIN_TEST=1 \
+                 on a machine that is thrown away afterwards"
+            );
+        }
+        allowed
+    }
+
+    /// A keyring under a service no one else uses, so the item is nobody's key.
+    pub fn throwaway() -> Arc<OsKeyring> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Arc::new(OsKeyring::new(
+            format!(
+                "com.sum.syndeo.keystore.test.{}.{nanos}",
+                std::process::id()
+            ),
+            "root-seed",
+        ))
+    }
+
+    /// Erases the item when the test ends, however it ends.
+    pub struct Erased(pub Arc<OsKeyring>);
+
+    impl Drop for Erased {
+        fn drop(&mut self) {
+            let _ = self.0.erase();
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    /// The keystore as shipped, signed or not: no keychain access group, so the
+    /// enclave refuses it and the wrapping key goes to the ordinary keychain —
+    /// with no access group attribute on it — and is reported as not gated.
+    #[test]
+    fn without_the_entitlement_the_key_is_kept_in_the_ordinary_keychain() {
+        if !default_keychain::allowed() {
+            return;
+        }
+        assert!(
+            !crate::enclave::EnclaveItem::presence_can_be_enforced(),
+            "this test binary has no keychain access group, so the enclave must refuse it"
+        );
+        let store = default_keychain::throwaway();
+        let _erased = default_keychain::Erased(store.clone());
+        assert!(matches!(store.exists(), Ok(false)));
+
+        let key = [7u8; 32];
+        store.store(&key).unwrap();
+        assert!(
+            matches!(store.enclave.exists(), Ok(false)),
+            "nothing may reach the data protection keychain"
+        );
+        assert!(
+            matches!(store.fallback_exists(), Ok(true)),
+            "the ordinary keychain holds the key"
+        );
+        assert!(matches!(store.exists(), Ok(true)));
+        assert_eq!(*store.load().unwrap(), key);
+        assert!(
+            !store.presence_enforced(),
+            "a key in the ordinary keychain is not gated, and must not be reported as gated"
+        );
+        assert_eq!(
+            attributes(&store).get("agrp"),
+            None,
+            "an access group on the item"
+        );
+
+        store.erase().unwrap();
+        assert!(matches!(store.exists(), Ok(false)));
+        assert!(matches!(store.load(), Err(WrappingError::Missing)));
+    }
+
+    /// The item's attributes, read the way `fallback_exists` finds it.
+    fn attributes(store: &OsKeyring) -> std::collections::HashMap<String, String> {
+        use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+        use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
+
+        let keychain = SecKeychain::default_for_domain(SecPreferencesDomain::User).unwrap();
+        let found = ItemSearchOptions::new()
+            .keychains(&[keychain])
+            .class(ItemClass::generic_password())
+            .service(&store.service)
+            .account(&store.account)
+            .load_attributes(true)
+            .limit(Limit::Max(1))
+            .search()
+            .unwrap();
+        assert_eq!(found.len(), 1, "exactly the one item");
+        found[0]
+            .simplify_dict()
+            .expect("the item's attributes, as a dictionary")
     }
 }
