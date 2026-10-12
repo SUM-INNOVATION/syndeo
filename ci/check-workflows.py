@@ -404,6 +404,32 @@ def check_order(jobs):
                                           "ci/sign-macos-pkg.sh finish", "ci/verify-pkg.sh inspect")]
     if None in order or order != sorted(order):
         found.append("release.yml: package does not sign, submit, wait, staple and inspect, in that order")
+    # Stapling's diagnostics: written by finish to one directory, uploaded
+    # only when the package job fails, from that directory alone, for at most
+    # a week, and read by no other job. Nothing that inspects the package or
+    # hands it on runs after a failure.
+    finish = 'ci/sign-macos-pkg.sh finish "dist/$PKG" "$RUNNER_TEMP/pkg-state" notarization/package diagnostics/stapling'
+    if not any(finish in c for _, c in joined(pk)):
+        found.append("release.yml: package does not have ci/sign-macos-pkg.sh finish keep its diagnostics in diagnostics/stapling")
+    kept = [st for st in steps(pk) if any(c.strip() == "name: internal-staple-diagnostics" for _, c in st)]
+    if len(kept) != 1:
+        found.append("release.yml: package keeps the stapling diagnostics in %d steps, not one" % len(kept))
+    else:
+        st = [c.strip() for _, c in kept[0]]
+        days = [re.sub(r"\D", "", x) for x in st if x.startswith("retention-days:")]
+        if [x for x in st if x.startswith("if:")] != ["if: failure()"] or \
+                [x for x in st if x.startswith("path:")] != ["path: diagnostics/stapling/"] or \
+                len(days) != 1 or not days[0] or int(days[0]) > 7:
+            found.append("release.yml: package's stapling diagnostics are not kept only on failure, from diagnostics/stapling/ "
+                         "alone, for at most 7 days")
+    for name, lines in jobs.items():
+        if name != "package" and any("internal-staple-diagnostics" in c for _, c in lines):
+            found.append("release.yml: %s reads the stapling diagnostics; no job but package may name them" % name)
+    for st in steps(pk):
+        text = " ".join(c for _, c in st)
+        if ("ci/verify-pkg.sh inspect" in text or "name: syndeo-aarch64-apple-darwin" in text) and \
+                any(c.strip().startswith("if:") and re.search(r"always\(\)|failure\(\)|cancelled\(\)", c) for _, c in st):
+            found.append("release.yml: package inspects the package, or hands it on, even after a failure")
     return found
 
 
@@ -599,6 +625,29 @@ def self_test(directory):
          in_job(rel, "build-macos", "      - name: The tarball\n",
                 "      - run: python3 -I ci/notarize.py submit dist/x.zip --record r\n      - name: The tarball\n"),
          "build-macos notarizes")
+    case("the stapling diagnostics kept whatever happened", ci,
+         in_job(rel, "package", "        if: failure()\n", "        if: always()\n"),
+         "stapling diagnostics are not kept only on failure")
+    case("the stapling diagnostics kept from RUNNER_TEMP", ci,
+         in_job(rel, "package", "          path: diagnostics/stapling/\n", "          path: ${{ runner.temp }}\n"),
+         "stapling diagnostics are not kept only on failure")
+    case("the stapling diagnostics kept for 90 days", ci,
+         in_job(rel, "package", "          retention-days: 7\n", "          retention-days: 90\n"),
+         "stapling diagnostics are not kept only on failure")
+    case("another job reading the stapling diagnostics", ci,
+         add_to_job(rel, "pkg-install", "    env:\n      X: internal-staple-diagnostics"),
+         "pkg-install reads the stapling diagnostics")
+    case("finish without its diagnostics directory", ci,
+         in_job(rel, "package", " notarization/package diagnostics/stapling\n", " notarization/package\n"),
+         "package does not have ci/sign-macos-pkg.sh finish keep its diagnostics")
+    case("the package inspected even after a failure", ci,
+         in_job(rel, "package", "      - name: Inspect the package without installing it\n",
+                "      - name: Inspect the package without installing it\n        if: always()\n"),
+         "package inspects the package, or hands it on, even after a failure")
+    case("the package handed on even after a failure", ci,
+         in_job(rel, "package", "      - uses: actions/upload-artifact@v4\n        with:\n          name: syndeo-aarch64-apple-darwin\n",
+                "      - uses: actions/upload-artifact@v4\n        if: ${{ !cancelled() }}\n        with:\n          name: syndeo-aarch64-apple-darwin\n"),
+         "package inspects the package, or hands it on, even after a failure")
     signed_run = '        run: bash ci/verify-pkg.sh signed-binaries "dist/$TARBALL" "$VERSION"\n'
     case("build-macos not running the signed binaries", ci,
          in_job(rel, "build-macos", signed_run, "        run: true\n"),

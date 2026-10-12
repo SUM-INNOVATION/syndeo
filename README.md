@@ -769,7 +769,11 @@ version, and builds the three targets and the macOS installer package.
        verdict.
     3. `package` builds the installer package from that same tarball,
        checked by its SHA-256. It signs it with `ci/sign-macos-pkg.sh`, sends
-       it to Apple once, waits, and only then staples it.
+       it to Apple once, waits, and only then staples it. Every stapler
+       command is shown with its output and exit status. Validating the
+       stapled ticket is retried, up to five times over about four minutes,
+       and has to pass; if it never does, the job fails and keeps the package
+       and what the tools said as an internal artifact, for a week.
 
     Each wait has its own job, and its own deadline inside that job's time
     limit. A deadline reached means Apple has not decided, which is not a
