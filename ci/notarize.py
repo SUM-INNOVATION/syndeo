@@ -17,7 +17,10 @@ twice.
 
 `wait` reads the ID from DIR and asks `notarytool info` for its status,
 every S seconds (60 by default), until:
-- Accepted: exit 0;
+- Accepted: the notary's log is fetched into DIR/log.json too, as Apple
+  recommends even for an accepted submission, for its issues and the
+  ticket's contents. Best effort: a log that cannot be fetched is recorded in
+  DIR/result.json and is not a failure. Exit 0;
 - Invalid or Rejected: the notary's log is fetched into DIR/log.json; exit 1;
 - the deadline, N minutes after the submission: exit 2. The submission is
   still unresolved, which is not a rejection; it is never resubmitted, and
@@ -165,6 +168,8 @@ def submit(path, record):
 
 
 def fetch_log(sid, record, creds):
+    """Fetch the notary's log for SID into RECORD/log.json, and print it.
+    True if it was fetched; never submits anything."""
     out = os.path.join(record, "log.json")
     rc, _, err = notarytool("log", ["log", sid, out], creds)
     if rc == 0 and os.path.isfile(out):
@@ -172,8 +177,9 @@ def fetch_log(sid, record, creds):
         with open(out) as f:
             for line in f.read().splitlines()[:200]:
                 print("    " + line)
-    else:
-        say("the notary's log for %s could not be fetched: %s" % (sid, err or "no output"))
+        return True
+    say("the notary's log for %s could not be fetched: %s" % (sid, err or "no output"))
+    return False
 
 
 def wait(record, deadline_s, interval_s):
@@ -207,6 +213,11 @@ def wait(record, deadline_s, interval_s):
                 result.update(outcome="accepted", message="Apple accepted it")
                 write_json(os.path.join(record, "result.json"), result)
                 say("submission %s: Accepted, after %s" % (sid, str(t - submitted).split(".")[0]))
+                # Apple's log, even for an accepted submission. Best effort: the
+                # verdict is already recorded, and a log that cannot be had is
+                # noted beside it, not a failure.
+                result.update(log="log.json" if fetch_log(sid, record, creds) else "not fetched")
+                write_json(os.path.join(record, "result.json"), result)
                 return 0
             if status in ("Invalid", "Rejected"):
                 result.update(outcome=status.lower(), message="Apple did not accept it; see log.json")
@@ -299,8 +310,15 @@ elif kind == "info":
         import time; time.sleep(5)
     print(json.dumps({"id": args[2], "status": step, "name": "notarize.zip", "createdDate": "2026-10-12T03:36:55.304Z"}))
 elif kind == "log":
-    # notarytool log ID OUTPUT, then the credential options.
-    open(args[3], "w").write(json.dumps({"status": "Invalid", "issues": [{"severity": "error", "path": "notarize.zip/notarize/syndeo", "message": "The binary is not signed with a valid Developer ID certificate.", "architecture": "arm64"}]}, indent=2))
+    # notarytool log ID OUTPUT, then the credential options. The log says
+    # what the plan ended in: an accepted one carries no issues and a ticket.
+    if os.environ.get("STANDIN_LOG") == "fail":
+        sys.stderr.write("Error: HTTP status code: 404\n"); sys.exit(1)
+    if plan[-1] == "Accepted":
+        log = {"status": "Accepted", "issues": None, "ticketContents": [{"path": "notarize.zip/notarize/syndeo", "digestAlgorithm": "SHA-256", "cdhash": "0123456789abcdef0123456789abcdef01234567", "arch": "arm64"}]}
+    else:
+        log = {"status": plan[-1], "issues": [{"severity": "error", "path": "notarize.zip/notarize/syndeo", "message": "The binary is not signed with a valid Developer ID certificate.", "architecture": "arm64"}]}
+    open(args[3], "w").write(json.dumps(log, indent=2))
 else:
     sys.exit(2)
 '''
@@ -318,7 +336,7 @@ def self_test():
     me = os.path.abspath(__file__)
 
     def run(label, args, want_rc, want_text, plan="Accepted", submit_mode="", prepare=None, check=None, signal_after=None,
-            want_calls=None, drop=()):
+            want_calls=None, drop=(), log_mode=""):
         nonlocal cases, wrong
         case = tempfile.mkdtemp(dir=root)
         record = os.path.join(case, "record")
@@ -330,6 +348,7 @@ def self_test():
         env = {"PATH": bindir + ":/usr/bin:/bin", "RUNNER_TEMP": temp,
                "STANDIN_CALLS": os.path.join(case, "calls"), "STANDIN_KEYS": os.path.join(case, "keys"),
                "STANDIN_STATE": os.path.join(case, "state"), "STANDIN_PLAN": plan, "STANDIN_SUBMIT": submit_mode,
+               "STANDIN_LOG": log_mode,
                "MACOS_NOTARY_KEY_BASE64": base64.b64encode(b"notary-key").decode(),
                "MACOS_NOTARY_KEY_ID": "SECRETKEYID", "MACOS_NOTARY_ISSUER_ID": "SECRET-ISSUER-VALUE"}
         for name in drop:
@@ -413,10 +432,22 @@ def self_test():
 
     print("\n  waiting, never submitting")
     w = ["wait", "--record", "@record", "--deadline-seconds", "4", "--interval-seconds", "0.2"]
-    run("Accepted at once: exit 0", w, 0, ["Accepted"], prepare=submitted, want_calls=["info " + sid],
-        check=outcome("accepted"))
+    def accepted_with_log(record, calls, out):
+        r = json.load(open(os.path.join(record, "result.json")))
+        log = json.load(open(os.path.join(record, "log.json")))
+        return outcome("accepted")(record, calls, out) + (
+            [] if r.get("log") == "log.json" and log.get("status") == "Accepted" and log.get("ticketContents") else
+            ["the accepted submission's log not kept: %s" % r.get("log")])
+    run("Accepted at once: exit 0, and Apple's log for it kept", w, 0, ["Accepted", "ticketContents"], prepare=submitted,
+        want_calls=["info " + sid, "log " + sid], check=accepted_with_log)
     run("In Progress twice, then Accepted: polled until accepted", w, 0, ["In Progress (poll 1)", "Accepted"],
-        plan="In Progress,In Progress,Accepted", prepare=submitted, want_calls=["info " + sid] * 3, check=outcome("accepted"))
+        plan="In Progress,In Progress,Accepted", prepare=submitted, want_calls=["info " + sid] * 3 + ["log " + sid],
+        check=accepted_with_log)
+    run("Accepted, but its log cannot be fetched: still exit 0, the miss recorded, nothing resubmitted", w, 0,
+        ["Accepted", "could not be fetched"], prepare=submitted, want_calls=["info " + sid, "log " + sid], log_mode="fail",
+        check=lambda r, c, o: outcome("accepted")(r, c, o) + (
+            [] if json.load(open(os.path.join(r, "result.json"))).get("log") == "not fetched" and
+            not os.path.exists(os.path.join(r, "log.json")) else ["the miss is not recorded"]))
     run("Invalid: the log fetched and kept, exit 1", w, 1, ["Invalid", "The binary is not signed"], plan="Invalid",
         prepare=submitted, want_calls=["info " + sid, "log " + sid],
         check=lambda r, c, o: outcome("invalid")(r, c, o) + ([] if os.path.isfile(os.path.join(r, "log.json")) else ["no log.json"]))
@@ -424,7 +455,8 @@ def self_test():
         want_calls=["info " + sid, "log " + sid],
         check=lambda r, c, o: outcome("rejected")(r, c, o) + ([] if os.path.isfile(os.path.join(r, "log.json")) else ["no log.json"]))
     run("two API errors, then Accepted: the errors tolerated", w, 0, ["info failed (1 in a row)", "Accepted"],
-        plan="error,garbage,Accepted", prepare=submitted, want_calls=["info " + sid] * 3, check=outcome("accepted"))
+        plan="error,garbage,Accepted", prepare=submitted, want_calls=["info " + sid] * 3 + ["log " + sid],
+        check=outcome("accepted"))
     run("API errors ten in a row: unresolved, exit 3, not a rejection, nothing resubmitted",
         ["wait", "--record", "@record", "--deadline-seconds", "60", "--interval-seconds", "0.05"], 3,
         ["unresolved", "It was not rejected and is not resubmitted"], plan="error", prepare=submitted,
