@@ -416,8 +416,16 @@ def self_test(directory):
 
     def case(label, ci_text, rel_text, want):
         nonlocal cases, wrong
-        found = check_ci(ci_text) + check_release(rel_text)
+        # A check that cannot even read the workflow is a wrong case, not a crash.
+        try:
+            found = check_ci(ci_text) + check_release(rel_text)
+        except Exception as e:
+            found = None
+            print("  WRONG %s: the check failed: %s: %s" % (label, e.__class__.__name__, e))
         cases += 1
+        if found is None:
+            wrong += 1
+            return
         good = (not found) if want is None else any(want in f for f in found)
         if good:
             print("  ok    %s" % label)
