@@ -62,11 +62,15 @@ unpacking one yourself does the same thing.
 notarization.**
 Installed with the one-liner above, the binaries are not quarantined and run.
 An archive downloaded in a browser is quarantined, and Gatekeeper rejects its
-executables, which have no Developer ID — use the one-liner instead. Unsigned also means the
-keystore cannot reach the data protection keychain, so Secure Enclave presence
-(Touch ID) is not enforced: the keystore uses the ordinary login keychain, and
-the passphrase is mandatory. `syndeo-keystore status` reports which of the two
-a build is in.
+executables, which have no Developer ID — use the one-liner instead.
+
+**No macOS build enforces Secure Enclave presence (Touch ID), signed or not.**
+The keystore keeps its wrapping key in the ordinary login keychain, reports
+platform presence as unenforced, and requires the passphrase. The data
+protection keychain that would gate the key needs a keychain access group
+entitlement that only a provisioning profile can authorise, and a standalone
+executable cannot carry one: signed with it anyway, macOS kills it at launch.
+`syndeo-keystore status` reports this.
 
 ### Verifying a download yourself
 
@@ -659,16 +663,19 @@ Two things provide it, and they are not the same:
 - **Shell confirmation** — the user agreeing to a specific payload. This is
   enforced always, by our own code, and tested.
 
-Whether the first one is *in force* depends on how the binary was signed. The
-attributes only mean anything in the macOS data protection keychain, which is
-only reachable from a binary signed with a keychain access group; without one
-`SecItemAdd` returns `errSecMissingEntitlement` and the keystore falls back to
-the ordinary keychain and reports presence as unenforced — at which point the
-passphrase is mandatory rather than optional. `syndeo-keystore status` says which
-of the two you are in, and how to change it. The entitlements file is committed
-at `crates/syndeo-keystore/Syndeo.entitlements`; a real signing identity is
-required, since ad-hoc signing with that entitlement produces a binary the kernel
-kills at launch.
+The first one is not in force in any build Syndeo ships, signed or not. The
+attributes only mean anything in the macOS data protection keychain, which a
+process reaches only with a `keychain-access-groups` entitlement. That
+entitlement is restricted: macOS honours it only where a provisioning profile
+authorises it, and kills at launch a process that claims it without one, Developer
+ID signed or not (Apple's TN3125). A standalone executable such as
+`syndeo-keystore` cannot embed a profile. So Syndeo's binaries are signed
+without entitlements, `SecItemAdd` returns `errSecMissingEntitlement`, and the
+keystore keeps the wrapping key in the ordinary keychain and reports presence
+as unenforced — at which point the passphrase is mandatory rather than
+optional. `syndeo-keystore status` says so. Turning platform presence on would
+take wrapping the keystore in an app-like bundle with a Developer ID
+provisioning profile for its own App ID; that is separate work, not started.
 
 The keystore also forgets the seed on its own, and how depends on the platform
 and the session:
@@ -741,8 +748,9 @@ version, and builds the three targets and the macOS installer package.
   environment's `SYNDEO_EXPECT_SIGNED` and the ten secrets it names, and
   refuses any half-configured state.
   - Signed, the macOS release goes through three jobs, in order:
-    1. `build-macos` signs the binaries with `ci/sign-macos.sh`, checks them,
-       and makes the tarball.
+    1. `build-macos` signs the binaries with `ci/sign-macos.sh` (Developer ID
+       Application, the hardened runtime and a secure timestamp, and no
+       entitlements), checks them, and makes the tarball.
     2. `notarize-binaries` sends exactly those binaries to Apple once, with
        `ci/notarize.py`, and waits for the verdict.
     3. `package` builds the installer package from that same tarball,

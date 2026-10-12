@@ -53,8 +53,7 @@
 #                         executable carries a Developer ID. yes: every
 #                         executable is Developer ID Application of
 #                         MACOS_TEAM_ID, with the hardened runtime and a secure
-#                         timestamp, and only syndeo-keystore has entitlements,
-#                         exactly its keychain access group; the package is
+#                         timestamp, and none has any entitlement; the package is
 #                         Developer ID Installer of that team, chained to Apple
 #                         Root CA, its notarization ticket stapled, and
 #                         Gatekeeper accepts it as Notarized Developer ID.
@@ -295,6 +294,9 @@ TEAM_RE='^[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10}$'
 
 # entitlements_are XML GROUP: XML, what codesign printed as the entitlements,
 # is exactly keychain-access-groups = [GROUP], or, with GROUP empty, nothing.
+# Every shipped executable is checked with GROUP empty: a restricted
+# entitlement, such as the keychain access group the keystore once claimed,
+# gets a standalone executable killed at launch.
 entitlements_are() {
   python3 -I -c '
 import plistlib, sys
@@ -315,10 +317,9 @@ developer_id() {
 # found byte-identical to the tarball's.
 # signed_executables TREE TEAM: each of the seven executables in TREE is
 # Developer ID Application of TEAM, chained to Apple Root CA, with the
-# hardened runtime and a secure timestamp; syndeo-keystore's entitlements are
-# exactly its keychain access group, and the other six have none.
+# hardened runtime and a secure timestamp, and none has any entitlement.
 signed_executables() {
-  local tree="$1" team="$2" n out first last group entitled problems
+  local tree="$1" team="$2" n out first last problems
   for n in $NAMES; do
     problems=""
     codesign --verify --strict "$tree/$n" >/dev/null 2>&1 || problems="$problems does not verify;"
@@ -331,16 +332,10 @@ signed_executables() {
       problems="$problems TeamIdentifier '$(printf '%s\n' "$out" | sed -n 's/^TeamIdentifier=//p')';"
     printf '%s\n' "$out" | grep -qE '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' || problems="$problems no hardened runtime;"
     printf '%s\n' "$out" | grep -q '^Timestamp=' || problems="$problems no secure timestamp;"
-    group=''
-    entitled="no entitlements"
-    if [ "$n" = syndeo-keystore ]; then
-      group="$team.com.sum.syndeo.keystore"
-      entitled="keychain-access-groups [$group] and nothing else"
-    fi
-    entitlements_are "$(codesign -d --entitlements - --xml "$tree/$n" 2>/dev/null)" "$group" ||
-      problems="$problems entitlements are not: $entitled;"
+    entitlements_are "$(codesign -d --entitlements - --xml "$tree/$n" 2>/dev/null)" "" ||
+      problems="$problems has entitlements, and no shipped executable may;"
     if [ -z "$problems" ]; then
-      ok "$n: Developer ID Application of $team, hardened runtime, secure timestamp, $entitled"
+      ok "$n: Developer ID Application of $team, hardened runtime, secure timestamp, no entitlements"
     else
       bad "$n" "${problems# }"
     fi
@@ -1424,12 +1419,11 @@ case "$1" in
       echo "TeamIdentifier=$team"
     } >&2 ;;
   -d)
-    group=''
-    [ "$n" != syndeo-keystore ] || group="${STANDIN_KEYSTORE_GROUP:-$team.com.sum.syndeo.keystore}"
-    [ "$n" != "${STANDIN_ENTITLED:-}" ] || group="$team.com.sum.syndeo.keystore"
-    [ -n "$group" ] || exit 0
-    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>keychain-access-groups</key><array><string>%s</string></array>%s</dict></plist>\n' \
-      "$group" "${STANDIN_KEYSTORE_EXTRA:-}" ;;
+    # No entitlements, unless STANDIN_ENTITLED names this executable: then the
+    # keychain access group the keystore used to claim, or STANDIN_ENTITLEMENT.
+    [ "$n" = "${STANDIN_ENTITLED:-}" ] || exit 0
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>%s</dict></plist>\n' \
+      "${STANDIN_ENTITLEMENT:-<key>keychain-access-groups</key><array><string>$team.com.sum.syndeo.keystore</string></array>}" ;;
 esac
 EOF
   cat >"$bin/pkgutil" <<'EOF'
@@ -1474,14 +1468,14 @@ EOF
     printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
   }
   printf '\n  this script: inspect, of a signed release, against stand-ins for the signing tools\n'
-  signed_case "Developer ID throughout, the keystore alone entitled, notarized and stapled: passes" 0 ""
+  signed_case "Developer ID throughout, no entitlements, notarized and stapled: passes" 0 ""
   signed_case "one executable of another team" 1 "syndeo-net — signed by 'Developer ID Application: Example Org (ZZ99ZZ99ZZ)'; TeamIdentifier 'ZZ99ZZ99ZZ';" STANDIN_OTHER_TEAM=syndeo-net
   signed_case "one executable that does not verify" 1 "syndeo-ui — does not verify;" STANDIN_UNVERIFIED=syndeo-ui
   signed_case "one executable without the hardened runtime" 1 "syndeo-agent — no hardened runtime;" STANDIN_NO_RUNTIME=syndeo-agent
   signed_case "one executable without a secure timestamp" 1 "syndeo-proxy — no secure timestamp;" STANDIN_NO_TIMESTAMP=syndeo-proxy
-  signed_case "the keystore's access group of another team" 1 "syndeo-keystore — entitlements are not: keychain-access-groups [AB12CD34EF.com.sum.syndeo.keystore] and nothing else;" STANDIN_KEYSTORE_GROUP=ZZ99ZZ99ZZ.com.sum.syndeo.keystore
-  signed_case "the keystore with one entitlement more" 1 "syndeo-keystore — entitlements are not: keychain-access-groups [AB12CD34EF.com.sum.syndeo.keystore] and nothing else;" "STANDIN_KEYSTORE_EXTRA=<key>com.apple.security.get-task-allow</key><true/>"
-  signed_case "the access group on another executable" 1 "syndeo-agent — entitlements are not: no entitlements;" STANDIN_ENTITLED=syndeo-agent
+  signed_case "the keystore with the keychain access group it used to claim" 1 "syndeo-keystore — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=syndeo-keystore
+  signed_case "the keystore with any other entitlement" 1 "syndeo-keystore — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=syndeo-keystore "STANDIN_ENTITLEMENT=<key>com.apple.security.get-task-allow</key><true/>"
+  signed_case "the access group on another executable" 1 "syndeo-agent — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=syndeo-agent
   signed_case "the package signed by another team" 1 "package signature — signed by 'Developer ID Installer: Other Org (ZZ99ZZ99ZZ)';" "STANDIN_PKG_SIGNER=Developer ID Installer: Other Org (ZZ99ZZ99ZZ)" "STANDIN_ORIGIN=Developer ID Installer: Other Org (ZZ99ZZ99ZZ)"
   signed_case "the package signed with the Application identity" 1 "package signature — signed by 'Developer ID Application:" "STANDIN_PKG_SIGNER=Developer ID Application: Example Org (AB12CD34EF)" "STANDIN_ORIGIN=Developer ID Application: Example Org (AB12CD34EF)"
   signed_case "the package not chained to Apple Root CA" 1 "chained to 'Someone Root', not Apple Root CA;" "STANDIN_PKG_ROOT=Someone Root"
@@ -1505,12 +1499,13 @@ EOF
     printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
   }
   printf '\n  this script: signed-binaries, the tarball before notarization\n'
-  binaries_case "all seven Developer ID of the team, the keystore alone entitled: passes" 0 ""
+  binaries_case "all seven Developer ID of the team, none entitled: passes" 0 ""
   binaries_case "one executable of another team" 1 "syndeo-net — signed by 'Developer ID Application: Example Org (ZZ99ZZ99ZZ)'" STANDIN_OTHER_TEAM=syndeo-net
   binaries_case "one executable without the hardened runtime" 1 "syndeo-agent — no hardened runtime;" STANDIN_NO_RUNTIME=syndeo-agent
   binaries_case "one executable without a secure timestamp" 1 "syndeo-proxy — no secure timestamp;" STANDIN_NO_TIMESTAMP=syndeo-proxy
-  binaries_case "the keystore's access group of another team" 1 "syndeo-keystore — entitlements are not" STANDIN_KEYSTORE_GROUP=ZZ99ZZ99ZZ.com.sum.syndeo.keystore
-  binaries_case "the access group on another executable" 1 "syndeo-ui — entitlements are not: no entitlements;" STANDIN_ENTITLED=syndeo-ui
+  binaries_case "the keystore with the keychain access group it used to claim" 1 "syndeo-keystore — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=syndeo-keystore
+  binaries_case "the access group on another executable" 1 "syndeo-ui — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=syndeo-ui
+  binaries_case "any entitlement on any executable" 1 "syndeo-webkit — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=syndeo-webkit "STANDIN_ENTITLEMENT=<key>com.apple.security.cs.disable-library-validation</key><true/>"
   out="$(env -u MACOS_TEAM_ID SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)" && status=0 || status=$?
   expect "signed-binaries: without MACOS_TEAM_ID, refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs MACOS_TEAM_ID'"
   out="$(SYNDEO_EXPECT_SIGNED=no MACOS_TEAM_ID=AB12CD34EF bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)" && status=0 || status=$?

@@ -60,11 +60,10 @@ jobs:
       # before any wait, and every verdict, timeout and API error handled,
       # with a stand-in for notarytool. A pull request never notarizes.
       - run: python3 -I ci/notarize.py --self-test
-      # The keystore's entitlements, as committed and as release signing
-      # renders them, parsed strictly (on macOS by codesign itself, signing a
-      # scratch binary ad hoc), so a release never finds them malformed.
-      - run: bash ci/check-entitlements.sh
-      - run: bash ci/check-entitlements.sh --self-test
+      # The binaries' signing, with stand-ins for the tools: all seven alike,
+      # and none with an entitlement, which a standalone executable cannot
+      # carry without being killed at launch.
+      - run: bash ci/sign-macos.sh --self-test
       - run: bash ci/sign-macos-pkg.sh --self-test
       # Where the signing secrets may go: nowhere in this workflow, and in
       # release.yml only to the four jobs that declare release-macos, each its
