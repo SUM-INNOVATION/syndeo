@@ -56,6 +56,10 @@ jobs:
       # of it; and the package's signing order, with stand-ins for the tools
       # (macOS only). A pull request never signs anything.
       - run: bash ci/check-signing-config.sh --self-test
+      # The release's notarization: one submission per file, its ID recorded
+      # before any wait, and every verdict, timeout and API error handled,
+      # with a stand-in for notarytool. A pull request never notarizes.
+      - run: python3 -I ci/notarize.py --self-test
       # The keystore's entitlements, as committed and as release signing
       # renders them, parsed strictly (on macOS by codesign itself, signing a
       # scratch binary ad hoc), so a release never finds them malformed.

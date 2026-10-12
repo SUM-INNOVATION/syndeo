@@ -2,6 +2,7 @@
 # Decide whether a release is signed, and refuse every state in between.
 #
 #   ci/check-signing-config.sh [--github-output]
+#   ci/check-signing-config.sh --stage NAME
 #   ci/check-signing-config.sh --self-test
 #
 # SYNDEO_EXPECT_SIGNED says which: `yes`, or `no`, which is also what empty or
@@ -29,6 +30,17 @@
 # identities of that team. ci/sign-macos.sh signs whatever it is given; this
 # runs first, so the half-states it would accept never reach it.
 #
+# --stage NAME checks one job of the release, given the decision as
+# SYNDEO_EXPECT_SIGNED: under yes, that job's own secrets have to be there
+# and consistent, and every other one absent, so a job that is handed more
+# than it needs fails; under no, all ten have to be absent. The stages:
+#
+#   binary-sign      the Application certificate, its password, its
+#                    identity, and the team id
+#   binary-notarize  the notary key, its id, its issuer, and the team id
+#   package          the Installer certificate, its password, its identity,
+#                    the team id, and the notary key, its id and its issuer
+#
 # It prints names and its decision, never a value, and refuses to run traced.
 # On success it prints `signing: yes` or `signing: no`; with --github-output it
 # also appends `signed=yes` or `signed=no` to $GITHUB_OUTPUT.
@@ -54,6 +66,53 @@ identity_of_team() {
   local kind="$1" value="$2" team="$3"
   case "$value" in *[[:cntrl:]]*) return 1 ;; esac
   [[ "$value" =~ ^Developer\ ID\ $kind:\ .+\ \(([A-Z0-9]{10})\)$ ]] && [ "${BASH_REMATCH[1]}" = "$team" ]
+}
+
+# stage_names STAGE: the names that stage's job is given.
+stage_names() {
+  case "$1" in
+    binary-sign) echo MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD MACOS_SIGNING_IDENTITY MACOS_TEAM_ID ;;
+    binary-notarize) echo MACOS_NOTARY_KEY_BASE64 MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID MACOS_TEAM_ID ;;
+    package) echo MACOS_INSTALLER_CERTIFICATE_P12_BASE64 MACOS_INSTALLER_CERTIFICATE_PASSWORD MACOS_INSTALLER_SIGNING_IDENTITY MACOS_TEAM_ID MACOS_NOTARY_KEY_BASE64 MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID ;;
+    *) return 1 ;;
+  esac
+}
+
+# check_stage STAGE: one release job's share of the configuration.
+check_stage() {
+  case "$-" in *x*) refuse "tracing is on, and would print the secrets" ;; esac
+  local stage="$1" own expect n missing='' extra='' set_names=''
+  own="$(stage_names "$stage")" || refuse "no stage called $(printf '%q' "$stage")"
+  case "${SYNDEO_EXPECT_SIGNED-}" in
+    '' | no) expect=no ;;
+    yes) expect=yes ;;
+    *) refuse "SYNDEO_EXPECT_SIGNED must be yes, no or empty, not $(printf '%q' "$SYNDEO_EXPECT_SIGNED")" ;;
+  esac
+  for n in "${NAMES[@]}"; do
+    [ -z "${!n-}" ] || set_names="$set_names $n"
+    case " $own " in
+      *" $n "*) [[ "${!n-}" =~ [^[:space:]] ]] || missing="$missing $n" ;;
+      *) [ -z "${!n-}" ] || extra="$extra $n" ;;
+    esac
+  done
+  if [ "$expect" = no ]; then
+    [ -z "$set_names" ] || refuse "SYNDEO_EXPECT_SIGNED is no, but these are set:$set_names"
+  else
+    [ -z "$extra" ] || refuse "the $stage stage was given what it does not need:$extra"
+    [ -z "$missing" ] || refuse "SYNDEO_EXPECT_SIGNED is yes, but the $stage stage lacks, or has blank:$missing"
+    [[ "$MACOS_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || refuse "MACOS_TEAM_ID is not ten capital letters and digits"
+    case " $own " in
+      *" MACOS_SIGNING_IDENTITY "*)
+        identity_of_team Application "$MACOS_SIGNING_IDENTITY" "$MACOS_TEAM_ID" ||
+          refuse "MACOS_SIGNING_IDENTITY is not a Developer ID Application identity of MACOS_TEAM_ID" ;;
+    esac
+    case " $own " in
+      *" MACOS_INSTALLER_SIGNING_IDENTITY "*)
+        identity_of_team Installer "$MACOS_INSTALLER_SIGNING_IDENTITY" "$MACOS_TEAM_ID" ||
+          refuse "MACOS_INSTALLER_SIGNING_IDENTITY is not a Developer ID Installer identity of MACOS_TEAM_ID" ;;
+    esac
+  fi
+  printf 'stage %s: signing %s\n' "$stage" "$expect"
 }
 
 check() {
@@ -195,6 +254,65 @@ self_test() {
     run 1 "SYNDEO_EXPECT_SIGNED must be yes, no or empty" "$(printf '%q' "$e"), nothing set: refused" SYNDEO_EXPECT_SIGNED="$e"
   done
 
+  printf '\n  one release job at a time (--stage)\n'
+  # stage_run WANT TEXT LABEL STAGE [NAME=VALUE...]: --stage STAGE, with only
+  # PATH and the given variables.
+  stage_run() {
+    local want="$1" text="$2" label="$3" stage="$4" status out verdict=yes
+    shift 4
+    out="$(env -i PATH="$PATH" "$@" bash "$0" --stage "$stage" 2>&1)" && status=0 || status=$?
+    [ "$status" = "$want" ] || verdict=no
+    printf '%s' "$out" | grep -qF -- "$text" || verdict=no
+    if printf '%s' "$out" | grep -qE "SECRETVALUE|$team\)|U0VDUkVU"; then verdict=no; fi
+    cases=$((cases + 1))
+    if [ "$verdict" = yes ]; then
+      printf '  ok    %s\n' "$label"
+    else
+      printf '  WRONG %s (exit %s: %s)\n' "$label" "$status" "$out"
+      wrong=$((wrong + 1))
+    fi
+  }
+  # only NAMES...: the good values of exactly those names.
+  only() {
+    local v n
+    for v in "${good[@]}"; do
+      for n in "$@"; do [ "${v%%=*}" != "$n" ] || printf '%s\0' "$v"; done
+    done
+  }
+  local stage names first outsider
+  for stage in binary-sign binary-notarize package; do
+    names="$(stage_names "$stage")"
+    # shellcheck disable=SC2086
+    load < <(only $names)
+    stage_run 0 "stage $stage: signing yes" "$stage, yes, exactly its own: passes" "$stage" SYNDEO_EXPECT_SIGNED=yes "${env_[@]}"
+    outsider=''
+    for n in "${NAMES[@]}"; do case " $names " in *" $n "*) ;; *) outsider="$n"; break ;; esac; done
+    stage_run 1 "given what it does not need: $outsider" "$stage, yes, and $outsider too: refused" "$stage" \
+      SYNDEO_EXPECT_SIGNED=yes "${env_[@]}" "$outsider=SECRETVALUE"
+    for first in $names; do
+      # shellcheck disable=SC2086,SC2046 # the names, split on purpose
+      load < <(only $(printf '%s\n' $names | grep -vx "$first"))
+      stage_run 1 "lacks, or has blank: $first" "$stage, yes, without $first: refused" "$stage" SYNDEO_EXPECT_SIGNED=yes "${env_[@]}"
+    done
+    stage_run 0 "stage $stage: signing no" "$stage, no, nothing set: passes" "$stage" SYNDEO_EXPECT_SIGNED=no
+    first="${names%% *}"
+    stage_run 1 "these are set: $first" "$stage, no, with $first set: refused" "$stage" SYNDEO_EXPECT_SIGNED=no "$first=SECRETVALUE"
+  done
+  # shellcheck disable=SC2046
+  load < <(only $(stage_names binary-sign))
+  stage_run 1 "MACOS_SIGNING_IDENTITY is not" "binary-sign, an Application identity of another team: refused" binary-sign \
+    SYNDEO_EXPECT_SIGNED=yes "${env_[@]}" "MACOS_SIGNING_IDENTITY=Developer ID Application: SECRETVALUE Org (ZZ99ZZ99ZZ)"
+  # shellcheck disable=SC2046
+  load < <(only $(stage_names package))
+  stage_run 1 "MACOS_INSTALLER_SIGNING_IDENTITY is not" "package, an Installer identity of another team: refused" package \
+    SYNDEO_EXPECT_SIGNED=yes "${env_[@]}" "MACOS_INSTALLER_SIGNING_IDENTITY=Developer ID Application: SECRETVALUE Org ($team)"
+  # shellcheck disable=SC2046
+  load < <(only $(stage_names binary-notarize))
+  stage_run 1 "MACOS_TEAM_ID is not" "binary-notarize, a malformed team id: refused" binary-notarize \
+    SYNDEO_EXPECT_SIGNED=yes "${env_[@]}" MACOS_TEAM_ID=ab12cd34ef
+  stage_run 1 "no stage called" "an unknown stage: refused" release SYNDEO_EXPECT_SIGNED=no
+  stage_run 1 "SYNDEO_EXPECT_SIGNED must be yes, no or empty" "a stage with SYNDEO_EXPECT_SIGNED=YES: refused" package SYNDEO_EXPECT_SIGNED=YES
+
   printf '\n  how it runs\n'
   local out status
   out="$(env -i PATH="$PATH" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" bash -x "$0" 2>&1)" && status=0 || status=$?
@@ -231,5 +349,9 @@ self_test() {
 case "${1:-}" in
   --self-test) self_test ;;
   '' | --github-output) check "${1:-}" ;;
-  *) echo "usage: $0 [--github-output] | --self-test" >&2; exit 2 ;;
+  --stage)
+    [ "$#" = 2 ] || { echo "usage: $0 --stage NAME" >&2; exit 2; }
+    check_stage "$2"
+    ;;
+  *) echo "usage: $0 [--github-output] | --stage NAME | --self-test" >&2; exit 2 ;;
 esac
