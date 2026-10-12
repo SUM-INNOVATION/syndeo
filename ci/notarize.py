@@ -368,7 +368,11 @@ def self_test():
         if want_calls is not None and calls != want_calls:
             problems.append("calls %s, not %s" % (calls, want_calls))
         if check:
-            problems += check(record, calls, out) or []
+            # A check that cannot even read the record is a wrong case, not a crash.
+            try:
+                problems += check(record, calls, out) or []
+            except Exception as e:
+                problems.append("the check failed: %s: %s" % (e.__class__.__name__, e))
         strays = sorted(set(os.listdir(case)) - {"record", "temp", "notarize.zip", "calls", "keys", "state"})
         if strays:
             problems.append("wrote outside the record: %s" % strays)
