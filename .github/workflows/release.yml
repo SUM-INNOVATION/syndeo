@@ -212,7 +212,11 @@ jobs:
         shell: bash
         run: ./ci/package.sh "$VERSION" aarch64-apple-darwin
 
-      - name: Check the signed binaries in the tarball
+      # Signed, checked, and run: each binary's --version, and the keystore's
+      # status. macOS kills a binary it refuses as it starts, as it killed the
+      # keystore signed with a keychain access group, and that has to fail
+      # here rather than after a notarization submission.
+      - name: Check the signed binaries in the tarball, and run each of them
         if: needs.signing-config.outputs.signed == 'yes'
         env:
           SYNDEO_EXPECT_SIGNED: "yes"
@@ -295,7 +299,7 @@ jobs:
           printf '%s  %s\n' "$WANT" "dist/$TARBALL" | shasum -a 256 -c -
           echo "sha256=$WANT" >> "$GITHUB_OUTPUT"
 
-      - name: Check the signed binaries again, before Apple sees them
+      - name: Check and run the signed binaries again, before Apple sees them
         if: needs.signing-config.outputs.signed == 'yes'
         env:
           SYNDEO_EXPECT_SIGNED: "yes"

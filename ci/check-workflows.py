@@ -389,6 +389,17 @@ def check_order(jobs):
     submitted = first_line(nb, "ci/notarize.py submit")
     if zipped is None or submitted is None or zipped > submitted:
         found.append("release.yml: notarize-binaries does not make the binaries' ZIP before it submits")
+    # Every signed binary checked and run before Apple sees any of them: in
+    # build-macos once they are signed, and in notarize-binaries before the
+    # ZIP is made and anything is submitted. macOS kills a binary it refuses
+    # as it starts, and a submission is not something to spend on one.
+    run = "ci/verify-pkg.sh signed-binaries"
+    signing, ran = first_line(b, "ci/sign-macos.sh"), first_line(b, run)
+    if signing is None or ran is None or ran < signing:
+        found.append("release.yml: build-macos does not run the signed binaries (%s) once it has signed them" % run)
+    ran = first_line(nb, run)
+    if ran is None or zipped is None or submitted is None or ran > zipped or ran > submitted:
+        found.append("release.yml: notarize-binaries does not run the signed binaries (%s) before the ZIP and the submission" % run)
     order = [first_line(pk, x) for x in ("ci/sign-macos-pkg.sh sign", "ci/notarize.py submit", "ci/notarize.py wait",
                                           "ci/sign-macos-pkg.sh finish", "ci/verify-pkg.sh inspect")]
     if None in order or order != sorted(order):
@@ -588,6 +599,29 @@ def self_test(directory):
          in_job(rel, "build-macos", "      - name: The tarball\n",
                 "      - run: python3 -I ci/notarize.py submit dist/x.zip --record r\n      - name: The tarball\n"),
          "build-macos notarizes")
+    signed_run = '        run: bash ci/verify-pkg.sh signed-binaries "dist/$TARBALL" "$VERSION"\n'
+    case("build-macos not running the signed binaries", ci,
+         in_job(rel, "build-macos", signed_run, "        run: true\n"),
+         "build-macos does not run the signed binaries")
+    a, b = job(rel, "build-macos")
+    text = rel[a:b]
+    sign_at = text.index("      - name: Sign the binaries\n")
+    check_at = text.index("      - name: Check the signed binaries in the tarball, and run each of them\n")
+    sum_at = text.index("      - name: The tarball's SHA-256\n")
+    early = text[:sign_at] + text[check_at:sum_at] + text[sign_at:check_at] + text[sum_at:]
+    case("build-macos running the binaries before it signs them", ci, rel[:a] + early + rel[b:],
+         "build-macos does not run the signed binaries")
+    case("notarize-binaries not running the signed binaries", ci,
+         in_job(rel, "notarize-binaries", signed_run, "        run: true\n"),
+         "notarize-binaries does not run the signed binaries")
+    a, b = job(rel, "notarize-binaries")
+    text = rel[a:b]
+    check_at = text.index("      - name: Check and run the signed binaries again, before Apple sees them\n")
+    zip_at = text.index("      - name: The ZIP of exactly the seven executables\n")
+    wait_at = text.index("      - name: Wait for Apple's verdict on the binaries\n")
+    late = text[:check_at] + text[zip_at:wait_at] + text[check_at:zip_at] + text[wait_at:]
+    case("notarize-binaries running the binaries only after it submits them", ci, rel[:a] + late + rel[b:],
+         "notarize-binaries does not run the signed binaries")
     case("notarize-binaries without a time limit", ci,
          in_job(rel, "notarize-binaries", "    timeout-minutes: 350\n", ""), "notarize-binaries sets no timeout-minutes")
     case("package allowed GitHub's whole 360 minutes", ci,
@@ -674,7 +708,8 @@ def main():
         return 1
     print("check-workflows: ci.yml reads no secret and no environment; in release.yml only signing-config, build-macos, "
           "notarize-binaries and package, behind release-macos, read secrets, each only its own share, each gating first; "
-          "the macOS release runs build, notarize the binaries, package, in order, on one tarball by its SHA-256, with one "
+          "the macOS release runs build, notarize the binaries, package, in order, on one tarball by its SHA-256, runs "
+          "every signed binary before Apple sees any of them, with one "
           "submission per file inside each job's time; every release is created a draft, publish checks it before making "
           "it public, and rehearse only deletes its own")
     return 0

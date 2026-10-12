@@ -68,7 +68,8 @@ jobs:
       # Where the signing secrets may go: nowhere in this workflow, and in
       # release.yml only to the four jobs that declare release-macos, each its
       # own share, after its gate; and the macOS release's order, its one
-      # tarball, and one submission per file within each job's time.
+      # tarball, every signed binary run before Apple sees any of them, and
+      # one submission per file within each job's time.
       - run: python3 -I ci/check-workflows.py
       - run: python3 -I ci/check-workflows.py --self-test
       # Nothing a pull request runs may see a signing or notarization secret.

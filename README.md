@@ -750,9 +750,15 @@ version, and builds the three targets and the macOS installer package.
   - Signed, the macOS release goes through three jobs, in order:
     1. `build-macos` signs the binaries with `ci/sign-macos.sh` (Developer ID
        Application, the hardened runtime and a secure timestamp, and no
-       entitlements), checks them, and makes the tarball.
-    2. `notarize-binaries` sends exactly those binaries to Apple once, with
-       `ci/notarize.py`, and waits for the verdict.
+       entitlements) and makes the tarball. It then checks the signatures and
+       runs every binary in it (`ci/verify-pkg.sh signed-binaries`): each
+       `--version` has to exit 0 with exactly its name and version, and
+       `syndeo-keystore status` has to report presence unenforced and the
+       passphrase required. macOS kills a binary it refuses as it starts, and
+       that fails here, before Apple is sent anything.
+    2. `notarize-binaries` checks and runs exactly those binaries again, then
+       sends them to Apple once, with `ci/notarize.py`, and waits for the
+       verdict.
     3. `package` builds the installer package from that same tarball,
        checked by its SHA-256. It signs it with `ci/sign-macos-pkg.sh`, sends
        it to Apple once, waits, and only then staples it.

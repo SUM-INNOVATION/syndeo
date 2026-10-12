@@ -29,8 +29,13 @@
 #
 # signed-binaries checks the seven executables of a release tarball the way
 # inspect checks the package's, with SYNDEO_EXPECT_SIGNED=yes and
-# MACOS_TEAM_ID: release.yml runs it on the signed tarball before the
-# binaries are sent to be notarized.
+# MACOS_TEAM_ID, and then runs each of them: --version has to exit 0 and say
+# exactly "<name> <version>", and syndeo-keystore status, in a home of its
+# own, has to report platform presence unenforced and the passphrase
+# required. release.yml runs it on the signed tarball right after signing and
+# again before the binaries are sent to be notarized, so a binary macOS kills
+# at launch (as it killed the keystore signed with a keychain access group)
+# fails before any notarization submission is spent on it.
 #
 # release is what release.yml checks a release's assets with. sums requires
 # <dir> to hold exactly the three tarballs and the package of <version> and
@@ -58,6 +63,9 @@
 #                         Root CA, its notarization ticket stapled, and
 #                         Gatekeeper accepts it as Notarized Developer ID.
 #   MACOS_TEAM_ID         with yes, the team every signature has to be of.
+#
+# For signed-binaries, SYNDEO_VERIFY_LAUNCH_SECONDS (60 by default) is how
+# long each run may take; the self-test shortens it.
 #
 # Exits non-zero if any check fails.
 set -uo pipefail
@@ -457,9 +465,55 @@ release_check() {
   fi
 }
 
+# bounded SECONDS COMMAND...: COMMAND, with stdin closed, killed by SIGALRM if
+# it runs longer than SECONDS; its stdout and stderr together, and its exit
+# status, are what the caller captures.
+bounded() {
+  perl -e 'alarm shift @ARGV; exec @ARGV or die "exec: $!\n"' "$@" </dev/null 2>&1
+}
+
+# launch_problem STATUS OUT WANT SECONDS: what was wrong with a run that did
+# not exit 0 saying exactly WANT.
+launch_problem() {
+  case "$1" in
+    0) printf "said '%s', not %s" "$(printf '%s' "$2" | head -c 120 | tr '\n' '|')" "$3" ;;
+    142) printf 'did not finish in %s seconds' "$4" ;;
+    1[3-9][0-9] | 2[0-5][0-9]) printf 'killed by signal %s at launch' "$(($1 - 128))" ;;
+    *) printf "exited %s, saying '%s'" "$1" "$(printf '%s' "$2" | head -c 120 | tr '\n' '|')" ;;
+  esac
+}
+
+# launched TREE VERSION: each of the seven executables in TREE, run. Signed
+# alike and checked alike is not enough: macOS can still refuse to run a
+# signed binary, and does so by killing it as it starts.
+launched() {
+  local tree="$1" v="$2" n out status home seconds="${SYNDEO_VERIFY_LAUNCH_SECONDS:-60}"
+  note "each signed executable, run (each within $seconds seconds)"
+  for n in $NAMES; do
+    out="$(bounded "$seconds" "$tree/$n" --version)" && status=0 || status=$?
+    if [ "$status" = 0 ] && [ "$out" = "$n $v" ]; then
+      ok "$n --version: exits 0 and says '$n $v'"
+    else
+      bad "$n" "--version: $(launch_problem "$status" "$out" "'$n $v'" "$seconds")"
+    fi
+  done
+  # The keystore, asked what it enforces, in a home that holds nothing: the
+  # ordinary keychain, presence unenforced, the passphrase required.
+  home="$(mktemp -d "$inspect_work/keystore-home.XXXXXX")"
+  out="$(SYNDEO_HOME="$home" HOME="$home" bounded "$seconds" "$tree/syndeo-keystore" status)" && status=0 || status=$?
+  if [ "$status" = 0 ] && printf '%s\n' "$out" | grep -qx 'presence enforced    false' &&
+    printf '%s\n' "$out" | grep -qx 'passphrase required  true'; then
+    ok "syndeo-keystore status: platform presence unenforced, the passphrase required"
+  elif [ "$status" = 0 ]; then
+    bad "syndeo-keystore status" "does not report platform presence unenforced and the passphrase required: $(printf '%s' "$out" | grep -E '^(presence enforced|passphrase required)' | tr '\n' ';')"
+  else
+    bad "syndeo-keystore status" "$(launch_problem "$status" "$out" "a status" "$seconds")"
+  fi
+}
+
 # signed_binaries TARBALL VERSION: the release tarball's executables, signed
-# and ready to be notarized. Requires SYNDEO_EXPECT_SIGNED=yes and
-# MACOS_TEAM_ID.
+# and ready to be notarized, and each of them run. Requires
+# SYNDEO_EXPECT_SIGNED=yes and MACOS_TEAM_ID.
 signed_binaries() {
   local tarball="$1" v="$2" team="${MACOS_TEAM_ID:-}" name
   [ "${SYNDEO_EXPECT_SIGNED:-}" = yes ] || { echo "signed-binaries needs SYNDEO_EXPECT_SIGNED=yes" >&2; return 2; }
@@ -477,6 +531,7 @@ signed_binaries() {
     return 0
   fi
   signed_executables "$inspect_work/binaries/$name" "$team"
+  launched "$inspect_work/binaries/$name" "$v"
 }
 
 # ------------------------------------------------------------------ installed
@@ -1332,7 +1387,25 @@ st_tarball() {
   name="syndeo-$v-aarch64-apple-darwin"
   mkdir -p "$dir/src/$name/tools"
   for n in $NAMES; do
-    printf '#!/bin/sh\necho "%s %s"\n' "$n" "$v" >"$dir/src/$name/$n"
+    # What it says, unless a knob names it: STANDIN_KILLED (killed as it
+    # starts, as macOS kills a binary it refuses), STANDIN_SAYS_OTHER,
+    # STANDIN_EXITS (exit 3), STANDIN_HANGS; and the keystore's status, with
+    # STANDIN_PRESENCE and STANDIN_PASSPHRASE_REQUIRED.
+    cat >"$dir/src/$name/$n" <<EOF
+#!/bin/sh
+n=$n v=$v
+EOF
+    cat >>"$dir/src/$name/$n" <<'EOF'
+[ "$n" != "${STANDIN_KILLED:-}" ] || kill -9 $$
+[ "$n" != "${STANDIN_HANGS:-}" ] || exec sleep 30
+if [ "$n" = syndeo-keystore ] && [ "${1:-}" = status ]; then
+  printf 'initialized          false\nunsealed             false\n'
+  printf 'passphrase required  %s\npresence enforced    %s\n' "${STANDIN_PASSPHRASE_REQUIRED:-true}" "${STANDIN_PRESENCE:-false}"
+  exit 0
+fi
+if [ "$n" = "${STANDIN_SAYS_OTHER:-}" ]; then echo "$n 9.9.9"; else echo "$n $v"; fi
+[ "$n" != "${STANDIN_EXITS:-}" ] || exit 3
+EOF
     chmod 755 "$dir/src/$name/$n"
   done
   cp "$here/../README.md" "$here/../LICENSE" "$dir/src/$name/"
@@ -1492,7 +1565,8 @@ EOF
     out="$(env "$@" PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF \
       bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)"
     if [ "$fails" = 0 ]; then
-      expect "signed-binaries: $label" eval "printf '%s' \"\$out\" | grep -q '7 passed, 0 failed'"
+      # Seven signatures, seven runs, and the keystore's status.
+      expect "signed-binaries: $label" eval "printf '%s' \"\$out\" | grep -q '15 passed, 0 failed'"
     else
       expect "signed-binaries: $label" eval "printf '%s' \"\$out\" | grep -q ' passed, $fails failed' && printf '%s' \"\$out\" | grep 'FAIL' | grep -qF -- \"\$text\""
     fi
@@ -1506,6 +1580,13 @@ EOF
   binaries_case "the keystore with the keychain access group it used to claim" 1 "syndeo-keystore — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=syndeo-keystore
   binaries_case "the access group on another executable" 1 "syndeo-ui — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=syndeo-ui
   binaries_case "any entitlement on any executable" 1 "syndeo-webkit — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=syndeo-webkit "STANDIN_ENTITLEMENT=<key>com.apple.security.cs.disable-library-validation</key><true/>"
+  binaries_case "the keystore killed at launch, as macOS killed it entitled: fails, its version and its status" 2 "syndeo-keystore — --version: killed by signal 9 at launch" STANDIN_KILLED=syndeo-keystore
+  binaries_case "another executable killed at launch" 1 "syndeo-proxy — --version: killed by signal 9 at launch" STANDIN_KILLED=syndeo-proxy
+  binaries_case "an executable that says another version" 1 "syndeo-net — --version: said 'syndeo-net 9.9.9', not 'syndeo-net 0.0.1'" STANDIN_SAYS_OTHER=syndeo-net
+  binaries_case "an executable that says its version and exits non-zero" 1 "syndeo-agent — --version: exited 3, saying 'syndeo-agent 0.0.1'" STANDIN_EXITS=syndeo-agent
+  binaries_case "an executable that does not finish" 1 "syndeo-ui — --version: did not finish in 2 seconds" STANDIN_HANGS=syndeo-ui SYNDEO_VERIFY_LAUNCH_SECONDS=2
+  binaries_case "the keystore claiming platform presence" 1 "syndeo-keystore status — does not report platform presence unenforced and the passphrase required" STANDIN_PRESENCE=true
+  binaries_case "the keystore not requiring the passphrase" 1 "syndeo-keystore status — does not report platform presence unenforced and the passphrase required" STANDIN_PASSPHRASE_REQUIRED=false
   out="$(env -u MACOS_TEAM_ID SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)" && status=0 || status=$?
   expect "signed-binaries: without MACOS_TEAM_ID, refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs MACOS_TEAM_ID'"
   out="$(SYNDEO_EXPECT_SIGNED=no MACOS_TEAM_ID=AB12CD34EF bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)" && status=0 || status=$?
