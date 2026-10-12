@@ -725,18 +725,35 @@ and macOS.
 
 `.github/workflows/release.yml` refuses a tag that disagrees with the workspace
 version, and builds the three targets and the macOS installer package.
-- **One job sees the signing configuration.** The macOS build alone declares
-  the `release-macos` environment, which holds `SYNDEO_EXPECT_SIGNED` and any
-  signing secrets, so no other job sees them. The environment is that
-  boundary, not an approval gate: it has no required reviewers and no wait
-  timer, and a release run waits for no one.
+- **Only the signing jobs see the signing configuration.** The
+  `release-macos` environment holds `SYNDEO_EXPECT_SIGNED` and any signing
+  secrets. Four jobs declare it, and each is given only its own share:
+  - `signing-config` decides;
+  - `build-macos` gets the Application certificate;
+  - `notarize-binaries` gets the notary key;
+  - `package` gets the Installer certificate and the notary key.
+
+  No other job sees any of it. The environment is that boundary, not an
+  approval gate: it has no required reviewers and no wait timer, and a
+  release run waits for no one.
 - **Signing is all or nothing.**
   [`ci/check-signing-config.sh`](ci/check-signing-config.sh) reads the
   environment's `SYNDEO_EXPECT_SIGNED` and the ten secrets it names, and
   refuses any half-configured state.
-  - Signed, `ci/sign-macos.sh` signs and notarizes the binaries, and
-    `ci/sign-macos-pkg.sh` signs, notarizes and staples the package.
-  - Unsigned, neither runs.
+  - Signed, the macOS release goes through three jobs, in order:
+    1. `build-macos` signs the binaries with `ci/sign-macos.sh`, checks them,
+       and makes the tarball.
+    2. `notarize-binaries` sends exactly those binaries to Apple once, with
+       `ci/notarize.py`, and waits for the verdict.
+    3. `package` builds the installer package from that same tarball,
+       checked by its SHA-256. It signs it with `ci/sign-macos-pkg.sh`, sends
+       it to Apple once, waits, and only then staples it.
+
+    Each wait has its own job, and its own deadline inside that job's time
+    limit. A deadline reached means Apple has not decided, which is not a
+    rejection: nothing is resubmitted, and the submission ID is kept to ask
+    about later.
+  - Unsigned, nothing is signed or sent to Apple.
   - v0.1.6 is built with `SYNDEO_EXPECT_SIGNED=no` and no signing secrets,
     so its binaries have no Developer ID and its package is unsigned.
 - **The package** is built from the macOS tarball, inspected against what was

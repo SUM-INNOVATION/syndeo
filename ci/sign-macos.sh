@@ -9,8 +9,10 @@
 # which of the two a user is running.
 #
 # Secrets this reads, all of them secrets of the release-macos environment,
-# which release.yml gives to its macOS build alone, and only
-# after ci/check-signing-config.sh has found all ten consistent:
+# and only after ci/check-signing-config.sh has found all ten consistent.
+# release.yml's build-macos gives it the Application certificate and the team
+# alone, never a notary key, so there it signs and does not notarize:
+# notarize-binaries does that, in a job of its own.
 #
 #   MACOS_CERTIFICATE_P12_BASE64  Developer ID Application certificate and key,
 #                                 exported as .p12 and base64 encoded

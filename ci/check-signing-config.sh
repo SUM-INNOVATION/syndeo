@@ -10,7 +10,8 @@
 # other value is refused.
 #
 # The ten signing and notarization secrets, which belong only to the
-# release-macos environment, and so only to the one job that declares it:
+# release-macos environment, and so only to the jobs that declare it, each of
+# which is given only its own share (see --stage below):
 #
 #   MACOS_CERTIFICATE_P12_BASE64            Developer ID Application, .p12, base64
 #   MACOS_CERTIFICATE_PASSWORD              its export password
