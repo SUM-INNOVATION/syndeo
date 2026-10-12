@@ -3,6 +3,88 @@
 The release workflow reads the section matching the tag and puts it in the
 release notes, so a heading here is `## <version>` and nothing else.
 
+## 0.1.7
+
+The first release whose macOS binaries and installer package are signed with
+a Developer ID and notarized by Apple. v0.1.6 and the releases before it stay
+as they were published: ad-hoc signed and not notarized, and the v0.1.6
+package unsigned.
+
+**Before you upgrade**
+
+- **The macOS binaries are signed with a Developer ID Application identity and
+  notarized.** All seven are standalone executables, signed with the hardened
+  runtime and a secure timestamp, and none carries an entitlement. A
+  notarization ticket cannot be stapled to a bare executable, so Gatekeeper
+  checks these with Apple when it needs to.
+- **The installer package is signed with a Developer ID Installer identity and
+  notarized, and its ticket is stapled.** Gatekeeper accepts it as Notarized
+  Developer ID.
+- **Secure Enclave presence is still not enforced, and the passphrase is still
+  mandatory.** Signing does not change that:
+  - The keystore keeps its wrapping key in the ordinary macOS keychain, as
+    every earlier release did, and `syndeo-keystore status` reports platform
+    presence as unenforced.
+  - Enforcing it needs the data protection keychain, and so a keychain access
+    group entitlement, which macOS honours only where a provisioning profile
+    authorises it. A standalone executable cannot carry one: signed with the
+    entitlement anyway, the keystore is killed at launch.
+  - Stronger integration would take wrapping the keystore in an app-like
+    bundle with a provisioning profile. That is not part of this release.
+- **With the package, quit Syndeo before installing or upgrading,** as with
+  v0.1.6.
+
+**Changed**
+
+- **The release workflow signs and notarizes.**
+  - Notarization is split into two stages, each in a job of its own, with its
+    own deadline inside that job's time limit:
+    - the payload, the seven executables, sent to Apple once as one ZIP;
+    - then the installer package, built only from the exact tarball whose
+      binaries Apple accepted, checked by its SHA-256, and sent once.
+
+    Each submission's ID is recorded before the wait. A deadline reached means
+    Apple has not decided, which is not a rejection, and nothing is
+    resubmitted.
+  - The package is stapled only once Apple has accepted exactly that file, and
+    Gatekeeper then has to accept it as Notarized Developer ID.
+  - Each job that signs or notarizes is given only its own share of the
+    signing secrets, and checks that share before it uses any of it.
+- **Every signed binary is run before anything is sent to Apple.** Each
+  `--version` has to exit 0 and say exactly its name and version, and
+  `syndeo-keystore status` has to report presence unenforced and the
+  passphrase required.
+- **The keystore no longer has an entitlements file,** and
+  `syndeo-keystore status` no longer suggests signing it with one.
+
+**Security**
+
+- **quinn-proto 0.11.17 → 0.11.18**, for RUSTSEC-2026-0338, RUSTSEC-2026-0340
+  and RUSTSEC-2026-0343. It is in `syndeo-net`, and through it in
+  `syndeo-proxy`. None of the three advisories' preconditions was found in how
+  Syndeo uses QUIC: streams are read in order, ACK frequency is off, and no
+  datagrams are sent. The update removes the affected code all the same.
+
+**What was and was not tested**
+
+- **The release workflow publishes only after:**
+  - the seven signed binaries pass their checks and run;
+  - Apple accepts the binaries, and then the package;
+  - the package is stapled, and Gatekeeper accepts it;
+  - the package is installed, used and removed on a fresh macOS runner;
+  - a draft's assets and notes are checked against what was built.
+- **A signed dry run of this exact commit and version** ran before the tag.
+  An earlier signed dry run had Apple accept both submissions, then found the
+  keystore, signed with its keychain access group, killed at launch. That is
+  why the entitlement is gone and every binary is now run first.
+- **The keystore's fallback** is tested against the real ordinary keychain on
+  CI's macOS runner: the key stored there and nowhere else, and setup and
+  unsealing refused without the passphrase.
+- **Not tested:**
+  - installing from Finder;
+  - Gatekeeper on a browser-downloaded tarball;
+  - Secure Enclave presence, which no build enforces.
+
 ## 0.1.6
 
 The first release with a macOS installer package, which installs Syndeo for

@@ -50,10 +50,14 @@ welcome as a second opinion; they are not treated as new.
   status` says so. Enforcing presence would take an app-like bundle with a
   provisioning profile, which is separate work.
 - **macOS releases through v0.1.6 are ad-hoc signed**, without Developer ID or
-  notarization. A browser-downloaded archive is quarantined and Gatekeeper
-  rejects it; the one-line installer is not quarantined.
+  notarization. A browser-downloaded archive of them is quarantined and
+  Gatekeeper rejects it; the one-line installer is not quarantined. From
+  v0.1.7 the binaries are signed with a Developer ID and notarized, and the
+  package is signed, notarized and stapled.
 - **The macOS installer package runs two scripts as root.** v0.1.6 is the
-  first release to include the package, and the v0.1.6 package is unsigned.
+  first release to include the package, and the v0.1.6 package is unsigned;
+  from v0.1.7 it is signed with a Developer ID Installer identity, notarized
+  and stapled. Signing says who built it, not that its scripts are harmless.
   - Its preinstall refuses to install over anything it cannot account for.
     The reason is normally recorded in `/var/log/install.log`, but is not
     guaranteed to appear there.

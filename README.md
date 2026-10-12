@@ -58,11 +58,13 @@ unpacking one yourself does the same thing.
 - **Windows and ChromeOS**: not yet, and tracked at
   [#17](https://github.com/SUM-INNOVATION/syndeo/issues/17).
 
-**macOS releases through v0.1.6 are ad-hoc signed, without Developer ID or
-notarization.**
-Installed with the one-liner above, the binaries are not quarantined and run.
-An archive downloaded in a browser is quarantined, and Gatekeeper rejects its
-executables, which have no Developer ID — use the one-liner instead.
+**From v0.1.7, the macOS binaries are signed with a Developer ID and
+notarized, and the installer package is signed, notarized and stapled.**
+Releases through v0.1.6 are ad-hoc signed, without Developer ID or
+notarization: installed with the one-liner above, those binaries are not
+quarantined and run, while an archive of them downloaded in a browser is
+quarantined, and Gatekeeper rejects its executables — use the one-liner for
+them instead.
 
 **No macOS build enforces Secure Enclave presence (Touch ID), signed or not.**
 The keystore keeps its wrapping key in the ordinary login keychain, reports
@@ -150,12 +152,14 @@ sudo installer -pkg syndeo-<version>-aarch64-apple-darwin.pkg -target /
   sudo /usr/sbin/pkgutil --forget com.sum.syndeo.pkg --volume /
   ```
 - **Signing.**
-  - The v0.1.6 package is unsigned. A package is signed only by a release
-    built with a Developer ID Installer identity.
-  - The binaries in it are ad-hoc signed, without Developer ID or
-    notarization.
-  - Downloaded with `curl`, as above, it is not quarantined and installs.
-  - Opened from a browser download, Gatekeeper is expected to reject it.
+  - From v0.1.7 the package is signed with a Developer ID Installer identity,
+    notarized, and its ticket stapled, and Gatekeeper accepts it. The
+    binaries in it are signed with a Developer ID Application identity and
+    notarized, and carry no entitlements.
+  - The v0.1.6 package is unsigned, and the binaries in it are ad-hoc
+    signed, without Developer ID or notarization. Downloaded with `curl`, as
+    above, it is not quarantined and installs; opened from a browser
+    download, Gatekeeper is expected to reject it.
 - **What was tested.** Every pull request builds the package from the release
   tarball, inspects it, and installs it for real on a disposable
   GitHub-hosted macOS 15 runner. The test covers:
@@ -716,8 +720,12 @@ Before handing a release to anyone, check the thing that was published rather
 than the thing that was built:
 
 ```sh
-ci/verify-release.sh 0.1.6
+SYNDEO_EXPECT_SIGNED=yes ci/verify-release.sh 0.1.7
 ```
+
+`SYNDEO_EXPECT_SIGNED=yes` is for a signed release, v0.1.7 and later; for an
+earlier one leave it out, and the binaries are expected to carry no Developer
+ID.
 
 It installs from the release with the same one-liner the README gives, into a
 throwaway directory, and then asks the installed binaries to demonstrate what
@@ -768,8 +776,9 @@ version, and builds the three targets and the macOS installer package.
     rejection: nothing is resubmitted, and the submission ID is kept to ask
     about later.
   - Unsigned, nothing is signed or sent to Apple.
-  - v0.1.6 is built with `SYNDEO_EXPECT_SIGNED=no` and no signing secrets,
-    so its binaries have no Developer ID and its package is unsigned.
+  - v0.1.6 was built with `SYNDEO_EXPECT_SIGNED=no` and no signing secrets,
+    so its binaries have no Developer ID and its package is unsigned. v0.1.7
+    is the first release built with `SYNDEO_EXPECT_SIGNED=yes`.
 - **The package** is built from the macOS tarball, inspected against what was
   decided (`ci/verify-pkg.sh inspect`), and installed and removed on a fresh
   runner.
