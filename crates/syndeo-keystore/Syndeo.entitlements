@@ -10,7 +10,7 @@
     back to the ordinary keychain, and it reports platform presence as
     unenforced — at which point the passphrase becomes mandatory instead.
 
-    Sign with a real identity, not ad-hoc: `codesign --sign -` with this
+    Sign with a real identity, not ad-hoc: ad-hoc signing with this
     entitlement produces a binary the kernel kills at launch, because the access
     group has no team prefix behind it. $(AppIdentifierPrefix) is substituted by
     Xcode; signing from the command line wants the literal team prefix in its

@@ -56,6 +56,11 @@ jobs:
       # of it; and the package's signing order, with stand-ins for the tools
       # (macOS only). A pull request never signs anything.
       - run: bash ci/check-signing-config.sh --self-test
+      # The keystore's entitlements, as committed and as release signing
+      # renders them, parsed strictly (on macOS by codesign itself, signing a
+      # scratch binary ad hoc), so a release never finds them malformed.
+      - run: bash ci/check-entitlements.sh
+      - run: bash ci/check-entitlements.sh --self-test
       - run: bash ci/sign-macos-pkg.sh --self-test
       # Where the signing secrets may go: nowhere in this workflow, and in
       # release.yml only to the macOS build, the one job that declares the
