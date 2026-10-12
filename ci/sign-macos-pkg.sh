@@ -1,44 +1,48 @@
 #!/usr/bin/env bash
-# Sign, notarize and staple the macOS installer package, in a fixed order.
+# Sign the macOS installer package, and, once Apple has accepted it, staple
+# it. Notarization itself is ci/notarize.py's, between the two.
 #
-#   ci/sign-macos-pkg.sh <unsigned.pkg> <signed.pkg>
+#   ci/sign-macos-pkg.sh sign <unsigned.pkg> <signed.pkg> <state-dir>
+#   ci/sign-macos-pkg.sh finish <signed.pkg> <state-dir> <notarization-record>
 #   ci/sign-macos-pkg.sh --self-test
 #
-# Only for a release that ci/check-signing-config.sh calls signed: it runs
-# that first, with the whole configuration, and refuses anything else. Then,
-# stopping at the first failure:
-#  1. expand the unsigned package (pkgutil --expand-full);
+# Only for a release that ci/check-signing-config.sh calls signed
+# (SYNDEO_EXPECT_SIGNED=yes); both modes refuse anything else.
+#
+# sign, stopping at the first failure:
+#  1. expand the unsigned package (pkgutil --expand-full), and keep its
+#     manifest in <state-dir>, which must not exist yet;
 #  2. productsign it with the Developer ID Installer identity, from a keychain
 #     of its own, into <signed.pkg>;
 #  3. expand that, and require it identical to the unsigned one: the
 #     Distribution, PackageInfo, BOM, scripts and every payload path, with its
-#     bytes, mode, owner and link target. Only the signature may differ;
-#  4. notarize it (notarytool submit --wait). The status has to be Accepted;
-#     anything else fetches the notary's log, prints it, and fails;
-#  5. staple the ticket to it, and validate the ticket;
-#  6. expand it once more, and require the same again;
-#  7. require Gatekeeper to accept it as Notarized Developer ID, from the
-#     Installer identity.
+#     bytes, mode, owner and link target. Only the signature may differ.
 # Before it changes anything it reads the user keychain search list, and stops
 # if it cannot. Whatever happens after that, cleanup attempts all of: putting
 # that list back, deleting its keychain, removing its working directory (the
-# certificate, the notary key and the expansions), and reading the list back
-# to check it is exactly as it was. If any of those fails, that is a failure
-# too, even of a package otherwise signed. On any failure <signed.pkg> is
-# removed, so nothing half-done can be shipped, and the exit status is the
-# first failure's.
+# certificate and the expansions), and reading the list back to check it is
+# exactly as it was. If any of those fails, that is a failure too, even of a
+# package otherwise signed.
 #
-# The secrets it uses: MACOS_INSTALLER_CERTIFICATE_P12_BASE64,
-# MACOS_INSTALLER_CERTIFICATE_PASSWORD, MACOS_INSTALLER_SIGNING_IDENTITY,
-# MACOS_NOTARY_KEY_BASE64, MACOS_NOTARY_KEY_ID and MACOS_NOTARY_ISSUER_ID; see
-# ci/check-signing-config.sh for all ten. Nothing is traced, and no value is
-# printed. The tools are found on PATH, which is how the self-test puts
-# stand-ins in their place.
+# finish, after `ci/notarize.py submit <signed.pkg> --record R` and `wait`:
+#  4. refuse unless R says Apple accepted it, and the file R submitted, by
+#     name and SHA-256, is <signed.pkg> exactly as it is now;
+#  5. staple the ticket to it, and validate the ticket;
+#  6. expand it once more, and require it identical to the unsigned package;
+#  7. require Gatekeeper to accept it as Notarized Developer ID, from the
+#     Installer identity.
+#
+# In either mode, on any failure <signed.pkg> is removed, so nothing half-done
+# can be shipped, and the exit status is the first failure's.
+#
+# The secrets: sign uses MACOS_INSTALLER_CERTIFICATE_P12_BASE64,
+# MACOS_INSTALLER_CERTIFICATE_PASSWORD, MACOS_INSTALLER_SIGNING_IDENTITY and
+# MACOS_TEAM_ID; finish uses MACOS_INSTALLER_SIGNING_IDENTITY. Nothing is
+# traced, and no value is printed. The tools are found on PATH, which is how
+# the self-test puts stand-ins in their place.
 set -euo pipefail
 LC_ALL=C
 export LC_ALL
-
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 say() { printf 'sign-macos-pkg: %s\n' "$*"; }
 die() {
@@ -78,23 +82,40 @@ search_list() {
 # same_as_unsigned STEP DIR: DIR, an expansion, is exactly the unsigned one.
 same_as_unsigned() {
   manifest "$2" >"$work/$1.manifest"
-  if ! cmp -s "$work/unsigned.manifest" "$work/$1.manifest"; then
-    diff "$work/unsigned.manifest" "$work/$1.manifest" | grep '^[<>]' | head -10 >&2 || true
+  if ! cmp -s "$state/unsigned.manifest" "$work/$1.manifest"; then
+    diff "$state/unsigned.manifest" "$work/$1.manifest" | grep '^[<>]' | head -10 >&2 || true
     die "$1: the package's contents differ from the unsigned package's"
   fi
 }
 
+# signed_yes: SYNDEO_EXPECT_SIGNED says yes.
+signed_yes() {
+  [ "${SYNDEO_EXPECT_SIGNED-}" = yes ] || die "refusing: SYNDEO_EXPECT_SIGNED is not yes, so there is nothing to sign"
+}
+
+# not_blank NAME...: each is set to something besides white space.
+not_blank() {
+  local n missing=''
+  for n in "$@"; do [[ "${!n-}" =~ [^[:space:]] ]] || missing="$missing $n"; done
+  [ -z "$missing" ] || die "refusing: not set:$missing"
+}
+
 sign() {
   case "$-" in *x*) die "refusing: tracing is on, and would print the secrets" ;; esac
-  [ "$#" = 2 ] || die "usage: $0 <unsigned.pkg> <signed.pkg>"
+  [ "$#" = 3 ] || die "usage: $0 sign <unsigned.pkg> <signed.pkg> <state-dir>"
   unsigned="$1"
   out="$2"
-  local decision
-  decision="$(bash "$here/check-signing-config.sh")" || die "refusing: the signing configuration is not consistent"
-  [ "$decision" = "signing: yes" ] || die "refusing: SYNDEO_EXPECT_SIGNED is not yes, so there is nothing to sign"
+  state="$3"
+  signed_yes
+  not_blank MACOS_INSTALLER_CERTIFICATE_P12_BASE64 MACOS_INSTALLER_CERTIFICATE_PASSWORD MACOS_INSTALLER_SIGNING_IDENTITY MACOS_TEAM_ID
+  local identity="$MACOS_INSTALLER_SIGNING_IDENTITY" team="$MACOS_TEAM_ID"
+  case "$identity" in *[[:cntrl:]]*) die "refusing: MACOS_INSTALLER_SIGNING_IDENTITY is not one line" ;; esac
+  [[ "$team" =~ ^[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10}$ ]] || die "refusing: MACOS_TEAM_ID is not ten capital letters and digits"
+  [[ "$identity" =~ ^Developer\ ID\ Installer:\ .+\ \(([ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10})\)$ ]] && [ "${BASH_REMATCH[1]}" = "$team" ] ||
+    die "refusing: MACOS_INSTALLER_SIGNING_IDENTITY is not a Developer ID Installer identity of MACOS_TEAM_ID"
   [ -f "$unsigned" ] || die "no $unsigned"
   [ ! -e "$out" ] && [ ! -L "$out" ] || die "$out exists"
-  local identity="$MACOS_INSTALLER_SIGNING_IDENTITY"
+  [ ! -e "$state" ] && [ ! -L "$state" ] || die "$state exists"
 
   # The search list as it is, read before anything is changed or made, to
   # put back and check whatever happens. If it cannot be read, nothing has
@@ -112,14 +133,15 @@ sign() {
   keychain=''
   keychain_made=no
   succeeded=no
-  trap cleanup EXIT
+  trap cleanup_sign EXIT
   trap 'exit 130' INT TERM HUP
+  mkdir "$state"
   work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sign-macos-pkg.XXXXXX")"
   keychain="$work/installer.keychain-db"
 
   pkgutil --expand-full "$unsigned" "$work/unsigned" >/dev/null || die "1. could not expand $unsigned"
-  manifest "$work/unsigned" >"$work/unsigned.manifest"
-  say "1. expanded the unsigned package: $(wc -l <"$work/unsigned.manifest" | tr -d ' ') paths"
+  manifest "$work/unsigned" >"$state/unsigned.manifest"
+  say "1. expanded the unsigned package: $(wc -l <"$state/unsigned.manifest" | tr -d ' ') paths"
 
   local password
   password="$(openssl rand -hex 32)"
@@ -141,52 +163,13 @@ sign() {
   pkgutil --expand-full "$out" "$work/signed" >/dev/null || die "3. could not expand the signed package"
   same_as_unsigned 3.signed "$work/signed"
   say "3. the signed package's contents are exactly the unsigned package's"
-
-  printf '%s' "$MACOS_NOTARY_KEY_BASE64" | base64 --decode >"$work/notary.p8" || die "4. the notary key is not base64"
-  local notary=(--key "$work/notary.p8" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID")
-  xcrun notarytool submit "$out" "${notary[@]}" --wait --timeout 30m --output-format json \
-    >"$work/notary.json" 2>"$work/notary.err" || true
-  local status id
-  status="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",""))' "$work/notary.json" 2>/dev/null)" || status=''
-  id="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id",""))' "$work/notary.json" 2>/dev/null)" || id=''
-  if [ "$status" != Accepted ]; then
-    sed 's/^/    /' "$work/notary.err" >&2 || true
-    if [[ "$id" =~ ^[0-9A-Za-z-]+$ ]]; then
-      xcrun notarytool log "$id" "${notary[@]}" "$work/notary-log.json" >/dev/null 2>&1 || true
-      say "4. the notary's log for submission $id:"
-      sed 's/^/    /' "$work/notary-log.json" 2>/dev/null || say "   (it could not be fetched)"
-    fi
-    die "4. notarization ended '${status:-without a status}', not Accepted"
-  fi
-  rm -f "$work/notary.p8"
-  say "4. notarized: submission $id, Accepted"
-
-  xcrun stapler staple "$out" >/dev/null || die "5. could not staple the ticket"
-  xcrun stapler validate "$out" >/dev/null || die "5. the stapled ticket does not validate"
-  say "5. the ticket is stapled and validates"
-
-  pkgutil --expand-full "$out" "$work/stapled" >/dev/null || die "6. could not expand the stapled package"
-  same_as_unsigned 6.stapled "$work/stapled"
-  say "6. the stapled package's contents are exactly the unsigned package's"
-
-  local assessed=yes result
-  spctl -a -vv -t install "$out" >"$work/spctl" 2>&1 || assessed=no
-  result="$(cat "$work/spctl")"
-  if [ "$assessed" = yes ] && printf '%s\n' "$result" | grep -qxF "$out: accepted" &&
-    printf '%s\n' "$result" | grep -qx 'source=Notarized Developer ID' &&
-    printf '%s\n' "$result" | grep -qxF "origin=$identity"; then
-    say "7. Gatekeeper accepts it: Notarized Developer ID, from the Installer identity"
-  else
-    printf '%s\n' "${result//"$identity"/<the Installer identity>}" | sed 's/^/    /' >&2
-    die "7. Gatekeeper does not accept it as Notarized Developer ID from the Installer identity"
-  fi
   succeeded=yes
-  say "signed, notarized and stapled: $out"
+  say "signed, not yet notarized: $out ($(shasum -a 256 "$out" | cut -d' ' -f1))"
 }
 
-# cleanup: every step attempted, whatever failed before it; any of them
+# cleanup_sign: every step attempted, whatever failed before it; any of them
 # failing is a failure, and the first failure's status is kept.
-cleanup() {
+cleanup_sign() {
   local status=$? failed='' now
   # No step may stop the ones after it.
   set +e
@@ -218,10 +201,85 @@ cleanup() {
   exit "$status"
 }
 
+finish() {
+  case "$-" in *x*) die "refusing: tracing is on, and would print the secrets" ;; esac
+  [ "$#" = 3 ] || die "usage: $0 finish <signed.pkg> <state-dir> <notarization-record>"
+  out="$1"
+  state="$2"
+  local record="$3"
+  # The same umask as sign's, so the stapled expansion compares like for like
+  # with the unsigned one.
+  umask 077
+  work=''
+  succeeded=no
+  trap cleanup_finish EXIT
+  trap 'exit 130' INT TERM HUP
+  signed_yes
+  not_blank MACOS_INSTALLER_SIGNING_IDENTITY
+  local identity="$MACOS_INSTALLER_SIGNING_IDENTITY"
+  [ -f "$out" ] || die "no $out"
+  [ -f "$state/unsigned.manifest" ] || die "no $state/unsigned.manifest: was the package signed by this script's sign mode?"
+
+  # 4. Apple accepted exactly this file.
+  local verdict
+  verdict="$(python3 -I - "$record" "$out" 2>&1 <<'PY'
+import hashlib, json, os, sys
+record, pkg = sys.argv[1:3]
+try:
+    sub = json.load(open(os.path.join(record, "submission.json")))
+    res = json.load(open(os.path.join(record, "result.json")))
+except (OSError, ValueError) as e:
+    sys.exit("no notarization record in %s (%s)" % (record, e.__class__.__name__))
+h = hashlib.sha256(open(pkg, "rb").read()).hexdigest()
+if res.get("outcome") != "accepted" or res.get("id") != sub.get("id"):
+    sys.exit("submission %s was not accepted: %s" % (sub.get("id"), res.get("outcome")))
+if sub.get("file") != os.path.basename(pkg) or sub.get("sha256") != h:
+    sys.exit("submission %s was %s (%s), not this %s (%s)" % (sub.get("id"), sub.get("file"), sub.get("sha256"), os.path.basename(pkg), h))
+print(sub["id"])
+PY
+)" || die "4. refusing to staple: $verdict"
+  say "4. Apple accepted submission $verdict, which is exactly this file"
+
+  work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sign-macos-pkg.XXXXXX")"
+  xcrun stapler staple "$out" >/dev/null || die "5. could not staple the ticket"
+  xcrun stapler validate "$out" >/dev/null || die "5. the stapled ticket does not validate"
+  say "5. the ticket is stapled and validates"
+
+  pkgutil --expand-full "$out" "$work/stapled" >/dev/null || die "6. could not expand the stapled package"
+  same_as_unsigned 6.stapled "$work/stapled"
+  say "6. the stapled package's contents are exactly the unsigned package's"
+
+  local assessed=yes result
+  spctl -a -vv -t install "$out" >"$work/spctl" 2>&1 || assessed=no
+  result="$(cat "$work/spctl")"
+  if [ "$assessed" = yes ] && printf '%s\n' "$result" | grep -qxF "$out: accepted" &&
+    printf '%s\n' "$result" | grep -qx 'source=Notarized Developer ID' &&
+    printf '%s\n' "$result" | grep -qxF "origin=$identity"; then
+    say "7. Gatekeeper accepts it: Notarized Developer ID, from the Installer identity"
+  else
+    printf '%s\n' "${result//"$identity"/<the Installer identity>}" | sed 's/^/    /' >&2
+    die "7. Gatekeeper does not accept it as Notarized Developer ID from the Installer identity"
+  fi
+  succeeded=yes
+  say "signed, notarized and stapled: $out"
+}
+
+cleanup_finish() {
+  local status=$?
+  set +e
+  [ -z "$work" ] || rm -rf "$work"
+  if [ "$succeeded" != yes ]; then
+    rm -f "${out:?}" 2>/dev/null || true
+    [ ! -e "$out" ] || printf 'sign-macos-pkg: could not remove %s\n' "$out" >&2
+    [ "$status" != 0 ] || status=1
+  fi
+  exit "$status"
+}
+
 # ------------------------------------------------------------------ self-test
 
 # The tools, as stand-ins that log what they were asked and do what the case
-# says; pkgutil is the real one behind a log.
+# says; pkgutil is the real one behind a log. Nothing here may notarize.
 write_standins() {
   local bin="$1"
   mkdir -p "$bin"
@@ -264,29 +322,22 @@ echo "productsign" >>"$STANDIN_CALLS"
 in="${@: -2:1}"; out="${@: -1}"
 case "${STANDIN_PRODUCTSIGN:-copy}" in
   copy) cp "$in" "$out" ;;
+  # An interruption while it signs: the signer is sent TERM.
+  interrupted) kill -TERM "$PPID"; sleep 1; exit 1 ;;
+  fails) exit 1 ;;
   *) cp "$STANDIN_PRODUCTSIGN" "$out" ;;
 esac
 EOF
   cat >"$bin/xcrun" <<'EOF'
 #!/bin/bash
 case "$1 $2" in
-  "notarytool submit")
-    echo "xcrun notarytool submit" >>"$STANDIN_CALLS"
-    # An interruption while it waits: the signer is sent TERM.
-    if [ "${STANDIN_NOTARY:-}" = interrupted ]; then kill -TERM "$PPID"; exit 1; fi
-    [ "$(cat "$5")" = "notary-key" ] || exit 1
-    printf '{"id":"4f1d0e3a-0000-4000-8000-000000000001","status":"%s","message":"Processing complete"}\n' "${STANDIN_NOTARY:-Accepted}"
-    [ "${STANDIN_NOTARY:-Accepted}" = Accepted ] ;;
-  "notarytool log")
-    echo "xcrun notarytool log" >>"$STANDIN_CALLS"
-    printf '{"status":"Invalid","issues":[{"message":"The binary is not signed."}]}\n' >"${@: -1}" ;;
   "stapler staple")
     echo "xcrun stapler staple" >>"$STANDIN_CALLS"
     [ -z "${STANDIN_STAPLE:-}" ] || cp "$STANDIN_STAPLE" "$3" ;;
   "stapler validate")
     echo "xcrun stapler validate" >>"$STANDIN_CALLS"
     [ "${STANDIN_VALIDATE:-yes}" = yes ] ;;
-  *) exit 1 ;;
+  *) echo "xcrun $1 $2" >>"$STANDIN_CALLS"; exit 1 ;;
 esac
 EOF
   cat >"$bin/spctl" <<'EOF'
@@ -318,17 +369,13 @@ self_test() {
   trap 'rm -rf "$T"' EXIT
   write_standins "$T/bin"
   local identity="Developer ID Installer: SECRETVALUE Org ($team)"
-  local -a good=(
-    MACOS_CERTIFICATE_P12_BASE64=U0VDUkVUVkFMVUUtYXBw
-    MACOS_CERTIFICATE_PASSWORD=SECRETVALUE-app-password
-    "MACOS_SIGNING_IDENTITY=Developer ID Application: SECRETVALUE Org ($team)"
+  # What the sign step is given; finish is given the identity alone.
+  local -a signing=(
+    SYNDEO_EXPECT_SIGNED=yes
     MACOS_INSTALLER_CERTIFICATE_P12_BASE64=U0VDUkVUVkFMVUUtaW5zdGFsbGVy
     MACOS_INSTALLER_CERTIFICATE_PASSWORD=SECRETVALUE-installer-password
     "MACOS_INSTALLER_SIGNING_IDENTITY=$identity"
     "MACOS_TEAM_ID=$team"
-    "MACOS_NOTARY_KEY_BASE64=$(printf notary-key | base64)"
-    MACOS_NOTARY_KEY_ID=SECRETVALUE-key-id
-    MACOS_NOTARY_ISSUER_ID=SECRETVALUE-issuer
   )
 
   # Three packages: the one to sign, and two that differ from it in one
@@ -348,16 +395,34 @@ self_test() {
       --install-location / "$d/$3.pkg" >/dev/null 2>&1 || { echo "pkgbuild failed" >&2; return 1; }
   done
 
-  # sign_case LABEL WANT-STATUS WANT-CALLS WANT-TEXT [NAME=VALUE...]: signing
-  # the unsigned package exits WANT-STATUS, calls exactly WANT-CALLS (the
-  # tools other than security, in order, comma-separated), says WANT-TEXT
-  # (each of them, if it is several separated by |),
-  # leaves the signed package only on success, never prints a secret, and
-  # leaves nothing behind. Once it has made a keychain, cleanup attempts
-  # every step: the list put back, the keychain deleted, and the list read
-  # back last. The list ends as it began, unless list_may_change is yes,
-  # for a case that breaks putting it back. initial_list=empty starts it
-  # empty.
+  # verdict_of LABEL VERDICT GOT OUT: count a case, and show what it did.
+  verdict_of() {
+    cases=$((cases + 1))
+    if [ "$2" = yes ]; then
+      printf '  ok    %s\n' "$1"
+    else
+      printf '  WRONG %s\n          | calls: %s\n' "$1" "$3"
+      printf '%s\n' "$4" | sed 's/^/          | /'
+      wrong=$((wrong + 1))
+    fi
+  }
+  # says OUT TEXT: OUT holds each of TEXT's |-separated parts.
+  says() {
+    local t
+    while IFS= read -r -d '|' t; do
+      printf '%s' "$1" | grep -qF -- "$t" || return 1
+    done <<<"$2|"
+  }
+
+  # sign_case LABEL WANT-STATUS WANT-CALLS WANT-TEXT [NAME=VALUE...]: sign
+  # exits WANT-STATUS, calls exactly WANT-CALLS (the tools other than
+  # security, in order, comma-separated), says WANT-TEXT, leaves the signed
+  # package and the unsigned manifest only on success, never prints a
+  # secret, never notarizes, and leaves nothing behind. Once it has made a
+  # keychain, cleanup attempts every step: the list put back, the keychain
+  # deleted, and the list read back last. The list ends as it began, unless
+  # list_may_change is yes, for a case that breaks putting it back.
+  # initial_list=empty starts it empty.
   list_may_change=no
   initial_list=two
   sign_case() {
@@ -373,16 +438,14 @@ self_test() {
     fi
     cp "$T/run/list" "$T/run/list.before"
     out="$(env -i PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$T/run" RUNNER_TEMP="$T/run/temp" \
-      STANDIN_CALLS="$T/run/calls" STANDIN_LIST="$T/run/list" STANDIN_ORIGIN="$identity" \
-      "$@" bash "$0" "$d/unsigned.pkg" "$T/run/signed.pkg" 2>&1)" && status=0 || status=$?
+      STANDIN_CALLS="$T/run/calls" STANDIN_LIST="$T/run/list" "$@" \
+      bash "$0" sign "$d/unsigned.pkg" "$T/run/signed.pkg" "$T/run/state" 2>&1)" && status=0 || status=$?
     got="$({ grep -v '^security' "$T/run/calls" || true; } | paste -sd, -)"
     [ "$status" = "$want" ] || verdict=no
     [ "$got" = "$calls" ] || verdict=no
-    local t
-    while IFS= read -r -d '|' t; do
-      printf '%s' "$out" | grep -qF -- "$t" || verdict=no
-    done <<<"$text|"
-    if printf '%s' "$out" | grep -qE 'SECRETVALUE|U0VDUkVU|notary-key'; then verdict=no; fi
+    says "$out" "$text" || verdict=no
+    if printf '%s' "$out" | grep -qE 'SECRETVALUE|U0VDUkVU'; then verdict=no; fi
+    if grep -q notarytool "$T/run/calls"; then verdict=no; fi
     if [ "$list_may_change" != yes ]; then cmp -s "$T/run/list" "$T/run/list.before" || verdict=no; fi
     [ -z "$(ls -A "$T/run/temp")" ] || verdict=no
     if grep -qx 'security create-keychain' "$T/run/calls"; then
@@ -393,104 +456,151 @@ self_test() {
         [ "$(tail -n 1 "$T/run/calls")" = 'security list-keychains' ] || verdict=no
     fi
     if [ "$want" = 0 ]; then
-      [ -f "$T/run/signed.pkg" ] || verdict=no
+      [ -f "$T/run/signed.pkg" ] && [ -s "$T/run/state/unsigned.manifest" ] || verdict=no
       grep -qx 'security create-keychain' "$T/run/calls" || verdict=no
     else
       [ ! -e "$T/run/signed.pkg" ] || verdict=no
     fi
-    cases=$((cases + 1))
-    if [ "$verdict" = yes ]; then
-      printf '  ok    %s\n' "$label"
-    else
-      printf '  WRONG %s\n          | exit %s; calls: %s\n' "$label" "$status" "$got"
-      printf '%s\n' "$out" | sed 's/^/          | /'
-      wrong=$((wrong + 1))
-    fi
+    verdict_of "$label" "$verdict" "$got" "$out"
   }
-  local all="pkgutil --expand-full,productsign,pkgutil --expand-full,xcrun notarytool submit,xcrun stapler staple,xcrun stapler validate,pkgutil --expand-full,spctl"
+  local signed="pkgutil --expand-full,productsign,pkgutil --expand-full"
 
-  printf '\n  signing the package, in order, with stand-ins for the tools\n'
-  sign_case "a consistent signed configuration: expand, sign, compare, notarize, staple, validate, compare, Gatekeeper" \
-    0 "$all" "signed, notarized and stapled" SYNDEO_EXPECT_SIGNED=yes "${good[@]}"
-
-  printf '\n  the keychain search list, and cleanup\n'
-  sign_case "the search list cannot be read: stopped before any keychain or output" \
-    1 "" "could not read the keychain search list; nothing was changed" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_LIST_READ=fails
-  sign_case "putting the search list back fails: fatal, though it signed; the package removed" \
-    1 "$all" "cleanup failed: putting the keychain search list back;" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_RESTORE=fails
-  sign_case "deleting the keychain fails: fatal, though it signed; the package removed, the list put back" \
-    1 "$all" "cleanup failed: deleting the temporary keychain;" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_DELETE=fails
-  list_may_change=yes
-  sign_case "both fail: both reported, the list found wrong, the package removed" \
-    1 "$all" "cleanup failed: putting the keychain search list back; deleting the temporary keychain; the keychain search list is not as it was;" \
-    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_RESTORE=fails STANDIN_DELETE=fails
-  sign_case "putting the list back says it worked, but leaves another list: caught, the package removed" \
-    1 "$all" "cleanup failed: the keychain search list is not as it was;" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_RESTORE=wrong
-  list_may_change=no
-  initial_list=empty
-  sign_case "an empty search list to begin with: signed, and left empty" \
-    0 "$all" "signed, notarized and stapled" SYNDEO_EXPECT_SIGNED=yes "${good[@]}"
-  initial_list=two
-  sign_case "an earlier failure, then a failing cleanup: both said, cleanup finished" \
-    1 "pkgutil --expand-full,productsign,pkgutil --expand-full,xcrun notarytool submit,xcrun notarytool log" \
-    "4. notarization ended 'Invalid', not Accepted|cleanup failed: deleting the temporary keychain;" \
-    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_NOTARY=Invalid STANDIN_DELETE=fails
-  sign_case "interrupted while notarizing, and deleting fails: exit 130 kept, cleanup finished" \
-    130 "pkgutil --expand-full,productsign,pkgutil --expand-full,xcrun notarytool submit" \
-    "cleanup failed: deleting the temporary keychain;" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_NOTARY=interrupted STANDIN_DELETE=fails
-
-  printf '\n  the configuration, and each step failing\n'
+  printf '\n  sign: expand, productsign, compare; never notarize\n'
+  sign_case "a consistent configuration: expand, sign, compare; the manifest kept for finish" \
+    0 "$signed" "signed, not yet notarized" "${signing[@]}"
   sign_case "SYNDEO_EXPECT_SIGNED=no: refused before any tool runs" \
     1 "" "SYNDEO_EXPECT_SIGNED is not yes" SYNDEO_EXPECT_SIGNED=no
   local n v partial
-  for n in MACOS_INSTALLER_CERTIFICATE_P12_BASE64 MACOS_INSTALLER_SIGNING_IDENTITY MACOS_NOTARY_KEY_BASE64 MACOS_CERTIFICATE_PASSWORD; do
+  for n in MACOS_INSTALLER_CERTIFICATE_P12_BASE64 MACOS_INSTALLER_CERTIFICATE_PASSWORD MACOS_INSTALLER_SIGNING_IDENTITY MACOS_TEAM_ID; do
     partial=()
-    for v in "${good[@]}"; do [ "${v%%=*}" = "$n" ] || partial+=("$v"); done
-    sign_case "yes without $n: refused before any tool runs" 1 "" "not consistent" SYNDEO_EXPECT_SIGNED=yes "${partial[@]}"
+    for v in "${signing[@]}"; do [ "${v%%=*}" = "$n" ] || partial+=("$v"); done
+    sign_case "without $n: refused before any tool runs" 1 "" "not set: $n" "${partial[@]}"
   done
-  sign_case "a productsign that changes a payload byte: caught, nothing notarized" \
-    1 "pkgutil --expand-full,productsign,pkgutil --expand-full" "3.signed: the package's contents differ" \
-    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_PRODUCTSIGN="$d/payload.pkg"
-  sign_case "a productsign that changes the preinstall: caught, nothing notarized" \
-    1 "pkgutil --expand-full,productsign,pkgutil --expand-full" "3.signed: the package's contents differ" \
-    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_PRODUCTSIGN="$d/script.pkg"
-  sign_case "notarization Invalid: its log is fetched and printed, nothing stapled" \
-    1 "pkgutil --expand-full,productsign,pkgutil --expand-full,xcrun notarytool submit,xcrun notarytool log" "The binary is not signed." \
-    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_NOTARY=Invalid
-  sign_case "notarization In Progress after the wait: not Accepted, fails" \
-    1 "pkgutil --expand-full,productsign,pkgutil --expand-full,xcrun notarytool submit,xcrun notarytool log" "'In Progress', not Accepted" \
-    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" "STANDIN_NOTARY=In Progress"
-  sign_case "a ticket that does not validate: fails, Gatekeeper not asked" \
-    1 "pkgutil --expand-full,productsign,pkgutil --expand-full,xcrun notarytool submit,xcrun stapler staple,xcrun stapler validate" "does not validate" \
-    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_VALIDATE=no
-  sign_case "stapling that changes the contents: caught" \
-    1 "pkgutil --expand-full,productsign,pkgutil --expand-full,xcrun notarytool submit,xcrun stapler staple,xcrun stapler validate,pkgutil --expand-full" "6.stapled: the package's contents differ" \
-    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_STAPLE="$d/payload.pkg"
-  sign_case "Gatekeeper accepts it, but as Developer ID, not notarized: fails" \
-    1 "$all" "does not accept it as Notarized Developer ID" \
-    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" "STANDIN_SOURCE=Developer ID"
-  sign_case "Gatekeeper accepts it from another identity: fails" \
-    1 "$all" "does not accept it as Notarized Developer ID" \
-    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" "STANDIN_ORIGIN=Developer ID Installer: Someone Else (ZZ99ZZ99ZZ)"
-  sign_case "Gatekeeper rejects it: fails" \
-    1 "$all" "does not accept it as Notarized Developer ID" \
-    SYNDEO_EXPECT_SIGNED=yes "${good[@]}" STANDIN_SPCTL=rejected
+  sign_case "an Installer identity of another team: refused" 1 "" "not a Developer ID Installer identity of MACOS_TEAM_ID" \
+    "${signing[@]}" "MACOS_INSTALLER_SIGNING_IDENTITY=Developer ID Installer: SECRETVALUE Org (ZZ99ZZ99ZZ)"
+  sign_case "an Application identity where the Installer one belongs: refused" 1 "" "not a Developer ID Installer identity" \
+    "${signing[@]}" "MACOS_INSTALLER_SIGNING_IDENTITY=Developer ID Application: SECRETVALUE Org ($team)"
+  sign_case "a productsign that changes a payload byte: caught, the package removed" \
+    1 "$signed" "3.signed: the package's contents differ" "${signing[@]}" STANDIN_PRODUCTSIGN="$d/payload.pkg"
+  sign_case "a productsign that changes the preinstall: caught, the package removed" \
+    1 "$signed" "3.signed: the package's contents differ" "${signing[@]}" STANDIN_PRODUCTSIGN="$d/script.pkg"
 
-  local out status
-  out="$(env -i PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" SYNDEO_EXPECT_SIGNED=yes "${good[@]}" \
-    STANDIN_CALLS="$T/run/calls" STANDIN_LIST="$T/run/list" bash -x "$0" "$d/unsigned.pkg" "$T/run/x.pkg" 2>&1)" && status=0 || status=$?
-  cases=$((cases + 1))
-  if [ "$status" = 1 ] && printf '%s' "$out" | grep -qF "tracing is on" && ! printf '%s' "$out" | grep -qE 'SECRETVALUE|U0VDUkVU'; then
-    printf '  ok    %s\n' "traced: refused, before any value is read"
-  else
-    printf '  WRONG %s (exit %s)\n' "traced: refused, before any value is read" "$status"
-    wrong=$((wrong + 1))
-  fi
+  printf '\n  sign: the keychain search list, and cleanup\n'
+  sign_case "the search list cannot be read: stopped before any keychain or output" \
+    1 "" "could not read the keychain search list; nothing was changed" "${signing[@]}" STANDIN_LIST_READ=fails
+  sign_case "putting the search list back fails: fatal, though it signed; the package removed" \
+    1 "$signed" "cleanup failed: putting the keychain search list back;" "${signing[@]}" STANDIN_RESTORE=fails
+  sign_case "deleting the keychain fails: fatal, though it signed; the package removed, the list put back" \
+    1 "$signed" "cleanup failed: deleting the temporary keychain;" "${signing[@]}" STANDIN_DELETE=fails
+  list_may_change=yes
+  sign_case "both fail: both reported, the list found wrong, the package removed" \
+    1 "$signed" "cleanup failed: putting the keychain search list back; deleting the temporary keychain; the keychain search list is not as it was;" \
+    "${signing[@]}" STANDIN_RESTORE=fails STANDIN_DELETE=fails
+  sign_case "putting the list back says it worked, but leaves another list: caught, the package removed" \
+    1 "$signed" "cleanup failed: the keychain search list is not as it was;" "${signing[@]}" STANDIN_RESTORE=wrong
+  list_may_change=no
+  initial_list=empty
+  sign_case "an empty search list to begin with: signed, and left empty" \
+    0 "$signed" "signed, not yet notarized" "${signing[@]}"
+  initial_list=two
+  sign_case "an earlier failure, then a failing cleanup: both said, cleanup finished" \
+    1 "pkgutil --expand-full,productsign" "2. productsign failed|cleanup failed: deleting the temporary keychain;" \
+    "${signing[@]}" STANDIN_PRODUCTSIGN=fails STANDIN_DELETE=fails
+  sign_case "interrupted while signing, and deleting fails: exit 130 kept, cleanup finished" \
+    130 "pkgutil --expand-full,productsign" "cleanup failed: deleting the temporary keychain;" \
+    "${signing[@]}" STANDIN_PRODUCTSIGN=interrupted STANDIN_DELETE=fails
+
+  # A signed package and its state, made by sign, for finish to work on.
+  rm -rf "$T/made"
+  mkdir -p "$T/made/temp"
+  printf '%s\n' /Users/runner/Library/Keychains/login.keychain-db >"$T/made/list"
+  env -i PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$T/made" RUNNER_TEMP="$T/made/temp" \
+    STANDIN_CALLS="$T/made/calls" STANDIN_LIST="$T/made/list" "${signing[@]}" \
+    bash "$0" sign "$d/unsigned.pkg" "$T/made/signed.pkg" "$T/made/state" >/dev/null 2>&1 || { echo "the setup sign failed" >&2; return 1; }
+
+  # record DIR OUTCOME [FILE [SHA256]]: a notarization record as
+  # ci/notarize.py writes it, for the signed package unless told otherwise.
+  record() {
+    local dir="$1" outcome="$2" file="${3:-signed.pkg}" sum="${4:-}"
+    [ -n "$sum" ] || sum="$(shasum -a 256 "$T/made/signed.pkg" | cut -d' ' -f1)"
+    mkdir -p "$dir"
+    printf '{"id": "11111111-2222-4333-8444-555555555555", "file": "%s", "sha256": "%s", "submitted_at": "2026-10-12T03:36:57Z"}\n' \
+      "$file" "$sum" >"$dir/submission.json"
+    printf '{"id": "11111111-2222-4333-8444-555555555555", "outcome": "%s"}\n' "$outcome" >"$dir/result.json"
+  }
+
+  # finish_case LABEL WANT-STATUS WANT-CALLS WANT-TEXT RECORD-SETUP
+  # [NAME=VALUE...]: finish, on a copy of the signed package, with the
+  # record RECORD-SETUP makes (a command given the record's directory).
+  finish_case() {
+    local label="$1" want="$2" calls="$3" text="$4" setup="$5" status out verdict=yes got
+    shift 5
+    rm -rf "$T/run"
+    mkdir -p "$T/run/temp"
+    : >"$T/run/calls"
+    cp -p "$T/made/signed.pkg" "$T/run/signed.pkg"
+    cp -Rp "$T/made/state" "$T/run/state"
+    $setup "$T/run/record"
+    out="$(env -i PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$T/run" RUNNER_TEMP="$T/run/temp" \
+      STANDIN_CALLS="$T/run/calls" STANDIN_ORIGIN="$identity" SYNDEO_EXPECT_SIGNED=yes \
+      "MACOS_INSTALLER_SIGNING_IDENTITY=$identity" "$@" \
+      bash "$0" finish "$T/run/signed.pkg" "$T/run/state" "$T/run/record" 2>&1)" && status=0 || status=$?
+    got="$(paste -sd, - <"$T/run/calls")"
+    [ "$status" = "$want" ] || verdict=no
+    [ "$got" = "$calls" ] || verdict=no
+    says "$out" "$text" || verdict=no
+    if printf '%s' "$out" | grep -qE 'SECRETVALUE|U0VDUkVU'; then verdict=no; fi
+    if grep -q notarytool "$T/run/calls"; then verdict=no; fi
+    [ -z "$(ls -A "$T/run/temp")" ] || verdict=no
+    if [ "$want" = 0 ]; then [ -f "$T/run/signed.pkg" ] || verdict=no; else [ ! -e "$T/run/signed.pkg" ] || verdict=no; fi
+    verdict_of "$label" "$verdict" "$got" "$out"
+  }
+  accepted() { record "$1" accepted; }
+  none() { :; }
+  unresolved() { record "$1" unresolved-deadline; }
+  invalid() { record "$1" invalid; }
+  other_file() { record "$1" accepted other.pkg; }
+  other_bytes() { record "$1" accepted signed.pkg 0000000000000000000000000000000000000000000000000000000000000000; }
+  local finished="xcrun stapler staple,xcrun stapler validate,pkgutil --expand-full,spctl"
+
+  printf '\n  finish: only after Apple accepted exactly this file\n'
+  finish_case "accepted: staple, validate, compare, Gatekeeper" 0 "$finished" "4. Apple accepted submission|signed, notarized and stapled" accepted
+  finish_case "no notarization record: refused, nothing stapled, the package removed" 1 "" "refusing to staple: no notarization record" none
+  finish_case "a submission still unresolved at its deadline: refused, nothing stapled" 1 "" "was not accepted: unresolved-deadline" unresolved
+  finish_case "an Invalid submission: refused, nothing stapled" 1 "" "was not accepted: invalid" invalid
+  finish_case "Apple accepted another file: refused" 1 "" "not this signed.pkg" other_file
+  finish_case "Apple accepted other bytes under this name: refused" 1 "" "not this signed.pkg" other_bytes
+  finish_case "SYNDEO_EXPECT_SIGNED=no: refused" 1 "" "SYNDEO_EXPECT_SIGNED is not yes" accepted SYNDEO_EXPECT_SIGNED=no
+  finish_case "a ticket that does not validate: fails, Gatekeeper not asked" \
+    1 "xcrun stapler staple,xcrun stapler validate" "does not validate" accepted STANDIN_VALIDATE=no
+  finish_case "stapling that changes the contents: caught" \
+    1 "xcrun stapler staple,xcrun stapler validate,pkgutil --expand-full" "6.stapled: the package's contents differ" accepted \
+    STANDIN_STAPLE="$d/payload.pkg"
+  finish_case "Gatekeeper accepts it, but as Developer ID, not notarized: fails" \
+    1 "$finished" "does not accept it as Notarized Developer ID" accepted "STANDIN_SOURCE=Developer ID"
+  finish_case "Gatekeeper accepts it from another identity: fails" \
+    1 "$finished" "does not accept it as Notarized Developer ID" accepted "STANDIN_ORIGIN=Developer ID Installer: Someone Else (ZZ99ZZ99ZZ)"
+  finish_case "Gatekeeper rejects it: fails" 1 "$finished" "does not accept it as Notarized Developer ID" accepted STANDIN_SPCTL=rejected
+
+  local out status mode
+  for mode in sign finish; do
+    out="$(env -i PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" "${signing[@]}" STANDIN_CALLS="$T/run/calls" STANDIN_LIST="$T/run/list" \
+      bash -x "$0" "$mode" "$d/unsigned.pkg" "$T/run/x.pkg" "$T/run/x" 2>&1)" && status=0 || status=$?
+    cases=$((cases + 1))
+    if [ "$status" = 1 ] && printf '%s' "$out" | grep -qF "tracing is on" && ! printf '%s' "$out" | grep -qE 'SECRETVALUE|U0VDUkVU'; then
+      printf '  ok    %s\n' "$mode, traced: refused, before any value is read"
+    else
+      printf '  WRONG %s (exit %s)\n' "$mode, traced: refused, before any value is read" "$status"
+      wrong=$((wrong + 1))
+    fi
+  done
   printf '\n  %d cases, %d wrong\n\n' "$cases" "$wrong"
   [ "$wrong" -eq 0 ]
 }
 
 case "${1:-}" in
   --self-test) self_test ;;
-  *) sign "$@" ;;
+  sign) shift; sign "$@" ;;
+  finish) shift; finish "$@" ;;
+  *) die "usage: $0 sign <unsigned.pkg> <signed.pkg> <state-dir> | finish <signed.pkg> <state-dir> <notarization-record> | --self-test" ;;
 esac

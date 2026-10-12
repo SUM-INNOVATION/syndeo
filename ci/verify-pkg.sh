@@ -2,6 +2,7 @@
 # Check Syndeo's macOS installer package, before and after it is installed.
 #
 #   ci/verify-pkg.sh inspect <pkg> <version> --tarball <tarball>
+#   ci/verify-pkg.sh signed-binaries <tarball> <version>
 #   ci/verify-pkg.sh installed <version> [--commands-say <version>]
 #   ci/verify-pkg.sh release sums <dir> <version>
 #   ci/verify-pkg.sh release check <draft-dir> <version> --against <dir> \
@@ -25,6 +26,11 @@
 # version tree, `current`, the seven command links, and each command's
 # --version as started from /usr/local/bin. --commands-say is for a stand-in
 # package made of other binaries, which report their own version.
+#
+# signed-binaries checks the seven executables of a release tarball the way
+# inspect checks the package's, with SYNDEO_EXPECT_SIGNED=yes and
+# MACOS_TEAM_ID: release.yml runs it on the signed tarball before the
+# binaries are sent to be notarized.
 #
 # release is what release.yml checks a release's assets with. sums requires
 # <dir> to hold exactly the three tarballs and the package of <version> and
@@ -307,9 +313,12 @@ developer_id() {
 # signed_state PKG TREE TEAM: what a signed release has to be, checked on the
 # package and on the executables in its payload, which inspect has already
 # found byte-identical to the tarball's.
-signed_state() {
-  local pkg="$1" tree="$2" team="$3" n out first last group entitled problems chain
-  note "signing (expected: Developer ID of $team, notarized and stapled)"
+# signed_executables TREE TEAM: each of the seven executables in TREE is
+# Developer ID Application of TEAM, chained to Apple Root CA, with the
+# hardened runtime and a secure timestamp; syndeo-keystore's entitlements are
+# exactly its keychain access group, and the other six have none.
+signed_executables() {
+  local tree="$1" team="$2" n out first last group entitled problems
   for n in $NAMES; do
     problems=""
     codesign --verify --strict "$tree/$n" >/dev/null 2>&1 || problems="$problems does not verify;"
@@ -336,6 +345,12 @@ signed_state() {
       bad "$n" "${problems# }"
     fi
   done
+}
+
+signed_state() {
+  local pkg="$1" tree="$2" team="$3" out first last problems chain
+  note "signing (expected: Developer ID of $team, notarized and stapled)"
+  signed_executables "$tree" "$team"
 
   # Captured whole: pkgutil exits non-zero for a package it does not trust.
   out="$(pkgutil --check-signature "$pkg" 2>&1 | sed 's/^[[:space:]]*//')"
@@ -445,6 +460,28 @@ release_check() {
       bad "notes" "differ from the expected: $(diff <(cat "$want_notes") <(cat "$have_notes" 2>/dev/null) | grep '^[<>]' | head -3 | tr '\n' ' ')"
     fi
   fi
+}
+
+# signed_binaries TARBALL VERSION: the release tarball's executables, signed
+# and ready to be notarized. Requires SYNDEO_EXPECT_SIGNED=yes and
+# MACOS_TEAM_ID.
+signed_binaries() {
+  local tarball="$1" v="$2" team="${MACOS_TEAM_ID:-}" name
+  [ "${SYNDEO_EXPECT_SIGNED:-}" = yes ] || { echo "signed-binaries needs SYNDEO_EXPECT_SIGNED=yes" >&2; return 2; }
+  [[ "$team" =~ $TEAM_RE ]] || { echo "signed-binaries needs MACOS_TEAM_ID, ten capital letters and digits" >&2; return 2; }
+  syndeo_version_valid "$v" || { echo "signed-binaries: '$v' is not a version" >&2; return 2; }
+  name="syndeo-$v-aarch64-apple-darwin"
+  note "the signed binaries of $name.tar.gz (expected: Developer ID Application of $team)"
+  if [ "${tarball##*/}" != "$name.tar.gz" ]; then
+    bad "name" "${tarball##*/} is not $name.tar.gz"
+    return 0
+  fi
+  mkdir "$inspect_work/binaries"
+  if ! tar -xzf "$tarball" -C "$inspect_work/binaries" 2>/dev/null; then
+    bad "tarball" "could not unpack $tarball"
+    return 0
+  fi
+  signed_executables "$inspect_work/binaries/$name" "$team"
 }
 
 # ------------------------------------------------------------------ installed
@@ -1453,6 +1490,33 @@ EOF
   signed_case "Gatekeeper: Developer ID, not notarized" 1 "Gatekeeper — source=Developer ID;" "STANDIN_SOURCE=Developer ID"
   signed_case "Gatekeeper: from another origin" 1 "Gatekeeper — from another origin;" "STANDIN_ORIGIN=Developer ID Installer: Example Org (ZZ99ZZ99ZZ)"
   signed_case "Gatekeeper rejects it" 1 "Gatekeeper — rejected;" STANDIN_SPCTL=rejected
+  # binaries_case LABEL FAILS TEXT [NAME=VALUE...]: signed-binaries on the
+  # stand-in tarball, as for signed_case.
+  binaries_case() {
+    local label="$1" fails="$2" text="$3"
+    shift 3
+    out="$(env "$@" PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF \
+      bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)"
+    if [ "$fails" = 0 ]; then
+      expect "signed-binaries: $label" eval "printf '%s' \"\$out\" | grep -q '7 passed, 0 failed'"
+    else
+      expect "signed-binaries: $label" eval "printf '%s' \"\$out\" | grep -q ' passed, $fails failed' && printf '%s' \"\$out\" | grep 'FAIL' | grep -qF -- \"\$text\""
+    fi
+    printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
+  }
+  printf '\n  this script: signed-binaries, the tarball before notarization\n'
+  binaries_case "all seven Developer ID of the team, the keystore alone entitled: passes" 0 ""
+  binaries_case "one executable of another team" 1 "syndeo-net — signed by 'Developer ID Application: Example Org (ZZ99ZZ99ZZ)'" STANDIN_OTHER_TEAM=syndeo-net
+  binaries_case "one executable without the hardened runtime" 1 "syndeo-agent — no hardened runtime;" STANDIN_NO_RUNTIME=syndeo-agent
+  binaries_case "one executable without a secure timestamp" 1 "syndeo-proxy — no secure timestamp;" STANDIN_NO_TIMESTAMP=syndeo-proxy
+  binaries_case "the keystore's access group of another team" 1 "syndeo-keystore — entitlements are not" STANDIN_KEYSTORE_GROUP=ZZ99ZZ99ZZ.com.sum.syndeo.keystore
+  binaries_case "the access group on another executable" 1 "syndeo-ui — entitlements are not: no entitlements;" STANDIN_ENTITLED=syndeo-ui
+  out="$(env -u MACOS_TEAM_ID SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)" && status=0 || status=$?
+  expect "signed-binaries: without MACOS_TEAM_ID, refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs MACOS_TEAM_ID'"
+  out="$(SYNDEO_EXPECT_SIGNED=no MACOS_TEAM_ID=AB12CD34EF bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)" && status=0 || status=$?
+  expect "signed-binaries: SYNDEO_EXPECT_SIGNED=no, refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs SYNDEO_EXPECT_SIGNED=yes'"
+  out="$(PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.2 2>&1)" && status=0 || status=$?
+  expect "signed-binaries: a tarball of another version, refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'is not syndeo-0.0.2-aarch64-apple-darwin.tar.gz'"
   out="$(PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=no bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --tarball "$tgz" 2>&1)"
   expect "inspect: SYNDEO_EXPECT_SIGNED=no, of a package that is signed: fails" eval "printf '%s' \"\$out\" | grep -q 'a Developer ID signature on: syndeo'"
   out="$(env -u MACOS_TEAM_ID SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --tarball "$tgz" 2>&1)" && status=0 || status=$?
@@ -1618,6 +1682,16 @@ case "${1:-}" in
         ;;
       *) echo "usage: $0 release sums <dir> <version> | release check <draft-dir> <version> --against <dir> [--notes <expected> <draft's>]" >&2; exit 2 ;;
     esac
+    status=$?
+    [ "$status" = 2 ] && exit 2
+    report
+    [ "$fail" -eq 0 ]
+    ;;
+  signed-binaries)
+    [ "$#" = 3 ] || { echo "usage: $0 signed-binaries <tarball> <version>" >&2; exit 2; }
+    inspect_work="$(mktemp -d)"
+    trap 'rm -rf "$inspect_work"' EXIT
+    signed_binaries "$2" "$3"
     status=$?
     [ "$status" = 2 ] && exit 2
     report
