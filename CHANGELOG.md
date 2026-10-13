@@ -664,9 +664,10 @@ Measured on a YouTube watch page, sequential DASH segments through our cache:
   `syndeo-webkit <url>` is the whole of it after a one-time
   `syndeo-proxy ca --trust`.
 - **The authority is per-user**, SSL-policy only, no `sudo`, and
-  `syndeo-proxy ca --untrust` removes it. `--trust` asks first, because macOS
-  does not prompt for a trust setting in your own login keychain — a browser
-  that added a root silently would be one you should not run. It is needed
+  `syndeo-proxy ca --untrust` removes it. `--trust` asks first, saying what the
+  authority can do, and macOS then asks for your password, though its dialog
+  does not say what is being trusted. (This note used to say that macOS does
+  not prompt for a trust setting in your own login keychain; it does.) It is needed
   because WebKit validates subresources in its networking process, which never
   consults an in-process pinned anchor: without it a page loads its document
   and silently drops the other seventy-odd resources.

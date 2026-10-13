@@ -996,10 +996,15 @@ fn text(status: StatusCode, message: &str) -> Response<Body> {
 /// this authority can vouch for a TLS server and for nothing else — not code
 /// signing, not S/MIME, not a timestamp.
 ///
-/// macOS does not ask before a trust setting goes into the user's own login
-/// keychain, so the consent is ours: nothing changes unless the user types
-/// exactly `yes`. There is no flag here to bypass it, because a browser that
-/// can silently add a root to your machine is a browser you should not run.
+/// macOS asks too: a trust setting in the user's own login keychain needs the
+/// user's authorisation, and `security add-trusted-cert` waits for macOS's
+/// password dialog (measured on a hosted macOS 15 runner, where it waited
+/// until it was killed). That dialog says only that trust settings are
+/// changing, not what this authority is or what it can do, so the consent
+/// that explains it is ours, and comes first: nothing changes unless the user
+/// types exactly `yes`, and then macOS asks for the password. There is no flag
+/// here to bypass it, because a browser that can add a root to your machine
+/// without saying what it is doing is a browser you should not run.
 /// `ca --untrust` when this home has no authority: never create one, and
 /// offer to remove any certificate carrying our name. Returns whether it
 /// handled the request, which it does exactly when there is no local
@@ -1024,10 +1029,10 @@ fn trust_in_login_keychain(certificate: &std::path::Path) -> anyhow::Result<()> 
     let keychain = format!("{home}/Library/Keychains/login.keychain-db");
 
     {
-        // Asked here, because macOS does not ask. A trust setting in the user's
-        // own login keychain goes in without a prompt, so a browser that ran
-        // this silently would be adding a root to someone's machine without
-        // telling them. The prompt is ours to put up.
+        // Asked here first. macOS then asks for the user's password, but its
+        // dialog says only that trust settings are changing, not what this
+        // authority is or what it can do; the explanation, and the consent
+        // to it, are ours to put up.
         println!("This will add one certificate authority to your login keychain,");
         println!("trusted for TLS only, for your user only — no sudo, nobody else");
         println!("on this machine. It was generated here and its key is at");

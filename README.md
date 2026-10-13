@@ -322,7 +322,7 @@ in and the fallback to `python3` is what actually decides the version.
 ### A page that plays
 
 ```sh
-syndeo-proxy ca --trust                  # once, and it asks first
+syndeo-proxy ca --trust                  # once: it asks first, then macOS asks for your password
 syndeo-webkit https://www.youtube.com/watch?v=wXtngLBkK4Q
 ```
 
