@@ -202,6 +202,56 @@ jobs:
             ${{ runner.temp }}/syndeo-pkg-user/doctor
           if-no-files-found: warn
 
+  macos-app:
+    name: Syndeo.app (opened and quit on a disposable runner)
+    # The desktop application as a person starts it: assembled from release
+    # binaries, signed ad hoc (the helper first, then the bundle), opened with
+    # `open`, checked through Launch Services and the window server, quit as
+    # the Quit menu item would, and opened again. Unsigned with a Developer
+    # ID, and with no secrets: a pull request never signs. Then, reported and
+    # not gated, what this runner allows an onboarding test to do.
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      SYNDEO_ALLOW_APP_TEST: "yes"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-app
+
+      - name: Build the app and its helper
+        run: cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app -p syndeo-proxy
+
+      - name: Assemble Syndeo.app, then sign it ad hoc, the helper first
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          mkdir -p dist
+          bash ci/package-macos-app.sh "$version" target/aarch64-apple-darwin/release dist
+          codesign --force --sign - --options runtime dist/Syndeo.app/Contents/Helpers/syndeo-proxy
+          codesign --force --sign - --options runtime dist/Syndeo.app
+          codesign --verify --strict --verbose=2 dist/Syndeo.app
+
+      - name: Open it, check it, quit it, and open it again
+        run: bash ci/test-app.sh launch "$PWD/dist/Syndeo.app"
+
+      - name: What this runner allows (measured, not a gate)
+        if: always()
+        run: bash ci/test-app.sh measure
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app-logs
+          path: ${{ runner.temp }}/syndeo-app-test/
+          if-no-files-found: warn
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-22.04
