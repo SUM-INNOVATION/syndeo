@@ -17,7 +17,9 @@
 #   - in it, as a person uses it — File > Open Location…, then the address
 #     typed as keystrokes and Return: an address opens and shows the page's
 #     own text, and the count on the proxy's own page, which only the proxy
-#     answers, rises for it; Back and Forward
+#     answers, rises for it (example.com, with a query of this instance's
+#     own, so that no copy WebKit cached for another instance stands in for
+#     it); Back and Forward
 #     work, by the bar's button and by History > Forward; words and a file:
 #     address are refused with Syndeo's own page, not sent anywhere; File >
 #     New Tab opens a tab with the start page, beside the first in one window,
@@ -25,7 +27,8 @@
 #     Close Tab once it has seen the tabs), closes that tab and no other,
 #     letting its window go and leaving the first as it was;
 #   - nothing of a visited page's path or query is in the app's log or its
-#     proxy's, for a page that opened and one whose host does not exist;
+#     proxy's, for a page that opened and one whose host does not exist, nor
+#     the query of any example.com page opened;
 #   - https://example.com opens, and the proxy's count shows it fetched it,
 #     though Syndeo's authority is in no trust settings: the window's own
 #     delegate anchors it, and the trust settings are checked unchanged at
@@ -33,7 +36,9 @@
 #   - on a page this test serves, each link and script to a scheme a window
 #     may not show (file, mailto, ftp, blob, data), in the window or in a new
 #     tab, leaves the page as it was, opens no tab, shows nothing of what it
-#     points at and starts no other application; and its link to a web page
+#     points at and starts no other application, judged against what ran
+#     just before that attempt (an application it did start is quit, and has
+#     to be gone before the next attempt); and its link to a web page
 #     in a new tab opens one;
 #   - an address typed while a page loads is not overwritten when it arrives,
 #     leaving the field shows the page's address again, and the field then
@@ -124,6 +129,9 @@ no_app() { [ -z "$("$APPCTL" pids "$ID")" ]; }
 keystore_item() { security find-generic-password -s com.sum.syndeo.keystore >/dev/null 2>&1 && echo present || echo absent; }
 
 CANNOT_BROWSE="Syndeo can't open websites right now."
+# This instance's query for example.com (see started).
+FRESH=''
+
 # What example.com's page itself says. Its <title> is "Example Domain", and
 # the window takes its title from the page through its controller, so that is
 # no proof the page was shown; this sentence is in the page's body.
@@ -136,6 +144,10 @@ EXAMPLE_BODY='This domain is for use in documentation examples'
 started() {
   local app="$1" round="$2" children image windows
   PID='' HELPER=''
+  # This instance's own query for example.com: random, and nothing else.
+  # WebKit's cache persists from one instance to the next, so a page another
+  # instance opened could otherwise be shown without this one fetching it.
+  FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
   open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" || { bad "open ($round)" "open failed"; return 1; }
   if ! wait_for 30 the_app_runs; then
     bad "running ($round)" "no running application is $ID 30 s after open"
@@ -347,8 +359,8 @@ pinned() {
   local before
   counted "before https"
   before="$COUNTED"
-  visit "https://example.com" "https://example.com/" "$EXAMPLE_BODY" \
-    "https://example.com opens and shows its own text, with Syndeo's authority in no trust settings"
+  visit "https://example.com/?$FRESH" "https://example.com/?$FRESH" "$EXAMPLE_BODY" \
+    "https://example.com opens, with this instance's own query, and shows its own text, with Syndeo's authority in no trust settings"
   counted "after https"
   risen "$before" "and the proxy fetched it over https"
 }
@@ -359,16 +371,24 @@ risen() {
     "$2: the proxy's count went from ${1:-?} to ${COUNTED:-?}"
 }
 
-# plain_http: http://example.com, typed, opens and shows its own text, and
-# the proxy's count shows the window reached it through the proxy.
+# plain_http: http://example.com, typed with this instance's own query, opens
+# and shows its own text, and the proxy's count shows the window reached it
+# through the proxy.
 plain_http() {
   local before
   counted "before http"
   before="$COUNTED"
-  visit "http://example.com" "http://example.com/" "$EXAMPLE_BODY" \
-    "http://example.com, typed, opens on Return and shows its own text"
+  visit "http://example.com/?$FRESH" "http://example.com/?$FRESH" "$EXAMPLE_BODY" \
+    "http://example.com, typed with this instance's own query, opens on Return and shows its own text"
   counted "after http"
   risen "$before" "and the proxy fetched it over http"
+}
+
+# unlogged LOG: this instance's query, on every example.com page it opened,
+# is in no log line of the app's or its proxy's.
+unlogged() {
+  must "$([ -n "$FRESH" ] && ! grep -q "$FRESH" "$1" && echo yes)" \
+    "the query of each example.com page opened is in no log, the app's or its proxy's" "$(grep -c "$FRESH" "$1") lines"
 }
 
 # private LOG: visit a page with a path and a query, and one whose host does
@@ -391,14 +411,15 @@ private() {
 # and start no other application; and the link to a web page in a new tab
 # opens one, made as every tab is.
 policy() {
-  local log="$1" page label where opened apps problems
+  local log="$1" page label where opened apps started_now problems id how
   origin || return 1
   page="http://127.0.0.1:$ORIGIN_PORT/policy.html"
   visit "$page" "$page" 'Policy test' "a page with links and scripts to other schemes opens"
-  apps="$("$APPCTL" apps)"
   while IFS='|' read -r label where; do
     at "$page" 'Policy test' || visit "$page" "$page" 'Policy test' "the page with links and scripts, again"
     opened="$(grep -c 'a window opened' "$log")"
+    # What runs, taken immediately before this attempt and for it alone.
+    apps="$("$APPCTL" apps)"
     if ! "$APPCTL" press-web "$PID" "$label"; then
       bad "policy: $label is refused $where" "no such link or button on the page: $(page_text | head -c 160)"
       continue
@@ -408,8 +429,18 @@ policy() {
     [ "$(grep -c 'a window opened' "$log")" = "$opened" ] || problems="$problems a tab opened;"
     at "$page" 'Policy test' || problems="$problems the window left the page (address '$(address)', page: $(page_text | head -c 120));"
     if "$APPCTL" ax-tree "$PID" | grep -qE 'root:|SYNDEO-(BLOB|DATA)-PAGE'; then problems="$problems what it points at is shown;"; fi
-    [ "$("$APPCTL" apps)" = "$apps" ] || problems="$problems another application started: $(comm -13 <(printf '%s\n' "$apps") <("$APPCTL" apps) | tr '\n' ' ');"
+    started_now="$(comm -13 <(printf '%s\n' "$apps") <("$APPCTL" apps))"
+    [ -z "$started_now" ] || problems="$problems another application started: $(printf '%s' "$started_now" | tr '\n' ' ');"
     if [ -z "$problems" ]; then ok "policy: $label is refused $where"; else bad "policy: $label is refused $where" "$problems"; fi
+    # Any application it started, and only those, is quit, and has to be
+    # gone before the next attempt; one that will not go is a failure.
+    for id in $started_now; do
+      if how="$("$APPCTL" stop "$id")"; then
+        printf '        %s, started by %s, was stopped (%s)\n' "$id" "$label" "$how"
+      else
+        bad "cleanup after $label" "$id, which it started, is $how"
+      fi
+    done
     # A tab it opened is closed again, so the next attempt starts as this one
     # did: its opening has already been counted against it.
     if [ "$(grep -c 'a window opened' "$log")" != "$opened" ]; then
@@ -485,7 +516,7 @@ browsing() {
   arrive "" 'Welcome to Syndeo' "a new window shows the start page, with an empty address field ($round)"
   plain_http
   "$APPCTL" press "$PID" syndeo.back || bad "Back" "no Back button to press in the front window"
-  arrive "http://example.com/" "$EXAMPLE_BODY" "the bar's Back button goes back"
+  arrive "http://example.com/?$FRESH" "$EXAMPLE_BODY" "the bar's Back button goes back"
   choose History Forward
   arrive "http://syndeo.local/stats" 'requests [1-9]' "History > Forward goes forward"
   visit "bread" "bread" 'does not search' "a word is refused by Syndeo's own page, which says it was not sent anywhere"
@@ -509,6 +540,7 @@ browsing() {
 
   private "$log"
   pinned
+  unlogged "$log"
 
   # Measured, not gated: a page on this runner's loopback, and the proxy's
   # count around it.
@@ -631,7 +663,7 @@ mutant() {
     browses "mutant-$name"
     log="$LOGS/app-mutant-$name.stderr"
     case "$name" in
-      no-pinning-delegate) plain_http; pinned ;;
+      no-pinning-delegate) plain_http; pinned; unlogged "$log" ;;
       no-editing-guard) editing ;;
       *) policy "$log" ;;
     esac

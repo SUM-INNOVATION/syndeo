@@ -7,6 +7,10 @@
 //                                window pid owns; exits 1 if there are none
 //   appctl quit <bundle-id>      ask each running application with it to quit,
 //                                as the Quit menu item would; exits 1 if none was asked
+//   appctl stop <bundle-id>      quit each running application with it and wait,
+//                                up to 10 s, until its process is gone; then force
+//                                any left and wait 10 s more. Says "quit", "forced"
+//                                or "still running"; exits 1 only for the last
 //   appctl ax                    whether this process is trusted for Accessibility
 //   appctl ax-close <pid>        press the close button of each of pid's windows, as a
 //                                person would; exits 1 if there was none to press
@@ -180,6 +184,21 @@ case "quit" where args.count == 3:
         asked = app.terminate() || asked
     }
     exit(asked ? 0 : 1)
+case "stop" where args.count == 3:
+    let apps = NSRunningApplication.runningApplications(withBundleIdentifier: args[2])
+    let pids = apps.map { $0.processIdentifier }
+    // Gone when the kernel has no such process: not what this process's copy
+    // of NSRunningApplication says, which needs a run loop to change.
+    func gone() -> Bool { pids.allSatisfy { kill($0, 0) != 0 && errno == ESRCH } }
+    func wait() { for _ in 0..<100 where !gone() { usleep(100_000) } }
+    for app in apps { _ = app.terminate() }
+    wait()
+    if gone() { print("quit"); exit(0) }
+    for app in apps { _ = app.forceTerminate() }
+    wait()
+    if gone() { print("forced"); exit(0) }
+    print("still running")
+    exit(1)
 case "ax" where args.count == 2:
     print(AXIsProcessTrusted() ? "trusted" : "not trusted")
 case "ax-close" where args.count == 3:
