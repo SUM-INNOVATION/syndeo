@@ -17,6 +17,8 @@
 //   appctl activate <pid>        bring pid to the front; exits 1 if it is not frontmost
 //   appctl type <pid> <text>     bring pid to the front, then type the text and
 //                                Return, as keystrokes; exits 1 if pid is not frontmost
+//   appctl type-only <pid> <text>     the same, without Return
+//   appctl tab <pid>             bring pid to the front and press Tab
 //   appctl press <pid> <id>      press the element with that accessibility identifier
 //                                in pid's front window; exits 1 if there is none
 //   appctl value <pid> <id>      that element's value
@@ -24,6 +26,10 @@
 //   appctl menu <pid> <menu> <item>   press a menu item, as a click on it would;
 //                                exits 1 if there is no such item
 //   appctl menu-items <pid> <menu>    the title of each item in that menu, one a line
+//   appctl menu-key <pid> <menu> <key>   press the one enabled item in that menu
+//                                whose key equivalent is exactly Command and <key>,
+//                                whatever its title, and print its title; exits 1,
+//                                listing them, unless there is exactly one
 //   appctl shortcut <pid> <menu> <item>   the item's key equivalent, as
 //                                "<character> <modifiers>": 0 is Command alone
 //   appctl press-web <pid> <text>     press the first link or button in the front
@@ -209,6 +215,16 @@ case "type" where args.count == 4:
         key(pid, 0, String(character))
     }
     key(pid, 36, "\r")
+case "type-only" where args.count == 4:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    guard activate(pid) else { print("not frontmost"); exit(1) }
+    for character in args[3] {
+        key(pid, 0, String(character))
+    }
+case "tab" where args.count == 3:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    guard activate(pid) else { print("not frontmost"); exit(1) }
+    key(pid, 48, "\t")
 case "press" where args.count == 4:
     guard let pid = Int32(args[2]) else { exit(2) }
     guard let element = identified(pid, args[3]) else { exit(1) }
@@ -227,6 +243,20 @@ case "menu-items" where args.count == 4:
     for item in menuItems(pid, args[3]) {
         print(oneLine(attribute(item, kAXTitleAttribute)))
     }
+case "menu-key" where args.count == 5:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    let matching = menuItems(pid, args[3]).filter {
+        oneLine(attribute($0, kAXMenuItemCmdCharAttribute)).uppercased() == args[4].uppercased()
+            && (attribute($0, kAXMenuItemCmdModifiersAttribute) as? Int) == 0
+            && (attribute($0, kAXEnabledAttribute) as? Bool) == true
+    }
+    let titles = matching.map { oneLine(attribute($0, kAXTitleAttribute)) }
+    guard matching.count == 1 else {
+        print("\(matching.count) enabled items with Command-\(args[4]): \(titles.joined(separator: " | "))")
+        exit(1)
+    }
+    print(titles[0])
+    exit(AXUIElementPerformAction(matching[0], kAXPressAction as CFString) == .success ? 0 : 1)
 case "shortcut" where args.count == 5:
     guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
     let character = oneLine(attribute(item, kAXMenuItemCmdCharAttribute))

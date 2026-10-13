@@ -22,6 +22,9 @@ back.
 - any-scheme-in-a-new-tab: a page asking for a new window gets a tab
   whatever the scheme. A page's links and scripts to other schemes in a new
   tab must then be seen opening one.
+- no-editing-guard: the address field is written whenever a page reports
+  its address, whoever is typing there. What someone types while a page is
+  loading must then be seen overwritten when it arrives.
 """
 import os
 import sys
@@ -70,6 +73,13 @@ MUTANTS = {
             BROWSER,
             "            if address::allowed_in_main_frame(&scheme_of(&request)) {\n",
             "            if true {\n",
+        ),
+    ],
+    "no-editing-guard": [
+        (
+            BROWSER,
+            "        if self.ivars().typing.get() {\n",
+            "        if false {\n",
         ),
     ],
 }

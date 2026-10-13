@@ -215,7 +215,7 @@ jobs:
     # private URL in any log, https pinned through the proxy, a page's own
     # links to other schemes refused; its last window closed and brought back
     # by opening it again, quit as the Quit menu item would, and opened again;
-    # three mutants, each of which the test has to catch; and a copy
+    # four mutants, each of which the test has to catch; and a copy
     # whose proxy cannot start, which has to refuse to browse. Unsigned with a Developer
     # ID, and with no secrets: a pull request never signs. Then, reported and
     # not gated, what this runner allows an onboarding test to do.
@@ -269,9 +269,10 @@ jobs:
 
       # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
       # mutants.py): the pinning delegate, the main frame's navigation policy,
-      # the schemes a new tab may open. Each is built from this tree, which is
-      # then put back, and the test has to catch each by the checks meant to,
-      # with every other check passing. All three are run whatever any one
+      # the schemes a new tab may open, the address field's guard for typing.
+      # Each is built from this tree, which is then put back, and the test has
+      # to catch each by the checks meant to, with every other check passing.
+      # All four are run whatever any one
       # does, each recorded on its own and cleaned up after; the step fails at
       # the end if any was not caught exactly as intended.
       - name: Build each mutant, and require the test to catch it

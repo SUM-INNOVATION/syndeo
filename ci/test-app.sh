@@ -21,8 +21,9 @@
 #     work, by the bar's button and by History > Forward; words and a file:
 #     address are refused with Syndeo's own page, not sent anywhere; File >
 #     New Tab opens a tab with the start page, beside the first in one window,
-#     and File > Close Tab (⌘W, as AppKit retitles Close while there are tabs)
-#     closes it, letting its window go and leaving the first as it was;
+#     and File's one enabled ⌘W item, whatever AppKit titles it (Close, or
+#     Close Tab once it has seen the tabs), closes that tab and no other,
+#     letting its window go and leaving the first as it was;
 #   - nothing of a visited page's path or query is in the app's log or its
 #     proxy's, for a page that opened and one whose host does not exist;
 #   - https://example.com opens, and the proxy's count shows it fetched it,
@@ -34,6 +35,9 @@
 #     tab, leaves the page as it was, opens no tab, shows nothing of what it
 #     points at and starts no other application; and its link to a web page
 #     in a new tab opens one;
+#   - an address typed while a page loads is not overwritten when it arrives,
+#     leaving the field shows the page's address again, and the field then
+#     follows navigation as before;
 #   - asked to quit as the Quit menu item would, it exits, and its proxy
 #     with it;
 #   - with its last window closed, through the window's own close button, the
@@ -56,8 +60,9 @@
 # with one safeguard taken out, and this passes only if the checks meant to
 # catch it fail, at least one, and no other check does: https for
 # no-pinning-delegate (while http, rendered and counted, still works), a
-# page's links in the window for no-navigation-policy, and in a new tab for
-# any-scheme-in-a-new-tab. Any other failure is a failure.
+# page's links in the window for no-navigation-policy, in a new tab for
+# any-scheme-in-a-new-tab, and typing kept through a page's arrival for
+# no-editing-guard. Any other failure is a failure.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -212,6 +217,19 @@ choose() {
   "$APPCTL" menu "$PID" "$1" "$2" || bad "$1 > $2" "no such menu item to press; $1 has: $("$APPCTL" menu-items "$PID" "$1" | tr '\n' '|')"
 }
 
+# close_tab WHEN: press File's one enabled item whose shortcut is exactly
+# Command-W, whatever AppKit titles it at that moment: Close, or Close Tab
+# once it has seen the window's tabs.
+close_tab() {
+  local title
+  "$APPCTL" activate "$PID" >/dev/null || true
+  if title="$("$APPCTL" menu-key "$PID" File W)"; then
+    ok "File has one enabled ⌘W item, '$title', and it was pressed ($1)"
+  else
+    bad "File's ⌘W item ($1)" "$title; File has: $("$APPCTL" menu-items "$PID" File | tr '\n' '|')"
+  fi
+}
+
 # The app's log, its proxy's lines included, without terminal colours.
 plain_log() { perl -pe 's/\e\[[0-9;]*m//g' "$1"; }
 
@@ -244,7 +262,8 @@ EOF
 
 # The free port of a loopback origin this test starts, and its pid. A plain
 # TCPServer: http.server's own looks this host's name up when it binds, which
-# on the runner took longer than the test waits. It serves policy.html: a
+# on the runner took longer than the test waits. Its /slow.html answers 8 s
+# after it is asked for, with SYNDEO-SLOW-PAGE. It serves policy.html: a
 # page whose links and scripts go to schemes a window's main frame may not
 # show, in the window and in a new tab, and one link to a web page in a new
 # tab. What they point at says SYNDEO-...-PAGE, or is /etc/passwd.
@@ -268,9 +287,21 @@ origin() {
 <p><a href="http://example.com/" target="_blank">Example in a new tab</a></p>
 EOF
   python3 -I -u -c '
-import http.server, os, socketserver, sys
+import http.server, os, socketserver, sys, time
 os.chdir(sys.argv[1])
-server = socketserver.TCPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if not self.path.startswith("/slow.html"):
+            return super().do_GET()
+        time.sleep(8)
+        body = b"<!doctype html><title>Slow page</title><p>SYNDEO-SLOW-PAGE</p>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+socketserver.ThreadingTCPServer.daemon_threads = True
+server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
 print("port", server.server_address[1], flush=True)
 server.serve_forever()' "$dir" >"$LOGS/origin.log" 2>&1 &
   ORIGIN_PID=$!
@@ -383,7 +414,7 @@ policy() {
     # did: its opening has already been counted against it.
     if [ "$(grep -c 'a window opened' "$log")" != "$opened" ]; then
       "$APPCTL" activate "$PID" >/dev/null || true
-      "$APPCTL" menu "$PID" File "Close Tab" >/dev/null 2>&1 || "$APPCTL" menu "$PID" File Close >/dev/null 2>&1 || true
+      "$APPCTL" menu-key "$PID" File W >/dev/null 2>&1 || true
       sleep 1
     fi
   done <<'EOF'
@@ -406,8 +437,40 @@ EOF
     bad "a link to a web page in a new tab opens one" "the app reports no new window: $(grep 'a window' "$log" | tail -n 2 | tr '\n' ' ')"
   fi
   arrive "http://example.com/" "$EXAMPLE_BODY" "and the new tab shows that page"
-  choose File "Close Tab"
+  close_tab "the tab a link opened"
   arrive "$page" 'Policy test' "closing it leaves the page with the link as it was"
+}
+
+# editing: what someone types in the address field while a page loads stays
+# theirs. From a page this test serves, /slow.html is opened, and while it
+# loads (it answers 8 s later) another address is typed and not given. When
+# the page arrives, the field still says what was typed; leaving it with Tab
+# shows the page's address again; and the field follows navigation as before,
+# Back showing the page before.
+editing() {
+  local first slow typed="http://example.com/typed-while-loading" said
+  origin || return 1
+  first="http://127.0.0.1:$ORIGIN_PORT/policy.html"
+  slow="http://127.0.0.1:$ORIGIN_PORT/slow.html"
+  visit "$first" "$first" 'Policy test' "a page to start from opens"
+  choose File "Open Location…"
+  "$APPCTL" type "$PID" "$slow" >/dev/null || bad "typing $slow" "pid $PID could not be brought to the front"
+  choose File "Open Location…"
+  "$APPCTL" type-only "$PID" "$typed" >/dev/null || bad "typing while it loads" "pid $PID could not be brought to the front"
+  if wait_for 30 page_says 'SYNDEO-SLOW-PAGE'; then
+    ok "the slow page arrives while the field holds an address typed and not given"
+  else
+    bad "the slow page arrives" "not within 30 s: $(page_text)"
+  fi
+  # Every report of its arrival (commit, finish) made by now.
+  sleep 2
+  said="$("$APPCTL" value "$PID" syndeo.address)"
+  must "$([ "$said" = "$typed" ] && echo yes)" \
+    "typing in the address field while a page loads: the page's arrival leaves what was typed" "the field says '$said'"
+  "$APPCTL" tab "$PID" >/dev/null || bad "Tab" "pid $PID could not be brought to the front"
+  arrive "$slow" 'SYNDEO-SLOW-PAGE' "leaving the field with Tab shows the page's address again"
+  "$APPCTL" press "$PID" syndeo.back || bad "Back" "no Back button to press in the front window"
+  arrive "$first" 'Policy test' "and the field follows navigation again: Back shows the page before"
 }
 
 # Browse as a person would, in the first window and a tab beside it.
@@ -437,10 +500,8 @@ browsing() {
   "$APPCTL" titles "$PID" >"$LOGS/browse-tabs.txt" 2>&1
   "$APPCTL" front-tree "$PID" >"$LOGS/browse-two-tabs-tree.txt" 2>&1
   "$APPCTL" menu-items "$PID" File >"$LOGS/browse-two-tabs-file-menu.txt" 2>&1
-  have="$("$APPCTL" shortcut "$PID" File "Close Tab")"
-  must "$([ "$(printf '%s' "$have" | tr '[:lower:]' '[:upper:]')" = "W 0" ] && echo yes)" "with tabs, File > Close is File > Close Tab, ⌘W" "${have:-no Close Tab; File has: $(tr '\n' '|' <"$LOGS/browse-two-tabs-file-menu.txt")}"
-  choose File "Close Tab"
-  if wait_for 15 grep -q 'a window closed open=1' "$log"; then ok "File > Close Tab closes the tab, and the app lets its window go"; else bad "Close" "the app does not report one window: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
+  close_tab "with two tabs"
+  if wait_for 15 grep -q 'a window closed open=1' "$log"; then ok "it closes the tab in front, one window and no other, and the app lets it go"; else bad "Close" "the app does not report one window: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
   arrive "file:///etc/passwd" 'not file: ones' "the first tab is in front again, as it was left"
   must "$(alive "$PID" && [ "$(pgrep -P "$PID" | tr -d '\n')" = "$HELPER" ] && echo yes)" "the app and its proxy run on (pids $PID, $HELPER)"
 
@@ -458,6 +519,7 @@ browsing() {
       "$ORIGIN_PORT" "$(grep -c 'GET /policy.html ' "$LOGS/origin.log")" "${before:-?}" "${COUNTED:-?}"
   fi
   policy "$log"
+  editing
   origin_stop
   stopped "$round"
 }
@@ -559,6 +621,7 @@ mutant() {
     no-pinning-delegate) intended='^(https://example\.com opens|and the proxy fetched it over https:)' ;;
     no-navigation-policy) intended='^policy: .* is refused in the window$' ;;
     any-scheme-in-a-new-tab) intended='^policy: .* is refused and opens no tab$' ;;
+    no-editing-guard) intended="^typing in the address field while a page loads" ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
   if started "$app" "mutant-$name"; then
@@ -567,6 +630,7 @@ mutant() {
     log="$LOGS/app-mutant-$name.stderr"
     case "$name" in
       no-pinning-delegate) plain_http; pinned ;;
+      no-editing-guard) editing ;;
       *) policy "$log" ;;
     esac
   fi
