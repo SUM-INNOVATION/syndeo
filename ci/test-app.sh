@@ -503,6 +503,8 @@ browsing() {
   close_tab "with two tabs"
   if wait_for 15 grep -q 'a window closed open=1' "$log"; then ok "it closes the tab in front, one window and no other, and the app lets it go"; else bad "Close" "the app does not report one window: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
   arrive "file:///etc/passwd" 'not file: ones' "the first tab is in front again, as it was left"
+  on_screen="$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')"
+  must "$([ "$on_screen" = 1 ] && echo yes)" "and its window is still the one on screen" "$on_screen on screen"
   must "$(alive "$PID" && [ "$(pgrep -P "$PID" | tr -d '\n')" = "$HELPER" ] && echo yes)" "the app and its proxy run on (pids $PID, $HELPER)"
 
   private "$log"
