@@ -11154,6 +11154,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "syndeo-app"
+version = "0.1.7"
+dependencies = [
+ "anyhow",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "objc2-web-kit",
+ "syndeo-shell",
+ "syndeo-webkit",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "syndeo-cache"
 version = "0.1.7"
 dependencies = [
