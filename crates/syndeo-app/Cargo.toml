@@ -15,7 +15,7 @@ anyhow.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 syndeo-shell.workspace = true
-syndeo-webkit = { path = "../syndeo-webkit" }
+syndeo-webkit.workspace = true
 
 # The versions syndeo-webkit builds its web view configuration and pinning
 # delegate with: a different objc2 is a different `Retained<T>`, and the
