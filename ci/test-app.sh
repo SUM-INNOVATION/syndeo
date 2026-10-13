@@ -12,11 +12,18 @@
 #   - its one child is the proxy, from this bundle's Contents/Helpers, and no
 #     keystore process exists;
 #   - its window holds a web view and no error;
+#   - in it, typed the way a person types: an address opens; the proxy's own
+#     page, which only the proxy answers, has counted that request; Back and
+#     Forward work, by the bar's button and by ⌘]; words and a file: address
+#     are refused with Syndeo's own page, not sent anywhere; File > New Tab
+#     opens a tab with the start page, beside the first in one window, and ⌘W
+#     closes it, letting its window go and leaving the first as it was;
 #   - asked to quit as the Quit menu item would, it exits, and its proxy
 #     with it;
 #   - with its last window closed, through the window's own close button, the
-#     same app and the same proxy keep running, and opening the bundle again
-#     brings a window back in that same process, with that same proxy;
+#     window is let go, the same app and the same proxy keep running, and
+#     opening the bundle again brings a window back in that same process, with
+#     that same proxy;
 #   - opened again, all of that holds again, and quitting again leaves nothing;
 #   - it made no keystore changes: no keystore in its home and no keychain
 #     item for one;
@@ -24,6 +31,10 @@
 #
 # refuse, which gates: a bundle whose proxy cannot start opens all the same,
 # its window says it cannot browse and holds no web view, and no helper runs.
+#
+# launch also measures, without gating: whether an https page opens while the
+# proxy's authority is not trusted, and whether a page on this runner's own
+# loopback opens, and a link on it to a new tab opens one.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -147,6 +158,109 @@ stopped() {
   if wait_for 10 no_app; then ok "nothing runs as $ID ($round)"; else bad "after quit ($round)" "$("$APPCTL" pids "$ID" | tr '\n' ' ')"; fi
 }
 
+# The front window, as Accessibility has it; its address field; its page.
+front() { "$APPCTL" front-tree "$PID"; }
+address() { "$APPCTL" value "$PID" syndeo.address; }
+page_says() { front | grep -qE "$1"; }
+# at ADDRESS PAGE: there is an address field, it says ADDRESS, and the page says PAGE.
+at() {
+  local said
+  said="$(address)" || return 1
+  [ "$said" = "$1" ] && page_says "$2"
+}
+page_text() { front | grep -E '^AX(StaticText|Heading)' | cut -f2,3 | tr '\t\n' '  ' | head -c 300; }
+
+# arrive ADDRESS PAGE WHAT: within 30 s the front window's address field says
+# ADDRESS and its page says PAGE, an extended regular expression.
+arrive() {
+  if wait_for 30 at "$1" "$2"; then ok "$3"; else bad "$3" "address field: '$(address)'; page: $(page_text)"; fi
+}
+
+# visit TEXT ADDRESS PAGE WHAT: type TEXT into the address field and press
+# Return, as a person would, and require arrive ADDRESS PAGE.
+visit() {
+  if "$APPCTL" type "$PID" "$1" >/dev/null; then arrive "$2" "$3" "$4"; else bad "$4" "pid $PID could not be brought to the front to type into"; fi
+}
+
+# The free port of a loopback origin this test starts, and its pid.
+ORIGIN_PORT='' ORIGIN_PID=''
+origin() {
+  local dir="$LOGS/origin"
+  mkdir -p "$dir"
+  printf '%s\n' '<!doctype html><title>Loopback origin</title><h1>Loopback origin</h1>' \
+    '<p><a href="http://example.com/" target="_blank">Example in a new tab</a></p>' >"$dir/index.html"
+  python3 -u -m http.server --bind 127.0.0.1 --directory "$dir" 0 >"$LOGS/origin.log" 2>&1 &
+  ORIGIN_PID=$!
+  wait_for 10 grep -q 'port [0-9]' "$LOGS/origin.log" || return 1
+  ORIGIN_PORT="$(sed -n 's/.* port \([0-9][0-9]*\).*/\1/p' "$LOGS/origin.log" | head -n 1)"
+}
+
+# Browse as a person would, in the first window and a tab beside it.
+browsing() {
+  local app="$1" round=browse log outcome on_screen
+  say "browse: addresses, Back and Forward, refusals, a tab"
+  started "$app" "$round" || return
+  helper_of "$app" "$round"
+  browses "$round"
+  log="$LOGS/app-$round.stderr"
+  arrive "" 'Welcome to Syndeo' "a new window shows the start page, with an empty address field ($round)"
+  visit "http://example.com" "http://example.com/" 'Example Domain' "an address typed into the field opens on Return"
+  visit "http://syndeo.local/stats" "http://syndeo.local/stats" 'requests [1-9]' \
+    "the proxy's own page, which only the proxy answers, opens and has counted that request"
+  "$APPCTL" press "$PID" syndeo.back || bad "Back" "no Back button to press in the front window"
+  arrive "http://example.com/" 'Example Domain' "the bar's Back button goes back"
+  "$APPCTL" keys "$PID" 'cmd+]' >/dev/null || bad "Forward" "pid $PID could not be brought to the front"
+  arrive "http://syndeo.local/stats" 'requests [1-9]' "History > Forward (⌘]) goes forward"
+  visit "bread" "bread" 'does not search' "a word is refused by Syndeo's own page, which says it was not sent anywhere"
+  visit "file:///etc/passwd" "file:///etc/passwd" 'not file: ones' "a file: address is refused"
+  must "$(page_says 'root:' && echo no || echo yes)" "and nothing of that file is shown"
+
+  "$APPCTL" activate "$PID" >/dev/null || true
+  "$APPCTL" menu "$PID" File "New Tab" || bad "New Tab" "no File > New Tab to press"
+  if wait_for 15 grep -q 'a window opened open=2' "$log"; then ok "File > New Tab opens a second tab"; else bad "New Tab" "the app does not report two windows: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
+  arrive "" 'Welcome to Syndeo' "the new tab shows the start page, with an empty address field"
+  on_screen="$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')"
+  must "$([ "$on_screen" = 1 ] && echo yes)" "the two are tabs of one window: one window on screen" "$on_screen on screen"
+  "$APPCTL" titles "$PID" >"$LOGS/browse-tabs.txt" 2>&1
+  "$APPCTL" front-tree "$PID" >"$LOGS/browse-two-tabs-tree.txt" 2>&1
+  "$APPCTL" keys "$PID" cmd+w >/dev/null || bad "Close" "pid $PID could not be brought to the front"
+  if wait_for 15 grep -q 'a window closed open=1' "$log"; then ok "File > Close (⌘W) closes the tab, and the app lets its window go"; else bad "Close" "the app does not report one window: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
+  arrive "file:///etc/passwd" 'not file: ones' "the first tab is in front again, as it was left"
+  must "$(alive "$PID" && [ "$(pgrep -P "$PID" | tr -d '\n')" = "$HELPER" ] && echo yes)" "the app and its proxy run on (pids $PID, $HELPER)"
+
+  # Measured, not gated.
+  "$APPCTL" type "$PID" "https://example.com" >/dev/null || true
+  if wait_for 30 page_says "Example Domain|couldn't open"; then
+    if page_says 'Example Domain'; then outcome="it opened"; else outcome="Syndeo's failure page: $(page_text)"; fi
+  else
+    outcome="neither the page nor a failure page after 30 s: $(page_text)"
+  fi
+  printf '  MEASURE  https://example.com, the authority not trusted: %s\n' "$outcome"
+  if origin; then
+    "$APPCTL" type "$PID" "http://127.0.0.1:$ORIGIN_PORT/" >/dev/null || true
+    if wait_for 30 page_says "Loopback origin|couldn't open"; then
+      if page_says 'Loopback origin'; then outcome="it opened"; else outcome="Syndeo's failure page: $(page_text)"; fi
+    else
+      outcome="neither the page nor a failure page after 30 s: $(page_text)"
+    fi
+    printf '  MEASURE  a page on this runner'"'"'s loopback, http://127.0.0.1:%s/: %s; the origin saw: %s\n' \
+      "$ORIGIN_PORT" "$outcome" "$(grep -c 'GET / ' "$LOGS/origin.log") request(s) for /"
+    if page_says 'Loopback origin' && "$APPCTL" press-link "$PID" "Example in a new tab"; then
+      if wait_for 15 grep -q 'a window opened open=2' "$log"; then
+        wait_for 30 page_says 'Example Domain' || true
+        printf '  MEASURE  a target=_blank link opened a tab; in front: %s, %s\n' "$(address)" "$(page_text | head -c 80)"
+      else
+        printf '  MEASURE  a target=_blank link opened no tab in 15 s\n'
+      fi
+    fi
+    kill "$ORIGIN_PID" 2>/dev/null
+  else
+    printf '  MEASURE  could not start a loopback origin: %s\n' "$(head -c 200 "$LOGS/origin.log")"
+    kill "$ORIGIN_PID" 2>/dev/null
+  fi
+  stopped "$round"
+}
+
 # One launch: open, check everything, quit, and require nothing left.
 one_launch() {
   local app="$1" round="$2"
@@ -169,6 +283,7 @@ reopened() {
   pid="$PID" helper="$HELPER"
   "$APPCTL" ax-close "$pid" || bad "close ($round)" "no window had a close button to press"
   if wait_for 15 sh -c '! "$1" windows "$2"' _ "$APPCTL" "$pid"; then ok "its last window closed ($round)"; else bad "close ($round)" "a window is still on screen"; fi
+  if wait_for 10 grep -q 'a window closed open=0' "$LOGS/app-$round.stderr"; then ok "and the app let that window go ($round)"; else bad "close ($round)" "the app does not report no windows: $(grep 'a window' "$LOGS/app-$round.stderr" | tail -n 3 | tr '\n' ' ')"; fi
   sleep 2
   must "$(alive "$pid" && [ "$("$APPCTL" pids "$ID")" = "$pid" ] && echo yes)" "with no window, the same app runs on (pid $pid)" "$("$APPCTL" pids "$ID" | tr '\n' ' ')"
   must "$([ -n "$helper" ] && alive "$helper" && echo yes)" "and so does its proxy (pid $helper)"
@@ -176,6 +291,7 @@ reopened() {
   if wait_for 30 "$APPCTL" windows "$pid"; then ok "opened again, a window is back in pid $pid ($round)"; else bad "reopen ($round)" "no window 30 s after open"; fi
   must "$([ "$("$APPCTL" pids "$ID" | tr -d '\n')" = "$pid" ] && echo yes)" "it is still the one application, pid $pid ($round)" "$("$APPCTL" pids "$ID" | tr '\n' ' ')"
   must "$([ "$(pgrep -P "$pid" | tr -d '\n')" = "$helper" ] && echo yes)" "with the same proxy, pid $helper ($round)" "children: $(pgrep -P "$pid" | tr '\n' ' ')"
+  must "$([ "$(grep -c 'a window opened open=1' "$LOGS/app-$round.stderr")" = 2 ] && echo yes)" "a new window, the second this process opened ($round)" "$(grep 'a window' "$LOGS/app-$round.stderr" | tr '\n' ' ')"
   browses "$round"
   stopped "$round"
 }
@@ -190,6 +306,7 @@ launch() {
   keystore_before="$(keystore_item)"
   printf '\nSyndeo.app, opened as a person opens it: %s\n' "$app"
   one_launch "$app" first
+  browsing "$app"
   reopened "$app"
   one_launch "$app" again
   printf '\nwhat it left\n'
