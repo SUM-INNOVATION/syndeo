@@ -269,26 +269,54 @@ jobs:
 
       # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
       # mutants.py): the pinning delegate, the main frame's navigation policy,
-      # the schemes a new tab may open. Each is built from this tree, then the
-      # tree is put back, and the test has to catch each by the check meant
-      # to: https, a page's links in the window, a page's links in a new tab.
+      # the schemes a new tab may open. Each is built from this tree, which is
+      # then put back, and the test has to catch each by the checks meant to,
+      # with every other check passing. All three are run whatever any one
+      # does, each recorded on its own and cleaned up after; the step fails at
+      # the end if any was not caught exactly as intended.
       - name: Build each mutant, and require the test to catch it
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          results=()
+          wrong=0
           for name in $(python3 -I ci/macos-app/mutants.py names); do
-            python3 -I ci/macos-app/mutants.py apply "$name" .
-            cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app
+            echo "::group::mutant $name"
+            built=no
+            if python3 -I ci/macos-app/mutants.py apply "$name" . &&
+              cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app; then
+              built=yes
+            fi
+            # Put back whatever happened, and exactly.
             git checkout -- crates/syndeo-app
-            git diff --exit-code
-            mkdir -p "mutant-bins/$name" "dist-mutant/$name"
-            cp target/aarch64-apple-darwin/release/syndeo-app target/aarch64-apple-darwin/release/syndeo-proxy "mutant-bins/$name/"
-            bash ci/package-macos-app.sh "$version" "mutant-bins/$name" "dist-mutant/$name"
-            codesign --force --sign - --options runtime "dist-mutant/$name/Syndeo.app/Contents/Helpers/syndeo-proxy"
-            codesign --force --sign - --options runtime "dist-mutant/$name/Syndeo.app"
-            bash ci/test-app.sh mutant "$name" "$PWD/dist-mutant/$name/Syndeo.app"
+            if ! git diff --quiet; then
+              echo "::error::the tree was not put back after mutant $name"
+              exit 1
+            fi
+            verdict="caught as intended"
+            if [ "$built" != yes ]; then
+              verdict="NOT BUILT"
+            elif ! { mkdir -p "mutant-bins/$name" "dist-mutant/$name" &&
+              cp target/aarch64-apple-darwin/release/syndeo-app target/aarch64-apple-darwin/release/syndeo-proxy "mutant-bins/$name/" &&
+              bash ci/package-macos-app.sh "$version" "mutant-bins/$name" "dist-mutant/$name" &&
+              codesign --force --sign - --options runtime "dist-mutant/$name/Syndeo.app/Contents/Helpers/syndeo-proxy" &&
+              codesign --force --sign - --options runtime "dist-mutant/$name/Syndeo.app"; }; then
+              verdict="NOT ASSEMBLED"
+            elif ! bash ci/test-app.sh mutant "$name" "$PWD/dist-mutant/$name/Syndeo.app"; then
+              verdict="NOT CAUGHT AS INTENDED"
+            fi
+            # Nothing of this mutant left running for the next.
+            pkill -x Syndeo 2>/dev/null || true
+            pkill -x syndeo-proxy 2>/dev/null || true
+            sleep 1
+            [ "$verdict" = "caught as intended" ] || wrong=1
+            results+=("$name: $verdict")
+            echo "::endgroup::"
           done
+          printf '\nmutants:\n'
+          printf '  %s\n' "${results[@]}"
+          [ "$wrong" = 0 ]
 
       - name: What this runner allows (measured, not a gate)
         if: always()
