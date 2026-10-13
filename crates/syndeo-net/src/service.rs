@@ -7,6 +7,7 @@
 use crate::fetch::{FetchRequest, Net};
 use futures::StreamExt;
 use std::sync::Arc;
+use syndeo_cache::redact::Redacted;
 use syndeo_cache::Integrity;
 use syndeo_ipc::protocol::{NetRequest, NetResponse};
 use syndeo_ipc::transport::Server;
@@ -155,7 +156,7 @@ where
         Err(err) => return framed.send(&NetResponse::Error(err.to_string())).await,
     };
     tracing::debug!(
-        %url,
+        url = %Redacted(&url),
         source = ?response.source,
         served_ms = started.elapsed().as_millis(),
         "served"
@@ -170,7 +171,7 @@ where
             Err(err) => return framed.send(&NetResponse::Error(err.to_string())).await,
         };
         if let Err(err) = integrity.check(&whole) {
-            tracing::warn!(%url, %err, "integrity check failed");
+            tracing::warn!(url = %Redacted(&url), %err, "integrity check failed");
             return framed
                 .send(&NetResponse::Error(format!("integrity: {err}")))
                 .await;

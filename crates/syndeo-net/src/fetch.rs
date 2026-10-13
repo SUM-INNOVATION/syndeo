@@ -23,6 +23,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use syndeo_cache::headers::now_secs;
+use syndeo_cache::redact::Redacted;
 use syndeo_cache::{Cache, CacheOptions, Lookup, Provenance, StoreOutcome};
 
 /// Where the bytes actually came from. The proxy reports this per request, and
@@ -469,7 +470,7 @@ impl Net {
                             // The origin confirmed a body the store no longer
                             // holds; the cache has dropped the entry.
                             Err(err) if err.is_lost_body() => {
-                                tracing::warn!(url = %request.url, %err, "the confirmed body was lost; fetching it again");
+                                tracing::warn!(url = %Redacted(&request.url), %err, "the confirmed body was lost; fetching it again");
                                 self.refetch_lost(&request, started).await
                             }
                             Err(err) => Err(err.into()),
@@ -503,7 +504,7 @@ impl Net {
                         // The origin is unreachable. `stale-if-error` is the only
                         // licence to answer anyway.
                         if self.config.honour_stale_if_error && stale_if_error.is_some() {
-                            tracing::warn!(%err, url = %request.url, "origin unreachable, serving stale");
+                            tracing::warn!(%err, url = %Redacted(&request.url), "origin unreachable, serving stale");
                             Ok(self.finish(
                                 response.status,
                                 response.headers.clone(),
@@ -627,10 +628,10 @@ impl Net {
                         self.alt_svc.failed(&authority);
                         quic.forget(&authority).await;
                         if !crate::h3::may_retry_over_tcp(&request.method, failed.reached) {
-                            tracing::debug!(url = %request.url, err = %failed.error, "HTTP/3 attempt failed after the request was sent; not repeating it");
+                            tracing::debug!(url = %Redacted(&request.url), err = %failed.error, "HTTP/3 attempt failed after the request was sent; not repeating it");
                             return Err(failed.error);
                         }
-                        tracing::debug!(url = %request.url, err = %failed.error, "HTTP/3 attempt failed; falling back to TCP");
+                        tracing::debug!(url = %Redacted(&request.url), err = %failed.error, "HTTP/3 attempt failed; falling back to TCP");
                     }
                 }
             }
@@ -676,15 +677,18 @@ impl Net {
             return Ok(self.finish_with(status, headers, body, source, content, started, protocol));
         }
         if let Err(err) = integrity.check(&body) {
-            tracing::warn!(url = %request.url, %err, "the origin's body does not satisfy the declared integrity");
-            return Err(NetError::Integrity(format!("{}: {err}", request.url)));
+            tracing::warn!(url = %Redacted(&request.url), %err, "the origin's body does not satisfy the declared integrity");
+            return Err(NetError::Integrity(format!(
+                "{}: {err}",
+                Redacted(&request.url)
+            )));
         }
         let content = self.store(request, status, &headers, &body, started);
         if let Some(content) = content {
             match self.cache.grant_peer_eligibility(content, integrity) {
                 Ok(granted) => self.announce(granted),
                 Err(err) => {
-                    tracing::warn!(url = %request.url, %err, "could not record a verified body")
+                    tracing::warn!(url = %Redacted(&request.url), %err, "could not record a verified body")
                 }
             }
         }
@@ -723,10 +727,10 @@ impl Net {
             }
             return true;
         }
-        tracing::info!(url = %request.url, "the stored body does not satisfy the declared integrity; asking the origin");
+        tracing::info!(url = %Redacted(&request.url), "the stored body does not satisfy the declared integrity; asking the origin");
         if let Some(content) = stored.content {
             if let Err(err) = self.cache.discard_representation(&stored.key, content) {
-                tracing::warn!(url = %request.url, %err, "could not drop the stored entry");
+                tracing::warn!(url = %Redacted(&request.url), %err, "could not drop the stored entry");
             }
         }
         false
@@ -805,15 +809,15 @@ impl Net {
             // A range landed in the store but the body is still incomplete, so
             // there is no whole-body address to report yet.
             Ok(StoreOutcome::StoredPartial { held, complete_len }) => {
-                tracing::debug!(url = %request.url, held, ?complete_len, "stored a partial body");
+                tracing::debug!(url = %Redacted(&request.url), held, ?complete_len, "stored a partial body");
                 None
             }
             Ok(StoreOutcome::NotStored(reason)) => {
-                tracing::debug!(url = %request.url, reason, "not cached");
+                tracing::debug!(url = %Redacted(&request.url), reason, "not cached");
                 None
             }
             Err(err) => {
-                tracing::warn!(url = %request.url, %err, "cache write failed");
+                tracing::warn!(url = %Redacted(&request.url), %err, "cache write failed");
                 None
             }
         }
@@ -835,7 +839,7 @@ impl Net {
         let body = match peers.fetch_integrity(&hash).await {
             Ok(body) => body,
             Err(err) => {
-                tracing::debug!(url = %request.url, %err, "no peer had it");
+                tracing::debug!(url = %Redacted(&request.url), %err, "no peer had it");
                 return None;
             }
         };
@@ -843,7 +847,7 @@ impl Net {
             &syndeo_cache::PeerProof::Integrity(integrity.clone()),
             &body,
         ) {
-            tracing::warn!(url = %request.url, %err, "a peer body failed its own declared hash");
+            tracing::warn!(url = %Redacted(&request.url), %err, "a peer body failed its own declared hash");
             return None;
         }
 
@@ -906,14 +910,14 @@ impl Net {
                 refresh_entry(&client, &config, &cache, &request, &key, &conditional).await;
             match outcome {
                 Ok(Refreshed::Stored { shared }) => {
-                    tracing::debug!(url = %request.url, "refreshed a stale entry");
+                    tracing::debug!(url = %Redacted(&request.url), "refreshed a stale entry");
                     announce_to(peers.as_ref(), &announcements, shared);
                 }
                 Ok(Refreshed::NotStored) => {
-                    tracing::debug!(url = %request.url, "the refresh was not storable")
+                    tracing::debug!(url = %Redacted(&request.url), "the refresh was not storable")
                 }
                 Err(err) => {
-                    tracing::debug!(url = %request.url, %err, "background refresh failed; the stored entry stands")
+                    tracing::debug!(url = %Redacted(&request.url), %err, "background refresh failed; the stored entry stands")
                 }
             }
             inflight
@@ -1205,10 +1209,10 @@ fn finish_streamed(state: &mut Teed) {
     match outcome {
         Ok(StoreOutcome::Stored { .. }) => {}
         Ok(StoreOutcome::NotStored(reason)) => {
-            tracing::debug!(url = %state.request.url, reason, "not cached");
+            tracing::debug!(url = %Redacted(&state.request.url), reason, "not cached");
         }
         Ok(StoreOutcome::StoredPartial { .. }) => {}
-        Err(err) => tracing::warn!(url = %state.request.url, %err, "cache write failed"),
+        Err(err) => tracing::warn!(url = %Redacted(&state.request.url), %err, "cache write failed"),
     }
 }
 
@@ -1246,7 +1250,7 @@ async fn refresh_entry(
     let verified = match &request.integrity {
         Some(integrity) if !is_hop(request, status, &headers) => {
             if !integrity.verify(&body) {
-                tracing::warn!(url = %request.url, "a refreshed body does not satisfy the declared integrity; not stored");
+                tracing::warn!(url = %Redacted(&request.url), "a refreshed body does not satisfy the declared integrity; not stored");
                 return Ok(Refreshed::NotStored);
             }
             Some(integrity)
@@ -1345,7 +1349,10 @@ fn refuse_unusable_integrity(request: &FetchRequest) -> Result<()> {
     } else {
         return Ok(());
     };
-    Err(NetError::Integrity(format!("{}: {refusal}", request.url)))
+    Err(NetError::Integrity(format!(
+        "{}: {refusal}",
+        Redacted(&request.url)
+    )))
 }
 
 /// A redirect this process will follow rather than hand back: not the

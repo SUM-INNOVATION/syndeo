@@ -6,6 +6,7 @@ use crate::headers::{now_secs, StoredHeaders};
 use crate::index::{entry_key, BlobRecord, EntryRecord, Index, Provenance, Segment, StoredBody};
 use crate::policy::{self, CacheOptions, Freshness, Storability, StoredMeta};
 use crate::range::{self, Coverage, Resolved};
+use crate::redact::Redacted;
 use crate::sri::Integrity;
 use crate::stats::Stats;
 use crate::vary;
@@ -415,7 +416,7 @@ impl Cache {
 
     fn drop_broken(&self, key: &str, record: &EntryRecord, err: &CacheError) -> Result<()> {
         if let Some(orphaned) = self.index.drop_broken_entry(key, record)? {
-            tracing::warn!(url = %record.url, %err, "dropped a cache entry whose body was lost");
+            tracing::warn!(url = %Redacted(&record.url), %err, "dropped a cache entry whose body was lost");
             self.index.bump(counters::CORRUPT_ENTRIES, 1)?;
             self.delete_orphans(&orphaned)?;
         }
@@ -1246,7 +1247,7 @@ impl Cache {
         if !same_representation(&stored, head_headers) {
             let orphaned = self.index.remove_entry(&key)?;
             self.delete_orphans(&orphaned)?;
-            tracing::debug!(url, "a HEAD contradicted the stored GET; invalidated it");
+            tracing::debug!(url = %Redacted(url), "a HEAD contradicted the stored GET; invalidated it");
             return Ok(());
         }
 

@@ -21,6 +21,7 @@ use hyper_util::server::conn::auto::Builder as ServerBuilder;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use syndeo_cache::redact::Redacted;
 use syndeo_net::{DnsMode, FetchRequest, Net, NetConfig, RedirectMode};
 use tokio::net::TcpListener;
 
@@ -806,7 +807,7 @@ async fn forward(
                 .unwrap_or_else(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "malformed response"))
         }
         Err(err) => {
-            tracing::warn!(%url, %err, "fetch failed");
+            tracing::warn!(url = %Redacted(&url), %err, "fetch failed");
             text(StatusCode::BAD_GATEWAY, &format!("{err}"))
         }
     }
@@ -1200,6 +1201,83 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(serve(listener, proxy.clone()));
         (address, proxy)
+    }
+
+    /// Log output, kept for a test to read.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// No log line or message in the proxy shows a URL as itself; see
+    /// `syndeo_cache::redact::unredacted`. The request trace, which is opt-in
+    /// and off in a browser's own proxy, is the one place a URL is shown
+    /// whole, and it does not go through a field.
+    #[test]
+    fn nothing_in_the_proxy_shows_a_url_as_itself() {
+        for (file, source) in [
+            ("main.rs", include_str!("main.rs")),
+            ("auth.rs", include_str!("auth.rs")),
+            ("ca.rs", include_str!("ca.rs")),
+            ("keychain.rs", include_str!("keychain.rs")),
+            ("stats.rs", include_str!("stats.rs")),
+        ] {
+            let found = syndeo_cache::redact::unredacted(source);
+            assert!(found.is_empty(), "{file}: {found:#?}");
+        }
+    }
+
+    /// A fetch that fails is logged, at every level, with the origin it was
+    /// for and nothing of the path or query, which can hold a search, a token
+    /// or a password-reset link.
+    #[tokio::test]
+    async fn a_failed_fetch_is_logged_with_its_origin_and_nothing_private() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = start_proxy(dir.path()).await;
+        // A port nothing listens on, so the fetch fails.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("http://127.0.0.1:{closed}/reset/private?token=private");
+        let reply = through(proxy, &url, &[]).await;
+        assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+
+        let log = captured.text();
+        assert!(log.contains("fetch failed"), "{log}");
+        assert!(log.contains(&format!("http://127.0.0.1:{closed}")), "{log}");
+        for private in ["private", "token", "/reset"] {
+            assert!(!log.contains(private), "{private} in {log}");
+        }
     }
 
     /// What came back through the proxy.

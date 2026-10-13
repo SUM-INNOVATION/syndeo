@@ -18,6 +18,7 @@ pub mod headers;
 pub mod index;
 pub mod policy;
 pub mod range;
+pub mod redact;
 pub mod sri;
 pub mod stats;
 pub mod vary;
