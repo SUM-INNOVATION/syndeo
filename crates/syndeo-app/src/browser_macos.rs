@@ -80,6 +80,10 @@ pub struct Ivars {
     /// while the failure page stands in for it.
     failed: RefCell<Option<String>>,
     loading: Cell<bool>,
+    /// This controller refused the last navigation a page started, which
+    /// WebKit may then report as a load it interrupted: the page stays as it
+    /// was, and there is no failure to show.
+    refused: Cell<bool>,
 }
 
 /// `NSURLErrorCancelled`: a load stopped by Stop, or replaced by another.
@@ -126,6 +130,7 @@ define_class!(
             let scheme = scheme_of(&request);
             let allowed = !main_frame || address::allowed_in_main_frame(&scheme);
             if !allowed {
+                self.ivars().refused.set(true);
                 tracing::info!(scheme = %scheme, "refused a page that is not the web's own in a window");
             }
             handler.call((if allowed { WKNavigationActionPolicy::Allow } else { WKNavigationActionPolicy::Cancel },));
@@ -133,6 +138,7 @@ define_class!(
 
         #[unsafe(method(webView:didStartProvisionalNavigation:))]
         fn did_start(&self, _webview: &WKWebView, _navigation: Option<&WKNavigation>) {
+            self.ivars().refused.set(false);
             self.ivars().loading.set(true);
             self.refresh();
         }
@@ -155,7 +161,8 @@ define_class!(
         #[unsafe(method(webView:didFailProvisionalNavigation:withError:))]
         fn did_fail_provisional(&self, _webview: &WKWebView, _navigation: Option<&WKNavigation>, error: &NSError) {
             self.ivars().loading.set(false);
-            if error.code() != CANCELLED {
+            let refused = error.code() == INTERRUPTED && self.ivars().refused.replace(false);
+            if error.code() != CANCELLED && !refused {
                 self.show_failure(error);
             }
             self.refresh();

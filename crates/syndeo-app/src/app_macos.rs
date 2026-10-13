@@ -20,7 +20,10 @@
 //! a native label saying so instead — no web view at all, so nothing in it
 //! can reach the network. There is no unproxied configuration and no unpinned
 //! web view anywhere in this application, and a page asking for a new window
-//! gets a tab made the same way.
+//! gets a tab made the same way. WebKit itself opens some local addresses,
+//! this Mac's own among them, directly rather than through the proxy (seen on
+//! CI for 127.0.0.1), so those are not cached by Syndeo, and nothing here
+//! claims that every request goes through it.
 //!
 //! The proxy is the one helper, started once at launch from the bundle's
 //! `Contents/Helpers` (`syndeo_webkit::owned`), and stopped when the
