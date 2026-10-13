@@ -720,12 +720,25 @@ Before handing a release to anyone, check the thing that was published rather
 than the thing that was built:
 
 ```sh
-SYNDEO_EXPECT_SIGNED=yes ci/verify-release.sh 0.1.7
+SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=<team> ci/verify-release.sh 0.1.7
 ```
 
-`SYNDEO_EXPECT_SIGNED=yes` is for a signed release, v0.1.7 and later; for an
-earlier one leave it out, and the binaries are expected to carry no Developer
-ID.
+`SYNDEO_EXPECT_SIGNED=yes` is for a signed release, v0.1.7 and later, and
+`MACOS_TEAM_ID` is the ten-character team it is signed by, which
+`pkgutil --check-signature` shows for the release's package. Each binary is
+then held to what a notarized command-line tool is:
+- Developer ID Application of that team, chained to Apple Root CA;
+- a strict verification;
+- the hardened runtime and a secure timestamp;
+- no entitlements;
+- notarized, as `codesign --check-notarization -R=notarized` finds;
+- it runs, and its `--version` says exactly this release.
+
+Gatekeeper's `spctl -a -t execute` is not asked about the binaries. That
+assessment is for apps, and rejects every bare command-line tool, however
+it is signed. Gatekeeper still judges the package (`ci/verify-pkg.sh`). For
+an earlier release leave both out, and the binaries are expected to carry no
+Developer ID.
 
 It installs from the release with the same one-liner the README gives, into a
 throwaway directory, and then asks the installed binaries to demonstrate what
