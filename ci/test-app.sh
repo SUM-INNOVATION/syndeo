@@ -15,8 +15,9 @@
 #   - its window holds a web view and no error;
 #   - its menus have the usual shortcuts, read from the menu items;
 #   - in it, as a person uses it — File > Open Location…, then the address
-#     typed as keystrokes and Return: an address opens; the proxy's own page,
-#     which only the proxy answers, has counted that request; Back and Forward
+#     typed as keystrokes and Return: an address opens and shows the page's
+#     own text, and the count on the proxy's own page, which only the proxy
+#     answers, rises for it; Back and Forward
 #     work, by the bar's button and by History > Forward; words and a file:
 #     address are refused with Syndeo's own page, not sent anywhere; File >
 #     New Tab opens a tab with the start page, beside the first in one window,
@@ -52,10 +53,11 @@
 # fetch that failed.
 #
 # mutant, which gates: the app given is one of ci/macos-app/mutants.py's,
-# with one safeguard taken out, and this passes only if the check meant to
-# catch it fails: https for no-pinning-delegate (while http still works),
-# a page's links in the window for no-navigation-policy, and in a new tab for
-# any-scheme-in-a-new-tab.
+# with one safeguard taken out, and this passes only if the checks meant to
+# catch it fail, at least one, and no other check does: https for
+# no-pinning-delegate (while http, rendered and counted, still works), a
+# page's links in the window for no-navigation-policy, and in a new tab for
+# any-scheme-in-a-new-tab. Any other failure is a failure.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -117,6 +119,10 @@ no_app() { [ -z "$("$APPCTL" pids "$ID")" ]; }
 keystore_item() { security find-generic-password -s com.sum.syndeo.keystore >/dev/null 2>&1 && echo present || echo absent; }
 
 CANNOT_BROWSE="Syndeo can't open websites right now."
+# What example.com's page itself says. Its <title> is "Example Domain", and
+# the window takes its title from the page through its controller, so that is
+# no proof the page was shown; this sentence is in the page's body.
+EXAMPLE_BODY='This domain is for use in documentation examples'
 
 # started APP ROUND: open APP and check what is running: Launch Services has
 # it as $ID, from APP, with an on-screen window, and its one child is the
@@ -271,7 +277,28 @@ server.serve_forever()' "$dir" >"$LOGS/origin.log" 2>&1 &
   wait_for 10 grep -q '^port [0-9]' "$LOGS/origin.log" || { bad "loopback origin" "it did not start: $(head -c 200 "$LOGS/origin.log")"; return 1; }
   ORIGIN_PORT="$(sed -n 's/^port \([0-9][0-9]*\)$/\1/p' "$LOGS/origin.log" | head -n 1)"
 }
-origin_stop() { [ -n "$ORIGIN_PID" ] && kill "$ORIGIN_PID" 2>/dev/null; ORIGIN_PORT='' ORIGIN_PID=''; }
+# origin_stop: stop the loopback origin, which has to be running until then
+# and stop for the SIGTERM sent, and nothing else. Reaped here, so the shell
+# does not report the stop it was asked for; any other end, or a traceback in
+# its log, is a failure.
+origin_stop() {
+  local status
+  [ -n "$ORIGIN_PID" ] || return 0
+  if kill -0 "$ORIGIN_PID" 2>/dev/null; then
+    kill "$ORIGIN_PID"
+    wait "$ORIGIN_PID" 2>/dev/null
+    status=$?
+    [ "$status" = 143 ] || bad "loopback origin" "it ended with status $status, not from the SIGTERM sent: $(tail -n 3 "$LOGS/origin.log" | tr '\n' ' ')"
+  else
+    wait "$ORIGIN_PID" 2>/dev/null
+    status=$?
+    bad "loopback origin" "it had already ended, status $status, before it was stopped: $(tail -n 3 "$LOGS/origin.log" | tr '\n' ' ')"
+  fi
+  if grep -q 'Traceback' "$LOGS/origin.log"; then
+    bad "loopback origin" "it raised: $(grep -A3 'Traceback' "$LOGS/origin.log" | tail -n 1)"
+  fi
+  ORIGIN_PORT='' ORIGIN_PID=''
+}
 
 # counted WHEN: open the proxy's own page, which only the proxy answers, and
 # set COUNTED to the requests it has counted so far.
@@ -289,11 +316,28 @@ pinned() {
   local before
   counted "before https"
   before="$COUNTED"
-  visit "https://example.com" "https://example.com/" 'Example Domain' \
-    "https://example.com opens, with Syndeo's authority in no trust settings"
+  visit "https://example.com" "https://example.com/" "$EXAMPLE_BODY" \
+    "https://example.com opens and shows its own text, with Syndeo's authority in no trust settings"
   counted "after https"
-  must "$([ -n "$before" ] && [ -n "$COUNTED" ] && [ "$COUNTED" -gt "$before" ] && echo yes)" \
-    "and the proxy fetched it: its count went from ${before:-?} to ${COUNTED:-?}"
+  risen "$before" "and the proxy fetched it over https"
+}
+
+# risen BEFORE WHAT: COUNTED, the proxy's count read since, is above BEFORE.
+risen() {
+  must "$([ -n "$1" ] && [ -n "$COUNTED" ] && [ "$COUNTED" -gt "$1" ] && echo yes)" \
+    "$2: the proxy's count went from ${1:-?} to ${COUNTED:-?}"
+}
+
+# plain_http: http://example.com, typed, opens and shows its own text, and
+# the proxy's count shows the window reached it through the proxy.
+plain_http() {
+  local before
+  counted "before http"
+  before="$COUNTED"
+  visit "http://example.com" "http://example.com/" "$EXAMPLE_BODY" \
+    "http://example.com, typed, opens on Return and shows its own text"
+  counted "after http"
+  risen "$before" "and the proxy fetched it over http"
 }
 
 # private LOG: visit a page with a path and a query, and one whose host does
@@ -335,6 +379,13 @@ policy() {
     if "$APPCTL" ax-tree "$PID" | grep -qE 'root:|SYNDEO-(BLOB|DATA)-PAGE'; then problems="$problems what it points at is shown;"; fi
     [ "$("$APPCTL" apps)" = "$apps" ] || problems="$problems another application started: $(comm -13 <(printf '%s\n' "$apps") <("$APPCTL" apps) | tr '\n' ' ');"
     if [ -z "$problems" ]; then ok "policy: $label is refused $where"; else bad "policy: $label is refused $where" "$problems"; fi
+    # A tab it opened is closed again, so the next attempt starts as this one
+    # did: its opening has already been counted against it.
+    if [ "$(grep -c 'a window opened' "$log")" != "$opened" ]; then
+      "$APPCTL" activate "$PID" >/dev/null || true
+      "$APPCTL" menu "$PID" File "Close Tab" >/dev/null 2>&1 || "$APPCTL" menu "$PID" File Close >/dev/null 2>&1 || true
+      sleep 1
+    fi
   done <<'EOF'
 file link|in the window
 mail link|in the window
@@ -354,7 +405,7 @@ EOF
   else
     bad "a link to a web page in a new tab opens one" "the app reports no new window: $(grep 'a window' "$log" | tail -n 2 | tr '\n' ' ')"
   fi
-  arrive "http://example.com/" 'Example Domain' "and the new tab shows that page"
+  arrive "http://example.com/" "$EXAMPLE_BODY" "and the new tab shows that page"
   choose File "Close Tab"
   arrive "$page" 'Policy test' "closing it leaves the page with the link as it was"
 }
@@ -369,11 +420,9 @@ browsing() {
   log="$LOGS/app-$round.stderr"
   shortcuts
   arrive "" 'Welcome to Syndeo' "a new window shows the start page, with an empty address field ($round)"
-  visit "http://example.com" "http://example.com/" 'Example Domain' "an address typed into the field opens on Return"
-  visit "http://syndeo.local/stats" "http://syndeo.local/stats" 'requests [1-9]' \
-    "the proxy's own page, which only the proxy answers, opens and has counted that request"
+  plain_http
   "$APPCTL" press "$PID" syndeo.back || bad "Back" "no Back button to press in the front window"
-  arrive "http://example.com/" 'Example Domain' "the bar's Back button goes back"
+  arrive "http://example.com/" "$EXAMPLE_BODY" "the bar's Back button goes back"
   choose History Forward
   arrive "http://syndeo.local/stats" 'requests [1-9]' "History > Forward goes forward"
   visit "bread" "bread" 'does not search' "a word is refused by Syndeo's own page, which says it was not sent anywhere"
@@ -495,49 +544,47 @@ refuse() {
 }
 
 # mutant NAME APP: APP is Syndeo.app with NAME's safeguard taken out. Run what
-# should catch it, and pass only if the check meant to catch it failed (and,
-# for no-pinning-delegate, http still worked, so it is the pinning that
-# failed and not the mutant as a whole).
+# should catch it, and pass only if the checks meant to catch it failed, at
+# least one of them, and nothing else did: every other check, from launch
+# through quitting, is the mutant's isolation, and an unrelated failure is a
+# failure here too. For no-pinning-delegate that includes http through the
+# proxy, rendered and counted, so it is the pinning that failed.
 mutant() {
-  local name="${1:-}" app want keep='' log
+  local name="${1:-}" app intended log caught unrelated
   [ -n "$name" ] && [ -d "${2:-}" ] || { say "usage: $0 mutant <name> <Syndeo.app>"; exit 2; }
   app="$(cd "$2" && pwd -P)"
   no_app || { say "refusing: $ID is already running"; exit 2; }
   printf '\nSyndeo.app with a safeguard taken out (%s): %s\n' "$name" "$app"
-  started "$app" "mutant-$name" || exit 1
-  helper_of "$app" "mutant-$name"
-  browses "mutant-$name"
-  log="$LOGS/app-mutant-$name.stderr"
   case "$name" in
-    no-pinning-delegate)
-      visit "http://example.com" "http://example.com/" 'Example Domain' "the mutant still browses over http"
-      pinned
-      want="^https://example\.com opens"
-      keep="the mutant still browses over http"
-      ;;
-    no-navigation-policy)
-      policy "$log"
-      want="^policy: .* is refused in the window$"
-      ;;
-    any-scheme-in-a-new-tab)
-      policy "$log"
-      want="^policy: .* is refused and opens no tab$"
-      ;;
-    *) say "no mutant $name"; stopped "mutant-$name"; exit 2 ;;
+    no-pinning-delegate) intended='^(https://example\.com opens|and the proxy fetched it over https:)' ;;
+    no-navigation-policy) intended='^policy: .* is refused in the window$' ;;
+    any-scheme-in-a-new-tab) intended='^policy: .* is refused and opens no tab$' ;;
+    *) say "no mutant $name"; exit 2 ;;
   esac
+  if started "$app" "mutant-$name"; then
+    helper_of "$app" "mutant-$name"
+    browses "mutant-$name"
+    log="$LOGS/app-mutant-$name.stderr"
+    case "$name" in
+      no-pinning-delegate) plain_http; pinned ;;
+      *) policy "$log" ;;
+    esac
+  fi
   origin_stop
   stopped "mutant-$name"
   printf '\n'
-  if [ -n "$keep" ] && printf '%s' "$FAILED" | grep -qxF "$keep"; then
-    printf 'MUTANT NOT ISOLATED  %s: "%s" failed too, so the mutant is broken as a whole\n' "$name" "$keep"
+  caught="$(printf '%s' "$FAILED" | grep -E "$intended")"
+  unrelated="$(printf '%s' "$FAILED" | grep -vE "$intended")"
+  if [ -n "$unrelated" ]; then
+    printf 'MUTANT WRONG  %s: a check it was not meant to fail failed: %s\n' "$name" "$(printf '%s' "$unrelated" | tr '\n' ';')"
     return 1
   fi
-  if printf '%s' "$FAILED" | grep -qE "$want"; then
-    printf 'MUTANT CAUGHT  %s, by: %s\n' "$name" "$(printf '%s' "$FAILED" | grep -E "$want" | tr '\n' ';')"
-    return 0
+  if [ -z "$caught" ]; then
+    printf 'MUTANT SURVIVED  %s: no check matching /%s/ failed\n' "$name" "$intended"
+    return 1
   fi
-  printf 'MUTANT SURVIVED  %s: nothing matching /%s/ failed; what failed: %s\n' "$name" "$want" "$(printf '%s' "$FAILED" | tr '\n' ';')"
-  return 1
+  printf 'MUTANT CAUGHT  %s, by: %s\n' "$name" "$(printf '%s' "$caught" | tr '\n' ';')"
+  return 0
 }
 
 # measure: report what this runner allows; fail only if it cannot put the
