@@ -23,8 +23,12 @@
 # a separate step, the helper first and then the bundle.
 #
 # --check requires a bundle to be exactly that: the paths and their modes,
-# the Info.plist's identifier, executable, versions and minimum system, the
-# PkgInfo, and an icon.
+# the Info.plist's identifier, executable, versions and minimum system, its
+# App Transport Security exactly as below, the PkgInfo, and an icon.
+#
+# App Transport Security: web pages may load over plain http, as they do in
+# any browser, and nothing else is relaxed. NSAllowsArbitraryLoadsInWebContent
+# applies to web views only; the application's own connections keep ATS.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -136,6 +140,11 @@ CFBundleVersion=$version
 LSMinimumSystemVersion=13.0
 NSPrincipalClass=NSApplication
 EOF
+  have="$(plutil -extract NSAppTransportSecurity json -o - "$plist" 2>/dev/null || echo '<missing>')"
+  if [ "$have" != '{"NSAllowsArbitraryLoadsInWebContent":true}' ]; then
+    printf '  FAIL  Info.plist NSAppTransportSecurity — %s, not web content only\n' "$have"
+    bad=1
+  fi
   if [ "$(cat "$app/Contents/PkgInfo" 2>/dev/null)" != 'APPL????' ]; then
     printf '  FAIL  PkgInfo — not APPL????\n'
     bad=1
@@ -212,6 +221,12 @@ self_test() {
   fresh
   plutil -replace LSMinimumSystemVersion -string 12.0 "$T/out-dir/Syndeo.app/Contents/Info.plist"
   expect "1:another minimum system: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  fresh
+  plutil -insert NSAppTransportSecurity.NSAllowsArbitraryLoads -bool YES "$T/out-dir/Syndeo.app/Contents/Info.plist"
+  expect "1:App Transport Security turned off for everything, not only web content: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  fresh
+  plutil -remove NSAppTransportSecurity "$T/out-dir/Syndeo.app/Contents/Info.plist"
+  expect "1:web pages held to App Transport Security, so no http page opens: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
   fresh
   ln -s Syndeo "$T/out-dir/Syndeo.app/Contents/MacOS/link"
   expect "1:a link inside the bundle: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
