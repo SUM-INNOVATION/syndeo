@@ -14,9 +14,6 @@
 
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(target_os = "macos")]
-#[path = "pin_macos.rs"]
-mod pin;
 
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
