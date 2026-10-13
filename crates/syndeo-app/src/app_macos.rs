@@ -505,13 +505,16 @@ impl AppDelegate {
         window
     }
 
-    /// The start page, saying whether the authority is trusted.
+    /// The start page, saying whether the authority is trusted: that, and
+    /// nothing about what follows from it. Syndeo's windows open secure
+    /// websites either way, since each answers its challenges with that
+    /// authority as the anchor; what else, if anything, needs the keychain's
+    /// trust is for onboarding to establish.
     fn first_launch_page(&self) -> String {
         let trust = if owned::authority_is_trusted(&authority(&self.ivars().home)) {
             "Syndeo's local certificate authority is trusted in your login keychain."
         } else {
-            "Syndeo's local certificate authority is not trusted yet. Secure (https) websites \
-             will not open until it is, and this preview of Syndeo cannot yet ask for that."
+            "Syndeo's local certificate authority is not in your login keychain's trust settings."
         };
         FIRST_LAUNCH.replace("{{TRUST}}", &address::escape(trust))
     }
