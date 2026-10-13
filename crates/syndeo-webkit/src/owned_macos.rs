@@ -208,6 +208,21 @@ fn exited_soon(owned: &mut ProxyChild) -> Option<std::process::ExitStatus> {
     None
 }
 
+/// How a browser's own proxy is run: on a loopback port the system picks,
+/// announced, with its credential on stdin, gone with its parent, and not
+/// tracing requests. A request trace is every URL in full, paths and queries
+/// included, and those can hold a search, a token or a password-reset link;
+/// the proxy's other logs show only a URL's origin.
+pub const PROXY_ARGS: [&str; 7] = [
+    "run",
+    "--exit-with-parent",
+    "--listen",
+    "127.0.0.1:0",
+    "--announce",
+    "--auth-stdin",
+    "--trace-requests=false",
+];
+
 /// Start the proxy this browser fetches through, and wait until it says where.
 ///
 /// A sibling binary, found beside the image this process is running, as the
@@ -227,14 +242,7 @@ pub fn start_proxy(
 
     let mut command = std::process::Command::new(beside);
     command
-        .args([
-            "run",
-            "--exit-with-parent",
-            "--listen",
-            "127.0.0.1:0",
-            "--announce",
-            "--auth-stdin",
-        ])
+        .args(PROXY_ARGS)
         // On the environment rather than a flag, because that is where the
         // proxy reads it from and inventing a flag it does not have is how the
         // first attempt at this failed.
@@ -313,6 +321,14 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", script]);
         command
+    }
+
+    #[test]
+    fn a_browsers_own_proxy_does_not_trace_requests() {
+        assert!(PROXY_ARGS.contains(&"--trace-requests=false"));
+        assert!(!PROXY_ARGS
+            .iter()
+            .any(|arg| *arg == "--trace-requests" || *arg == "--trace-requests=true"));
     }
 
     #[test]
