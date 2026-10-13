@@ -55,7 +55,10 @@ EOF
 # What APP actually holds, in manifest's form.
 holds() {
   (
-    cd "$1"
+    # Inside a command substitution bash does not apply set -e, so a
+    # directory that cannot be entered has to stop this here, or find
+    # would list wherever it was run from instead.
+    cd "$1" || exit 1
     find . -mindepth 1 -print | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r p; do
       if [ -L "$p" ]; then
         printf '%s l\n' "$p"
@@ -103,6 +106,10 @@ assemble() {
 check() {
   local app="$1" version="$2" plist bad=0 key want have
   plist="$app/Contents/Info.plist"
+  if [ ! -d "$app/Contents" ] || [ -L "$app" ]; then
+    printf '  FAIL  bundle — %s is not a bundle\n' "$app"
+    return 1
+  fi
   if [ "$(holds "$app")" != "$(manifest)" ]; then
     printf '  FAIL  manifest — %s\n' "$(diff <(manifest) <(holds "$app") | grep '^[<>]' | tr '\n' ';')"
     bad=1
@@ -145,6 +152,9 @@ EOF
 
 self_test() {
   local cases=0 wrong=0
+  # A case whose preparation fails is a wrong case, not the end of the run:
+  # the self-test keeps going and counts it.
+  set +e
   # Not local: the EXIT trap runs after this function has returned.
   T="$(mktemp -d)"
   trap 'rm -rf "$T"' EXIT
@@ -162,9 +172,11 @@ self_test() {
       wrong=$((wrong + 1))
     fi
   }
+  # fresh: a new bundle for 0.2.0 in $T/out-dir. If assembly fails there is
+  # none, and the case after it is wrong.
   fresh() {
     rm -rf "$T/out-dir" && mkdir -p "$T/out-dir"
-    bash "$0" 0.2.0 "$T/bins" "$T/out-dir" >/dev/null
+    bash "$0" 0.2.0 "$T/bins" "$T/out-dir" >/dev/null 2>&1
   }
 
   printf '\n  package-macos-app.sh: the bundle, exactly\n'
@@ -206,6 +218,8 @@ self_test() {
   fresh
   printf 'garbage' >"$T/out-dir/Syndeo.app/Contents/Info.plist"
   expect "1:an Info.plist that is not one: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  rm -rf "$T/out-dir/Syndeo.app"
+  expect "1:no bundle at all: refused at once, nothing else looked at" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
 
   printf '\n  %d cases, %d wrong\n\n' "$cases" "$wrong"
   [ "$wrong" -eq 0 ]
