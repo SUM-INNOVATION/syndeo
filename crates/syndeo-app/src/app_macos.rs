@@ -1,10 +1,12 @@
 //! The application: AppKit, with WebKit in its windows.
 //!
 //! Everything a Mac user expects of an application comes from AppKit itself,
-//! not from a window library: a Dock icon, the Syndeo, File, Edit and Window
-//! menus with their usual shortcuts, a Dock click that brings a window back,
-//! and closing the last window leaving the application running, as Mac
-//! applications do, until it is quit.
+//! not from a window library: a Dock icon; the Syndeo, File, Edit, View,
+//! History and Window menus with their usual shortcuts; tabs, as macOS draws
+//! them; a Dock click that brings a window back; and closing the last window
+//! leaving the application running, as Mac applications do, until it is quit.
+//! Each window has its controller (`browser_macos`), which is let go when the
+//! window closes.
 //!
 //! **It fails closed.** A web view that can reach the network is made only
 //! from a [`Browsing`], and a `Browsing` exists only once all of this held at
@@ -12,11 +14,13 @@
 //! configuration routed through it was built, its certificate authority is on
 //! disk and is a certificate, and the delegate that accepts that authority
 //! and no other was built. Each window then gets its own configuration,
-//! routed through the proxy, and its web view carries that delegate, checked
-//! after it is set. If any of it fails, the window holds a native label
-//! saying so instead — no web view at all, so nothing in it can reach the
-//! network. There is no unproxied configuration and no unpinned web view
-//! anywhere in this application.
+//! routed through the proxy, and its web view's delegate is the window's
+//! controller, which answers every TLS challenge with that authority as the
+//! only anchor, checked after it is set. If any of it fails, the window holds
+//! a native label saying so instead — no web view at all, so nothing in it
+//! can reach the network. There is no unproxied configuration and no unpinned
+//! web view anywhere in this application, and a page asking for a new window
+//! gets a tab made the same way.
 //!
 //! The proxy is the one helper, started once at launch from the bundle's
 //! `Contents/Helpers` (`syndeo_webkit::owned`), and stopped when the
@@ -27,18 +31,27 @@
 //! keychain entry is made for it, no passphrase is asked for and no recovery
 //! phrase is generated.
 
+use crate::address;
+use crate::browser_macos::{browser_content, BrowserController, Hooks};
 use anyhow::{Context, Result};
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
-use objc2::{define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly};
+use objc2::{
+    define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly, Message,
+};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSEventModifierFlags, NSMenu, NSMenuItem, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSEventModifierFlags, NSMenu, NSMenuItem, NSTextField, NSView, NSWindow, NSWindowOrderingMode,
+    NSWindowStyleMask,
 };
-use objc2_foundation::{ns_string, NSNotification, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    ns_string, NSNotification, NSPoint, NSRect, NSSize, NSString, NSURLRequest,
+};
 use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
 use std::cell::RefCell;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use syndeo_shell::supervisor::InstallDir;
 use syndeo_webkit::{owned, pin, proxied};
 
@@ -48,6 +61,9 @@ const FIRST_LAUNCH: &str = include_str!("first_launch.html");
 /// The first line of every window that cannot browse.
 const CANNOT_BROWSE: &str = "Syndeo can't open websites right now.";
 
+/// Every browser window's tabbing identifier, so they tab together.
+const TABS: &str = "com.sum.syndeo.browser";
+
 // ------------------------------------------------------------- the decisions
 
 /// What a window's content is made of: the WebKit pieces, behind a seam so
@@ -55,17 +71,20 @@ const CANNOT_BROWSE: &str = "Syndeo can't open websites right now.";
 trait Engine {
     type Config;
     type Pinner;
+    type WebView;
     type View;
+    type Delegate;
     /// A web view configuration whose data store sends everything through
     /// `target`, with its credential.
     fn configure(&self, target: &proxied::ProxyTarget) -> Result<Self::Config>;
     /// The delegate that accepts the authority in `pem`, and no other.
     fn pinner(&self, pem: &str) -> Result<Self::Pinner>;
     /// A web view made with `config`.
-    fn web_view(&self, config: &Self::Config) -> Self::View;
-    /// Make `pinner` the view's navigation delegate, and say whether it is,
-    /// as the view reports it afterwards.
-    fn pin(&self, view: &Self::View, pinner: &Self::Pinner) -> bool;
+    fn web_view(&self, config: &Self::Config) -> Self::WebView;
+    /// Make the view's navigation delegate one that answers challenges with
+    /// `pinner`, and hand it back, but only if the view reports it as its
+    /// navigation delegate afterwards.
+    fn pin(&self, view: &Self::WebView, pinner: &Self::Pinner) -> Option<Self::Delegate>;
     /// A view that says `text` and cannot reach the network.
     fn error(&self, text: &str) -> Self::View;
 }
@@ -82,6 +101,15 @@ struct Browsing<P> {
 enum Readiness<S, P> {
     Ready { proxy: S, browsing: Browsing<P> },
     NotReady(String),
+}
+
+/// What a new window holds.
+enum Content<W, V, D> {
+    /// A web view routed through the proxy, and the delegate that pins it.
+    Browser(W, D),
+    /// A view saying why the window cannot browse, which cannot reach the
+    /// network.
+    Refused(V),
 }
 
 /// Decide, once, whether this application may make web views that reach the
@@ -129,25 +157,29 @@ fn prepare<E: Engine, S>(
 /// What a new window holds: a web view routed through the proxy and pinned
 /// to its authority, or, if any of that is not so, a view that says why and
 /// cannot reach the network.
-fn content<E: Engine>(engine: &E, browsing: Option<&Browsing<E::Pinner>>, reason: &str) -> E::View {
+fn content<E: Engine>(
+    engine: &E,
+    browsing: Option<&Browsing<E::Pinner>>,
+    reason: &str,
+) -> Content<E::WebView, E::View, E::Delegate> {
     let Some(browsing) = browsing else {
-        return engine.error(&cannot_browse(reason));
+        return Content::Refused(engine.error(&cannot_browse(reason)));
     };
     let config = match engine.configure(&browsing.target) {
         Ok(config) => config,
         Err(err) => {
-            return engine.error(&cannot_browse(&format!(
+            return Content::Refused(engine.error(&cannot_browse(&format!(
                 "Syndeo could not route this window through its local proxy: {err:#}"
-            )))
+            ))))
         }
     };
     let view = engine.web_view(&config);
-    if !engine.pin(&view, &browsing.pinner) {
-        return engine.error(&cannot_browse(
+    let Some(delegate) = engine.pin(&view, &browsing.pinner) else {
+        return Content::Refused(engine.error(&cannot_browse(
             "Syndeo could not pin this window to its certificate authority.",
-        ));
-    }
-    view
+        )));
+    };
+    Content::Browser(view, delegate)
 }
 
 /// What a window that cannot browse says.
@@ -177,7 +209,8 @@ fn authority(home: &Path) -> PathBuf {
 
 // ------------------------------------------------------------- WebKit
 
-/// The engine the application runs: WebKit, AppKit and the pinning delegate.
+/// The engine the application runs: WebKit, AppKit and the window
+/// controllers that pin.
 struct WebKit {
     mtm: MainThreadMarker,
     frame: NSRect,
@@ -186,7 +219,9 @@ struct WebKit {
 impl Engine for WebKit {
     type Config = Retained<WKWebViewConfiguration>;
     type Pinner = Retained<pin::Pinner>;
+    type WebView = Retained<WKWebView>;
     type View = Retained<NSView>;
+    type Delegate = Retained<BrowserController>;
 
     fn configure(&self, target: &proxied::ProxyTarget) -> Result<Self::Config> {
         proxied::configuration(target, self.mtm)
@@ -196,26 +231,15 @@ impl Engine for WebKit {
         pin::Pinner::new(self.mtm, pem)
     }
 
-    fn web_view(&self, config: &Self::Config) -> Self::View {
-        let view = unsafe {
+    fn web_view(&self, config: &Self::Config) -> Self::WebView {
+        unsafe {
             WKWebView::initWithFrame_configuration(WKWebView::alloc(self.mtm), self.frame, config)
-        };
-        Retained::into_super(view)
+        }
     }
 
-    fn pin(&self, view: &Self::View, pinner: &Self::Pinner) -> bool {
-        let Some(webview) = view.downcast_ref::<WKWebView>() else {
-            return false;
-        };
-        let delegate = pin::as_delegate(pinner);
-        unsafe { webview.setNavigationDelegate(Some(&delegate)) };
-        let set = unsafe { webview.navigationDelegate() };
-        set.is_some_and(|set| {
-            std::ptr::eq(
-                Retained::as_ptr(&set).cast::<AnyObject>(),
-                Retained::as_ptr(pinner).cast::<AnyObject>(),
-            )
-        })
+    fn pin(&self, view: &Self::WebView, pinner: &Self::Pinner) -> Option<Self::Delegate> {
+        let controller = BrowserController::new(self.mtm, view.clone(), pinner.clone());
+        controller.take_over().then_some(controller)
     }
 
     fn error(&self, text: &str) -> Self::View {
@@ -236,7 +260,11 @@ pub struct State {
     browsing: RefCell<Option<Browsing<Retained<pin::Pinner>>>>,
     /// Why there is no browsing, when there is none.
     not_ready: RefCell<String>,
-    windows: RefCell<Vec<Retained<NSWindow>>>,
+    /// Every open window, with its controller.
+    windows: RefCell<Vec<(Retained<NSWindow>, Retained<BrowserController>)>>,
+    /// Windows that closed, let go of once their closing has finished.
+    retired: RefCell<Vec<(Retained<NSWindow>, Retained<BrowserController>)>>,
+    hooks: RefCell<Option<Rc<Hooks>>>,
 }
 
 define_class!(
@@ -289,7 +317,13 @@ define_class!(
     impl AppDelegate {
         /// File > New Window.
         #[unsafe(method(newWindow:))]
-        fn new_window(&self, _sender: Option<&AnyObject>) {
+        fn new_window_action(&self, _sender: Option<&AnyObject>) {
+            self.open_window();
+        }
+
+        /// File > New Tab with no window in front: a window.
+        #[unsafe(method(newWindowForTab:))]
+        fn new_window_for_tab(&self, _sender: Option<&AnyObject>) {
             self.open_window();
         }
     }
@@ -306,6 +340,35 @@ impl AppDelegate {
             mtm: self.mtm(),
             frame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1200.0, 800.0)),
         }
+    }
+
+    /// What every controller may ask of the application, made once.
+    fn hooks(&self) -> Rc<Hooks> {
+        if let Some(hooks) = self.ivars().hooks.borrow().clone() {
+            return hooks;
+        }
+        let me = Weak::from_retained(&self.retain());
+        let (tab, closed, start) = (me.clone(), me.clone(), me);
+        let hooks = Rc::new(Hooks {
+            open_tab: Box::new(move |window, request| {
+                if let Some(app) = tab.load() {
+                    app.open_tab(window, request);
+                }
+            }),
+            closed: Box::new(move |window| {
+                if let Some(app) = closed.load() {
+                    app.forget(window);
+                }
+            }),
+            start_page: Box::new(move || {
+                start
+                    .load()
+                    .map(|app| app.first_launch_page())
+                    .unwrap_or_default()
+            }),
+        });
+        *self.ivars().hooks.borrow_mut() = Some(hooks.clone());
+        hooks
     }
 
     /// Start the proxy and decide whether this application can browse.
@@ -339,19 +402,62 @@ impl AppDelegate {
         }
     }
 
-    /// Bring back a window that is closed, or open one if there is none.
+    /// Bring a window to the front, or open one if there is none.
     fn show_a_window(&self) {
-        let existing = self.ivars().windows.borrow().first().cloned();
+        let existing = self
+            .ivars()
+            .windows
+            .borrow()
+            .first()
+            .map(|(window, _)| window.clone());
         match existing {
             Some(window) => window.makeKeyAndOrderFront(None),
             None => self.open_window(),
         }
     }
 
+    /// A new window, in front, with the start page.
     fn open_window(&self) {
+        let window = self.new_window(None);
+        window.center();
+        window.makeKeyAndOrderFront(None);
+    }
+
+    /// A new tab beside `parent`: `request`, or the start page.
+    fn open_tab(&self, parent: &NSWindow, request: Option<Retained<NSURLRequest>>) {
+        let window = self.new_window(request);
+        parent.addTabbedWindow_ordered(&window, NSWindowOrderingMode::Above);
+        window.makeKeyAndOrderFront(None);
+    }
+
+    /// A window that closed: its controller already let go of its web view.
+    /// Kept until the next window opens or closes, so nothing is freed while
+    /// AppKit is still closing it.
+    fn forget(&self, window: &NSWindow) {
+        let state = self.ivars();
+        state.retired.borrow_mut().clear();
+        let mut windows = state.windows.borrow_mut();
+        let mut kept = Vec::with_capacity(windows.len());
+        for (open, controller) in windows.drain(..) {
+            if std::ptr::eq(&*open, window) {
+                open.setDelegate(None);
+                state.retired.borrow_mut().push((open, controller));
+            } else {
+                kept.push((open, controller));
+            }
+        }
+        *windows = kept;
+        tracing::info!(open = windows.len(), "a window closed");
+    }
+
+    /// A window: browsing through the proxy if this application can, a
+    /// window that says why not if it cannot.
+    fn new_window(&self, request: Option<Retained<NSURLRequest>>) -> Retained<NSWindow> {
         let mtm = self.mtm();
         let state = self.ivars();
+        state.retired.borrow_mut().clear();
         let engine = self.engine();
+        let hooks = self.hooks();
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::Closable
             | NSWindowStyleMask::Miniaturizable
@@ -365,26 +471,41 @@ impl AppDelegate {
                 false,
             )
         };
-        // Closed windows are kept and brought back, not freed under us.
+        // This application holds its windows, and lets them go when they close.
         unsafe { window.setReleasedWhenClosed(false) };
         window.setTitle(ns_string!("Syndeo"));
+        window.setTabbingIdentifier(&NSString::from_str(TABS));
 
-        let view = content(
+        let made = content(
             &engine,
             state.browsing.borrow().as_ref(),
             &state.not_ready.borrow(),
         );
-        if let Some(webview) = view.downcast_ref::<WKWebView>() {
-            let page = NSString::from_str(&self.first_launch_page());
-            unsafe { webview.loadHTMLString_baseURL(&page, None) };
-        }
-        window.setContentView(Some(&view));
-        window.center();
-        window.makeKeyAndOrderFront(None);
-        state.windows.borrow_mut().push(window);
+        let controller = match made {
+            Content::Browser(webview, controller) => {
+                let frame = NSRect::new(NSPoint::new(0.0, 0.0), engine.frame.size);
+                let (container, ui) = browser_content(mtm, frame, &webview, &controller);
+                controller.attach(&window, ui, hooks);
+                window.setContentView(Some(&container));
+                match request {
+                    Some(request) => controller.load(&request),
+                    None => controller.show_start_page(),
+                }
+                controller
+            }
+            Content::Refused(view) => {
+                window.setContentView(Some(&view));
+                BrowserController::inert(mtm, &window, hooks)
+            }
+        };
+        window.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
+        let mut windows = state.windows.borrow_mut();
+        windows.push((window.clone(), controller));
+        tracing::info!(open = windows.len(), "a window opened");
+        window
     }
 
-    /// The first-launch page, saying whether the authority is trusted.
+    /// The start page, saying whether the authority is trusted.
     fn first_launch_page(&self) -> String {
         let trust = if owned::authority_is_trusted(&authority(&self.ivars().home)) {
             "Syndeo's local certificate authority is trusted in your login keychain."
@@ -392,16 +513,8 @@ impl AppDelegate {
             "Syndeo's local certificate authority is not trusted yet. Secure (https) websites \
              will not open until it is, and this preview of Syndeo cannot yet ask for that."
         };
-        FIRST_LAUNCH.replace("{{TRUST}}", &escape(trust))
+        FIRST_LAUNCH.replace("{{TRUST}}", &address::escape(trust))
     }
-}
-
-/// Text for an HTML page.
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 /// Where this application keeps its state: its proxy's cache and authority.
@@ -443,7 +556,10 @@ fn submenu(
     menu
 }
 
-/// The menu bar: Syndeo, File, Edit and Window, with the usual shortcuts.
+/// The menu bar: Syndeo, File, Edit, View, History and Window, with the
+/// usual shortcuts. Browsing items have no target, so they reach the window
+/// in front through the responder chain, and are disabled where there is no
+/// browsing to do.
 fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> Retained<NSMenu> {
     let bar = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
     let hide_others = item(mtm, "Hide Others", sel!(hideOtherApplications:), "h");
@@ -468,9 +584,11 @@ fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> Retained<NSMenu> {
         &bar,
         "File",
         &[
+            item(mtm, "New Tab", sel!(newWindowForTab:), "t"),
             item(mtm, "New Window", sel!(newWindow:), "n"),
+            item(mtm, "Open Location…", sel!(openLocation:), "l"),
             NSMenuItem::separatorItem(mtm),
-            item(mtm, "Close Window", sel!(performClose:), "w"),
+            item(mtm, "Close", sel!(performClose:), "w"),
         ],
     );
     submenu(
@@ -485,6 +603,24 @@ fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> Retained<NSMenu> {
             item(mtm, "Copy", sel!(copy:), "c"),
             item(mtm, "Paste", sel!(paste:), "v"),
             item(mtm, "Select All", sel!(selectAll:), "a"),
+        ],
+    );
+    submenu(
+        mtm,
+        &bar,
+        "View",
+        &[
+            item(mtm, "Reload Page", sel!(reloadPage:), "r"),
+            item(mtm, "Stop Loading", sel!(stopPage:), "."),
+        ],
+    );
+    submenu(
+        mtm,
+        &bar,
+        "History",
+        &[
+            item(mtm, "Back", sel!(syndeoBack:), "["),
+            item(mtm, "Forward", sel!(syndeoForward:), "]"),
         ],
     );
     let window = submenu(
@@ -510,6 +646,7 @@ pub fn run(install: InstallDir) -> Result<()> {
             }),
         )
         .with_target(false)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
 
@@ -526,6 +663,8 @@ pub fn run(install: InstallDir) -> Result<()> {
             browsing: RefCell::new(None),
             not_ready: RefCell::new(String::from("Syndeo has not started its local proxy.")),
             windows: RefCell::new(Vec::new()),
+            retired: RefCell::new(Vec::new()),
+            hooks: RefCell::new(None),
         },
     );
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -538,7 +677,6 @@ pub fn run(install: InstallDir) -> Result<()> {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::rc::Rc;
 
     /// A self-signed certificate, for the authority checks; it trusts nothing.
     const CERTIFICATE: &str = "-----BEGIN CERTIFICATE-----
@@ -580,7 +718,9 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
     impl Engine for Fake {
         type Config = String;
         type Pinner = String;
+        type WebView = RefCell<View>;
         type View = RefCell<View>;
+        type Delegate = String;
 
         fn configure(&self, target: &proxied::ProxyTarget) -> Result<String> {
             self.configured.set(self.configured.get() + 1);
@@ -602,14 +742,14 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
                 pinned_to: None,
             })
         }
-        fn pin(&self, view: &RefCell<View>, pinner: &String) -> bool {
+        fn pin(&self, view: &RefCell<View>, pinner: &String) -> Option<String> {
             if self.pin_fails.get() {
-                return false;
+                return None;
             }
             if let View::Browser { pinned_to, .. } = &mut *view.borrow_mut() {
                 *pinned_to = Some(pinner.clone());
             }
-            true
+            Some(pinner.clone())
         }
         fn error(&self, text: &str) -> RefCell<View> {
             RefCell::new(View::Error(text.to_string()))
@@ -643,12 +783,20 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
         )
     }
 
-    fn view(engine: &Fake, readiness: &Readiness<Proxy, String>) -> View {
+    /// What a new window would hold, and the delegate it was given, if any.
+    fn window(engine: &Fake, readiness: &Readiness<Proxy, String>) -> (View, Option<String>) {
         let (browsing, reason) = match readiness {
             Readiness::Ready { browsing, .. } => (Some(browsing), ""),
             Readiness::NotReady(reason) => (None, reason.as_str()),
         };
-        content(engine, browsing, reason).into_inner()
+        match content(engine, browsing, reason) {
+            Content::Browser(view, delegate) => (view.into_inner(), Some(delegate)),
+            Content::Refused(view) => (view.into_inner(), None),
+        }
+    }
+
+    fn view(engine: &Fake, readiness: &Readiness<Proxy, String>) -> View {
+        window(engine, readiness).0
     }
 
     fn says(view: &View, text: &str) -> bool {
@@ -661,12 +809,16 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
         let stopped = Rc::new(Cell::new(false));
         let readiness = launch(&engine, &stopped);
         assert!(matches!(readiness, Readiness::Ready { .. }));
+        let pinned = CERTIFICATE.lines().nth(1).unwrap().to_string();
         assert_eq!(
-            view(&engine, &readiness),
-            View::Browser {
-                routed_to: "127.0.0.1:4567".into(),
-                pinned_to: Some(CERTIFICATE.lines().nth(1).unwrap().into())
-            }
+            window(&engine, &readiness),
+            (
+                View::Browser {
+                    routed_to: "127.0.0.1:4567".into(),
+                    pinned_to: Some(pinned.clone())
+                },
+                Some(pinned)
+            )
         );
         assert!(!stopped.get(), "the proxy of a ready launch is kept");
     }
@@ -797,15 +949,11 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
         let stopped = Rc::new(Cell::new(false));
         let readiness = launch(&engine, &stopped);
         engine.pin_fails.set(true);
-        let shown = view(&engine, &readiness);
+        let (shown, delegate) = window(&engine, &readiness);
         assert!(says(&shown, "could not pin this window"), "{shown:?}");
-    }
-
-    #[test]
-    fn the_page_is_given_text_never_markup() {
         assert_eq!(
-            escape("<b>\"&\"</b>"),
-            "&lt;b&gt;&quot;&amp;&quot;&lt;/b&gt;"
+            delegate, None,
+            "a window without its pinning delegate was handed out"
         );
     }
 

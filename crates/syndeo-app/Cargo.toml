@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+url.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 syndeo-shell.workspace = true
@@ -22,17 +23,24 @@ syndeo-webkit.workspace = true
 # types would not meet.
 objc2 = "0.6"
 objc2-foundation = "0.3"
+block2 = "0.6"
 # Only the classes this uses: the defaults would bring in bindings for
 # CloudKit, Core Data, Core Image, Core Text and Core Video as well.
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    "NSAccessibilityProtocols",
     "NSApplication",
+    "NSButton",
+    "NSCell",
     "NSControl",
     "NSEvent",
     "NSGraphics",
+    "NSImage",
     "NSMenu",
     "NSMenuItem",
+    "NSProgressIndicator",
     "NSResponder",
+    "NSText",
     "NSTextField",
     "NSRunningApplication",
     "NSView",

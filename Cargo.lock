@@ -11158,6 +11158,7 @@ name = "syndeo-app"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "block2 0.6.2",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
@@ -11168,6 +11169,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
