@@ -15,14 +15,16 @@
 //   appctl front-tree <pid>      the same, for pid's front window only
 //   appctl titles <pid>          the title of each window Accessibility has for pid
 //   appctl activate <pid>        bring pid to the front; exits 1 if it is not frontmost
-//   appctl type <pid> <text>     bring pid to the front, then ⌘L, the text and Return,
-//                                as keystrokes; exits 1 if pid is not frontmost
-//   appctl keys <pid> <combo>    bring pid to the front and press one key: cmd+w,
-//                                cmd+t, cmd+l, cmd+r, cmd+[, cmd+], cmd+. or return
+//   appctl type <pid> <text>     bring pid to the front, then type the text and
+//                                Return, as keystrokes; exits 1 if pid is not frontmost
 //   appctl press <pid> <id>      press the element with that accessibility identifier
 //                                in pid's front window; exits 1 if there is none
 //   appctl value <pid> <id>      that element's value
-//   appctl menu <pid> <menu> <item>   press a menu item, as a click on it would
+//   appctl enabled <pid> <id>    "enabled" or "disabled", for that element
+//   appctl menu <pid> <menu> <item>   press a menu item, as a click on it would;
+//                                exits 1 if there is no such item
+//   appctl shortcut <pid> <menu> <item>   the item's key equivalent, as
+//                                "<character> <modifiers>": 0 is Command alone
 //   appctl press-link <pid> <text>    press the first link in the front window whose
 //                                text contains <text>
 import AppKit
@@ -111,30 +113,31 @@ func activate(_ pid: Int32) -> Bool {
     return false
 }
 
-/// One keystroke to pid: down and up, with `flags`, typing `text`.
-func key(_ pid: Int32, _ code: CGKeyCode, _ text: String, _ flags: CGEventFlags = []) {
+/// One keystroke to pid, down and up, typing `text`.
+func key(_ pid: Int32, _ code: CGKeyCode, _ text: String) {
     let source = CGEventSource(stateID: .hidSystemState)
     let units = Array(text.utf16)
     for down in [true, false] {
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { continue }
-        event.flags = flags
+        event.flags = []
         event.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
         event.postToPid(pid)
         usleep(30_000)
     }
 }
 
-/// The keys `keys` presses: virtual key code and the character, US layout.
-let combos: [String: (CGKeyCode, String, CGEventFlags)] = [
-    "cmd+w": (13, "w", .maskCommand),
-    "cmd+t": (17, "t", .maskCommand),
-    "cmd+l": (37, "l", .maskCommand),
-    "cmd+r": (15, "r", .maskCommand),
-    "cmd+[": (33, "[", .maskCommand),
-    "cmd+]": (30, "]", .maskCommand),
-    "cmd+.": (47, ".", .maskCommand),
-    "return": (36, "\r", []),
-]
+/// The menu bar item `menu`'s item `title`.
+func menuItem(_ pid: Int32, _ menu: String, _ title: String) -> AXUIElement? {
+    guard let bar = asElement(attribute(AXUIElementCreateApplication(pid), kAXMenuBarAttribute)) else { return nil }
+    for top in children(bar) where oneLine(attribute(top, kAXTitleAttribute)) == menu {
+        for list in children(top) {
+            for item in children(list) where oneLine(attribute(item, kAXTitleAttribute)) == title {
+                return item
+            }
+        }
+    }
+    return nil
+}
 
 let args = CommandLine.arguments
 guard args.count >= 2 else { exit(2) }
@@ -197,18 +200,10 @@ case "activate" where args.count == 3:
 case "type" where args.count == 4:
     guard let pid = Int32(args[2]) else { exit(2) }
     guard activate(pid) else { print("not frontmost"); exit(1) }
-    let (code, character, flags) = combos["cmd+l"]!
-    key(pid, code, character, flags)
-    usleep(300_000)
     for character in args[3] {
         key(pid, 0, String(character))
     }
-    let (enter, newline, _) = combos["return"]!
-    key(pid, enter, newline)
-case "keys" where args.count == 4:
-    guard let pid = Int32(args[2]), let (code, character, flags) = combos[args[3]] else { exit(2) }
-    guard activate(pid) else { print("not frontmost"); exit(1) }
-    key(pid, code, character, flags)
+    key(pid, 36, "\r")
 case "press" where args.count == 4:
     guard let pid = Int32(args[2]) else { exit(2) }
     guard let element = identified(pid, args[3]) else { exit(1) }
@@ -216,17 +211,17 @@ case "press" where args.count == 4:
 case "value" where args.count == 4:
     guard let pid = Int32(args[2]), let element = identified(pid, args[3]) else { exit(1) }
     print(oneLine(attribute(element, kAXValueAttribute)))
+case "enabled" where args.count == 4:
+    guard let pid = Int32(args[2]), let element = identified(pid, args[3]) else { exit(1) }
+    print((attribute(element, kAXEnabledAttribute) as? Bool) == true ? "enabled" : "disabled")
 case "menu" where args.count == 5:
-    guard let pid = Int32(args[2]),
-          let bar = asElement(attribute(AXUIElementCreateApplication(pid), kAXMenuBarAttribute)) else { exit(1) }
-    for top in children(bar) where oneLine(attribute(top, kAXTitleAttribute)) == args[3] {
-        for menu in children(top) {
-            for item in children(menu) where oneLine(attribute(item, kAXTitleAttribute)) == args[4] {
-                exit(AXUIElementPerformAction(item, kAXPressAction as CFString) == .success ? 0 : 1)
-            }
-        }
-    }
-    exit(1)
+    guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
+    exit(AXUIElementPerformAction(item, kAXPressAction as CFString) == .success ? 0 : 1)
+case "shortcut" where args.count == 5:
+    guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
+    let character = oneLine(attribute(item, kAXMenuItemCmdCharAttribute))
+    let modifiers = (attribute(item, kAXMenuItemCmdModifiersAttribute) as? Int).map(String.init) ?? "?"
+    print("\(character) \(modifiers)")
 case "press-link" where args.count == 4:
     guard let pid = Int32(args[2]), let window = frontWindow(of: pid) else { exit(1) }
     let link = find(window, depth: 24) {

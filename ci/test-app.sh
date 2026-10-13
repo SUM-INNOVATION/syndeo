@@ -12,12 +12,15 @@
 #   - its one child is the proxy, from this bundle's Contents/Helpers, and no
 #     keystore process exists;
 #   - its window holds a web view and no error;
-#   - in it, typed the way a person types: an address opens; the proxy's own
-#     page, which only the proxy answers, has counted that request; Back and
-#     Forward work, by the bar's button and by ⌘]; words and a file: address
-#     are refused with Syndeo's own page, not sent anywhere; File > New Tab
-#     opens a tab with the start page, beside the first in one window, and ⌘W
-#     closes it, letting its window go and leaving the first as it was;
+#   - its menus have the usual shortcuts, read from the menu items;
+#   - in it, as a person uses it — File > Open Location…, then the address
+#     typed as keystrokes and Return: an address opens; the proxy's own page,
+#     which only the proxy answers, has counted that request; Back and Forward
+#     work, by the bar's button and by History > Forward; words and a file:
+#     address are refused with Syndeo's own page, not sent anywhere; File >
+#     New Tab opens a tab with the start page, beside the first in one window,
+#     and File > Close closes it, letting its window go and leaving the first
+#     as it was;
 #   - asked to quit as the Quit menu item would, it exits, and its proxy
 #     with it;
 #   - with its last window closed, through the window's own close button, the
@@ -169,30 +172,65 @@ at() {
   [ "$said" = "$1" ] && page_says "$2"
 }
 page_text() { front | grep -E '^AX(StaticText|Heading)' | cut -f2,3 | tr '\t\n' '  ' | head -c 300; }
+controls() { printf 'Back %s, Forward %s' "$("$APPCTL" enabled "$PID" syndeo.back)" "$("$APPCTL" enabled "$PID" syndeo.forward)"; }
 
 # arrive ADDRESS PAGE WHAT: within 30 s the front window's address field says
 # ADDRESS and its page says PAGE, an extended regular expression.
 arrive() {
-  if wait_for 30 at "$1" "$2"; then ok "$3"; else bad "$3" "address field: '$(address)'; page: $(page_text)"; fi
+  if wait_for 30 at "$1" "$2"; then ok "$3"; else bad "$3" "address field: '$(address)'; page: $(page_text); $(controls)"; fi
 }
 
-# visit TEXT ADDRESS PAGE WHAT: type TEXT into the address field and press
-# Return, as a person would, and require arrive ADDRESS PAGE.
+# choose MENU ITEM: bring the app to the front and press MENU > ITEM.
+choose() {
+  "$APPCTL" activate "$PID" >/dev/null || true
+  "$APPCTL" menu "$PID" "$1" "$2" || bad "$1 > $2" "no such menu item to press"
+}
+
+# visit TEXT ADDRESS PAGE WHAT: File > Open Location…, then TEXT typed and
+# Return, as a person would; then require arrive ADDRESS PAGE.
 visit() {
+  choose File "Open Location…"
   if "$APPCTL" type "$PID" "$1" >/dev/null; then arrive "$2" "$3" "$4"; else bad "$4" "pid $PID could not be brought to the front to type into"; fi
 }
 
-# The free port of a loopback origin this test starts, and its pid.
+# shortcuts: each menu item a person reaches by keyboard has its shortcut,
+# Command and one key, as AppKit has it.
+shortcuts() {
+  local menu item key have
+  while IFS='|' read -r menu item key; do
+    have="$("$APPCTL" shortcut "$PID" "$menu" "$item")"
+    must "$([ "$(printf '%s' "$have" | tr '[:lower:]' '[:upper:]')" = "$key 0" ] && echo yes)" "$menu > $item is ⌘$key" "${have:-no such item}"
+  done <<'EOF'
+Syndeo|Quit Syndeo|Q
+File|New Tab|T
+File|New Window|N
+File|Open Location…|L
+File|Close|W
+View|Reload Page|R
+View|Stop Loading|.
+History|Back|[
+History|Forward|]
+EOF
+}
+
+# The free port of a loopback origin this test starts, and its pid. A plain
+# TCPServer: http.server's own looks this host's name up when it binds, which
+# on the runner took longer than the test waits.
 ORIGIN_PORT='' ORIGIN_PID=''
 origin() {
   local dir="$LOGS/origin"
   mkdir -p "$dir"
   printf '%s\n' '<!doctype html><title>Loopback origin</title><h1>Loopback origin</h1>' \
     '<p><a href="http://example.com/" target="_blank">Example in a new tab</a></p>' >"$dir/index.html"
-  python3 -u -m http.server --bind 127.0.0.1 --directory "$dir" 0 >"$LOGS/origin.log" 2>&1 &
+  python3 -I -u -c '
+import http.server, os, socketserver, sys
+os.chdir(sys.argv[1])
+server = socketserver.TCPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
+print("port", server.server_address[1], flush=True)
+server.serve_forever()' "$dir" >"$LOGS/origin.log" 2>&1 &
   ORIGIN_PID=$!
-  wait_for 10 grep -q 'port [0-9]' "$LOGS/origin.log" || return 1
-  ORIGIN_PORT="$(sed -n 's/.* port \([0-9][0-9]*\).*/\1/p' "$LOGS/origin.log" | head -n 1)"
+  wait_for 10 grep -q '^port [0-9]' "$LOGS/origin.log" || return 1
+  ORIGIN_PORT="$(sed -n 's/^port \([0-9][0-9]*\)$/\1/p' "$LOGS/origin.log" | head -n 1)"
 }
 
 # Browse as a person would, in the first window and a tab beside it.
@@ -203,32 +241,33 @@ browsing() {
   helper_of "$app" "$round"
   browses "$round"
   log="$LOGS/app-$round.stderr"
+  shortcuts
   arrive "" 'Welcome to Syndeo' "a new window shows the start page, with an empty address field ($round)"
   visit "http://example.com" "http://example.com/" 'Example Domain' "an address typed into the field opens on Return"
   visit "http://syndeo.local/stats" "http://syndeo.local/stats" 'requests [1-9]' \
     "the proxy's own page, which only the proxy answers, opens and has counted that request"
   "$APPCTL" press "$PID" syndeo.back || bad "Back" "no Back button to press in the front window"
   arrive "http://example.com/" 'Example Domain' "the bar's Back button goes back"
-  "$APPCTL" keys "$PID" 'cmd+]' >/dev/null || bad "Forward" "pid $PID could not be brought to the front"
-  arrive "http://syndeo.local/stats" 'requests [1-9]' "History > Forward (⌘]) goes forward"
+  choose History Forward
+  arrive "http://syndeo.local/stats" 'requests [1-9]' "History > Forward goes forward"
   visit "bread" "bread" 'does not search' "a word is refused by Syndeo's own page, which says it was not sent anywhere"
   visit "file:///etc/passwd" "file:///etc/passwd" 'not file: ones' "a file: address is refused"
   must "$(page_says 'root:' && echo no || echo yes)" "and nothing of that file is shown"
 
-  "$APPCTL" activate "$PID" >/dev/null || true
-  "$APPCTL" menu "$PID" File "New Tab" || bad "New Tab" "no File > New Tab to press"
+  choose File "New Tab"
   if wait_for 15 grep -q 'a window opened open=2' "$log"; then ok "File > New Tab opens a second tab"; else bad "New Tab" "the app does not report two windows: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
   arrive "" 'Welcome to Syndeo' "the new tab shows the start page, with an empty address field"
   on_screen="$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')"
   must "$([ "$on_screen" = 1 ] && echo yes)" "the two are tabs of one window: one window on screen" "$on_screen on screen"
   "$APPCTL" titles "$PID" >"$LOGS/browse-tabs.txt" 2>&1
   "$APPCTL" front-tree "$PID" >"$LOGS/browse-two-tabs-tree.txt" 2>&1
-  "$APPCTL" keys "$PID" cmd+w >/dev/null || bad "Close" "pid $PID could not be brought to the front"
-  if wait_for 15 grep -q 'a window closed open=1' "$log"; then ok "File > Close (⌘W) closes the tab, and the app lets its window go"; else bad "Close" "the app does not report one window: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
+  choose File Close
+  if wait_for 15 grep -q 'a window closed open=1' "$log"; then ok "File > Close closes the tab, and the app lets its window go"; else bad "Close" "the app does not report one window: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
   arrive "file:///etc/passwd" 'not file: ones' "the first tab is in front again, as it was left"
   must "$(alive "$PID" && [ "$(pgrep -P "$PID" | tr -d '\n')" = "$HELPER" ] && echo yes)" "the app and its proxy run on (pids $PID, $HELPER)"
 
   # Measured, not gated.
+  choose File "Open Location…"
   "$APPCTL" type "$PID" "https://example.com" >/dev/null || true
   if wait_for 30 page_says "Example Domain|couldn't open"; then
     if page_says 'Example Domain'; then outcome="it opened"; else outcome="Syndeo's failure page: $(page_text)"; fi
@@ -237,6 +276,7 @@ browsing() {
   fi
   printf '  MEASURE  https://example.com, the authority not trusted: %s\n' "$outcome"
   if origin; then
+    choose File "Open Location…"
     "$APPCTL" type "$PID" "http://127.0.0.1:$ORIGIN_PORT/" >/dev/null || true
     if wait_for 30 page_says "Loopback origin|couldn't open"; then
       if page_says 'Loopback origin'; then outcome="it opened"; else outcome="Syndeo's failure page: $(page_text)"; fi
