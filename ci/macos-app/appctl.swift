@@ -26,8 +26,11 @@
 //   appctl menu-items <pid> <menu>    the title of each item in that menu, one a line
 //   appctl shortcut <pid> <menu> <item>   the item's key equivalent, as
 //                                "<character> <modifiers>": 0 is Command alone
-//   appctl press-link <pid> <text>    press the first link in the front window whose
-//                                text contains <text>
+//   appctl press-web <pid> <text>     press the first link or button in the front
+//                                window's page whose text contains <text>, as a click
+//                                would; exits 1 if there is none
+//   appctl apps                  the bundle identifier of each running application
+//                                that has a Dock icon, sorted, one a line
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -229,13 +232,19 @@ case "shortcut" where args.count == 5:
     let character = oneLine(attribute(item, kAXMenuItemCmdCharAttribute))
     let modifiers = (attribute(item, kAXMenuItemCmdModifiersAttribute) as? Int).map(String.init) ?? "?"
     print("\(character) \(modifiers)")
-case "press-link" where args.count == 4:
-    guard let pid = Int32(args[2]), let window = frontWindow(of: pid) else { exit(1) }
-    let link = find(window, depth: 24) {
-        (attribute($0, kAXRoleAttribute) as? String) == "AXLink" && text(of: $0).contains(args[3])
+case "press-web" where args.count == 4:
+    guard let pid = Int32(args[2]), let window = frontWindow(of: pid),
+          let page = find(window, depth: 12, { (attribute($0, kAXRoleAttribute) as? String) == "AXWebArea" }) else { exit(1) }
+    let control = find(page, depth: 24) {
+        ["AXLink", "AXButton"].contains(attribute($0, kAXRoleAttribute) as? String ?? "") && text(of: $0).contains(args[3])
     }
-    guard let link else { exit(1) }
-    exit(AXUIElementPerformAction(link, kAXPressAction as CFString) == .success ? 0 : 1)
+    guard let control else { exit(1) }
+    exit(AXUIElementPerformAction(control, kAXPressAction as CFString) == .success ? 0 : 1)
+case "apps" where args.count == 2:
+    let ids = NSWorkspace.shared.runningApplications
+        .filter { $0.activationPolicy == .regular }
+        .compactMap { $0.bundleIdentifier }
+    print(Set(ids).sorted().joined(separator: "\n"))
 default:
     exit(2)
 }

@@ -3,6 +3,7 @@
 #
 #   ci/test-app.sh launch <Syndeo.app>
 #   ci/test-app.sh refuse <Syndeo.app whose proxy cannot start>
+#   ci/test-app.sh mutant <name> <Syndeo.app with that safeguard taken out>
 #   ci/test-app.sh measure
 #
 # launch, which gates: open the app with `open`, never by running its
@@ -21,9 +22,17 @@
 #     New Tab opens a tab with the start page, beside the first in one window,
 #     and File > Close Tab (⌘W, as AppKit retitles Close while there are tabs)
 #     closes it, letting its window go and leaving the first as it was;
-#   - https://example.com opens, and the proxy fetched it, though Syndeo's
-#     authority is in no trust settings: the window's own delegate anchors
-#     it, and the trust settings are checked unchanged at the end;
+#   - nothing of a visited page's path or query is in the app's log or its
+#     proxy's, for a page that opened and one whose host does not exist;
+#   - https://example.com opens, and the proxy's count shows it fetched it,
+#     though Syndeo's authority is in no trust settings: the window's own
+#     delegate anchors it, and the trust settings are checked unchanged at
+#     the end;
+#   - on a page this test serves, each link and script to a scheme a window
+#     may not show (file, mailto, ftp, blob, data), in the window or in a new
+#     tab, leaves the page as it was, opens no tab, shows nothing of what it
+#     points at and starts no other application; and its link to a web page
+#     in a new tab opens one;
 #   - asked to quit as the Quit menu item would, it exits, and its proxy
 #     with it;
 #   - with its last window closed, through the window's own close button, the
@@ -38,9 +47,15 @@
 # refuse, which gates: a bundle whose proxy cannot start opens all the same,
 # its window says it cannot browse and holds no web view, and no helper runs.
 #
-# launch also measures, without gating: whether a page on this runner's own
-# loopback opens, and whether the proxy saw it, and whether a link on it to a
-# new tab opens one.
+# launch also measures, without gating: a page on this runner's own loopback,
+# and whether the proxy's count moved for it; and how the proxy logged the
+# fetch that failed.
+#
+# mutant, which gates: the app given is one of ci/macos-app/mutants.py's,
+# with one safeguard taken out, and this passes only if the check meant to
+# catch it fails: https for no-pinning-delegate (while http still works),
+# a page's links in the window for no-navigation-policy, and in a new tab for
+# any-scheme-in-a-new-tab.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -60,9 +75,11 @@ fails=0
 
 say() { printf 'test-app: %s\n' "$*"; }
 ok() { printf '  PASS  %s\n' "$1"; }
+FAILED=''
 bad() {
   printf '  FAIL  %s — %s\n' "$1" "$2"
   fails=$((fails + 1))
+  FAILED="$FAILED$1"$'\n'
 }
 must() { [ "$1" = yes ] && ok "$2" || bad "$2" "${3:-}"; }
 
@@ -221,13 +238,29 @@ EOF
 
 # The free port of a loopback origin this test starts, and its pid. A plain
 # TCPServer: http.server's own looks this host's name up when it binds, which
-# on the runner took longer than the test waits.
+# on the runner took longer than the test waits. It serves policy.html: a
+# page whose links and scripts go to schemes a window's main frame may not
+# show, in the window and in a new tab, and one link to a web page in a new
+# tab. What they point at says SYNDEO-...-PAGE, or is /etc/passwd.
 ORIGIN_PORT='' ORIGIN_PID=''
 origin() {
   local dir="$LOGS/origin"
+  [ -n "$ORIGIN_PORT" ] && return 0
   mkdir -p "$dir"
-  printf '%s\n' '<!doctype html><title>Loopback origin</title><h1>Loopback origin</h1>' \
-    '<p><a href="http://example.com/" target="_blank">Example in a new tab</a></p>' >"$dir/index.html"
+  cat >"$dir/policy.html" <<'EOF'
+<!doctype html><meta charset="utf-8"><title>Policy test</title>
+<h1>Policy test</h1>
+<p><a href="file:///etc/passwd">file link</a></p>
+<p><a href="mailto:someone@example.com">mail link</a></p>
+<p><a href="ftp://example.com/">ftp link</a></p>
+<p><button onclick="location.href = URL.createObjectURL(new Blob(['<h1>SYNDEO-BLOB-PAGE</h1>'], {type: 'text/html'}))">blob navigation</button></p>
+<p><button onclick="location.href = 'data:text/html,<h1>SYNDEO-DATA-PAGE</h1>'">data navigation</button></p>
+<p><a href="file:///etc/passwd" target="_blank">file in a new tab</a></p>
+<p><a href="mailto:someone@example.com" target="_blank">mail in a new tab</a></p>
+<p><button onclick="window.open(URL.createObjectURL(new Blob(['<h1>SYNDEO-BLOB-PAGE</h1>'], {type: 'text/html'})))">blob in a new tab</button></p>
+<p><button onclick="window.open('data:text/html,<h1>SYNDEO-DATA-PAGE</h1>')">data in a new tab</button></p>
+<p><a href="http://example.com/" target="_blank">Example in a new tab</a></p>
+EOF
   python3 -I -u -c '
 import http.server, os, socketserver, sys
 os.chdir(sys.argv[1])
@@ -235,14 +268,101 @@ server = socketserver.TCPServer(("127.0.0.1", 0), http.server.SimpleHTTPRequestH
 print("port", server.server_address[1], flush=True)
 server.serve_forever()' "$dir" >"$LOGS/origin.log" 2>&1 &
   ORIGIN_PID=$!
-  wait_for 10 grep -q '^port [0-9]' "$LOGS/origin.log" || return 1
+  wait_for 10 grep -q '^port [0-9]' "$LOGS/origin.log" || { bad "loopback origin" "it did not start: $(head -c 200 "$LOGS/origin.log")"; return 1; }
   ORIGIN_PORT="$(sed -n 's/^port \([0-9][0-9]*\)$/\1/p' "$LOGS/origin.log" | head -n 1)"
+}
+origin_stop() { [ -n "$ORIGIN_PID" ] && kill "$ORIGIN_PID" 2>/dev/null; ORIGIN_PORT='' ORIGIN_PID=''; }
+
+# counted WHEN: open the proxy's own page, which only the proxy answers, and
+# set COUNTED to the requests it has counted so far.
+COUNTED=''
+counted() {
+  visit "http://syndeo.local/stats" "http://syndeo.local/stats" 'requests [0-9]+' "the proxy's own page opens ($1)"
+  COUNTED="$(front | grep -oE 'requests [0-9]+' | head -n 1 | cut -d' ' -f2)"
+}
+
+# pinned: https through the proxy, whose authority is in no trust settings
+# (they are checked unchanged at the end), opens only because the window's
+# own delegate answers the challenge with that authority as the anchor. The
+# proxy's count shows the window reached it through the proxy.
+pinned() {
+  local before
+  counted "before https"
+  before="$COUNTED"
+  visit "https://example.com" "https://example.com/" 'Example Domain' \
+    "https://example.com opens, with Syndeo's authority in no trust settings"
+  counted "after https"
+  must "$([ -n "$before" ] && [ -n "$COUNTED" ] && [ "$COUNTED" -gt "$before" ] && echo yes)" \
+    "and the proxy fetched it: its count went from ${before:-?} to ${COUNTED:-?}"
+}
+
+# private LOG: visit a page with a path and a query, and one whose host does
+# not exist, and require nothing of either path or query in LOG, the app's
+# log, which holds its proxy's lines too.
+private() {
+  local log="$1"
+  visit "http://example.com/syndeo-private-path?syndeo-private-query=1" \
+    "http://example.com/syndeo-private-path?syndeo-private-query=1" '^AXWebArea' "a page with a path and a query opens"
+  visit "http://nonexistent.invalid/syndeo-private-path?syndeo-private-query=2" \
+    "http://nonexistent.invalid/syndeo-private-path?syndeo-private-query=2" '^AXWebArea' "a page whose host does not exist is tried"
+  must "$(grep -q 'proxy up' "$log" && echo yes)" "the proxy's own log lines are in the app's log"
+  must "$(grep -q 'syndeo-private' "$log" && echo no || echo yes)" \
+    "no path or query of either is in the app's log or its proxy's" "$(plain_log "$log" | grep 'syndeo-private' | head -n 2 | tr '\n' ' ')"
+  printf '  MEASURE  the failed fetch, as the proxy logged it: %s\n' "$(plain_log "$log" | grep 'fetch failed' | tail -n 1 | cut -c1-220)"
+}
+
+# policy LOG: on policy.html, each link and script to another scheme has to
+# leave the page as it was, open no tab, show nothing of what it points at,
+# and start no other application; and the link to a web page in a new tab
+# opens one, made as every tab is.
+policy() {
+  local log="$1" page label where opened apps problems
+  origin || return 1
+  page="http://127.0.0.1:$ORIGIN_PORT/policy.html"
+  visit "$page" "$page" 'Policy test' "a page with links and scripts to other schemes opens"
+  apps="$("$APPCTL" apps)"
+  while IFS='|' read -r label where; do
+    at "$page" 'Policy test' || visit "$page" "$page" 'Policy test' "the page with links and scripts, again"
+    opened="$(grep -c 'a window opened' "$log")"
+    if ! "$APPCTL" press-web "$PID" "$label"; then
+      bad "policy: $label is refused $where" "no such link or button on the page: $(page_text | head -c 160)"
+      continue
+    fi
+    sleep 3
+    problems=''
+    [ "$(grep -c 'a window opened' "$log")" = "$opened" ] || problems="$problems a tab opened;"
+    at "$page" 'Policy test' || problems="$problems the window left the page (address '$(address)', page: $(page_text | head -c 120));"
+    if "$APPCTL" ax-tree "$PID" | grep -qE 'root:|SYNDEO-(BLOB|DATA)-PAGE'; then problems="$problems what it points at is shown;"; fi
+    [ "$("$APPCTL" apps)" = "$apps" ] || problems="$problems another application started: $(comm -13 <(printf '%s\n' "$apps") <("$APPCTL" apps) | tr '\n' ' ');"
+    if [ -z "$problems" ]; then ok "policy: $label is refused $where"; else bad "policy: $label is refused $where" "$problems"; fi
+  done <<'EOF'
+file link|in the window
+mail link|in the window
+ftp link|in the window
+blob navigation|in the window
+data navigation|in the window
+file in a new tab|and opens no tab
+mail in a new tab|and opens no tab
+blob in a new tab|and opens no tab
+data in a new tab|and opens no tab
+EOF
+  at "$page" 'Policy test' || visit "$page" "$page" 'Policy test' "the page with links and scripts, again"
+  opened="$(grep -c 'a window opened' "$log")"
+  "$APPCTL" press-web "$PID" "Example in a new tab" || bad "a link to a web page in a new tab opens one" "no such link on the page"
+  if wait_for 15 sh -c '[ "$(grep -c "a window opened" "$1")" -gt "$2" ]' _ "$log" "$opened"; then
+    ok "a link to a web page in a new tab opens one"
+  else
+    bad "a link to a web page in a new tab opens one" "the app reports no new window: $(grep 'a window' "$log" | tail -n 2 | tr '\n' ' ')"
+  fi
+  arrive "http://example.com/" 'Example Domain' "and the new tab shows that page"
+  choose File "Close Tab"
+  arrive "$page" 'Policy test' "closing it leaves the page with the link as it was"
 }
 
 # Browse as a person would, in the first window and a tab beside it.
 browsing() {
-  local app="$1" round=browse log outcome on_screen have
-  say "browse: addresses, Back and Forward, refusals, a tab"
+  local app="$1" round=browse log on_screen have before
+  say "browse: addresses, Back and Forward, refusals, a tab, privacy, https, a page's own links"
   started "$app" "$round" || return
   helper_of "$app" "$round"
   browses "$round"
@@ -275,36 +395,21 @@ browsing() {
   arrive "file:///etc/passwd" 'not file: ones' "the first tab is in front again, as it was left"
   must "$(alive "$PID" && [ "$(pgrep -P "$PID" | tr -d '\n')" = "$HELPER" ] && echo yes)" "the app and its proxy run on (pids $PID, $HELPER)"
 
-  visit "https://example.com" "https://example.com/" 'Example Domain' \
-    "https://example.com opens, with Syndeo's authority in no trust settings"
-  must "$(plain_log "$log" | grep -qE ' 200 .*https://example\.com/$' && echo yes)" \
-    "and the proxy fetched it: the window reached it through the proxy" "$(plain_log "$log" | grep -E 'https://' | tail -n 3 | tr '\n' ' ')"
+  private "$log"
+  pinned
 
-  # Measured, not gated.
+  # Measured, not gated: a page on this runner's loopback, and the proxy's
+  # count around it.
   if origin; then
-    choose File "Open Location…"
-    "$APPCTL" type "$PID" "http://127.0.0.1:$ORIGIN_PORT/" >/dev/null || true
-    if wait_for 30 page_says "Loopback origin|couldn't open"; then
-      if page_says 'Loopback origin'; then outcome="it opened"; else outcome="Syndeo's failure page: $(page_text)"; fi
-    else
-      outcome="neither the page nor a failure page after 30 s: $(page_text)"
-    fi
-    printf '  MEASURE  a page on this runner'"'"'s loopback, http://127.0.0.1:%s/: %s; the origin saw: %s; the proxy logged: %s\n' \
-      "$ORIGIN_PORT" "$outcome" "$(grep -c 'GET / ' "$LOGS/origin.log") request(s) for /" \
-      "$(plain_log "$log" | grep -c "http://127.0.0.1:$ORIGIN_PORT/") request(s) for it"
-    if page_says 'Loopback origin' && "$APPCTL" press-link "$PID" "Example in a new tab"; then
-      if wait_for 15 grep -q 'a window opened open=2' "$log"; then
-        wait_for 30 page_says 'Example Domain' || true
-        printf '  MEASURE  a target=_blank link opened a tab; in front: %s, %s\n' "$(address)" "$(page_text | head -c 80)"
-      else
-        printf '  MEASURE  a target=_blank link opened no tab in 15 s\n'
-      fi
-    fi
-    kill "$ORIGIN_PID" 2>/dev/null
-  else
-    printf '  MEASURE  could not start a loopback origin: %s\n' "$(head -c 200 "$LOGS/origin.log")"
-    kill "$ORIGIN_PID" 2>/dev/null
+    counted "before a loopback page"
+    before="$COUNTED"
+    visit "http://127.0.0.1:$ORIGIN_PORT/policy.html" "http://127.0.0.1:$ORIGIN_PORT/policy.html" 'Policy test' "a page on this runner's loopback opens"
+    counted "after a loopback page"
+    printf '  MEASURE  http://127.0.0.1:%s/: the origin saw %s request(s); the proxy'"'"'s count went from %s to %s\n' \
+      "$ORIGIN_PORT" "$(grep -c 'GET /policy.html ' "$LOGS/origin.log")" "${before:-?}" "${COUNTED:-?}"
   fi
+  policy "$log"
+  origin_stop
   stopped "$round"
 }
 
@@ -389,6 +494,52 @@ refuse() {
   [ "$fails" = 0 ]
 }
 
+# mutant NAME APP: APP is Syndeo.app with NAME's safeguard taken out. Run what
+# should catch it, and pass only if the check meant to catch it failed (and,
+# for no-pinning-delegate, http still worked, so it is the pinning that
+# failed and not the mutant as a whole).
+mutant() {
+  local name="${1:-}" app want keep='' log
+  [ -n "$name" ] && [ -d "${2:-}" ] || { say "usage: $0 mutant <name> <Syndeo.app>"; exit 2; }
+  app="$(cd "$2" && pwd -P)"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  printf '\nSyndeo.app with a safeguard taken out (%s): %s\n' "$name" "$app"
+  started "$app" "mutant-$name" || exit 1
+  helper_of "$app" "mutant-$name"
+  browses "mutant-$name"
+  log="$LOGS/app-mutant-$name.stderr"
+  case "$name" in
+    no-pinning-delegate)
+      visit "http://example.com" "http://example.com/" 'Example Domain' "the mutant still browses over http"
+      pinned
+      want="^https://example\.com opens"
+      keep="the mutant still browses over http"
+      ;;
+    no-navigation-policy)
+      policy "$log"
+      want="^policy: .* is refused in the window$"
+      ;;
+    any-scheme-in-a-new-tab)
+      policy "$log"
+      want="^policy: .* is refused and opens no tab$"
+      ;;
+    *) say "no mutant $name"; stopped "mutant-$name"; exit 2 ;;
+  esac
+  origin_stop
+  stopped "mutant-$name"
+  printf '\n'
+  if [ -n "$keep" ] && printf '%s' "$FAILED" | grep -qxF "$keep"; then
+    printf 'MUTANT NOT ISOLATED  %s: "%s" failed too, so the mutant is broken as a whole\n' "$name" "$keep"
+    return 1
+  fi
+  if printf '%s' "$FAILED" | grep -qE "$want"; then
+    printf 'MUTANT CAUGHT  %s, by: %s\n' "$name" "$(printf '%s' "$FAILED" | grep -E "$want" | tr '\n' ';')"
+    return 0
+  fi
+  printf 'MUTANT SURVIVED  %s: nothing matching /%s/ failed; what failed: %s\n' "$name" "$want" "$(printf '%s' "$FAILED" | tr '\n' ';')"
+  return 1
+}
+
 # measure: report what this runner allows; fail only if it cannot put the
 # trust settings back.
 measure() {
@@ -432,6 +583,7 @@ measure() {
 case "${1:-}" in
   launch) shift; launch "$@" ;;
   refuse) shift; refuse "$@" ;;
+  mutant) shift; mutant "$@" ;;
   measure) measure ;;
-  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | measure"; exit 2 ;;
+  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | measure"; exit 2 ;;
 esac

@@ -67,6 +67,9 @@ jobs:
       # Syndeo.app's assembly: exactly its five files, and every way a bundle
       # can differ from that caught (macOS only).
       - run: bash ci/package-macos-app.sh --self-test
+      # The app's mutants, which the app job builds and has to catch: each
+      # still applies to the source exactly once.
+      - run: python3 -I ci/macos-app/mutants.py --check .
       - run: bash ci/sign-macos-pkg.sh --self-test
       # Where the signing secrets may go: nowhere in this workflow, and in
       # release.yml only to the four jobs that declare release-macos, each its
@@ -208,9 +211,11 @@ jobs:
     # binaries, signed ad hoc (the helper first, then the bundle), opened with
     # `open`, checked through Launch Services, the window server and
     # Accessibility; browsed in, by keystrokes and presses as a person would:
-    # addresses, Back and Forward, refusals, a tab opened and closed; its last
-    # window closed and brought back by opening it again, quit as the Quit
-    # menu item would, and opened again; and a copy
+    # addresses, Back and Forward, refusals, a tab opened and closed, no
+    # private URL in any log, https pinned through the proxy, a page's own
+    # links to other schemes refused; its last window closed and brought back
+    # by opening it again, quit as the Quit menu item would, and opened again;
+    # three mutants, each of which the test has to catch; and a copy
     # whose proxy cannot start, which has to refuse to browse. Unsigned with a Developer
     # ID, and with no secrets: a pull request never signs. Then, reported and
     # not gated, what this runner allows an onboarding test to do.
@@ -261,6 +266,29 @@ jobs:
 
       - name: Open it, and require it to refuse to browse
         run: bash ci/test-app.sh refuse "$PWD/dist-broken/Syndeo.app"
+
+      # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
+      # mutants.py): the pinning delegate, the main frame's navigation policy,
+      # the schemes a new tab may open. Each is built from this tree, then the
+      # tree is put back, and the test has to catch each by the check meant
+      # to: https, a page's links in the window, a page's links in a new tab.
+      - name: Build each mutant, and require the test to catch it
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          for name in $(python3 -I ci/macos-app/mutants.py names); do
+            python3 -I ci/macos-app/mutants.py apply "$name" .
+            cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app
+            git checkout -- crates/syndeo-app
+            git diff --exit-code
+            mkdir -p "mutant-bins/$name" "dist-mutant/$name"
+            cp target/aarch64-apple-darwin/release/syndeo-app target/aarch64-apple-darwin/release/syndeo-proxy "mutant-bins/$name/"
+            bash ci/package-macos-app.sh "$version" "mutant-bins/$name" "dist-mutant/$name"
+            codesign --force --sign - --options runtime "dist-mutant/$name/Syndeo.app/Contents/Helpers/syndeo-proxy"
+            codesign --force --sign - --options runtime "dist-mutant/$name/Syndeo.app"
+            bash ci/test-app.sh mutant "$name" "$PWD/dist-mutant/$name/Syndeo.app"
+          done
 
       - name: What this runner allows (measured, not a gate)
         if: always()
