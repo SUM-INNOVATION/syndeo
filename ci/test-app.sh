@@ -4,6 +4,7 @@
 #   ci/test-app.sh launch <Syndeo.app>
 #   ci/test-app.sh refuse <Syndeo.app whose proxy cannot start>
 #   ci/test-app.sh mutant <name> <Syndeo.app with that safeguard taken out>
+#   ci/test-app.sh routes <Syndeo.app>
 #   ci/test-app.sh measure
 #
 # launch, which gates: open the app with `open`, never by running its
@@ -69,6 +70,18 @@
 # any-scheme-in-a-new-tab, and typing kept through a page's arrival for
 # no-editing-guard. Any other failure is a failure.
 #
+# routes, which only reports: what Syndeo.app's web views reach directly,
+# through its proxy, or from WebKit's own cache. From a fresh WebKit state
+# (Syndeo's WebKit caches and storage removed first) and with a fresh token in
+# every address, so that no cached copy stands in for a fetch, it opens:
+# loopback by IPv4, IPv6 and localhost; this Mac's .local name and LAN
+# address; a public name for 127.0.0.1; redirects from loopback to the web and
+# from a public name to loopback; pages with an image from the other kind of
+# address; and a public page and a loopback page, each twice. For each it
+# reports whether the page was shown, which process the origin
+# (ci/macos-app/route-origin.py) saw each request from, WebKit's own or the
+# proxy, and how the proxy's own count moved.
+#
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
 # trust change raises an interactive authorization dialog — so the
@@ -76,7 +89,7 @@
 # certificate it trusts is a throwaway, removed afterwards, and the trust
 # settings have to be exactly as they were or this fails.
 #
-# Both change the user's state, so both refuse unless
+# Every mode changes the user's state, so each refuses unless
 # SYNDEO_ALLOW_APP_TEST=yes, which only CI's disposable runners set.
 set -uo pipefail
 
@@ -685,6 +698,140 @@ mutant() {
   return 0
 }
 
+# The routing origin (ci/macos-app/route-origin.py): its port, whether it
+# also answers on ::1, and its pid.
+ROUTE_PORT='' ROUTE_V6='' ROUTE_PID=''
+route_origin() {
+  python3 -I -u "$here/macos-app/route-origin.py" "$LOGS/routes-origin.jsonl" >"$LOGS/routes-origin.out" 2>&1 &
+  ROUTE_PID=$!
+  if ! wait_for 10 grep -q '^port [0-9]' "$LOGS/routes-origin.out"; then
+    bad "routing origin" "it did not start: $(head -c 200 "$LOGS/routes-origin.out")"
+    return 1
+  fi
+  ROUTE_PORT="$(sed -n 's/^port \([0-9][0-9]*\) v6 .*/\1/p' "$LOGS/routes-origin.out")"
+  ROUTE_V6="$(sed -n 's/^port [0-9]* v6 \(.*\)$/\1/p' "$LOGS/routes-origin.out")"
+}
+route_origin_stop() {
+  local status
+  [ -n "$ROUTE_PID" ] || return 0
+  if kill -0 "$ROUTE_PID" 2>/dev/null; then
+    kill "$ROUTE_PID"
+    wait "$ROUTE_PID" 2>/dev/null
+    status=$?
+    [ "$status" = 143 ] || bad "routing origin" "it ended with status $status, not from the SIGTERM sent"
+  else
+    wait "$ROUTE_PID" 2>/dev/null
+    bad "routing origin" "it had already ended, status $?, before it was stopped: $(tail -n 3 "$LOGS/routes-origin.out" | tr '\n' ' ')"
+  fi
+  if grep -q 'Traceback' "$LOGS/routes-origin.out"; then
+    bad "routing origin" "it raised: $(grep -A3 'Traceback' "$LOGS/routes-origin.out" | tail -n 1)"
+  fi
+  ROUTE_PID=''
+}
+
+# A fresh token, for one address: random, and nothing else.
+token() { printf 'r%s' "$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"; }
+
+# seen FROM TOKEN...: what the origin was asked, after its first FROM log
+# lines, for these tokens: each path, how many times, and from which process.
+seen() {
+  python3 -I - "$LOGS/routes-origin.jsonl" "$@" <<'PY'
+import collections, json, sys
+log, start, tokens = sys.argv[1], int(sys.argv[2]), set(sys.argv[3:])
+counts = collections.Counter()
+with open(log, encoding="utf-8") as f:
+    for line in f.readlines()[start:]:
+        entry = json.loads(line)
+        if entry["t"] in tokens:
+            counts[(entry["path"], entry["process"])] += 1
+print("; ".join(f"{n}x {path} from {process}" for (path, process), n in sorted(counts.items())) or "nothing")
+PY
+}
+
+# route LABEL URL MARKER TOKEN...: open URL, typed as a person would, and
+# report whether MARKER was shown, what the origin saw for TOKEN..., and the
+# proxy's count before and after.
+route() {
+  local label="$1" url="$2" marker="$3" before after shown from saw
+  shift 3
+  counted "before: $label"
+  before="$COUNTED"
+  from="$(wc -l <"$LOGS/routes-origin.jsonl" | tr -d ' ')"
+  choose File "Open Location…"
+  "$APPCTL" type "$PID" "$url" >/dev/null || true
+  if wait_for 20 page_says "$marker"; then shown=yes; else shown=no; fi
+  # Its images, or a redirect's second request, by now too.
+  sleep 2
+  saw="$(seen "$from" "$@")"
+  counted "after: $label"
+  after="$COUNTED"
+  printf '  MEASURE  %s: %s\n           shown: %s; the origin saw: %s; the proxy'"'"'s count: %s -> %s\n' \
+    "$label" "$url" "$shown" "$saw" "${before:-?}" "${after:-?}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$url" "$shown" "$saw" "${before:-?}" "${after:-?}" >>"$LOGS/routes.tsv"
+}
+
+# routes APP: see the top of this script. Reports; never fails for what it
+# finds.
+routes() {
+  local app d iface lan local_name resolved t s P
+  [ -d "${1:-}" ] || { say "usage: $0 routes <Syndeo.app>"; exit 2; }
+  app="$(cd "$1" && pwd -P)"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  printf '\nwhat Syndeo.app'"'"'s web views reach directly, through its proxy, or from cache (measured; not a gate)\n'
+  # A fresh WebKit state: nothing an earlier instance cached or stored.
+  for d in "$HOME/Library/Caches/$ID" "$HOME/Library/WebKit/$ID" "$HOME/Library/HTTPStorages/$ID" "$HOME/Library/HTTPStorages/$ID.binarycookies"; do
+    if [ -e "$d" ]; then rm -rf "$d" && printf '  cleared %s\n' "$d"; fi
+  done
+  : >"$LOGS/routes.tsv"
+  : >"$LOGS/routes-origin.jsonl"
+  route_origin || return 0
+  P="$ROUTE_PORT"
+  iface="$(/sbin/route -n get default 2>/dev/null | awk '/interface:/ {print $2}')"
+  lan="$([ -n "$iface" ] && ipconfig getifaddr "$iface" 2>/dev/null)"
+  local_name="$(scutil --get LocalHostName 2>/dev/null)"
+  local_name="${local_name:+$local_name.local}"
+  resolved="$([ -n "$local_name" ] && dscacheutil -q host -a name "$local_name" 2>/dev/null | awk '/_address:/ {print $2}' | tr '\n' ' ')"
+  printf '  this runner: the default route on %s, address %s; %s resolves to %s; the origin on port %s, IPv6 %s\n' \
+    "${iface:-?}" "${lan:-none}" "${local_name:-no .local name}" "${resolved:-nothing}" "$P" "$ROUTE_V6"
+  started "$app" routes || { route_origin_stop; return 0; }
+  helper_of "$app" routes
+  browses routes
+
+  t="$(token)"; route "IPv4 loopback" "http://127.0.0.1:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"
+  if [ "$ROUTE_V6" = yes ]; then t="$(token)"; route "IPv6 loopback" "http://[::1]:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"; fi
+  t="$(token)"; route "localhost" "http://localhost:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"
+  if [ -n "$local_name" ]; then t="$(token)"; route "this Mac's .local name" "http://$local_name:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"; fi
+  if [ -n "$lan" ]; then t="$(token)"; route "this Mac's LAN address" "http://$lan:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"; fi
+  t="$(token)"; route "a public name for 127.0.0.1" "http://127.0.0.1.nip.io:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"
+  t="$(token)"; s="$(token)"
+  route "a redirect from loopback to a public page" "http://127.0.0.1:$P/redirect?t=$t&to=http://example.com/?$s" "$EXAMPLE_BODY" "$t"
+  t="$(token)"; s="$(token)"
+  route "a redirect from a public name to loopback" "http://127.0.0.1.nip.io:$P/redirect?t=$t&to=http://127.0.0.1:$P/page?t=$s" "ROUTE-PAGE-$s" "$t" "$s"
+  t="$(token)"; s="$(token)"
+  route "a loopback page with an image from a public name" "http://127.0.0.1:$P/page?t=$t&sub=http://127.0.0.1.nip.io:$P/img?t=$s" "ROUTE-PAGE-$t" "$t" "$s"
+  t="$(token)"; s="$(token)"
+  route "a public-name page with a loopback image" "http://127.0.0.1.nip.io:$P/page?t=$t&sub=http://127.0.0.1:$P/img?t=$s" "ROUTE-PAGE-$t" "$t" "$s"
+  if [ -n "$lan" ]; then
+    t="$(token)"; s="$(token)"
+    route "a public-name page with an image from the LAN address" "http://127.0.0.1.nip.io:$P/page?t=$t&sub=http://$lan:$P/img?t=$s" "ROUTE-PAGE-$t" "$t" "$s"
+  fi
+  if [ -n "$local_name" ]; then
+    t="$(token)"; s="$(token)"
+    route "a public-name page with an image from the .local name" "http://127.0.0.1.nip.io:$P/page?t=$t&sub=http://$local_name:$P/img?t=$s" "ROUTE-PAGE-$t" "$t" "$s"
+  fi
+  t="$(token)"
+  route "a public page, the first time" "http://example.com/?$t" "$EXAMPLE_BODY" "$t"
+  route "the same public page, again" "http://example.com/?$t" "$EXAMPLE_BODY" "$t"
+  t="$(token)"
+  route "a loopback page, the first time" "http://127.0.0.1:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"
+  route "the same loopback page, again" "http://127.0.0.1:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"
+
+  stopped routes
+  route_origin_stop
+  printf '\n  %d of its own checks failed (reported, not gated)\n' "$fails"
+  return 0
+}
+
 # measure: report what this runner allows; fail only if it cannot put the
 # trust settings back.
 measure() {
@@ -729,6 +876,7 @@ case "${1:-}" in
   launch) shift; launch "$@" ;;
   refuse) shift; refuse "$@" ;;
   mutant) shift; mutant "$@" ;;
+  routes) shift; routes "$@" ;;
   measure) measure ;;
-  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | measure"; exit 2 ;;
+  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | measure"; exit 2 ;;
 esac

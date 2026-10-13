@@ -319,6 +319,14 @@ jobs:
           printf '  %s\n' "${results[@]}"
           [ "$wrong" = 0 ]
 
+      # Measured, not gated: what the web views reach directly, through the
+      # proxy, or from WebKit's own cache, from a fresh WebKit state and with a
+      # fresh token in every address, so no cached copy stands in for a fetch.
+      # The "Direct" state is to be designed from what this finds.
+      - name: What the web views reach directly, through the proxy, or from cache (measured, not a gate)
+        if: always()
+        run: bash ci/test-app.sh routes "$PWD/dist/Syndeo.app"
+
       - name: What this runner allows (measured, not a gate)
         if: always()
         run: bash ci/test-app.sh measure
