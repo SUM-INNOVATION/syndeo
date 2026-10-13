@@ -206,8 +206,10 @@ jobs:
     name: Syndeo.app (opened and quit on a disposable runner)
     # The desktop application as a person starts it: assembled from release
     # binaries, signed ad hoc (the helper first, then the bundle), opened with
-    # `open`, checked through Launch Services and the window server, quit as
-    # the Quit menu item would, and opened again. Unsigned with a Developer
+    # `open`, checked through Launch Services, the window server and
+    # Accessibility, its last window closed and brought back by opening it
+    # again, quit as the Quit menu item would, and opened again; and a copy
+    # whose proxy cannot start, which has to refuse to browse. Unsigned with a Developer
     # ID, and with no secrets: a pull request never signs. Then, reported and
     # not gated, what this runner allows an onboarding test to do.
     runs-on: macos-15
@@ -237,8 +239,26 @@ jobs:
           codesign --force --sign - --options runtime dist/Syndeo.app
           codesign --verify --strict --verbose=2 dist/Syndeo.app
 
-      - name: Open it, check it, quit it, and open it again
+      - name: Open it, check it, close its last window and open it again, quit it, and open it again
         run: bash ci/test-app.sh launch "$PWD/dist/Syndeo.app"
+
+      # The same app with a helper that exits at once, so its proxy can never
+      # start: it has to open, say it cannot browse, and hold no web view.
+      - name: Assemble a Syndeo.app whose proxy cannot start
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          mkdir -p broken-bins dist-broken
+          cp target/aarch64-apple-darwin/release/syndeo-app broken-bins/
+          printf 'int main(void) { return 1; }\n' | clang -x c - -o broken-bins/syndeo-proxy
+          bash ci/package-macos-app.sh "$version" broken-bins dist-broken
+          codesign --force --sign - --options runtime dist-broken/Syndeo.app/Contents/Helpers/syndeo-proxy
+          codesign --force --sign - --options runtime dist-broken/Syndeo.app
+          codesign --verify --strict --verbose=2 dist-broken/Syndeo.app
+
+      - name: Open it, and require it to refuse to browse
+        run: bash ci/test-app.sh refuse "$PWD/dist-broken/Syndeo.app"
 
       - name: What this runner allows (measured, not a gate)
         if: always()

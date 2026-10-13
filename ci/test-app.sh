@@ -2,6 +2,7 @@
 # Syndeo.app on a disposable macOS runner, started the way a person starts it.
 #
 #   ci/test-app.sh launch <Syndeo.app>
+#   ci/test-app.sh refuse <Syndeo.app whose proxy cannot start>
 #   ci/test-app.sh measure
 #
 # launch, which gates: open the app with `open`, never by running its
@@ -10,12 +11,19 @@
 #     Contents/MacOS/Syndeo, with an on-screen window;
 #   - its one child is the proxy, from this bundle's Contents/Helpers, and no
 #     keystore process exists;
+#   - its window holds a web view and no error;
 #   - asked to quit as the Quit menu item would, it exits, and its proxy
 #     with it;
+#   - with its last window closed, through the window's own close button, the
+#     same app and the same proxy keep running, and opening the bundle again
+#     brings a window back in that same process, with that same proxy;
 #   - opened again, all of that holds again, and quitting again leaves nothing;
 #   - it made no keystore changes: no keystore in its home and no keychain
 #     item for one;
 #   - the user's trust settings are as they were.
+#
+# refuse, which gates: a bundle whose proxy cannot start opens all the same,
+# its window says it cannot browse and holds no web view, and no helper runs.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -74,44 +82,102 @@ the_app_runs() { [ -n "$("$APPCTL" pids "$ID")" ]; }
 no_app() { [ -z "$("$APPCTL" pids "$ID")" ]; }
 keystore_item() { security find-generic-password -s com.sum.syndeo.keystore >/dev/null 2>&1 && echo present || echo absent; }
 
-# One launch: open, check everything, quit, and require nothing left.
-one_launch() {
-  local app="$1" round="$2" pid children child image windows
-  say "launch $round"
-  open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" || { bad "open ($round)" "open failed"; return; }
+CANNOT_BROWSE="Syndeo can't open websites right now."
+
+# started APP ROUND: open APP and check what is running: Launch Services has
+# it as $ID, from APP, with an on-screen window, and its one child is the
+# proxy from APP's Contents/Helpers; no keystore process exists. Sets PID and
+# HELPER; returns non-zero if there is no app to check further.
+started() {
+  local app="$1" round="$2" children image windows
+  PID='' HELPER=''
+  open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" || { bad "open ($round)" "open failed"; return 1; }
   if ! wait_for 30 the_app_runs; then
     bad "running ($round)" "no running application is $ID 30 s after open"
-    return
+    return 1
   fi
-  pid="$("$APPCTL" pids "$ID" | head -n 1)"
-  must "$([ "$("$APPCTL" pids "$ID" | wc -l | tr -d ' ')" = 1 ] && echo yes)" "one running application is $ID ($round, pid $pid)" "$("$APPCTL" pids "$ID" | tr '\n' ' ')"
-  must "$([ "$("$APPCTL" bundle "$pid")" = "$ID" ] && echo yes)" "Launch Services has pid $pid as $ID ($round)" "$("$APPCTL" bundle "$pid")"
-  image="$(image_of "$pid")"
+  PID="$("$APPCTL" pids "$ID" | head -n 1)"
+  must "$([ "$("$APPCTL" pids "$ID" | wc -l | tr -d ' ')" = 1 ] && echo yes)" "one running application is $ID ($round, pid $PID)" "$("$APPCTL" pids "$ID" | tr '\n' ' ')"
+  must "$([ "$("$APPCTL" bundle "$PID")" = "$ID" ] && echo yes)" "Launch Services has pid $PID as $ID ($round)" "$("$APPCTL" bundle "$PID")"
+  image="$(image_of "$PID")"
   must "$([ "$image" = "$app/Contents/MacOS/Syndeo" ] && echo yes)" "it runs $app/Contents/MacOS/Syndeo ($round)" "$image"
-  if wait_for 30 "$APPCTL" windows "$pid"; then
-    windows="$("$APPCTL" windows "$pid" | tr '\n' ';')"
+  if wait_for 30 "$APPCTL" windows "$PID"; then
+    windows="$("$APPCTL" windows "$PID" | tr '\n' ';')"
     ok "it has an on-screen window: $windows ($round)"
   else
     bad "window ($round)" "no on-screen window 30 s after open"
   fi
-  wait_for 15 pgrep -P "$pid" || true
-  children="$(pgrep -P "$pid" | tr '\n' ' ')"
+  must "$(pgrep -x syndeo-keystore >/dev/null && echo no || echo yes)" "no keystore process exists ($round)" "$(pgrep -lx syndeo-keystore)"
+  return 0
+}
+
+# helper_of ROUND: require pid PID's one child to be APP's proxy; sets HELPER.
+helper_of() {
+  local app="$1" round="$2" children image
+  wait_for 15 pgrep -P "$PID" || true
+  children="$(pgrep -P "$PID" | tr '\n' ' ')"
   # shellcheck disable=SC2086 # pids, split on purpose
   set -- $children
   must "$([ "$#" = 1 ] && echo yes)" "exactly one helper runs under it ($round)" "children: ${children:-none}"
-  child="${1:-}"
-  if [ -n "$child" ]; then
-    image="$(image_of "$child")"
+  HELPER="${1:-}"
+  if [ -n "$HELPER" ]; then
+    image="$(image_of "$HELPER")"
     must "$([ "$image" = "$app/Contents/Helpers/syndeo-proxy" ] && echo yes)" "that helper is $app/Contents/Helpers/syndeo-proxy ($round)" "$image"
   fi
-  must "$(pgrep -x syndeo-keystore >/dev/null && echo no || echo yes)" "no keystore process exists ($round)" "$(pgrep -lx syndeo-keystore)"
+}
 
+# browses ROUND: PID's window holds a web view (an AXWebArea) and no error.
+has_web_area() { "$APPCTL" ax-tree "$PID" | grep -q '^AXWebArea'; }
+browses() {
+  if wait_for 20 has_web_area; then ok "its window holds a web view ($1)"; else bad "web view ($1)" "no AXWebArea in its window: $("$APPCTL" ax-tree "$PID" | cut -f1 | sort | uniq -c | tr '\n' ' ')"; fi
+  must "$("$APPCTL" ax-tree "$PID" | grep -qF "$CANNOT_BROWSE" && echo no || echo yes)" "and no error ($1)"
+}
+
+# stopped ROUND: ask the app to quit, as the Quit menu item would, and
+# require it and its helper gone.
+stopped() {
+  local round="$1"
   "$APPCTL" quit "$ID" || bad "quit ($round)" "nothing was asked to quit"
-  if wait_for 20 gone "$pid"; then ok "asked to quit, it exited ($round)"; else bad "quit ($round)" "pid $pid still running 20 s later"; fi
-  if [ -n "$child" ]; then
-    if wait_for 10 gone "$child"; then ok "its helper exited with it ($round)"; else bad "helper ($round)" "pid $child still running 10 s after the app"; fi
+  if [ -n "$PID" ]; then
+    if wait_for 20 gone "$PID"; then ok "asked to quit, it exited ($round)"; else bad "quit ($round)" "pid $PID still running 20 s later"; fi
+  fi
+  if [ -n "$HELPER" ]; then
+    if wait_for 10 gone "$HELPER"; then ok "its helper exited with it ($round)"; else bad "helper ($round)" "pid $HELPER still running 10 s after the app"; fi
   fi
   if wait_for 10 no_app; then ok "nothing runs as $ID ($round)"; else bad "after quit ($round)" "$("$APPCTL" pids "$ID" | tr '\n' ' ')"; fi
+}
+
+# One launch: open, check everything, quit, and require nothing left.
+one_launch() {
+  local app="$1" round="$2"
+  say "launch $round"
+  started "$app" "$round" || return
+  helper_of "$app" "$round"
+  browses "$round"
+  stopped "$round"
+}
+
+# The Dock's way back: close the last window without quitting, require the
+# same app and proxy to stay, then open the bundle again, as a Dock click or
+# Finder would, and require a window back in that same process, with that
+# same proxy.
+reopened() {
+  local app="$1" round=reopen pid helper
+  say "close the last window, then open again"
+  started "$app" "$round" || return
+  helper_of "$app" "$round"
+  pid="$PID" helper="$HELPER"
+  "$APPCTL" ax-close "$pid" || bad "close ($round)" "no window had a close button to press"
+  if wait_for 15 sh -c '! "$1" windows "$2"' _ "$APPCTL" "$pid"; then ok "its last window closed ($round)"; else bad "close ($round)" "a window is still on screen"; fi
+  sleep 2
+  must "$(alive "$pid" && [ "$("$APPCTL" pids "$ID")" = "$pid" ] && echo yes)" "with no window, the same app runs on (pid $pid)" "$("$APPCTL" pids "$ID" | tr '\n' ' ')"
+  must "$([ -n "$helper" ] && alive "$helper" && echo yes)" "and so does its proxy (pid $helper)"
+  open "$app" || bad "open again ($round)" "open failed"
+  if wait_for 30 "$APPCTL" windows "$pid"; then ok "opened again, a window is back in pid $pid ($round)"; else bad "reopen ($round)" "no window 30 s after open"; fi
+  must "$([ "$("$APPCTL" pids "$ID" | tr -d '\n')" = "$pid" ] && echo yes)" "it is still the one application, pid $pid ($round)" "$("$APPCTL" pids "$ID" | tr '\n' ' ')"
+  must "$([ "$(pgrep -P "$pid" | tr -d '\n')" = "$helper" ] && echo yes)" "with the same proxy, pid $helper ($round)" "children: $(pgrep -P "$pid" | tr '\n' ' ')"
+  browses "$round"
+  stopped "$round"
 }
 
 launch() {
@@ -124,12 +190,37 @@ launch() {
   keystore_before="$(keystore_item)"
   printf '\nSyndeo.app, opened as a person opens it: %s\n' "$app"
   one_launch "$app" first
+  reopened "$app"
   one_launch "$app" again
   printf '\nwhat it left\n'
   must "$([ ! -e "$home/.keystore" ] && echo yes)" "no keystore in its home ($home)" "$(ls -la "$home/.keystore" 2>&1 | head -3)"
   must "$([ "$keystore_before" = absent ] && [ "$(keystore_item)" = absent ] && echo yes)" "no keychain item for a keystore, before or after" "before: $keystore_before, after: $(keystore_item)"
   security dump-trust-settings >"$LOGS/trust-after.txt" 2>&1 || true
   must "$(cmp -s "$LOGS/trust-before.txt" "$LOGS/trust-after.txt" && echo yes)" "the user's trust settings are as they were" "$(diff "$LOGS/trust-before.txt" "$LOGS/trust-after.txt" | head -5)"
+  printf '\n%d failed\n' "$fails"
+  [ "$fails" = 0 ]
+}
+
+# refuse APP: APP's helper cannot start. The app has to open all the same,
+# and its window has to say it cannot browse, hold no web view, and leave no
+# helper running.
+refuse() {
+  local app
+  [ -d "${1:-}" ] || { say "usage: $0 refuse <Syndeo.app>"; exit 2; }
+  app="$(cd "$1" && pwd -P)"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  printf '\nSyndeo.app whose proxy cannot start: %s\n' "$app"
+  started "$app" refuse || { printf '\n%d failed\n' "$fails"; return 1; }
+  if wait_for 20 sh -c '"$1" ax-tree "$2" | grep -qF "$3"' _ "$APPCTL" "$PID" "$CANNOT_BROWSE"; then
+    ok "its window says: $CANNOT_BROWSE"
+  else
+    bad "error view" "no '$CANNOT_BROWSE' in its window: $("$APPCTL" ax-tree "$PID" | head -5 | tr '\n' ' ')"
+  fi
+  "$APPCTL" ax-tree "$PID" >"$LOGS/refuse-ax-tree.txt"
+  must "$(grep -q '^AXWebArea' "$LOGS/refuse-ax-tree.txt" && echo no || echo yes)" "and holds no web view" "$(grep -c '^AXWebArea' "$LOGS/refuse-ax-tree.txt") web areas"
+  if wait_for 10 sh -c '[ -z "$(pgrep -P "$1")" ]' _ "$PID"; then ok "and no helper runs under it"; else bad "helper" "children: $(pgrep -P "$PID" | tr '\n' ' ')"; fi
+  HELPER=''
+  stopped refuse
   printf '\n%d failed\n' "$fails"
   [ "$fails" = 0 ]
 }
@@ -176,6 +267,7 @@ measure() {
 
 case "${1:-}" in
   launch) shift; launch "$@" ;;
+  refuse) shift; refuse "$@" ;;
   measure) measure ;;
-  *) say "usage: $0 launch <Syndeo.app> | measure"; exit 2 ;;
+  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | measure"; exit 2 ;;
 esac
