@@ -23,17 +23,30 @@
 # is checked, never believed. With no version given, the installed syndeo's own
 # report is used instead.
 #
-# Knobs, both optional:
+# Knobs:
 #
 #   SYNDEO_EXPECT_SIGNED  yes | no (default: no). On macOS, whether the binaries
-#                         must carry a valid Developer ID signature and be
-#                         accepted by Gatekeeper, or carry none and be rejected.
-#                         The check fails when the release is not what this
-#                         says, in either direction, and when it is half of each.
+#                         must be signed and notarized command-line tools, or
+#                         carry no Developer ID at all. The check fails when the
+#                         release is not what this says, in either direction,
+#                         and when it is half of each.
+#   MACOS_TEAM_ID         with SYNDEO_EXPECT_SIGNED=yes on macOS, required: the
+#                         ten-character team every binary must be signed by.
 #   SYNDEO_INSTALLER      the install.sh to run: a URL or a local path (default:
 #                         main's, from GitHub, as the README gives it). A path is
 #                         how a change to the installer is checked before it
 #                         reaches main.
+#
+# A signed release's binaries are command-line tools, not apps. Apple signs
+# those with a Developer ID Application certificate and notarizes them, but
+# Gatekeeper's execute assessment, spctl -a -t execute, is for app bundles and
+# rejects every one ("the code is valid but does not seem to be an app"), so it
+# is not asked. Each binary is held instead to what a notarized command-line
+# tool is: Developer ID Application of MACOS_TEAM_ID, chained to Apple Root
+# CA; a strict verification; the hardened runtime and a secure timestamp; no
+# entitlements; notarized, as codesign --check-notarization -R=notarized
+# finds; and it runs, saying its name and exactly this release. Gatekeeper
+# still judges the deliverable it is for, the package: see ci/verify-pkg.sh.
 #
 # --self-test checks this script's own judgement against stand-ins, with no
 # network and no real installer, codesign, spctl, uname or curl.
@@ -180,11 +193,50 @@ check_artifacts() {
   fi
 }
 
-# Every executable the installer put in $BIN, assessed once each by codesign and
-# Gatekeeper before anything is compared with what was expected.
+# A team identifier: ten capital letters and digits, whatever the locale.
+TEAM_RE='^[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10}$'
+
+# developer_id VALUE TEAM: VALUE is "Developer ID Application: <name> (TEAM)".
+developer_id() {
+  [[ "$1" =~ ^Developer\ ID\ Application:\ .+\ \(([ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10})\)$ ]] && [ "${BASH_REMATCH[1]}" = "$2" ]
+}
+
+# notarized_tool B: why $BIN/B is not a signed, notarized command-line tool of
+# $TEAM that runs as $expected, as "; "-ended reasons, or nothing if it is.
+notarized_tool() {
+  local b="$1" out first last status problems=""
+  out="$(codesign -dv --verbose=4 "$BIN/$b" 2>&1)"
+  first="$(printf '%s\n' "$out" | sed -n 's/^Authority=//p' | head -n 1)"
+  last="$(printf '%s\n' "$out" | sed -n 's/^Authority=//p' | tail -n 1)"
+  developer_id "$first" "$TEAM" || problems="$problems signed by '${first:-nobody}';"
+  [ "$last" = "Apple Root CA" ] || problems="$problems not chained to Apple Root CA;"
+  printf '%s\n' "$out" | grep -qx "TeamIdentifier=$TEAM" ||
+    problems="$problems TeamIdentifier '$(printf '%s\n' "$out" | sed -n 's/^TeamIdentifier=//p')';"
+  codesign --verify --strict "$BIN/$b" >/dev/null 2>&1 || problems="$problems does not verify strictly;"
+  printf '%s\n' "$out" | grep -qE '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' || problems="$problems no hardened runtime;"
+  printf '%s\n' "$out" | grep -q '^Timestamp=' || problems="$problems no secure timestamp;"
+  # Read whole before it is looked at: grep -q stopping at its first match
+  # would kill a writer still writing, and pipefail would then count the
+  # pipeline as failed.
+  out="$(codesign -d --entitlements - --xml "$BIN/$b" 2>/dev/null)"
+  case "$out" in
+    *'<key>'*) problems="$problems has entitlements, and no shipped executable may;" ;;
+  esac
+  codesign --verify --strict --check-notarization -R=notarized "$BIN/$b" >/dev/null 2>&1 || problems="$problems not notarized;"
+  out="$(perl -e 'alarm 60; exec @ARGV' "$BIN/$b" --version 2>&1)" && status=0 || status=$?
+  out="${out%%$'\n'*}"
+  if [ "$status" != 0 ] || [ "$out" != "$b $expected" ]; then
+    problems="$problems --version exited $status saying '$out', not '$b $expected';"
+  fi
+  printf '%s' "${problems# }"
+}
+
+# Every executable the installer put in $BIN, assessed once each by codesign
+# before anything is compared with what was expected; never by Gatekeeper's
+# execute assessment, which is for apps (see the top of this script).
 check_signing() {
-  local executables="" f b valid="" invalid="" unsigned="" accepted="" rejected=""
-  note "signing (expected: $([ "$EXPECT_SIGNED" = yes ] && echo "Developer ID signed and notarized" || echo "unsigned"))"
+  local executables="" f b out problems valid="" invalid="" unsigned=""
+  note "signing (expected: $([ "$EXPECT_SIGNED" = yes ] && echo "notarized command-line tools, Developer ID Application of ${TEAM:-?}" || echo "unsigned"))"
 
   for f in "$BIN"/*; do
     if [ -f "$f" ] && [ -x "$f" ]; then
@@ -195,13 +247,28 @@ check_signing() {
     bad "signing" "no executables were installed to assess"
     return
   fi
-  if ! spctl --status 2>&1 | grep -q 'assessments enabled'; then
-    bad "Gatekeeper" "assessments are disabled on this machine; the signing check cannot run"
+  printf '        assessed:%s\n' "$executables"
+
+  if [ "$EXPECT_SIGNED" = yes ]; then
+    if [ "$expected_ok" != yes ]; then
+      bad "signed executables" "cannot be judged without a valid release version"
+      return
+    fi
+    for b in $executables; do
+      problems="$(notarized_tool "$b")"
+      if [ -z "$problems" ]; then
+        ok "$b: Developer ID Application of $TEAM, verifies strictly, hardened runtime, secure timestamp, no entitlements, notarized, runs as $expected"
+      else
+        bad "$b" "$problems"
+      fi
+    done
     return
   fi
 
   for b in $executables; do
-    if codesign -dv --verbose=2 "$BIN/$b" 2>&1 | grep -q '^Authority=Developer ID Application'; then
+    # Whole, for the same reason as the entitlements above.
+    out="$(codesign -dv --verbose=4 "$BIN/$b" 2>&1)"
+    if case $'\n'"$out" in *$'\n'"Authority=Developer ID Application"*) true ;; *) false ;; esac; then
       if codesign --verify --strict "$BIN/$b" >/dev/null 2>&1; then
         valid="$valid $b"
       else
@@ -210,44 +277,12 @@ check_signing() {
     else
       unsigned="$unsigned $b"
     fi
-    if spctl -a -t execute "$BIN/$b" >/dev/null 2>&1; then
-      accepted="$accepted $b"
-    else
-      rejected="$rejected $b"
-    fi
   done
-  printf '        assessed:%s\n' "$executables"
-  printf '        Developer ID, valid:%s\n' "${valid:- none}"
-  printf '        Developer ID, invalid:%s\n' "${invalid:- none}"
   printf '        no Developer ID:%s\n' "${unsigned:- none}"
-  printf '        Gatekeeper accepts:%s\n' "${accepted:- none}"
-  printf '        Gatekeeper rejects:%s\n' "${rejected:- none}"
-
-  if [ "$EXPECT_SIGNED" = yes ]; then
-    if [ -z "$invalid" ] && [ -z "$unsigned" ]; then
-      ok "every executable carries a valid Developer ID signature"
-    else
-      bad "Developer ID signature" "invalid:${invalid:- none}; missing:${unsigned:- none}"
-    fi
-    if [ -z "$rejected" ]; then
-      ok "Gatekeeper accepts every executable"
-    else
-      bad "Gatekeeper" "rejects:$rejected"
-    fi
+  if [ -z "$valid" ] && [ -z "$invalid" ]; then
+    ok "no executable carries a Developer ID signature, as expected for an unsigned release"
   else
-    if [ -z "$valid" ] && [ -z "$invalid" ]; then
-      ok "no executable carries a Developer ID signature, as expected for an unsigned release"
-    else
-      bad "unsigned release" "Developer ID signature found on:${valid}${invalid} (set SYNDEO_EXPECT_SIGNED=yes if that is intended)"
-    fi
-    # An unsigned release has no Developer ID and no notarization, so
-    # Gatekeeper refusing it is the correct answer. One it accepts means the
-    # assessment is being overridden here, and says nothing about what users get.
-    if [ -z "$accepted" ]; then
-      ok "Gatekeeper rejects every executable, as it should an unsigned release"
-    else
-      bad "Gatekeeper" "accepts unsigned executables:$accepted"
-    fi
+    bad "unsigned release" "Developer ID signature found on:${valid}${invalid} (set SYNDEO_EXPECT_SIGNED=yes if that is intended)"
   fi
 }
 
@@ -371,6 +406,11 @@ main() {
     yes | no) ;;
     *) echo "SYNDEO_EXPECT_SIGNED must be yes or no, not '$EXPECT_SIGNED'" >&2; exit 2 ;;
   esac
+  TEAM="${MACOS_TEAM_ID:-}"
+  if [ "$EXPECT_SIGNED" = yes ] && [ "$(uname -s)" = Darwin ] && ! [[ "$TEAM" =~ $TEAM_RE ]]; then
+    echo "SYNDEO_EXPECT_SIGNED=yes needs MACOS_TEAM_ID, the ten-character team the release is signed by, not '$TEAM'" >&2
+    exit 2
+  fi
 
   WORK="$(mktemp -d)"
   trap 'rm -rf "$WORK"' EXIT
@@ -403,19 +443,50 @@ write_stand_ins() {
 echo "uname $*" >>"$FAKE_LOG"
 case "$1" in -s) echo "$FAKE_OS" ;; -m) echo arm64 ;; *) echo "$FAKE_OS" ;; esac
 EOF
+  # codesign, for the executables named in FAKE_SIGNED and FAKE_INVALID: a
+  # notarized command-line tool of AB12CD34EF, except where one of the other
+  # FAKE_* lists names it. Anything else is ad hoc.
   cat >"$dir/codesign" <<'EOF'
 #!/bin/sh
 echo "codesign $*" >>"$FAKE_LOG"
 for last; do :; done
 name="${last##*/}"
+listed() { case " $1 " in *" $name "*) return 0 ;; esac; return 1; }
 case "$1" in
   -dv)
-    case " $FAKE_SIGNED $FAKE_INVALID " in
-      *" $name "*) echo "Authority=Developer ID Application: Example (AB12CD34EF)" >&2 ;;
-      *) echo "Signature=adhoc" >&2 ;;
-    esac ;;
+    if listed "${FAKE_SIGNED:-} ${FAKE_INVALID:-}"; then
+      team=AB12CD34EF
+      if listed "${FAKE_OTHER_TEAM:-}"; then team=ZZ99ZZ99ZZ; fi
+      if listed "${FAKE_NOT_DEVID:-}"; then
+        echo "Authority=Apple Development: Example Org ($team)" >&2
+      else
+        echo "Authority=Developer ID Application: Example Org ($team)" >&2
+      fi
+      echo "Authority=Developer ID Certification Authority" >&2
+      listed "${FAKE_NO_ROOT:-}" || echo "Authority=Apple Root CA" >&2
+      if listed "${FAKE_NO_TIMESTAMP:-}"; then
+        echo "Signed Time=10 Oct 2026 at 12:00:00" >&2
+      else
+        echo "Timestamp=10 Oct 2026 at 12:00:00" >&2
+      fi
+      echo "TeamIdentifier=$team" >&2
+      if listed "${FAKE_NO_RUNTIME:-}"; then
+        echo "CodeDirectory v=20400 size=100 flags=0x0(none) hashes=1+2 location=embedded" >&2
+      else
+        echo "CodeDirectory v=20500 size=100 flags=0x10000(runtime) hashes=1+2 location=embedded" >&2
+      fi
+    else
+      echo "Signature=adhoc" >&2
+    fi ;;
+  -d)
+    if listed "${FAKE_ENTITLED:-}"; then
+      printf '%s' '<?xml version="1.0"?><plist version="1.0"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>'
+    fi ;;
   --verify)
-    case " $FAKE_INVALID " in *" $name "*) exit 1 ;; esac ;;
+    listed "${FAKE_INVALID:-}" && exit 1
+    case " $* " in
+      *" --check-notarization "*) listed "${FAKE_UNNOTARIZED:-} ${FAKE_INVALID:-}" && exit 1 ;;
+    esac ;;
 esac
 exit 0
 EOF
@@ -436,17 +507,16 @@ echo "curl $*" >>"$FAKE_LOG"
 exit 97
 EOF
   # The installer under test in each case: says $FAKE_BANNER, and installs
-  # $FAKE_INSTALL, with a syndeo that reports $FAKE_REPORTS.
+  # $FAKE_INSTALL, each saying its name and $FAKE_REPORTS whatever it is asked,
+  # except those in $FAKE_VERSION_OFF, which say 0.0.0.
   cat >"$dir/installer" <<'EOF'
 #!/bin/sh
 echo "Syndeo $FAKE_BANNER for fake-target"
 mkdir -p "$SYNDEO_INSTALL_DIR"
 for b in $FAKE_INSTALL; do
-  if [ "$b" = syndeo ]; then
-    printf '#!/bin/sh\necho "syndeo %s"\n' "$FAKE_REPORTS" >"$SYNDEO_INSTALL_DIR/$b"
-  else
-    printf '#!/bin/sh\nexit 0\n' >"$SYNDEO_INSTALL_DIR/$b"
-  fi
+  v="$FAKE_REPORTS"
+  case " ${FAKE_VERSION_OFF:-} " in *" $b "*) v=0.0.0 ;; esac
+  printf '#!/bin/sh\necho "%s %s"\n' "$b" "$v" >"$SYNDEO_INSTALL_DIR/$b"
   chmod 755 "$SYNDEO_INSTALL_DIR/$b"
 done
 EOF
@@ -496,6 +566,7 @@ self_test() {
       PATH="$stand_ins:$PATH"
       VERSION="$version"
       EXPECT_SIGNED="${FAKE_EXPECT:-no}"
+      TEAM=AB12CD34EF
       INSTALLER="$stand_ins/installer"
       WORK="$dir"; BIN="$dir/bin"; HOME_DIR="$dir/home"; banner=""
       pass=0; fail=0; failures=""
@@ -529,24 +600,27 @@ self_test() {
     if grep -q '^curl' "$FAKE_LOG"; then
       problems="$problems; curl was called"
     fi
-    # On macOS with signing assessed: every installed executable exactly once
-    # by codesign and by Gatekeeper, and verified only if it claimed Developer ID.
+    # On macOS with signing assessed: every installed executable described by
+    # codesign exactly once, and, for a signed release, its notarization
+    # checked exactly once; and nothing that was not installed.
     if [ "$FAKE_OS" = Darwin ] && [ "${FAKE_ASSESSED:-yes}" = yes ]; then
       for b in $FAKE_INSTALL; do
-        n=$(grep -c "^codesign -dv --verbose=2 .*/bin/$b\$" "$FAKE_LOG")
+        n=$(grep -c "^codesign -dv --verbose=4 .*/bin/$b\$" "$FAKE_LOG")
         [ "$n" = 1 ] || problems="$problems; codesign -dv on $b $n times"
-        n=$(grep -c "^spctl -a -t execute .*/bin/$b\$" "$FAKE_LOG")
-        [ "$n" = 1 ] || problems="$problems; spctl -a on $b $n times"
         expected_verify=0
-        case " ${FAKE_SIGNED:-} ${FAKE_INVALID:-} " in *" $b "*) expected_verify=1 ;; esac
-        n=$(grep -c "^codesign --verify --strict .*/bin/$b\$" "$FAKE_LOG")
-        [ "$n" = "$expected_verify" ] || problems="$problems; codesign --verify on $b $n times, not $expected_verify"
+        [ "${FAKE_EXPECT:-no}" = yes ] && expected_verify=1
+        n=$(grep -c "^codesign --verify --strict --check-notarization -R=notarized .*/bin/$b\$" "$FAKE_LOG")
+        [ "$n" = "$expected_verify" ] || problems="$problems; the notarization of $b checked $n times, not $expected_verify"
       done
-      # And nothing that was not installed.
       n=$(grep -c '^codesign -dv' "$FAKE_LOG")
       [ "$n" = "$(echo "$FAKE_INSTALL" | wc -w | tr -d ' ')" ] || problems="$problems; codesign -dv ran $n times"
     elif [ "$FAKE_OS" != Darwin ] && grep -qE '^(codesign|spctl)' "$FAKE_LOG"; then
       problems="$problems; signing was assessed off macOS"
+    fi
+    # Gatekeeper's execute assessment is for apps; a command-line tool is
+    # never put to it, signed or not.
+    if grep -q '^spctl' "$FAKE_LOG"; then
+      problems="$problems; spctl was asked about a command-line tool"
     fi
     if [ -z "$problems" ]; then
       printf '  ok    %s\n' "$name"
@@ -558,7 +632,7 @@ self_test() {
   }
 
   local six="$CORE" seven="$CORE syndeo-webkit"
-  export FAKE_OS=Darwin FAKE_GATEKEEPER=enabled FAKE_SIGNED="" FAKE_INVALID="" FAKE_ACCEPTED="" FAKE_EXPECT=no FAKE_ASSESSED=yes
+  export FAKE_OS=Darwin FAKE_GATEKEEPER=disabled FAKE_SIGNED="" FAKE_INVALID="" FAKE_ACCEPTED="" FAKE_EXPECT=no FAKE_ASSESSED=yes
 
   printf '\n  which release it is\n'
   FAKE_BANNER=0.1.2 FAKE_REPORTS=0.1.2 FAKE_INSTALL="$six" \
@@ -590,29 +664,54 @@ self_test() {
   FAKE_OS=Linux FAKE_BANNER=0.1.3 FAKE_REPORTS=0.1.3 FAKE_INSTALL="$seven" \
     run_case "Linux 0.1.3 with WebKit installed" fail 0.1.3 "syndeo-webkit is not installed"
 
-  printf '\n  signing and Gatekeeper, every executable\n'
+  printf '\n  signing: notarized command-line tools, or none at all\n'
   export FAKE_BANNER=0.1.3 FAKE_REPORTS=0.1.3 FAKE_INSTALL="$seven"
-  run_case "unsigned expected: none signed, all rejected" pass 0.1.3 ""
-  FAKE_EXPECT=yes FAKE_SIGNED="$seven" FAKE_ACCEPTED="$seven" \
-    run_case "signed expected: all valid, all accepted" pass 0.1.3 ""
+  run_case "unsigned expected: none signed" pass 0.1.3 ""
+  FAKE_EXPECT=yes FAKE_SIGNED="$seven" \
+    run_case "signed expected: all seven notarized command-line tools of the team, run as 0.1.3" pass 0.1.3 ""
+  FAKE_EXPECT=yes FAKE_SIGNED="$seven" FAKE_GATEKEEPER=enabled \
+    run_case "signed expected: Gatekeeper, which rejects every bare tool, is not asked" pass 0.1.3 ""
+  FAKE_EXPECT=yes FAKE_SIGNED="$seven" FAKE_NOT_DEVID="syndeo-ui" \
+    run_case "signed expected, one signed by a development certificate" fail 0.1.3 "syndeo-ui — signed by 'Apple Development: Example Org (AB12CD34EF)'"
+  FAKE_EXPECT=yes FAKE_SIGNED="$seven" FAKE_OTHER_TEAM="syndeo-net" \
+    run_case "signed expected, one of another team" fail 0.1.3 "syndeo-net — signed by 'Developer ID Application: Example Org (ZZ99ZZ99ZZ)'; TeamIdentifier 'ZZ99ZZ99ZZ';"
+  FAKE_EXPECT=yes FAKE_SIGNED="$seven" FAKE_NO_ROOT="syndeo-agent" \
+    run_case "signed expected, one not chained to Apple Root CA" fail 0.1.3 "syndeo-agent — not chained to Apple Root CA;"
+  FAKE_EXPECT=yes FAKE_SIGNED="syndeo syndeo-net syndeo-agent syndeo-proxy syndeo-ui syndeo-webkit" FAKE_INVALID="syndeo-keystore" \
+    run_case "signed expected, one that does not verify strictly" fail 0.1.3 "syndeo-keystore — does not verify strictly;"
+  FAKE_EXPECT=yes FAKE_SIGNED="$seven" FAKE_NO_RUNTIME="syndeo-proxy" \
+    run_case "signed expected, one without the hardened runtime" fail 0.1.3 "syndeo-proxy — no hardened runtime;"
+  FAKE_EXPECT=yes FAKE_SIGNED="$seven" FAKE_NO_TIMESTAMP="syndeo-webkit" \
+    run_case "signed expected, one without a secure timestamp" fail 0.1.3 "syndeo-webkit — no secure timestamp;"
+  FAKE_EXPECT=yes FAKE_SIGNED="$seven" FAKE_ENTITLED="syndeo-keystore" \
+    run_case "signed expected, one with an entitlement" fail 0.1.3 "syndeo-keystore — has entitlements, and no shipped executable may;"
+  FAKE_EXPECT=yes FAKE_SIGNED="$seven" FAKE_UNNOTARIZED="syndeo" \
+    run_case "signed expected, one not notarized" fail 0.1.3 "syndeo — not notarized;"
+  FAKE_EXPECT=yes FAKE_SIGNED="$seven" FAKE_VERSION_OFF="syndeo-agent" \
+    run_case "signed expected, one that says another version" fail 0.1.3 "syndeo-agent — --version exited 0 saying 'syndeo-agent 0.0.0', not 'syndeo-agent 0.1.3';"
+  FAKE_EXPECT=yes FAKE_SIGNED="syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-webkit" \
+    run_case "signed expected, one without a signature" fail 0.1.3 "syndeo-ui — signed by 'nobody'"
   FAKE_SIGNED="syndeo-net" \
     run_case "unsigned expected, one signed" fail 0.1.3 "unsigned release — Developer ID signature found on: syndeo-net"
-  FAKE_EXPECT=yes FAKE_SIGNED="syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-webkit" FAKE_ACCEPTED="$seven" \
-    run_case "signed expected, one without a signature" fail 0.1.3 "Developer ID signature — invalid: none; missing: syndeo-ui"
-  FAKE_ACCEPTED="syndeo-proxy" \
-    run_case "unsigned expected, Gatekeeper accepts one" fail 0.1.3 "Gatekeeper — accepts unsigned executables: syndeo-proxy"
-  FAKE_EXPECT=yes FAKE_SIGNED="$seven" FAKE_ACCEPTED="syndeo syndeo-net syndeo-keystore syndeo-proxy syndeo-ui syndeo-webkit" \
-    run_case "signed expected, Gatekeeper rejects one" fail 0.1.3 "Gatekeeper — rejects: syndeo-agent"
   FAKE_INVALID="syndeo-keystore" \
     run_case "unsigned expected, one with an invalid Developer ID signature" fail 0.1.3 "unsigned release — Developer ID signature found on: syndeo-keystore"
-  FAKE_EXPECT=yes FAKE_SIGNED="syndeo syndeo-net syndeo-agent syndeo-proxy syndeo-ui syndeo-webkit" FAKE_INVALID="syndeo-keystore" FAKE_ACCEPTED="$seven" \
-    run_case "signed expected, one with an invalid Developer ID signature" fail 0.1.3 "Developer ID signature — invalid: syndeo-keystore; missing: none"
   FAKE_INSTALL="" FAKE_ASSESSED=no \
     run_case "unsigned expected, nothing installed to assess" fail 0.1.3 "signing — no executables were installed to assess"
   FAKE_INSTALL="" FAKE_ASSESSED=no FAKE_EXPECT=yes \
     run_case "signed expected, nothing installed to assess" fail 0.1.3 "signing — no executables were installed to assess"
-  FAKE_GATEKEEPER=disabled FAKE_ASSESSED=no \
-    run_case "Gatekeeper assessments disabled" fail 0.1.3 "Gatekeeper — assessments are disabled"
+
+  # Without the team to hold a signed release to, nothing is installed or
+  # judged: the run stops at once, saying why.
+  cases=$((cases+1))
+  local out status
+  out="$(env -u MACOS_TEAM_ID FAKE_LOG="$root/no-team.log" FAKE_OS=Darwin PATH="$stand_ins:$PATH" \
+    SYNDEO_EXPECT_SIGNED=yes SYNDEO_INSTALLER="$root/no-such-installer" bash "$0" 0.1.3 2>&1)" && status=0 || status=$?
+  if [ "$status" = 2 ] && printf '%s' "$out" | grep -q 'needs MACOS_TEAM_ID'; then
+    printf '  ok    %s\n' "signed expected on macOS without MACOS_TEAM_ID: refused before anything runs"
+  else
+    printf '  WRONG %s; exit %s: %s\n' "signed expected on macOS without MACOS_TEAM_ID: refused before anything runs" "$status" "$(printf '%s' "$out" | tail -n 2 | tr '\n' ' ')"
+    wrong=$((wrong+1))
+  fi
 
   # doctor_case <name> <os> <pass|fail> <failure texts> <shown texts>, each
   # list "|"-separated. The doctor's output is $FAKE_DOCTOR, its stderr
