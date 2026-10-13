@@ -82,7 +82,11 @@ impl Pinner {
         Ok(unsafe { msg_send![super(this), init] })
     }
 
-    fn judge(&self, challenge: &NSURLAuthenticationChallenge) -> (isize, *mut AnyObject) {
+    /// The disposition, and the credential if any, for `challenge`: the
+    /// proxy's authority as the only anchor for a server-trust challenge, and
+    /// the default handling for anything else. Public so a delegate that also
+    /// follows navigation can answer challenges exactly as this one does.
+    pub fn judge(&self, challenge: &NSURLAuthenticationChallenge) -> (isize, *mut AnyObject) {
         let space: Retained<AnyObject> = unsafe { msg_send![challenge, protectionSpace] };
         let method: Retained<NSString> = unsafe { msg_send![&*space, authenticationMethod] };
         if method.to_string() != "NSURLAuthenticationMethodServerTrust" {
