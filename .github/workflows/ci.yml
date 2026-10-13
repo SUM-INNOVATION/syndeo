@@ -64,6 +64,9 @@ jobs:
       # and none with an entitlement, which a standalone executable cannot
       # carry without being killed at launch.
       - run: bash ci/sign-macos.sh --self-test
+      # Syndeo.app's assembly: exactly its five files, and every way a bundle
+      # can differ from that caught (macOS only).
+      - run: bash ci/package-macos-app.sh --self-test
       - run: bash ci/sign-macos-pkg.sh --self-test
       # Where the signing secrets may go: nowhere in this workflow, and in
       # release.yml only to the four jobs that declare release-macos, each its
