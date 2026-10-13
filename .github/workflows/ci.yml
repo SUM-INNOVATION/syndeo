@@ -207,8 +207,10 @@ jobs:
     # The desktop application as a person starts it: assembled from release
     # binaries, signed ad hoc (the helper first, then the bundle), opened with
     # `open`, checked through Launch Services, the window server and
-    # Accessibility, its last window closed and brought back by opening it
-    # again, quit as the Quit menu item would, and opened again; and a copy
+    # Accessibility; browsed in, by keystrokes and presses as a person would:
+    # addresses, Back and Forward, refusals, a tab opened and closed; its last
+    # window closed and brought back by opening it again, quit as the Quit
+    # menu item would, and opened again; and a copy
     # whose proxy cannot start, which has to refuse to browse. Unsigned with a Developer
     # ID, and with no secrets: a pull request never signs. Then, reported and
     # not gated, what this runner allows an onboarding test to do.
@@ -239,7 +241,7 @@ jobs:
           codesign --force --sign - --options runtime dist/Syndeo.app
           codesign --verify --strict --verbose=2 dist/Syndeo.app
 
-      - name: Open it, check it, close its last window and open it again, quit it, and open it again
+      - name: Open it, check it, browse in it, close its last window and open it again, quit it, and open it again
         run: bash ci/test-app.sh launch "$PWD/dist/Syndeo.app"
 
       # The same app with a helper that exits at once, so its proxy can never
