@@ -23,6 +23,7 @@
 //   appctl enabled <pid> <id>    "enabled" or "disabled", for that element
 //   appctl menu <pid> <menu> <item>   press a menu item, as a click on it would;
 //                                exits 1 if there is no such item
+//   appctl menu-items <pid> <menu>    the title of each item in that menu, one a line
 //   appctl shortcut <pid> <menu> <item>   the item's key equivalent, as
 //                                "<character> <modifiers>": 0 is Command alone
 //   appctl press-link <pid> <text>    press the first link in the front window whose
@@ -126,17 +127,18 @@ func key(_ pid: Int32, _ code: CGKeyCode, _ text: String) {
     }
 }
 
+/// The items of the menu bar item `menu`.
+func menuItems(_ pid: Int32, _ menu: String) -> [AXUIElement] {
+    guard let bar = asElement(attribute(AXUIElementCreateApplication(pid), kAXMenuBarAttribute)) else { return [] }
+    return children(bar)
+        .filter { oneLine(attribute($0, kAXTitleAttribute)) == menu }
+        .flatMap { children($0) }
+        .flatMap { children($0) }
+}
+
 /// The menu bar item `menu`'s item `title`.
 func menuItem(_ pid: Int32, _ menu: String, _ title: String) -> AXUIElement? {
-    guard let bar = asElement(attribute(AXUIElementCreateApplication(pid), kAXMenuBarAttribute)) else { return nil }
-    for top in children(bar) where oneLine(attribute(top, kAXTitleAttribute)) == menu {
-        for list in children(top) {
-            for item in children(list) where oneLine(attribute(item, kAXTitleAttribute)) == title {
-                return item
-            }
-        }
-    }
-    return nil
+    menuItems(pid, menu).first { oneLine(attribute($0, kAXTitleAttribute)) == title }
 }
 
 let args = CommandLine.arguments
@@ -217,6 +219,11 @@ case "enabled" where args.count == 4:
 case "menu" where args.count == 5:
     guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
     exit(AXUIElementPerformAction(item, kAXPressAction as CFString) == .success ? 0 : 1)
+case "menu-items" where args.count == 4:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    for item in menuItems(pid, args[3]) {
+        print(oneLine(attribute(item, kAXTitleAttribute)))
+    }
 case "shortcut" where args.count == 5:
     guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
     let character = oneLine(attribute(item, kAXMenuItemCmdCharAttribute))

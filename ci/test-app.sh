@@ -19,8 +19,11 @@
 #     work, by the bar's button and by History > Forward; words and a file:
 #     address are refused with Syndeo's own page, not sent anywhere; File >
 #     New Tab opens a tab with the start page, beside the first in one window,
-#     and File > Close closes it, letting its window go and leaving the first
-#     as it was;
+#     and File > Close Tab (⌘W, as AppKit retitles Close while there are tabs)
+#     closes it, letting its window go and leaving the first as it was;
+#   - https://example.com opens, and the proxy fetched it, though Syndeo's
+#     authority is in no trust settings: the window's own delegate anchors
+#     it, and the trust settings are checked unchanged at the end;
 #   - asked to quit as the Quit menu item would, it exits, and its proxy
 #     with it;
 #   - with its last window closed, through the window's own close button, the
@@ -35,9 +38,9 @@
 # refuse, which gates: a bundle whose proxy cannot start opens all the same,
 # its window says it cannot browse and holds no web view, and no helper runs.
 #
-# launch also measures, without gating: whether an https page opens while the
-# proxy's authority is not trusted, and whether a page on this runner's own
-# loopback opens, and a link on it to a new tab opens one.
+# launch also measures, without gating: whether a page on this runner's own
+# loopback opens, and whether the proxy saw it, and whether a link on it to a
+# new tab opens one.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -183,8 +186,11 @@ arrive() {
 # choose MENU ITEM: bring the app to the front and press MENU > ITEM.
 choose() {
   "$APPCTL" activate "$PID" >/dev/null || true
-  "$APPCTL" menu "$PID" "$1" "$2" || bad "$1 > $2" "no such menu item to press"
+  "$APPCTL" menu "$PID" "$1" "$2" || bad "$1 > $2" "no such menu item to press; $1 has: $("$APPCTL" menu-items "$PID" "$1" | tr '\n' '|')"
 }
+
+# The app's log, its proxy's lines included, without terminal colours.
+plain_log() { perl -pe 's/\e\[[0-9;]*m//g' "$1"; }
 
 # visit TEXT ADDRESS PAGE WHAT: File > Open Location…, then TEXT typed and
 # Return, as a person would; then require arrive ADDRESS PAGE.
@@ -235,7 +241,7 @@ server.serve_forever()' "$dir" >"$LOGS/origin.log" 2>&1 &
 
 # Browse as a person would, in the first window and a tab beside it.
 browsing() {
-  local app="$1" round=browse log outcome on_screen
+  local app="$1" round=browse log outcome on_screen have
   say "browse: addresses, Back and Forward, refusals, a tab"
   started "$app" "$round" || return
   helper_of "$app" "$round"
@@ -261,20 +267,20 @@ browsing() {
   must "$([ "$on_screen" = 1 ] && echo yes)" "the two are tabs of one window: one window on screen" "$on_screen on screen"
   "$APPCTL" titles "$PID" >"$LOGS/browse-tabs.txt" 2>&1
   "$APPCTL" front-tree "$PID" >"$LOGS/browse-two-tabs-tree.txt" 2>&1
-  choose File Close
-  if wait_for 15 grep -q 'a window closed open=1' "$log"; then ok "File > Close closes the tab, and the app lets its window go"; else bad "Close" "the app does not report one window: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
+  "$APPCTL" menu-items "$PID" File >"$LOGS/browse-two-tabs-file-menu.txt" 2>&1
+  have="$("$APPCTL" shortcut "$PID" File "Close Tab")"
+  must "$([ "$(printf '%s' "$have" | tr '[:lower:]' '[:upper:]')" = "W 0" ] && echo yes)" "with tabs, File > Close is File > Close Tab, ⌘W" "${have:-no Close Tab; File has: $(tr '\n' '|' <"$LOGS/browse-two-tabs-file-menu.txt")}"
+  choose File "Close Tab"
+  if wait_for 15 grep -q 'a window closed open=1' "$log"; then ok "File > Close Tab closes the tab, and the app lets its window go"; else bad "Close" "the app does not report one window: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
   arrive "file:///etc/passwd" 'not file: ones' "the first tab is in front again, as it was left"
   must "$(alive "$PID" && [ "$(pgrep -P "$PID" | tr -d '\n')" = "$HELPER" ] && echo yes)" "the app and its proxy run on (pids $PID, $HELPER)"
 
+  visit "https://example.com" "https://example.com/" 'Example Domain' \
+    "https://example.com opens, with Syndeo's authority in no trust settings"
+  must "$(plain_log "$log" | grep -qE ' 200 .*https://example\.com/$' && echo yes)" \
+    "and the proxy fetched it: the window reached it through the proxy" "$(plain_log "$log" | grep -E 'https://' | tail -n 3 | tr '\n' ' ')"
+
   # Measured, not gated.
-  choose File "Open Location…"
-  "$APPCTL" type "$PID" "https://example.com" >/dev/null || true
-  if wait_for 30 page_says "Example Domain|couldn't open"; then
-    if page_says 'Example Domain'; then outcome="it opened"; else outcome="Syndeo's failure page: $(page_text)"; fi
-  else
-    outcome="neither the page nor a failure page after 30 s: $(page_text)"
-  fi
-  printf '  MEASURE  https://example.com, the authority not trusted: %s\n' "$outcome"
   if origin; then
     choose File "Open Location…"
     "$APPCTL" type "$PID" "http://127.0.0.1:$ORIGIN_PORT/" >/dev/null || true
@@ -283,8 +289,9 @@ browsing() {
     else
       outcome="neither the page nor a failure page after 30 s: $(page_text)"
     fi
-    printf '  MEASURE  a page on this runner'"'"'s loopback, http://127.0.0.1:%s/: %s; the origin saw: %s\n' \
-      "$ORIGIN_PORT" "$outcome" "$(grep -c 'GET / ' "$LOGS/origin.log") request(s) for /"
+    printf '  MEASURE  a page on this runner'"'"'s loopback, http://127.0.0.1:%s/: %s; the origin saw: %s; the proxy logged: %s\n' \
+      "$ORIGIN_PORT" "$outcome" "$(grep -c 'GET / ' "$LOGS/origin.log") request(s) for /" \
+      "$(plain_log "$log" | grep -c "http://127.0.0.1:$ORIGIN_PORT/") request(s) for it"
     if page_says 'Loopback origin' && "$APPCTL" press-link "$PID" "Example in a new tab"; then
       if wait_for 15 grep -q 'a window opened open=2' "$log"; then
         wait_for 30 page_says 'Example Domain' || true
