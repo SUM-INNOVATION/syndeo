@@ -22,12 +22,12 @@ use objc2::{
     define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly, Message,
 };
 use objc2_app_kit::{
-    NSAccessibility, NSAutoresizingMaskOptions, NSButton, NSControlSize, NSImage, NSMenuItem,
-    NSMenuItemValidation, NSProgressIndicator, NSProgressIndicatorStyle, NSTextField, NSView,
-    NSWindow, NSWindowDelegate,
+    NSAccessibility, NSAutoresizingMaskOptions, NSButton, NSControlSize,
+    NSControlTextEditingDelegate, NSImage, NSMenuItem, NSMenuItemValidation, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSTextField, NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
-    ns_string, NSError, NSNotification, NSPoint, NSRect, NSSize, NSString,
+    ns_string, NSError, NSNotification, NSNumber, NSPoint, NSRect, NSSize, NSString,
     NSURLAuthenticationChallenge, NSURLRequest, NSURL,
 };
 use objc2_web_kit::{
@@ -84,7 +84,18 @@ pub struct Ivars {
     /// WebKit may then report as a load it interrupted: the page stays as it
     /// was, and there is no failure to show.
     refused: Cell<bool>,
+    /// The address the field shows when nobody is typing in it: the page's,
+    /// as navigation reports it, an address that failed, or nothing for the
+    /// start page. Kept apart from the field, so that what someone types is
+    /// never overwritten, and the field can show it again when they leave.
+    shown: RefCell<String>,
+    /// Someone has typed in the address field, and has not yet pressed
+    /// Return or left it.
+    typing: Cell<bool>,
 }
+
+/// `NSReturnTextMovement`: the address field was left by pressing Return.
+const RETURN: isize = 0x10;
 
 /// `NSURLErrorCancelled`: a load stopped by Stop, or replaced by another.
 const CANCELLED: isize = -999;
@@ -215,6 +226,32 @@ define_class!(
             }
         }
     }
+
+    unsafe impl NSControlTextEditingDelegate for BrowserController {
+        /// Someone typed in the address field: until they press Return or
+        /// leave it, nothing a page does overwrites what they typed.
+        #[unsafe(method(controlTextDidChange:))]
+        fn control_text_did_change(&self, _notification: &NSNotification) {
+            self.ivars().typing.set(true);
+        }
+
+        /// The address field was left. By Return, `navigateTo:` opens what
+        /// was typed; any other way, the field shows the page's address again.
+        #[unsafe(method(controlTextDidEndEditing:))]
+        fn control_text_did_end_editing(&self, notification: &NSNotification) {
+            let movement = notification
+                .userInfo()
+                .and_then(|info| info.objectForKey(ns_string!("NSTextMovement")))
+                .and_then(|value| value.downcast::<NSNumber>().ok())
+                .map(|number| number.integerValue());
+            self.ivars().typing.set(false);
+            if movement != Some(RETURN) {
+                self.show_address();
+            }
+        }
+    }
+
+    unsafe impl NSTextFieldDelegate for BrowserController {}
 
     unsafe impl NSMenuItemValidation for BrowserController {
         #[unsafe(method(validateMenuItem:))]
@@ -420,9 +457,7 @@ impl BrowserController {
             };
         }
         *self.ivars().failed.borrow_mut() = None;
-        if let Some(ui) = &*self.ivars().ui.borrow() {
-            ui.address.setStringValue(ns_string!(""));
-        }
+        self.set_shown("");
     }
 
     /// Load `request`, as a page asked for it.
@@ -434,17 +469,17 @@ impl BrowserController {
 
     /// Open what was typed, or say why not.
     fn go(&self, typed: &str) {
+        // What was typed has been given: it is no longer being typed.
+        self.ivars().typing.set(false);
         match address::interpret(typed) {
-            Typed::Empty => {}
+            Typed::Empty => self.show_address(),
             Typed::Load(url) => {
                 *self.ivars().failed.borrow_mut() = None;
                 let Some(nsurl) = NSURL::URLWithString(&NSString::from_str(url.as_str())) else {
                     return self.show_page(typed, "That address could not be read.");
                 };
                 let request = NSURLRequest::requestWithURL(&nsurl);
-                if let Some(ui) = &*self.ivars().ui.borrow() {
-                    ui.address.setStringValue(&NSString::from_str(url.as_str()));
-                }
+                self.set_shown(url.as_str());
                 self.load(&request);
             }
             Typed::Refused(why) => self.show_page(typed, &why),
@@ -478,13 +513,31 @@ impl BrowserController {
                     .loadHTMLString_baseURL(&NSString::from_str(&page), None)
             };
         }
+        self.set_shown(address);
+    }
+
+    /// Keep `text` as the address to show, and show it, unless someone is
+    /// typing in the field.
+    fn set_shown(&self, text: &str) {
+        *self.ivars().shown.borrow_mut() = text.to_string();
+        self.show_address();
+    }
+
+    /// The address field shows the address kept for it, unless someone is
+    /// typing there: then it is left as they have it.
+    fn show_address(&self) {
+        if self.ivars().typing.get() {
+            return;
+        }
         if let Some(ui) = &*self.ivars().ui.borrow() {
-            ui.address.setStringValue(&NSString::from_str(address));
+            ui.address
+                .setStringValue(&NSString::from_str(&self.ivars().shown.borrow()));
         }
     }
 
-    /// The field shows the page's address, for the web's own pages; Syndeo's
-    /// own pages leave it as it is (empty, or the address that failed).
+    /// The page's address, for the web's own pages, kept as the field's and
+    /// shown unless someone is typing there; Syndeo's own pages leave the
+    /// kept address as it is (empty, or the address that failed).
     fn refresh_address(&self) {
         let web = self.ivars().web.borrow();
         let Some(web) = web.as_ref() else { return };
@@ -501,9 +554,7 @@ impl BrowserController {
             .unwrap_or_default();
         if scheme == "http" || scheme == "https" {
             *self.ivars().failed.borrow_mut() = None;
-            if let Some(ui) = &*self.ivars().ui.borrow() {
-                ui.address.setStringValue(&NSString::from_str(&text));
-            }
+            self.set_shown(&text);
         }
     }
 
@@ -620,6 +671,8 @@ pub fn browser_content(
         cell.setSendsActionOnEndEditing(false);
     }
     unsafe {
+        // Told when someone types there, and when they leave.
+        address.setDelegate(Some(ProtocolObject::from_ref(controller)));
         address.setTarget(Some(target));
         address.setAction(Some(sel!(navigateTo:)));
     }
