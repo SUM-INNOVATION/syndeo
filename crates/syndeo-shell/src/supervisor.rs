@@ -319,10 +319,12 @@ impl InstallDir {
         self.dir
     }
 
-    /// Sibling binaries, so a build tree, a tarball install and the macOS
-    /// package all work.
+    /// Sibling binaries, so a build tree, a tarball install, the macOS
+    /// package and the macOS app all work.
     ///
-    /// This directory comes first. For the macOS package it is the only place
+    /// Inside the app, a helper is in the bundle's `Contents/Helpers` or it
+    /// is a [`MissingFromBundle`]: see [`bundle_helpers`]. Otherwise this
+    /// directory comes first. For the macOS package it is the only place
     /// looked, and a sibling that is not there is a [`RemovedByUpgrade`]: see
     /// [`is_packaged_dir`]. Anywhere else, after it, the invocation path
     /// resolved and then as given, because on macOS `current_exe` hands back a
@@ -332,22 +334,93 @@ impl InstallDir {
     /// copy of a different version.
     pub fn locate(self, name: &str) -> Result<PathBuf> {
         let exe = std::env::current_exe().ok();
-        locate_from(
-            name,
-            self.dir,
-            is_packaged_dir(self.dir),
-            exe.as_deref(),
-            std::env::var_os("PATH"),
-        )
+        find(name, self.dir, exe.as_deref(), std::env::var_os("PATH"))
     }
 
     /// A sibling in this directory and nowhere else, for a program that has no
     /// other place to look. For the macOS package, missing is a
-    /// [`RemovedByUpgrade`].
+    /// [`RemovedByUpgrade`]; inside the app, the place is the bundle's
+    /// `Contents/Helpers`, and missing is a [`MissingFromBundle`].
     pub fn beside(self, name: &str) -> Result<PathBuf> {
+        if let Some(helpers) = bundle_helpers(self.dir) {
+            return in_bundle(name, &helpers);
+        }
         beside_from(name, self.dir, is_packaged_dir(self.dir))
     }
 }
+
+/// [`InstallDir::locate`], given everything it looks at: the running image's
+/// directory, the invocation path, and `PATH`.
+fn find(
+    name: &str,
+    dir: &Path,
+    exe: Option<&Path>,
+    path: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if let Some(helpers) = bundle_helpers(dir) {
+        return in_bundle(name, &helpers);
+    }
+    locate_from(name, dir, is_packaged_dir(dir), exe, path)
+}
+
+/// The directory a macOS app bundle keeps its helpers in, when `dir` is that
+/// bundle's executable or helper directory: `<name>.app/Contents/MacOS` and
+/// `<name>.app/Contents/Helpers` both give `<name>.app/Contents/Helpers`.
+///
+/// Inside the app a helper is looked for there and nowhere else: not beside
+/// the app's own executable, not by the invocation path, and never on
+/// `PATH`. The app is started by Launch Services, with no shell and no
+/// terminal, and neither the `PATH` it inherits nor an install of the
+/// command-line tools may decide which helper it runs.
+pub fn bundle_helpers(dir: &Path) -> Option<PathBuf> {
+    let leaf = dir.file_name()?;
+    if leaf != "MacOS" && leaf != "Helpers" {
+        return None;
+    }
+    let contents = dir.parent()?;
+    if contents.file_name()? != "Contents" {
+        return None;
+    }
+    if contents.parent()?.extension()? != "app" {
+        return None;
+    }
+    Some(contents.join("Helpers"))
+}
+
+/// A helper of the app, from its bundle's `helpers` directory or not at all.
+fn in_bundle(name: &str, helpers: &Path) -> Result<PathBuf> {
+    let helper = helpers.join(name);
+    if helper.is_file() {
+        return Ok(helper);
+    }
+    Err(MissingFromBundle {
+        name: name.to_string(),
+        helpers: helpers.to_path_buf(),
+    }
+    .into())
+}
+
+/// The app's helper is not in its bundle: the bundle is incomplete, or was
+/// replaced while the app ran.
+#[derive(Debug)]
+pub struct MissingFromBundle {
+    pub name: String,
+    pub helpers: PathBuf,
+}
+
+impl std::fmt::Display for MissingFromBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is not in {}: this copy of Syndeo is incomplete, or was replaced while it ran. \
+             Quit Syndeo and open it again, and reinstall it if that does not help",
+            self.name,
+            self.helpers.display()
+        )
+    }
+}
+
+impl std::error::Error for MissingFromBundle {}
 
 /// [`InstallDir::beside`], given the directory and whether it is the
 /// package's.
@@ -662,6 +735,140 @@ mod tests {
                 .unwrap();
         }
         (versions.join("0.0.9"), bin)
+    }
+
+    /// An app laid out under `root`: `Syndeo.app/Contents/MacOS/Syndeo`, the
+    /// given helpers in `Contents/Helpers`, and every one of [`SIBLINGS`] as
+    /// a decoy both beside the app's executable and in `decoys`, which is
+    /// what `PATH` holds. Returns `Contents/MacOS`, `Contents/Helpers` and the
+    /// decoys' directory.
+    fn app(root: &Path, helpers: &[&str]) -> (PathBuf, PathBuf, PathBuf) {
+        let contents = root.join("Syndeo.app/Contents");
+        let (macos, helper_dir, decoys) = (
+            contents.join("MacOS"),
+            contents.join("Helpers"),
+            root.join("bin"),
+        );
+        for dir in [&macos, &helper_dir, &decoys] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        executable(&macos.join("Syndeo"));
+        for name in helpers {
+            executable(&helper_dir.join(name));
+        }
+        for name in SIBLINGS {
+            executable(&macos.join(name));
+            executable(&decoys.join(name));
+        }
+        (macos, helper_dir, decoys)
+    }
+
+    #[test]
+    fn the_app_layout_is_the_executable_or_helper_directory_of_a_bundle() {
+        for (dir, helpers) in [
+            (
+                "/Applications/Syndeo.app/Contents/MacOS",
+                "/Applications/Syndeo.app/Contents/Helpers",
+            ),
+            (
+                "/Applications/Syndeo.app/Contents/Helpers",
+                "/Applications/Syndeo.app/Contents/Helpers",
+            ),
+            (
+                "/Users/someone/Desktop/Syndeo 2.app/Contents/MacOS",
+                "/Users/someone/Desktop/Syndeo 2.app/Contents/Helpers",
+            ),
+        ] {
+            assert_eq!(
+                bundle_helpers(Path::new(dir)).as_deref(),
+                Some(Path::new(helpers)),
+                "{dir}"
+            );
+        }
+        for not in [
+            "/Applications/Syndeo.app/Contents/Resources",
+            "/Applications/Syndeo.app/Contents",
+            "/Applications/Syndeo.app",
+            "/Applications/Syndeo/Contents/MacOS",
+            "/Applications/Syndeo.app/Other/MacOS",
+            "/Applications/Syndeo.app/Contents/MacOS/nested",
+            "/usr/local/libexec/syndeo/0.1.7",
+            "/MacOS",
+            "/",
+        ] {
+            assert_eq!(bundle_helpers(Path::new(not)), None, "{not}");
+        }
+    }
+
+    #[test]
+    fn inside_the_app_a_helper_is_found_in_its_helpers_and_nowhere_else() {
+        let temp = tempfile::tempdir().unwrap();
+        let (macos, helpers, decoys) = app(temp.path(), &["syndeo-proxy"]);
+        let invoked = macos.join("Syndeo");
+        for from in [&macos, &helpers] {
+            // The app's own helper, from the app and from a helper beside it.
+            let found = find(
+                "syndeo-proxy",
+                from,
+                Some(&invoked),
+                Some(decoys.clone().into()),
+            )
+            .unwrap();
+            assert_eq!(
+                found,
+                helpers.join("syndeo-proxy"),
+                "from {}",
+                from.display()
+            );
+            // Not the copy beside the app's executable, nor the one on PATH.
+            let err = find(
+                "syndeo-net",
+                from,
+                Some(&invoked),
+                Some(decoys.clone().into()),
+            )
+            .unwrap_err();
+            assert!(err.downcast_ref::<MissingFromBundle>().is_some(), "{err:#}");
+            // The fallbacks would have found one.
+            assert!(locate_from(
+                "syndeo-net",
+                from,
+                false,
+                Some(&invoked),
+                Some(decoys.clone().into())
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn a_helper_missing_from_the_app_says_to_reopen_and_reinstall() {
+        let temp = tempfile::tempdir().unwrap();
+        let (macos, helpers, decoys) = app(temp.path(), &[]);
+        let err = find(
+            "syndeo-proxy",
+            &macos,
+            Some(&macos.join("Syndeo")),
+            Some(decoys.into()),
+        )
+        .unwrap_err();
+        let said = format!("{err:#}");
+        assert!(said.starts_with("syndeo-proxy is not in "), "{said}");
+        assert!(said.contains(&helpers.display().to_string()), "{said}");
+        assert!(
+            said.contains("Quit Syndeo and open it again, and reinstall it if that does not help"),
+            "{said}"
+        );
+        // beside() keeps to the bundle too.
+        let beside = InstallDir {
+            dir: Box::leak(macos.clone().into_boxed_path()),
+        }
+        .beside("syndeo-proxy")
+        .unwrap_err();
+        assert!(
+            beside.downcast_ref::<MissingFromBundle>().is_some(),
+            "{beside:#}"
+        );
     }
 
     #[test]
