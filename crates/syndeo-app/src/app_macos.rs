@@ -20,10 +20,17 @@
 //! a native label saying so instead — no web view at all, so nothing in it
 //! can reach the network. There is no unproxied configuration and no unpinned
 //! web view anywhere in this application, and a page asking for a new window
-//! gets a tab made the same way. WebKit itself opens some local addresses,
-//! this Mac's own among them, directly rather than through the proxy (seen on
-//! CI for 127.0.0.1), so those are not cached by Syndeo, and nothing here
-//! claims that every request goes through it.
+//! gets a tab made the same way. WebKit itself opens some local addresses
+//! directly rather than through the proxy — `localhost`, and loopback,
+//! private, link-local and shared addresses typed as numbers, as measured on
+//! CI — so those are not cached by Syndeo. Each window's bar says which way
+//! its page came (`address::route`), and nothing here claims that every
+//! request goes through Syndeo.
+//!
+//! Nothing here asks for, reads or changes the keychain's trust settings:
+//! each window accepts the proxy's authority, and no other, itself, so
+//! secure pages open without it. Settings (`settings_macos`) holds the
+//! search engine and Clear Browsing Data.
 //!
 //! The proxy is the one helper, started once at launch from the bundle's
 //! `Contents/Helpers` (`syndeo_webkit::owned`), and stopped when the
@@ -34,8 +41,9 @@
 //! keychain entry is made for it, no passphrase is asked for and no recovery
 //! phrase is generated.
 
-use crate::address;
+use crate::address::{self, Search};
 use crate::browser_macos::{browser_content, BrowserController, Hooks};
+use crate::settings_macos::{self, Clearing, SettingsController};
 use anyhow::{Context, Result};
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
@@ -58,7 +66,7 @@ use std::rc::Rc;
 use syndeo_shell::supervisor::InstallDir;
 use syndeo_webkit::{owned, pin, proxied};
 
-/// The first-launch page, with `{{TRUST}}` filled in.
+/// The first-launch page, with `{{SEARCH}}` filled in.
 const FIRST_LAUNCH: &str = include_str!("first_launch.html");
 
 /// The first line of every window that cannot browse.
@@ -268,6 +276,8 @@ pub struct State {
     /// Windows that closed, let go of once their closing has finished.
     retired: RefCell<Vec<(Retained<NSWindow>, Retained<BrowserController>)>>,
     hooks: RefCell<Option<Rc<Hooks>>>,
+    /// The Settings window's controller, made the first time it is shown.
+    settings: RefCell<Option<Retained<SettingsController>>>,
 }
 
 define_class!(
@@ -329,6 +339,12 @@ define_class!(
         fn new_window_for_tab(&self, _sender: Option<&AnyObject>) {
             self.open_window();
         }
+
+        /// Syndeo > Settings….
+        #[unsafe(method(showSettings:))]
+        fn show_settings(&self, _sender: Option<&AnyObject>) {
+            self.settings().show();
+        }
     }
 );
 
@@ -352,6 +368,7 @@ impl AppDelegate {
         }
         let me = Weak::from_retained(&self.retain());
         let (tab, closed, start) = (me.clone(), me.clone(), me);
+        let search: Box<dyn Fn() -> Search> = Box::new(settings_macos::search);
         let hooks = Rc::new(Hooks {
             open_tab: Box::new(move |window, request| {
                 if let Some(app) = tab.load() {
@@ -369,6 +386,7 @@ impl AppDelegate {
                     .map(|app| app.first_launch_page())
                     .unwrap_or_default()
             }),
+            search,
         });
         *self.ivars().hooks.borrow_mut() = Some(hooks.clone());
         hooks
@@ -403,6 +421,42 @@ impl AppDelegate {
                 *state.not_ready.borrow_mut() = reason;
             }
         }
+    }
+
+    /// The Settings window's controller, made the first time it is asked for:
+    /// clearing stops every window's loading, and asks this application's
+    /// proxy, if it has one, to empty its cache.
+    fn settings(&self) -> Retained<SettingsController> {
+        if let Some(settings) = self.ivars().settings.borrow().clone() {
+            return settings;
+        }
+        let me = Weak::from_retained(&self.retain());
+        let clearing = Clearing {
+            stop_loading: Box::new(move || {
+                let Some(app) = me.load() else { return };
+                // Copied first: stopping reports back, and nothing may find
+                // the list borrowed then.
+                let controllers: Vec<Retained<BrowserController>> = app
+                    .ivars()
+                    .windows
+                    .borrow()
+                    .iter()
+                    .map(|(_, controller)| controller.clone())
+                    .collect();
+                for controller in controllers {
+                    controller.stop_loading();
+                }
+            }),
+            proxy: self
+                .ivars()
+                .proxy
+                .borrow()
+                .as_ref()
+                .map(owned::OwnedProxy::control),
+        };
+        let settings = SettingsController::new(self.mtm(), clearing);
+        *self.ivars().settings.borrow_mut() = Some(settings.clone());
+        settings
     }
 
     /// Bring a window to the front, or open one if there is none.
@@ -508,19 +562,26 @@ impl AppDelegate {
         window
     }
 
-    /// The start page, saying whether the authority is trusted: that, and
-    /// nothing about what follows from it. Syndeo's windows open secure
-    /// websites either way, since each answers its challenges with that
-    /// authority as the anchor; what else, if anything, needs the keychain's
-    /// trust is for onboarding to establish.
+    /// The start page, saying what typing words there does now.
     fn first_launch_page(&self) -> String {
-        let trust = if owned::authority_is_trusted(&authority(&self.ivars().home)) {
-            "Syndeo's local certificate authority is trusted in your login keychain."
-        } else {
-            "Syndeo's local certificate authority is not in your login keychain's trust settings."
-        };
-        FIRST_LAUNCH.replace("{{TRUST}}", &address::escape(trust))
+        start_page(settings_macos::search())
     }
+}
+
+/// The start page, for `search`.
+fn start_page(search: Search) -> String {
+    let words = match search {
+        Search::Off => "Search is off, so words you type there are not sent anywhere. To \
+                        search from there, choose a search engine in Syndeo > Settings."
+            .to_string(),
+        engine => format!(
+            "Words you type there are searched for with {} when you press Return, and \
+             nothing is sent while you type. Choose another search engine, or none, in \
+             Syndeo > Settings.",
+            engine.title()
+        ),
+    };
+    FIRST_LAUNCH.replace("{{SEARCH}}", &address::escape(&words))
 }
 
 /// Where this application keeps its state: its proxy's cache and authority.
@@ -577,6 +638,8 @@ fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> Retained<NSMenu> {
         "Syndeo",
         &[
             item(mtm, "About Syndeo", sel!(orderFrontStandardAboutPanel:), ""),
+            NSMenuItem::separatorItem(mtm),
+            item(mtm, "Settings…", sel!(showSettings:), ","),
             NSMenuItem::separatorItem(mtm),
             item(mtm, "Hide Syndeo", sel!(hide:), "h"),
             hide_others,
@@ -671,6 +734,7 @@ pub fn run(install: InstallDir) -> Result<()> {
             windows: RefCell::new(Vec::new()),
             retired: RefCell::new(Vec::new()),
             hooks: RefCell::new(None),
+            settings: RefCell::new(None),
         },
     );
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -964,8 +1028,63 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
     }
 
     #[test]
-    fn the_first_launch_page_has_its_place_to_fill() {
-        assert!(FIRST_LAUNCH.contains("{{TRUST}}"));
+    fn the_start_page_says_what_typing_words_does_now() {
+        assert!(FIRST_LAUNCH.contains("{{SEARCH}}"));
+        let on = start_page(Search::DuckDuckGo);
+        assert!(
+            on.contains("searched for with DuckDuckGo when you press Return"),
+            "{on}"
+        );
+        let off = start_page(Search::Off);
+        assert!(off.contains("Search is off"), "{off}");
+        assert!(!off.contains("{{"), "{off}");
+    }
+
+    /// The start page says secure pages need nothing from the keychain, and
+    /// says which pages do not come through Syndeo; it never says the
+    /// authority needs trusting.
+    #[test]
+    fn the_start_page_asks_for_no_trust_and_claims_no_more_than_was_measured() {
+        let page = start_page(Search::DuckDuckGo);
+        assert!(page.contains("Nothing is added to your keychain"), "{page}");
+        assert!(page.contains("Direct — not cached by Syndeo"), "{page}");
+        assert!(page.contains("routed by their own address"), "{page}");
+        for claim in [
+            "not in your login keychain",
+            "trust Syndeo",
+            "Trust Syndeo",
+            "all traffic",
+            "every request",
+        ] {
+            assert!(!page.contains(claim), "the start page says {claim:?}");
+        }
+    }
+
+    /// Nothing in the application asks for, reads or changes the keychain's
+    /// trust settings, or runs `security`, which could: each window accepts
+    /// the proxy's authority itself.
+    #[test]
+    fn nothing_here_touches_the_keychains_trust() {
+        for (file, source) in [
+            ("app_macos.rs", include_str!("app_macos.rs")),
+            ("browser_macos.rs", include_str!("browser_macos.rs")),
+            ("settings_macos.rs", include_str!("settings_macos.rs")),
+            ("address.rs", include_str!("address.rs")),
+            ("main.rs", include_str!("main.rs")),
+        ] {
+            let code = source.split("#[cfg(test)]").next().unwrap();
+            for touch in [
+                "authority_is_trusted",
+                "trust_in_login_keychain",
+                "add-trusted-cert",
+                "remove-trusted-cert",
+                "SecTrustSettings",
+                "/usr/bin/security",
+                "AuthorizationRight",
+            ] {
+                assert!(!code.contains(touch), "{file} has {touch}");
+            }
+        }
     }
 
     /// The application's state is the Mac's place for it, never the

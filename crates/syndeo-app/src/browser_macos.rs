@@ -3,8 +3,11 @@
 //! - **The web view's navigation delegate.** It answers every TLS challenge
 //!   exactly as `syndeo_webkit::pin` does, with the proxy's authority as the
 //!   only anchor; lets a window's main frame show only the web's own pages
-//!   and Syndeo's (`address::allowed_in_main_frame`); and keeps the window's
-//!   controls in step with loading, and shows a failure page when a page
+//!   and Syndeo's (`address::allowed_in_main_frame`), and no IPv6 address
+//!   with a zone, which it refuses as the address field does; keeps the
+//!   window's controls in step with loading; says in the bar how the page on
+//!   screen was reached (`address::route`), from its address once it is
+//!   committed, after any redirect; and shows a failure page when a page
 //!   cannot be opened.
 //! - **Its UI delegate.** A page that asks for a new window gets a new tab,
 //!   made the way every other is, never a web view WebKit made for it.
@@ -15,16 +18,17 @@
 //! a window that cannot browse has no controller with a web view to do them,
 //! so they are disabled there.
 
-use crate::address::{self, Typed};
+use crate::address::{self, Route, Search, Typed};
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{
     define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly, Message,
 };
 use objc2_app_kit::{
-    NSAccessibility, NSAutoresizingMaskOptions, NSButton, NSControlSize,
-    NSControlTextEditingDelegate, NSImage, NSMenuItem, NSMenuItemValidation, NSProgressIndicator,
-    NSProgressIndicatorStyle, NSTextField, NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate,
+    NSAccessibility, NSAutoresizingMaskOptions, NSButton, NSColor, NSControlSize,
+    NSControlTextEditingDelegate, NSFont, NSImage, NSMenuItem, NSMenuItemValidation,
+    NSProgressIndicator, NSProgressIndicatorStyle, NSTextAlignment, NSTextField,
+    NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
     ns_string, NSError, NSNotification, NSNumber, NSPoint, NSRect, NSSize, NSString,
@@ -41,6 +45,9 @@ use syndeo_webkit::pin;
 /// The height of the bar above the page.
 pub const BAR: f64 = 36.0;
 
+/// The width of the bar's route, at its right, before the spinner.
+const ROUTE_WIDTH: f64 = 190.0;
+
 /// Open a tab beside a window: a page's request, or the start page.
 pub type OpenTab = Box<dyn Fn(&NSWindow, Option<Retained<NSURLRequest>>)>;
 
@@ -52,6 +59,8 @@ pub struct Hooks {
     pub closed: Box<dyn Fn(&NSWindow)>,
     /// The start page's HTML.
     pub start_page: Box<dyn Fn() -> String>,
+    /// The search engine chosen in Settings, as it is now.
+    pub search: Box<dyn Fn() -> Search>,
 }
 
 /// The web view a window browses in, and the delegate that pins it.
@@ -67,6 +76,8 @@ pub struct Ui {
     forward: Retained<NSButton>,
     reload: Retained<NSButton>,
     spinner: Retained<NSProgressIndicator>,
+    /// How the page on screen was reached: see [`Route`].
+    route: Retained<NSTextField>,
 }
 
 #[derive(Default)]
@@ -104,6 +115,12 @@ const CANCELLED: isize = -999;
 /// itself, for a file it does not show or an address a window may not open.
 const INTERRUPTED: isize = 102;
 
+/// What the bar's route says when someone points at it.
+const ROUTE_HELP: &str = "How this page was reached. Through Syndeo, it came through Syndeo's \
+    proxy, which may cache it; directly, WebKit opened it without the proxy, so Syndeo does \
+    not cache it. Each image, script and other part of the page is reached by its own \
+    address, so parts of it can go the other way.";
+
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -139,12 +156,18 @@ define_class!(
             let main_frame = unsafe { action.targetFrame() }.is_some_and(|frame| unsafe { frame.isMainFrame() });
             let request = unsafe { action.request() };
             let scheme = scheme_of(&request);
-            let allowed = !main_frame || address::allowed_in_main_frame(&scheme);
-            if !allowed {
+            let target = address_of(&request);
+            // Refused wherever it would load, as typing it is.
+            let zoned = address::has_zone(&target);
+            let allowed = (!main_frame || address::allowed_in_main_frame(&scheme)) && !zoned;
+            if !allowed && main_frame {
                 self.ivars().refused.set(true);
-                tracing::info!(scheme = %scheme, "refused a page that is not the web's own in a window");
+                tracing::info!(scheme = %scheme, zoned, "refused a page in a window");
             }
             handler.call((if allowed { WKNavigationActionPolicy::Allow } else { WKNavigationActionPolicy::Cancel },));
+            if zoned && main_frame {
+                self.show_page(&target, address::ZONED);
+            }
         }
 
         #[unsafe(method(webView:didStartProvisionalNavigation:))]
@@ -338,6 +361,15 @@ fn browsing_action(action: Option<Sel>) -> bool {
     })
 }
 
+/// A request's URL, as text, or empty.
+fn address_of(request: &NSURLRequest) -> String {
+    request
+        .URL()
+        .and_then(|url| url.absoluteString())
+        .map(|text| text.to_string())
+        .unwrap_or_default()
+}
+
 /// The scheme of a request's URL, lowercase, or empty.
 fn scheme_of(request: &NSURLRequest) -> String {
     request
@@ -428,6 +460,11 @@ impl BrowserController {
         }
     }
 
+    /// Stop the page loading, as Stop does.
+    pub fn stop_loading(&self) {
+        self.stop();
+    }
+
     fn stop(&self) {
         if let Some(web) = &*self.ivars().web.borrow() {
             unsafe { web.view.stopLoading() };
@@ -444,6 +481,13 @@ impl BrowserController {
         self.ivars().window.borrow().as_ref().and_then(Weak::load)
     }
 
+    /// The search engine chosen in Settings.
+    fn search(&self) -> Search {
+        self.hooks()
+            .map(|hooks| (hooks.search)())
+            .unwrap_or(Search::Off)
+    }
+
     /// Open the start page.
     pub fn show_start_page(&self) {
         let page = self
@@ -458,6 +502,7 @@ impl BrowserController {
         }
         *self.ivars().failed.borrow_mut() = None;
         self.set_shown("");
+        self.show_route(None);
     }
 
     /// Load `request`, as a page asked for it.
@@ -471,19 +516,24 @@ impl BrowserController {
     fn go(&self, typed: &str) {
         // What was typed has been given: it is no longer being typed.
         self.ivars().typing.set(false);
-        match address::interpret(typed) {
-            Typed::Empty => self.show_address(),
-            Typed::Load(url) => {
-                *self.ivars().failed.borrow_mut() = None;
-                let Some(nsurl) = NSURL::URLWithString(&NSString::from_str(url.as_str())) else {
-                    return self.show_page(typed, "That address could not be read.");
-                };
-                let request = NSURLRequest::requestWithURL(&nsurl);
-                self.set_shown(url.as_str());
-                self.load(&request);
+        let search = self.search();
+        let url = match address::interpret(typed, search) {
+            Typed::Empty => return self.show_address(),
+            Typed::Refused(why) => return self.show_page(typed, &why),
+            Typed::Load(url) => url,
+            Typed::Search(url) => {
+                // Which engine, and nothing of what was asked.
+                tracing::info!(engine = search.id(), "a search, on Return");
+                url
             }
-            Typed::Refused(why) => self.show_page(typed, &why),
-        }
+        };
+        *self.ivars().failed.borrow_mut() = None;
+        let Some(nsurl) = NSURL::URLWithString(&NSString::from_str(url.as_str())) else {
+            return self.show_page(typed, "That address could not be read.");
+        };
+        let request = NSURLRequest::requestWithURL(&nsurl);
+        self.set_shown(url.as_str());
+        self.load(&request);
     }
 
     /// The failure page for an error WebKit reported.
@@ -493,17 +543,19 @@ impl BrowserController {
             .objectForKey(ns_string!("NSErrorFailingURLStringKey"))
             .and_then(|value| value.downcast::<NSString>().ok());
         let address = failing.map(|s| s.to_string()).unwrap_or_default();
-        let why =
-            if error.domain().to_string() == "WebKitErrorDomain" && error.code() == INTERRUPTED {
-                "Syndeo opens web pages. It does not download files or open other kinds of address."
-                    .to_string()
-            } else {
-                error.localizedDescription().to_string()
-            };
+        let why = if address::has_zone(&address) {
+            address::ZONED.to_string()
+        } else if error.domain().to_string() == "WebKitErrorDomain" && error.code() == INTERRUPTED {
+            "Syndeo opens web pages. It does not download files or open other kinds of address."
+                .to_string()
+        } else {
+            error.localizedDescription().to_string()
+        };
         self.show_page(&address, &why);
     }
 
-    /// Show the failure page for `address`, keeping it in the field.
+    /// Show the failure page for `address`, keeping it in the field. The bar
+    /// says nothing of a route: no page came from there, either way.
     fn show_page(&self, address: &str, why: &str) {
         *self.ivars().failed.borrow_mut() = (!address.is_empty()).then(|| address.to_string());
         if let Some(web) = &*self.ivars().web.borrow() {
@@ -514,6 +566,17 @@ impl BrowserController {
             };
         }
         self.set_shown(address);
+        self.show_route(None);
+    }
+
+    /// Say in the bar how the page on screen was reached, or nothing for one
+    /// of Syndeo's own pages.
+    fn show_route(&self, route: Option<Route>) {
+        if let Some(ui) = &*self.ivars().ui.borrow() {
+            let label = route.map(Route::label).unwrap_or_default();
+            ui.route.setStringValue(&NSString::from_str(label));
+            ui.route.setHidden(route.is_none());
+        }
     }
 
     /// Keep `text` as the address to show, and show it, unless someone is
@@ -536,8 +599,9 @@ impl BrowserController {
     }
 
     /// The page's address, for the web's own pages, kept as the field's and
-    /// shown unless someone is typing there; Syndeo's own pages leave the
-    /// kept address as it is (empty, or the address that failed).
+    /// shown unless someone is typing there, with its route in the bar;
+    /// Syndeo's own pages leave the kept address as it is (empty, or the
+    /// address that failed).
     fn refresh_address(&self) {
         let web = self.ivars().web.borrow();
         let Some(web) = web.as_ref() else { return };
@@ -555,6 +619,11 @@ impl BrowserController {
         if scheme == "http" || scheme == "https" {
             *self.ivars().failed.borrow_mut() = None;
             self.set_shown(&text);
+            // From the committed address, which is where any redirect led.
+            self.show_route(address::route_of(&text));
+        } else {
+            // A page that is not the web's, which is reached no way at all.
+            self.show_route(None);
         }
     }
 
@@ -662,7 +731,7 @@ pub fn browser_content(
     let address = NSTextField::textFieldWithString(ns_string!(""), mtm);
     address.setFrame(NSRect::new(
         NSPoint::new(104.0, 6.0),
-        NSSize::new(width - 104.0 - 40.0, 24.0),
+        NSSize::new(width - 104.0 - 40.0 - ROUTE_WIDTH - 8.0, 24.0),
     ));
     address.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
     address.setPlaceholderString(Some(ns_string!("Enter a web address")));
@@ -676,6 +745,18 @@ pub fn browser_content(
         address.setTarget(Some(target));
         address.setAction(Some(sel!(navigateTo:)));
     }
+
+    let route = NSTextField::labelWithString(ns_string!(""), mtm);
+    route.setFrame(NSRect::new(
+        NSPoint::new(width - 40.0 - ROUTE_WIDTH, 10.0),
+        NSSize::new(ROUTE_WIDTH, 16.0),
+    ));
+    route.setAlignment(NSTextAlignment::Right);
+    route.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    route.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    route.setToolTip(Some(&NSString::from_str(ROUTE_HELP)));
+    route.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+    route.setHidden(true);
 
     let spinner = NSProgressIndicator::initWithFrame(
         NSProgressIndicator::alloc(mtm),
@@ -692,10 +773,18 @@ pub fn browser_content(
         (&*forward, "syndeo.forward"),
         (&*reload, "syndeo.reload"),
         (&*address, "syndeo.address"),
+        (&*route, "syndeo.route"),
     ] {
         control.setAccessibilityIdentifier(Some(&NSString::from_str(name)));
     }
-    for control in [&*back as &NSView, &*forward, &*reload, &*address, &*spinner] {
+    for control in [
+        &*back as &NSView,
+        &*forward,
+        &*reload,
+        &*address,
+        &*route,
+        &*spinner,
+    ] {
         bar.addSubview(control);
     }
 
@@ -715,6 +804,7 @@ pub fn browser_content(
         forward,
         reload,
         spinner,
+        route,
     };
     (container, ui)
 }

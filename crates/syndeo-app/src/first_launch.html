@@ -22,8 +22,10 @@
 <h1>Welcome to Syndeo</h1>
 <p class="lede">A browser that fetches the web through a cache and network of its own, on this Mac.</p>
 <ul>
-  <li id="proxy">Syndeo's local proxy is running, and web pages in this window are fetched through it. Some local addresses, such as this Mac's own, are opened directly instead, and are not cached by Syndeo.</li>
-  <li id="trust">{{TRUST}}</li>
+  <li id="proxy">Syndeo's local proxy is running, and web pages are fetched through it: the bar above a page says <b>Through Syndeo</b>. WebKit opens some local addresses directly instead — <b>localhost</b>, and addresses typed as numbers that belong to this Mac or a local network, such as 127.0.0.1 or 192.168.1.10 — and the bar says <b>Direct — not cached by Syndeo</b> for those. The images, scripts and other parts of a page are each routed by their own address.</li>
+  <li id="secure">Secure (https) pages open as they are: each Syndeo window accepts Syndeo's own local certificate authority, and no other, for the pages its proxy fetches. Nothing is added to your keychain, and your certificate trust settings are left as they are.</li>
+  <li id="search">{{SEARCH}}</li>
+  <li id="clear">To remove cookies, website storage and cached pages, choose Syndeo &gt; Settings, then Clear Browsing Data.</li>
 </ul>
 <p>Type a web address in the field above, such as <b>example.com</b>, and press Return.</p>
 <p>This is a preview of the Syndeo app. Identity and signing are not part of it yet.</p>

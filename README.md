@@ -455,6 +455,12 @@ not the command line's, and the two can run at once. Upgrading to 0.1.3 starts
 the proxy's cache empty. Proxy traffic is not partitioned by site: see *What it
 does not tell anyone*.
 
+The proxy caches only what came from the public internet. A response whose
+connection was to a loopback, private, link-local, shared (carrier-grade NAT)
+or other address that is not publicly reachable is passed on and never
+stored, even when a public name resolved there: it is the address the proxy
+actually connected to that counts, not the name in the URL.
+
 Trust the authority for the duration of the measurement and remove it after. It
 exists so an ordinary browser will talk to us before any of the browser is
 written, and for no other reason.
@@ -851,10 +857,13 @@ is a set of honest limits rather than work waiting to be done:
   been measured in `syndeo-webkit`.
 - WebRTC in `syndeo-webkit` is not covered by the proxy configuration, and
   whether WebKit sends its WebRTC traffic anywhere else has not been measured.
-- `syndeo-webkit` sends requests for localhost and loopback addresses
-  directly, not through the proxy. That was observed while testing the proxy's
-  authentication, not inferred. Such requests reach local services without the
-  proxy, and are neither cached nor counted by it.
+- WebKit sends some requests directly, not through the proxy: those for
+  `localhost`, and for addresses typed as numbers that are loopback, private,
+  link-local or shared (carrier-grade NAT) space, IPv4 or IPv6. That was
+  measured on CI, range by range, and is not inferred; every name, whatever it
+  resolves to, and every public address went through the proxy. Such requests
+  reach local services without the proxy, and are neither cached nor counted
+  by it. Syndeo.app says which way each page came, in its bar.
 - The proxy and `syndeo-webkit` share an unpartitioned cache.
 - A plain `syndeo-proxy run` asks for no credential; only the proxy
   `syndeo-webkit` starts does. Neither limits how many connections it accepts.
