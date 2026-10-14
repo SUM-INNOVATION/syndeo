@@ -700,6 +700,28 @@ impl Index {
         Ok(tx.open_table(ENTRIES)?.len()?)
     }
 
+    /// Forget every response: entries, their variants, blob records,
+    /// integrity rows and peer rows, in one transaction. Only the schema and
+    /// the counters stay. Returns how many entries there were.
+    ///
+    /// The blob files are the caller's to delete: see `Cache::clear`, which
+    /// holds the blob gate exclusively across this and that.
+    pub fn clear(&self) -> Result<u64> {
+        let tx = self.db.begin_write()?;
+        let entries = {
+            let mut table = tx.open_table(ENTRIES)?;
+            let entries = table.len()?;
+            table.retain(|_, _| false)?;
+            entries
+        };
+        tx.open_table(VARIANTS)?.retain(|_, _| false)?;
+        tx.open_table(BLOBS)?.retain(|_, _| false)?;
+        tx.open_table(SRI)?.retain(|_, _| false)?;
+        tx.open_table(PEER_ELIGIBLE)?.retain(|_, _| false)?;
+        tx.commit()?;
+        Ok(entries)
+    }
+
     /// Blobs nothing references any more.
     pub fn orphaned_blobs(&self) -> Result<Vec<ContentId>> {
         let tx = self.db.begin_read()?;

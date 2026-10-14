@@ -163,6 +163,39 @@ impl BlobStore {
         &self.root
     }
 
+    /// Remove every stored body: each file in the fan-out directories under
+    /// a content address. A temporary file is left alone; it belongs to a
+    /// write still in progress, which removes it itself, or to one that was
+    /// interrupted, which `sweep_abandoned` removes. Returns how many were
+    /// removed.
+    ///
+    /// Only for a caller that holds every store off for the duration, as
+    /// `Cache::clear` does with the blob gate: a store takes its reference to
+    /// a file it finds on disk, and must not find one this is about to remove.
+    pub(crate) fn remove_every_body(&self) -> Result<usize> {
+        let mut removed = 0;
+        for first in fs::read_dir(&self.root)? {
+            let first = first?;
+            if !first.file_type()?.is_dir() || !is_fan_out(&first.file_name()) {
+                continue;
+            }
+            for second in fs::read_dir(first.path())? {
+                let second = second?;
+                if !second.file_type()?.is_dir() || !is_fan_out(&second.file_name()) {
+                    continue;
+                }
+                for file in fs::read_dir(second.path())? {
+                    let file = file?;
+                    if file.file_type()?.is_file() && !is_temporary(&file.file_name()) {
+                        fs::remove_file(file.path())?;
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        Ok(removed)
+    }
+
     /// `<root>/ab/cd/<full hex>` — two levels of fan-out keeps directory sizes sane
     /// at hundreds of millions of objects.
     pub(crate) fn path_for(&self, id: ContentId) -> PathBuf {

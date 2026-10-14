@@ -165,3 +165,56 @@ fn without_the_flag_a_closed_stdin_is_not_a_reason_to_exit() {
     child.kill().unwrap();
     child.wait().unwrap();
 }
+
+/// Taking commands, the proxy answers `clear-cache` on its stdout after its
+/// announcement, and still goes when the pipe from its parent closes.
+#[test]
+fn taking_commands_it_clears_when_asked_and_exits_when_the_pipe_closes() {
+    use std::io::Write;
+    let home = tempfile::tempdir().unwrap();
+    let mut child = Command::new(PROXY)
+        .args([
+            "run",
+            "--dns",
+            "system",
+            "--listen",
+            "127.0.0.1:0",
+            "--announce",
+            "--exit-with-parent",
+            "--control-stdin",
+        ])
+        .env("SYNDEO_HOME", home.path())
+        .env("SYNDEO_LOG", "warn")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert!(line.starts_with("SYNDEO-PROXY-READY 1 "), "{line:?}");
+
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"clear-cache\nsomething else\n").unwrap();
+    stdin.flush().unwrap();
+    for expected in ["SYNDEO-PROXY-CLEARED 1 0\n", "SYNDEO-PROXY-UNKNOWN 1\n"] {
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line, expected);
+    }
+
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the proxy outlived the pipe from its parent"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success());
+}

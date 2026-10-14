@@ -28,7 +28,12 @@ pub struct Origin {
 impl Origin {
     /// Bind on a free loopback port and answer with `handler`.
     pub async fn start(handler: Handler) -> Origin {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on("127.0.0.1:0".parse().unwrap(), handler).await
+    }
+
+    /// Bind on `address` and answer with `handler`.
+    pub async fn start_on(address: SocketAddr, handler: Handler) -> Origin {
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
         let address = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
 

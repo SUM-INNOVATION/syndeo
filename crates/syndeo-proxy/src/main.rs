@@ -105,6 +105,17 @@ struct RunArgs {
     /// token never appears in arguments, the environment, or any log.
     #[arg(long, hide = true)]
     auth_stdin: bool,
+    /// Take commands from whoever started this, one a line on stdin after
+    /// any credential frame, and answer each with one line on stdout; and
+    /// exit when stdin closes, as `--exit-with-parent` does. See
+    /// [`answer_commands`]. Needs `--announce`, which gives stdout to the
+    /// announcement and these answers and to nothing else.
+    ///
+    /// For Syndeo.app, which empties this proxy's cache when someone clears
+    /// their browsing data: over a pipe only the app holds, so no page, and
+    /// no other process, can ask for it.
+    #[arg(long, hide = true, requires = "announce")]
+    control_stdin: bool,
 }
 
 /// 64 MiB: generous for a form or an upload, and a ceiling on what one client
@@ -128,10 +139,14 @@ struct CaArgs {
     /// Trust this authority for TLS, for this user only.
     ///
     /// Goes into the login keychain rather than the System one, so it needs no
-    /// `sudo` and applies to nobody else who uses the machine. macOS does not
-    /// ask before a trust setting goes into your own login keychain, so this
-    /// asks instead: it changes nothing unless you type exactly `yes`, and
-    /// there is deliberately no way to skip that from here.
+    /// `sudo` and applies to nobody else who uses the machine. This asks
+    /// first, saying what the authority is: it changes nothing unless you type
+    /// exactly `yes`, and there is deliberately no way to skip that from here.
+    /// Then macOS asks for your password, as it does for any change to your
+    /// trust settings.
+    ///
+    /// Only for using this proxy from another browser or tool. Syndeo.app
+    /// needs none of it: its windows accept this authority themselves.
     #[arg(long)]
     trust: bool,
     /// Remove the trust this added, and the certificate with it.
@@ -321,7 +336,8 @@ async fn run(args: RunArgs) -> Result<()> {
     } else {
         None
     };
-    if args.exit_with_parent {
+    // Taking commands watches stdin itself, and exits when it closes.
+    if args.exit_with_parent && !args.control_stdin {
         syndeo_ipc::exit_when_parent_does();
     }
     let dns: DnsMode = args
@@ -330,7 +346,7 @@ async fn run(args: RunArgs) -> Result<()> {
         .map_err(|e: String| anyhow::anyhow!("--dns: {e}"))?;
 
     let root = cache_root(&home(), args.cache.as_deref());
-    let net = open_net(&root, args.shared, dns)?;
+    let net = open_net(net_config(&root, args.shared, dns))?;
 
     let authority = CertificateAuthority::load_or_create(home().join("proxy"))?;
     let cert_path = authority.certificate_path();
@@ -345,6 +361,24 @@ async fn run(args: RunArgs) -> Result<()> {
         #[cfg(test)]
         handled: Default::default(),
     });
+
+    if args.control_stdin {
+        let proxy = proxy.clone();
+        std::thread::Builder::new()
+            .name("commands".into())
+            .spawn(move || {
+                let ended =
+                    answer_commands(std::io::stdin().lock(), &mut std::io::stdout(), || {
+                        Ok(proxy.net.clear_cache()?)
+                    });
+                if let Err(err) = ended {
+                    tracing::warn!(%err, "the command pipe failed");
+                }
+                tracing::info!("the process that started this one is gone; exiting");
+                std::process::exit(0);
+            })
+            .context("starting the command reader")?;
+    }
 
     let listener = TcpListener::bind(args.listen)
         .await
@@ -373,18 +407,85 @@ fn announce_ready(out: &mut impl std::io::Write, address: SocketAddr) -> std::io
     out.flush()
 }
 
-/// The network process the proxy fetches through, on the cache at `root`.
-fn open_net(root: &std::path::Path, shared: bool, dns: DnsMode) -> Result<Net> {
-    Net::new(NetConfig {
+/// How the proxy's network process fetches, on the cache at `root`.
+///
+/// It caches only what came from the public internet, judged by the address
+/// each answer actually came from: the cache is shared by every page that
+/// goes through the proxy, and nothing from this Mac's own services or the
+/// local network belongs in it, even when a public name resolves there.
+fn net_config(root: &std::path::Path, shared: bool, dns: DnsMode) -> NetConfig {
+    NetConfig {
         cache_root: root.to_path_buf(),
         shared_cache: shared,
         dns,
+        cache_public_addresses_only: true,
         ..NetConfig::default()
-    })
-    .map_err(|err| match err {
-        syndeo_net::NetError::Cache(syndeo_cache::CacheError::AlreadyOpen) => already_open(root),
+    }
+}
+
+/// The network process the proxy fetches through.
+fn open_net(config: NetConfig) -> Result<Net> {
+    let root = config.cache_root.clone();
+    Net::new(config).map_err(|err| match err {
+        syndeo_net::NetError::Cache(syndeo_cache::CacheError::AlreadyOpen) => already_open(&root),
         other => anyhow::Error::new(other).context("starting the network process"),
     })
+}
+
+/// The answer to `clear-cache`, followed by how many entries there were.
+const CLEARED: &str = "SYNDEO-PROXY-CLEARED 1";
+/// The answer to a command that failed; why is in the log, not here.
+const FAILED: &str = "SYNDEO-PROXY-FAILED 1";
+/// The answer to anything that is not a command.
+const UNKNOWN: &str = "SYNDEO-PROXY-UNKNOWN 1";
+/// The longest command line read; the rest of a longer one is skipped.
+const MAX_COMMAND: usize = 64;
+
+/// Answer the commands on `input`, one a line, each with one line on
+/// `output`, until `input` ends. There is one: `clear-cache`, which empties
+/// the cache with `clear` and answers [`CLEARED`] and how many entries there
+/// were, or [`FAILED`]. Anything else is answered [`UNKNOWN`] and does
+/// nothing.
+fn answer_commands(
+    input: impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    clear: impl Fn() -> Result<u64>,
+) -> std::io::Result<()> {
+    let mut lines = input.take(0);
+    loop {
+        let mut line = Vec::new();
+        // One line at most MAX_COMMAND bytes long; a longer one is read to
+        // its end, a bounded piece at a time, and is no command.
+        lines.set_limit(MAX_COMMAND as u64 + 1);
+        let read = std::io::BufRead::read_until(&mut lines, b'\n', &mut line)?;
+        if read == 0 {
+            return Ok(());
+        }
+        let mut whole = line.ends_with(b"\n");
+        let mut too_long = line.len() > MAX_COMMAND;
+        while !whole {
+            let mut rest = Vec::new();
+            lines.set_limit(MAX_COMMAND as u64 + 1);
+            if std::io::BufRead::read_until(&mut lines, b'\n', &mut rest)? == 0 {
+                // Ended part way through a line: not a command.
+                return Ok(());
+            }
+            too_long = true;
+            whole = rest.ends_with(b"\n");
+        }
+        let answer = match (too_long, line.strip_suffix(b"\n")) {
+            (false, Some(b"clear-cache")) => match clear() {
+                Ok(entries) => format!("{CLEARED} {entries}"),
+                Err(err) => {
+                    tracing::warn!("could not clear the cache: {err:#}");
+                    FAILED.to_string()
+                }
+            },
+            _ => UNKNOWN.to_string(),
+        };
+        writeln!(output, "{answer}")?;
+        output.flush()?;
+    }
 }
 
 /// Answer every connection on `listener` for as long as the process lives.
@@ -1186,7 +1287,20 @@ mod tests {
     /// The same, keeping hold of the proxy so a test can ask how many
     /// requests it was asked to handle.
     async fn start_proxy_with_count(dir: &std::path::Path) -> (SocketAddr, Arc<Proxy>) {
-        let net = open_net(&cache_root(dir, None), true, DnsMode::System).unwrap();
+        // These origins are on loopback, which the proxy never caches from
+        // (see the_proxy_caches_nothing_from_this_mac); the tests of what it
+        // does with an answer it cached need one that it does.
+        let mut config = net_config(&cache_root(dir, None), true, DnsMode::System);
+        config.cache_public_addresses_only = false;
+        start_proxy_with(dir, config).await
+    }
+
+    /// A real proxy, fetching with `config`.
+    async fn start_proxy_with(
+        dir: &std::path::Path,
+        config: NetConfig,
+    ) -> (SocketAddr, Arc<Proxy>) {
+        let net = open_net(config).unwrap();
         let authority = CertificateAuthority::load_or_create(dir.join("proxy")).unwrap();
         let proxy = Arc::new(Proxy {
             net,
@@ -1363,6 +1477,123 @@ mod tests {
         assert_eq!(&reply.body[..], b"moved");
         let paths: Vec<String> = origin.seen().into_iter().map(|s| s.path).collect();
         assert_eq!(paths, ["/start"], "the destination must not be fetched");
+    }
+
+    /// The proxy as `run` makes it, asked twice for each of the same pages on
+    /// this Mac — by address, by IPv6 address, and by a name that resolves
+    /// here — each of which says it may be cached for ten minutes. Every
+    /// request reaches the origin, and the cache holds nothing.
+    #[tokio::test]
+    async fn the_proxy_caches_nothing_from_this_mac() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = net_config(&cache_root(dir.path(), None), true, DnsMode::System);
+        assert!(config.cache_public_addresses_only);
+        let (proxy, running) = start_proxy_with(dir.path(), config).await;
+        let origin = Origin::start(Arc::new(|_| {
+            respond(200, &[("cache-control", "public, max-age=600")], b"local")
+        }))
+        .await;
+        let port = origin.address.port();
+        let mut urls = vec![
+            format!("http://127.0.0.1:{port}/by-address"),
+            format!("http://localhost:{port}/by-name"),
+        ];
+        if let Ok(listener) = tokio::net::TcpListener::bind(("::1", port)).await {
+            // The same origin's answers, on IPv6 loopback too.
+            let seen = origin.seen.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let seen = seen.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            seen.lock().unwrap().push(Seen {
+                                path: req.uri().path().to_string(),
+                                headers: req.headers().clone(),
+                            });
+                            async {
+                                Ok::<_, std::convert::Infallible>(respond(
+                                    200,
+                                    &[("cache-control", "public, max-age=600")],
+                                    b"local",
+                                ))
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            });
+            urls.push(format!("http://[::1]:{port}/by-ipv6"));
+        }
+        for url in &urls {
+            for _ in 0..2 {
+                let reply = through(proxy, url, &[]).await;
+                assert_eq!(
+                    (reply.status, &reply.body[..]),
+                    (StatusCode::OK, &b"local"[..])
+                );
+            }
+        }
+        let paths: Vec<String> = origin.seen().into_iter().map(|s| s.path).collect();
+        let expected: Vec<String> = urls
+            .iter()
+            .flat_map(|url| {
+                let path = url.rsplit_once('/').unwrap().1;
+                [format!("/{path}"), format!("/{path}")]
+            })
+            .collect();
+        assert_eq!(
+            paths, expected,
+            "a second request was answered from the cache"
+        );
+        let stats = running.net.cache().stats().unwrap();
+        assert_eq!((stats.entries, stats.blobs), (0, 0), "{stats:?}");
+    }
+
+    #[test]
+    fn the_command_pipe_clears_the_cache_and_answers_only_what_it_was_asked() {
+        let cleared = std::sync::atomic::AtomicUsize::new(0);
+        let clear = || {
+            cleared.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(7)
+        };
+        let long = format!("clear-cache{}\n", " ".repeat(200));
+        let input =
+            format!("clear-cache\nclear\n\nCLEAR-CACHE\n{long}clear-cache \nclear-cache\npartial");
+        let mut output = Vec::new();
+        answer_commands(input.as_bytes(), &mut output, clear).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            [
+                "SYNDEO-PROXY-CLEARED 1 7",
+                "SYNDEO-PROXY-UNKNOWN 1",
+                "SYNDEO-PROXY-UNKNOWN 1",
+                "SYNDEO-PROXY-UNKNOWN 1",
+                "SYNDEO-PROXY-UNKNOWN 1",
+                "SYNDEO-PROXY-UNKNOWN 1",
+                "SYNDEO-PROXY-CLEARED 1 7",
+                "",
+            ]
+            .join("\n"),
+            "a line cut off by the end of input is not a command"
+        );
+        assert_eq!(cleared.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let mut output = Vec::new();
+        answer_commands(&b"clear-cache\n"[..], &mut output, || {
+            anyhow::bail!("the disk at /private/path is full")
+        })
+        .unwrap();
+        assert_eq!(output, b"SYNDEO-PROXY-FAILED 1\n", "why stays in the log");
+    }
+
+    /// The flag that takes commands exists only alongside the one that keeps
+    /// stdout for answers.
+    #[test]
+    fn commands_need_the_announcement() {
+        assert!(run_args(&["--control-stdin", "--announce"]).control_stdin);
+        assert!(RunArgs::try_parse_from(["run", "--control-stdin"]).is_err());
     }
 
     fn cookies_of(reply: &Reply) -> Vec<String> {
@@ -1678,9 +1909,9 @@ mod tests {
     fn a_cache_in_use_says_so_and_what_to_do() {
         let home = tempfile::tempdir().unwrap();
         let root = cache_root(home.path(), None);
-        let _held = open_net(&root, true, DnsMode::System).unwrap();
+        let _held = open_net(net_config(&root, true, DnsMode::System)).unwrap();
 
-        let from_run = open_net(&root, true, DnsMode::System)
+        let from_run = open_net(net_config(&root, true, DnsMode::System))
             .err()
             .unwrap()
             .to_string();
@@ -1994,7 +2225,7 @@ mod tests {
     const STALE: [u8; 32] = [0xa5; 32];
 
     async fn start_proxy_with_auth(dir: &std::path::Path) -> (SocketAddr, Arc<Proxy>) {
-        let net = open_net(&cache_root(dir, None), true, DnsMode::System).unwrap();
+        let net = open_net(net_config(&cache_root(dir, None), true, DnsMode::System)).unwrap();
         let authority = CertificateAuthority::load_or_create(dir.join("proxy")).unwrap();
         let frame = auth::frame_for(&TOKEN);
         let proxy = Arc::new(Proxy {

@@ -20,7 +20,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Instant;
 use syndeo_cache::headers::now_secs;
 use syndeo_cache::redact::Redacted;
@@ -208,6 +209,39 @@ pub struct Net {
     refreshing: Arc<Mutex<HashSet<String>>>,
     /// Hashes handed to the swarm to announce, over this process's life.
     announcements: Arc<std::sync::atomic::AtomicU64>,
+    /// How many times the cache has been cleared; see [`Keep`].
+    cleared: Arc<RwLock<u64>>,
+}
+
+/// Whether what an origin answers may be stored: by the address it actually
+/// came from, and by whether the cache was cleared after it was asked for.
+///
+/// Every store of an origin's answer — a body as it streams, a whole one, a
+/// revalidation, a background refresh — asks this first, and holds what it
+/// gives until the store is written.
+#[derive(Clone)]
+struct Keep {
+    /// The clear count. [`Net::clear_cache`] raises it holding it exclusively,
+    /// for the whole clear; a store holds it shared until it is written.
+    cleared: Arc<RwLock<u64>>,
+    /// The count when this request began.
+    since: u64,
+    /// `NetConfig::cache_public_addresses_only`.
+    public_only: bool,
+}
+
+impl Keep {
+    /// Leave to store a response that came from `from`, to be held until the
+    /// store is written. None when only public addresses are kept and `from`
+    /// is not one — or is not known, which counts as not public — or when the
+    /// cache was cleared after this request began.
+    fn admits(&self, from: Option<IpAddr>) -> Option<RwLockReadGuard<'_, u64>> {
+        if self.public_only && !from.is_some_and(crate::reach::is_public) {
+            return None;
+        }
+        let cleared = self.cleared.read().unwrap_or_else(|e| e.into_inner());
+        (*cleared == self.since).then_some(cleared)
+    }
 }
 
 impl Net {
@@ -272,7 +306,27 @@ impl Net {
             alt_svc: Arc::new(AltSvc::default()),
             refreshing: Arc::new(Mutex::new(HashSet::new())),
             announcements: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cleared: Arc::new(RwLock::new(0)),
         })
+    }
+
+    /// What decides whether a request beginning now may store its answer.
+    fn keep(&self) -> Keep {
+        Keep {
+            cleared: self.cleared.clone(),
+            since: *self.cleared.read().unwrap_or_else(|e| e.into_inner()),
+            public_only: self.config.cache_public_addresses_only,
+        }
+    }
+
+    /// Empty the cache: every stored response and body, and anything an
+    /// origin was asked for before now and has not finished sending, which is
+    /// then passed on without being stored. Returns how many entries there
+    /// were.
+    pub fn clear_cache(&self) -> Result<u64> {
+        let mut cleared = self.cleared.write().unwrap_or_else(|e| e.into_inner());
+        *cleared += 1;
+        Ok(self.cache.clear()?)
     }
 
     pub fn peer_id(&self) -> Option<syndeo_peer::swarm::PeerId> {
@@ -364,6 +418,7 @@ impl Net {
     async fn fetch_once(&self, request: FetchRequest) -> Result<FetchResponse> {
         let started = Instant::now();
         let method = request.method.as_str().to_string();
+        let keep = self.keep();
 
         // An unsafe method invalidates whatever we hold for the target.
         if syndeo_cache::policy::invalidates(&method) {
@@ -372,9 +427,9 @@ impl Net {
                 .invalidate(request.partition.as_deref(), &method, &request.url);
             let response = self.origin(&request, &[]).await?;
             return Ok(self.finish(
-                response.0,
-                response.1,
-                response.2,
+                response.status,
+                response.headers,
+                response.body,
                 Source::PassThrough,
                 None,
                 started,
@@ -389,7 +444,7 @@ impl Net {
         )? {
             Lookup::Fresh(stored) => {
                 if !self.stored_satisfies(&request, &stored) {
-                    return self.fetch_from_origin(&request, &[], started).await;
+                    return self.fetch_from_origin(&request, &[], started, &keep).await;
                 }
                 Ok(self.finish(
                     stored.status,
@@ -407,14 +462,19 @@ impl Net {
                 ..
             } => {
                 if !self.stored_satisfies(&request, &response) {
-                    return self.fetch_from_origin(&request, &[], started).await;
+                    return self.fetch_from_origin(&request, &[], started, &keep).await;
                 }
                 if refresh_in_background {
                     // The whole point of the directive: move the revalidation
                     // off this request's critical path, having already answered
                     // it from the store.
                     let conditional = syndeo_cache::policy::conditional_headers(&response.meta);
-                    self.spawn_refresh(response.key.clone(), request.clone(), conditional);
+                    self.spawn_refresh(
+                        response.key.clone(),
+                        request.clone(),
+                        conditional,
+                        keep.clone(),
+                    );
                 }
                 Ok(self.finish(
                     response.status,
@@ -436,19 +496,42 @@ impl Net {
                 // still current would be a wasted round trip; ask for the
                 // representation instead, once.
                 if !self.stored_satisfies(&request, &response) {
-                    return self.fetch_from_origin(&request, &[], started).await;
+                    return self.fetch_from_origin(&request, &[], started, &keep).await;
                 }
                 let attempt = self.origin(&request, &conditional).await;
                 match attempt {
-                    Ok((304, headers, _)) => {
+                    Ok(Answer {
+                        status: 304,
+                        headers,
+                        from,
+                        ..
+                    }) => {
                         let now = now_secs();
-                        match self
-                            .cache
-                            .record_not_modified(&response.key, &headers, now, now)
-                        {
+                        let recorded = match keep.admits(from) {
+                            Some(_kept) => {
+                                self.cache
+                                    .record_not_modified(&response.key, &headers, now, now)
+                            }
+                            // Confirmed, but not by an origin whose word is
+                            // kept: served as it is, and the entry left as it
+                            // was.
+                            None => {
+                                return Ok(self.finish(
+                                    response.status,
+                                    with_cookies_of(response.headers.clone(), &headers),
+                                    Bytes::from(response.body.clone()),
+                                    Source::Revalidated,
+                                    response.content,
+                                    started,
+                                ))
+                            }
+                        };
+                        match recorded {
                             Ok(Some(refreshed)) => {
                                 if !self.stored_satisfies(&request, &refreshed) {
-                                    return self.fetch_from_origin(&request, &[], started).await;
+                                    return self
+                                        .fetch_from_origin(&request, &[], started, &keep)
+                                        .await;
                                 }
                                 Ok(self.finish(
                                     refreshed.status,
@@ -471,35 +554,45 @@ impl Net {
                             // holds; the cache has dropped the entry.
                             Err(err) if err.is_lost_body() => {
                                 tracing::warn!(url = %Redacted(&request.url), %err, "the confirmed body was lost; fetching it again");
-                                self.refetch_lost(&request, started).await
+                                self.refetch_lost(&request, started, &keep).await
                             }
                             Err(err) => Err(err.into()),
                         }
                     }
-                    Ok((status, headers, body)) => match &request.integrity {
-                        Some(integrity) => self.accept_declared(
-                            &request,
-                            integrity,
-                            status,
-                            headers,
-                            body,
-                            started,
-                            Protocol::None,
-                        ),
-                        None => {
-                            let content = self.store(&request, status, &headers, &body, started);
-                            Ok(
-                                self.finish(
+                    Ok(Answer {
+                        status,
+                        headers,
+                        body,
+                        from,
+                    }) => {
+                        match &request.integrity {
+                            Some(integrity) => self.accept_declared(
+                                &request,
+                                integrity,
+                                Answer {
+                                    status,
+                                    headers,
+                                    body,
+                                    from,
+                                },
+                                started,
+                                Protocol::None,
+                                &keep,
+                            ),
+                            None => {
+                                let content =
+                                    self.store(&request, status, &headers, &body, from, &keep);
+                                Ok(self.finish(
                                     status,
                                     headers,
                                     body,
                                     Source::Origin,
                                     content,
                                     started,
-                                ),
-                            )
+                                ))
+                            }
                         }
-                    },
+                    }
                     Err(err) => {
                         // The origin is unreachable. `stale-if-error` is the only
                         // licence to answer anyway.
@@ -524,7 +617,7 @@ impl Net {
                 if let Some(response) = self.try_peers(&request, started).await {
                     return Ok(response);
                 }
-                self.fetch_from_origin(&request, &[], started).await
+                self.fetch_from_origin(&request, &[], started, &keep).await
             }
         }
     }
@@ -542,8 +635,9 @@ impl Net {
         &self,
         request: &FetchRequest,
         started: Instant,
+        keep: &Keep,
     ) -> Result<FetchResponse> {
-        let response = self.fetch_from_origin(request, &[], started).await?;
+        let response = self.fetch_from_origin(request, &[], started, keep).await?;
         if response.status == 304 {
             return Err(NetError::LostBody(request.url.clone()));
         }
@@ -562,13 +656,25 @@ impl Net {
         request: &FetchRequest,
         extra: &[(HeaderName, String)],
         started: Instant,
+        keep: &Keep,
     ) -> Result<FetchResponse> {
-        let (status, headers, incoming, protocol) = self.origin_any(request, extra).await?;
+        let (status, headers, incoming, protocol, from) = self.origin_any(request, extra).await?;
 
         if let Some(integrity) = &request.integrity {
             let body = collect_body(incoming, self.config.max_body_bytes).await?;
-            return self
-                .accept_declared(request, integrity, status, headers, body, started, protocol);
+            return self.accept_declared(
+                request,
+                integrity,
+                Answer {
+                    status,
+                    headers,
+                    body,
+                    from,
+                },
+                started,
+                protocol,
+                keep,
+            );
         }
 
         let body = stream_body(
@@ -578,6 +684,7 @@ impl Net {
             headers.clone(),
             incoming,
             self.config.max_body_bytes,
+            (keep.clone(), from),
         );
         // The address is not known yet — a body is not addressable until its
         // last byte — so `content` is None and the entry appears when it lands.
@@ -602,7 +709,7 @@ impl Net {
         &self,
         request: &FetchRequest,
         extra: &[(HeaderName, String)],
-    ) -> Result<(u16, HeaderMap, OriginBody, Protocol)> {
+    ) -> Result<(u16, HeaderMap, OriginBody, Protocol, Option<IpAddr>)> {
         let uri: Uri = request
             .url
             .parse()
@@ -616,12 +723,13 @@ impl Net {
                     .request(&uri, &request.method, &headers, request.body.clone())
                     .await
                 {
-                    Ok((status, response_headers, body)) => {
+                    Ok((status, response_headers, body, from)) => {
                         return Ok((
                             status,
                             response_headers,
                             OriginBody::Quic(body),
                             Protocol::Http3,
+                            Some(from.ip()),
                         ));
                     }
                     Err(failed) => {
@@ -637,14 +745,14 @@ impl Net {
             }
         }
 
-        let (status, headers, incoming, protocol) =
+        let (status, headers, incoming, protocol, from) =
             origin_headers(&self.client, &self.config, request, extra).await?;
         // An origin advertises HTTP/3 on a response that came over TCP, which is
         // the only way it could: this is where the next request learns.
         if !authority.is_empty() {
             self.alt_svc.observe(&authority, &headers);
         }
-        Ok((status, headers, OriginBody::Tcp(incoming), protocol))
+        Ok((status, headers, OriginBody::Tcp(incoming), protocol, from))
     }
 
     /// A whole body from the origin, for a request that declared integrity:
@@ -656,19 +764,23 @@ impl Net {
     /// strongest level, which are then the only ones announced. A redirect this
     /// process will follow is not the representation the integrity describes,
     /// so it is neither checked nor shared — the response it leads to is.
-    #[allow(clippy::too_many_arguments)]
     fn accept_declared(
         &self,
         request: &FetchRequest,
         integrity: &syndeo_cache::Integrity,
-        status: u16,
-        headers: HeaderMap,
-        body: Bytes,
+        answer: Answer,
         started: Instant,
         protocol: Protocol,
+        keep: &Keep,
     ) -> Result<FetchResponse> {
+        let Answer {
+            status,
+            headers,
+            body,
+            from,
+        } = answer;
         if is_hop(request, status, &headers) {
-            let content = self.store(request, status, &headers, &body, started);
+            let content = self.store(request, status, &headers, &body, from, keep);
             let source = if content.is_some() {
                 Source::Origin
             } else {
@@ -683,7 +795,7 @@ impl Net {
                 Redacted(&request.url)
             )));
         }
-        let content = self.store(request, status, &headers, &body, started);
+        let content = self.store(request, status, &headers, &body, from, keep);
         if let Some(content) = content {
             match self.cache.grant_peer_eligibility(content, integrity) {
                 Ok(granted) => self.announce(granted),
@@ -785,14 +897,20 @@ impl Net {
         }
     }
 
+    /// Store an origin's answer that came from `from`, if `keep` admits it.
     fn store(
         &self,
         request: &FetchRequest,
         status: u16,
         headers: &HeaderMap,
         body: &Bytes,
-        _started: Instant,
+        from: Option<IpAddr>,
+        keep: &Keep,
     ) -> Option<syndeo_cache::ContentId> {
+        let Some(_kept) = keep.admits(from) else {
+            tracing::debug!(url = %Redacted(&request.url), "not cached: not from a public address, or the cache was cleared since it was asked for");
+            return None;
+        };
         let now = now_secs();
         match self.cache.store(
             request.partition.as_deref(),
@@ -889,6 +1007,7 @@ impl Net {
         key: String,
         request: FetchRequest,
         conditional: Vec<(HeaderName, String)>,
+        keep: Keep,
     ) {
         {
             let mut inflight = self.refreshing.lock().expect("refresh set is not poisoned");
@@ -906,8 +1025,16 @@ impl Net {
         let announcements = self.announcements.clone();
 
         tokio::spawn(async move {
-            let outcome =
-                refresh_entry(&client, &config, &cache, &request, &key, &conditional).await;
+            let outcome = refresh_entry(
+                &client,
+                &config,
+                &cache,
+                &request,
+                &key,
+                &conditional,
+                &keep,
+            )
+            .await;
             match outcome {
                 Ok(Refreshed::Stored { shared }) => {
                     tracing::debug!(url = %Redacted(&request.url), "refreshed a stale entry");
@@ -977,9 +1104,19 @@ impl Net {
         &self,
         request: &FetchRequest,
         extra: &[(HeaderName, String)],
-    ) -> Result<(u16, HeaderMap, Bytes)> {
+    ) -> Result<Answer> {
         origin_request(&self.client, &self.config, request, extra).await
     }
+}
+
+/// An origin's whole answer, and the address it came from.
+struct Answer {
+    status: u16,
+    headers: HeaderMap,
+    body: Bytes,
+    /// The address of the connection that carried it: the socket's peer, as
+    /// connected, whatever the URL named. None if the connection did not say.
+    from: Option<IpAddr>,
 }
 
 /// A body from the origin, whichever protocol brought it.
@@ -1014,13 +1151,19 @@ impl OriginBody {
 /// Returns as soon as the status line and headers are in. The body has not been
 /// read at this point and may not have been sent — which is the whole point:
 /// deciding what to do with a response should not cost the time it takes to
-/// receive it.
+/// receive it. With them, the address of the connection that carried it.
 async fn origin_headers(
     client: &HttpsClient,
     config: &NetConfig,
     request: &FetchRequest,
     extra: &[(HeaderName, String)],
-) -> Result<(u16, HeaderMap, hyper::body::Incoming, Protocol)> {
+) -> Result<(
+    u16,
+    HeaderMap,
+    hyper::body::Incoming,
+    Protocol,
+    Option<IpAddr>,
+)> {
     let uri: Uri = request
         .url
         .parse()
@@ -1076,7 +1219,13 @@ async fn origin_headers(
     let status = response.status().as_u16();
     let headers = response.headers().clone();
     let protocol = Protocol::from_version(response.version());
-    Ok((status, headers, response.into_body(), protocol))
+    // Set by the connector on every response, from the socket itself, whether
+    // the connection is new or pooled, HTTP/1.1 or h2.
+    let from = response
+        .extensions()
+        .get::<hyper_util::client::legacy::connect::HttpInfo>()
+        .map(|info| info.remote_addr().ip());
+    Ok((status, headers, response.into_body(), protocol, from))
 }
 
 /// Read a whole body into memory, refusing one past the ceiling.
@@ -1104,10 +1253,16 @@ async fn origin_request(
     config: &NetConfig,
     request: &FetchRequest,
     extra: &[(HeaderName, String)],
-) -> Result<(u16, HeaderMap, Bytes)> {
-    let (status, headers, incoming, _) = origin_headers(client, config, request, extra).await?;
+) -> Result<Answer> {
+    let (status, headers, incoming, _, from) =
+        origin_headers(client, config, request, extra).await?;
     let body = collect_body(OriginBody::Tcp(incoming), config.max_body_bytes).await?;
-    Ok((status, headers, body))
+    Ok(Answer {
+        status,
+        headers,
+        body,
+        from,
+    })
 }
 
 /// The state a teed body carries between chunks.
@@ -1120,6 +1275,9 @@ struct Teed {
     headers: HeaderMap,
     request_time: u64,
     done: bool,
+    /// What decides whether the entry may be written, and the address the
+    /// body came from.
+    keep: (Keep, Option<IpAddr>),
 }
 
 /// Hand the bytes to the caller and to the cache at the same time.
@@ -1139,10 +1297,16 @@ fn stream_body(
     headers: HeaderMap,
     incoming: OriginBody,
     limit: u64,
+    keep: (Keep, Option<IpAddr>),
 ) -> FetchBody {
     // A declared integrity is checked against the whole body before any of
     // it is handed out, so such a request is buffered and never gets here.
     debug_assert!(request.integrity.is_none());
+    // Not from an address whose answers are kept: not even a temporary copy.
+    if keep.0.admits(keep.1).is_none() {
+        tracing::debug!(url = %Redacted(&request.url), "not cached: not from a public address, or the cache was cleared since it was asked for");
+        return FetchBody::Stream(incoming.into_stream());
+    }
     let writer = match cache.begin_streamed() {
         Ok(writer) => writer,
         Err(err) => {
@@ -1160,6 +1324,7 @@ fn stream_body(
         headers,
         request_time: now_secs(),
         done: false,
+        keep,
     };
 
     FetchBody::Stream(
@@ -1191,6 +1356,13 @@ fn stream_body(
 /// The last byte has arrived: write the entry.
 fn finish_streamed(state: &mut Teed) {
     let Some(writer) = state.tee.take() else {
+        return;
+    };
+    // Asked again: the cache may have been cleared while it arrived. Dropping
+    // the writer removes what it wrote.
+    let (keep, from) = &state.keep;
+    let Some(_kept) = keep.admits(*from) else {
+        tracing::debug!(url = %Redacted(&state.request.url), "not cached: the cache was cleared while it arrived");
         return;
     };
     let now = now_secs();
@@ -1234,8 +1406,17 @@ async fn refresh_entry(
     request: &FetchRequest,
     key: &str,
     conditional: &[(HeaderName, String)],
+    keep: &Keep,
 ) -> Result<Refreshed> {
-    let (status, headers, body) = origin_request(client, config, request, conditional).await?;
+    let Answer {
+        status,
+        headers,
+        body,
+        from,
+    } = origin_request(client, config, request, conditional).await?;
+    let Some(_kept) = keep.admits(from) else {
+        return Ok(Refreshed::NotStored);
+    };
     let now = now_secs();
 
     if status == 304 {
@@ -1549,6 +1730,44 @@ mod tests {
         let result = net.origin_any(&request(method, &authority), &[]).await;
         assert!(result.is_err(), "nothing answered, so nothing can succeed");
         (received.load(Ordering::SeqCst), settle(&tcp, 1).await)
+    }
+
+    fn keeping(public_only: bool) -> (Arc<RwLock<u64>>, Keep) {
+        let cleared = Arc::new(RwLock::new(0));
+        let keep = Keep {
+            cleared: cleared.clone(),
+            since: 0,
+            public_only,
+        };
+        (cleared, keep)
+    }
+
+    #[test]
+    fn only_a_public_address_is_kept_when_only_public_ones_are() {
+        let (_, keep) = keeping(true);
+        assert!(keep
+            .admits(Some("93.184.215.14".parse().unwrap()))
+            .is_some());
+        for from in ["127.0.0.1", "::1", "10.1.2.3", "192.168.64.8", "fe80::1"] {
+            assert!(keep.admits(Some(from.parse().unwrap())).is_none(), "{from}");
+        }
+        assert!(
+            keep.admits(None).is_none(),
+            "an address nobody reported counts as not public"
+        );
+        let (_, anything) = keeping(false);
+        assert!(anything
+            .admits(Some("127.0.0.1".parse().unwrap()))
+            .is_some());
+        assert!(anything.admits(None).is_some());
+    }
+
+    #[test]
+    fn nothing_asked_for_before_a_clear_is_kept_after_it() {
+        let (cleared, keep) = keeping(false);
+        assert!(keep.admits(None).is_some());
+        *cleared.write().unwrap() += 1;
+        assert!(keep.admits(None).is_none());
     }
 
     #[tokio::test]

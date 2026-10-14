@@ -44,6 +44,15 @@ pub struct NetConfig {
     /// Join the peer swarm. A peer is only ever asked for a body the caller can
     /// already name by hash, so this is off by default and harmless when on.
     pub peers: Option<syndeo_peer::PeerConfig>,
+    /// Store only what came from the public internet, judged by the address
+    /// each response actually came from (`reach::is_public`), never by the
+    /// name in its URL: a public name can resolve to this Mac or the local
+    /// network. An address that is not known counts as not public.
+    ///
+    /// Off by default. `syndeo-proxy` turns it on, so that the cache every
+    /// page shares holds nothing from this Mac's own services, the local
+    /// network, or anything else not publicly reachable.
+    pub cache_public_addresses_only: bool,
 }
 
 impl Default for NetConfig {
@@ -58,6 +67,7 @@ impl Default for NetConfig {
             honour_stale_if_error: true,
             max_redirects: 10,
             peers: None,
+            cache_public_addresses_only: false,
         }
     }
 }

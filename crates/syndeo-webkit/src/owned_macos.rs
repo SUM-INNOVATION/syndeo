@@ -44,12 +44,90 @@ impl Drop for ProxyChild {
 pub struct OwnedProxy {
     child: ProxyChild,
     pub endpoint: std::net::SocketAddr,
+    control: ProxyControl,
 }
 
 impl OwnedProxy {
     pub fn pid(&self) -> u32 {
         self.child.0.id()
     }
+
+    /// The way to ask this proxy to do something.
+    pub fn control(&self) -> ProxyControl {
+        self.control.clone()
+    }
+}
+
+/// What this program asks its proxy, down the pipe to the proxy's stdin, and
+/// what the proxy answers on its stdout, a line each: see `syndeo-proxy run
+/// --control-stdin`. Only this program holds that pipe, so nothing else — no
+/// page, no other process — can ask. Cloned, to ask from another thread; one
+/// question at a time.
+#[derive(Clone)]
+pub struct ProxyControl(std::sync::Arc<std::sync::Mutex<Control>>);
+
+struct Control {
+    stdin: std::process::ChildStdin,
+    /// The proxy's lines after its announcement.
+    answers: std::sync::mpsc::Receiver<String>,
+    /// An earlier question went unanswered in time, so whatever comes next
+    /// may be its answer, not the next question's.
+    out_of_step: bool,
+}
+
+/// The proxy's answer to `clear-cache`, before how many entries there were.
+const CLEARED: &str = "SYNDEO-PROXY-CLEARED 1 ";
+/// Its answer to a command that failed.
+const FAILED: &str = "SYNDEO-PROXY-FAILED 1";
+
+impl ProxyControl {
+    /// Ask the proxy to empty its cache, and wait up to `within` for it to say
+    /// it has. Returns how many entries there were.
+    pub fn clear_cache(&self, within: std::time::Duration) -> Result<u64> {
+        use std::io::Write;
+        let mut control = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("an earlier question to the proxy failed part way"))?;
+        if control.out_of_step {
+            anyhow::bail!("the proxy stopped answering; quit Syndeo and open it again");
+        }
+        // Nothing the proxy said before this question answers it.
+        while control.answers.try_recv().is_ok() {}
+        let asked = control
+            .stdin
+            .write_all(b"clear-cache\n")
+            .and_then(|()| control.stdin.flush());
+        asked.context("asking the proxy to clear its cache")?;
+        match control.answers.recv_timeout(within) {
+            Ok(answer) => cleared(&answer),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                control.out_of_step = true;
+                anyhow::bail!(
+                    "the proxy did not say it had cleared its cache within {} seconds",
+                    within.as_secs()
+                )
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("the proxy has stopped")
+            }
+        }
+    }
+}
+
+/// How many entries the proxy said it cleared, from its answer.
+fn cleared(answer: &str) -> Result<u64> {
+    if let Some(entries) = answer.strip_prefix(CLEARED) {
+        if !entries.is_empty() && entries.bytes().all(|b| b.is_ascii_digit()) {
+            return entries
+                .parse()
+                .with_context(|| format!("not a count: {entries:?}"));
+        }
+    }
+    if answer == FAILED {
+        anyhow::bail!("the proxy could not clear its cache");
+    }
+    anyhow::bail!("the proxy answered {answer:?}, not that it had cleared its cache")
 }
 
 /// What `syndeo-proxy run --announce` writes once it is listening, before the
@@ -80,12 +158,18 @@ fn parse_announcement(line: &[u8]) -> Result<std::net::SocketAddr> {
     Ok(address)
 }
 
+/// The longest answer worth reading after the announcement. A longer line is
+/// none, and is read past.
+const MAX_ANSWER: usize = 96;
+
 /// On the child's stdout, on a thread of its own: the one announcement line,
-/// bounded, and then everything after it drained until the child goes, so a
-/// child that writes more can never block on a full pipe.
+/// bounded, and then everything after it read until the child goes, so a
+/// child that writes more can never block on a full pipe. Each line after the
+/// announcement that is short enough to be an answer is sent to `answers`.
 fn read_announcement(
     mut stdout: std::process::ChildStdout,
     found: std::sync::mpsc::Sender<Result<std::net::SocketAddr>>,
+    answers: std::sync::mpsc::Sender<String>,
 ) {
     use std::io::Read;
     let mut line = Vec::with_capacity(MAX_ANNOUNCEMENT);
@@ -117,12 +201,28 @@ fn read_announcement(
         }
     }
     let _ = found.send(parse_announcement(&line));
-    let mut sink = [0u8; 8192];
-    while let Ok(n) = stdout.read(&mut sink) {
+    let mut chunk = [0u8; 8192];
+    let mut answer: Vec<u8> = Vec::with_capacity(MAX_ANSWER);
+    let mut too_long = false;
+    while let Ok(n) = stdout.read(&mut chunk) {
         if n == 0 {
             return;
         }
-        tracing::debug!(bytes = n, "the proxy wrote to stdout after announcing");
+        for &byte in &chunk[..n] {
+            if byte == b'\n' {
+                match (too_long, String::from_utf8(std::mem::take(&mut answer))) {
+                    (false, Ok(text)) => {
+                        let _ = answers.send(text);
+                    }
+                    _ => tracing::debug!("the proxy wrote a line that is no answer"),
+                }
+                too_long = false;
+            } else if answer.len() < MAX_ANSWER {
+                answer.push(byte);
+            } else {
+                too_long = true;
+            }
+        }
     }
 }
 
@@ -146,21 +246,27 @@ pub fn start_owned(
         .context("starting the proxy")?;
     let mut owned = ProxyChild(child);
     // The credential goes down the pipe first, whole, before anything else
-    // could read it; the pipe then stays open for the child's parent watch.
+    // could read it; the pipe then stays open, for the child's parent watch
+    // and for what this program asks it later.
+    let mut stdin = owned.0.stdin.take().context("the proxy's stdin")?;
     if let Some(mut frame) = credential_frame {
         use std::io::Write;
-        let mut stdin = owned.0.stdin.take().context("the proxy's stdin")?;
         let written = stdin.write_all(&frame).and_then(|()| stdin.flush());
         frame.fill(0);
         written.context("handing the proxy its credential")?;
-        owned.0.stdin = Some(stdin);
     }
     let stdout = owned.0.stdout.take().context("the proxy's stdout")?;
     let (found, announced) = std::sync::mpsc::channel();
+    let (answered, answers) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("proxy-stdout".into())
-        .spawn(move || read_announcement(stdout, found))
+        .spawn(move || read_announcement(stdout, found, answered))
         .context("reading the proxy's output")?;
+    let control = ProxyControl(std::sync::Arc::new(std::sync::Mutex::new(Control {
+        stdin,
+        answers,
+        out_of_step: false,
+    })));
 
     let deadline = std::time::Instant::now() + within;
     loop {
@@ -173,6 +279,7 @@ pub fn start_owned(
                 return Ok(OwnedProxy {
                     child: owned,
                     endpoint,
+                    control,
                 });
             }
             Ok(Err(err)) => {
@@ -209,17 +316,19 @@ fn exited_soon(owned: &mut ProxyChild) -> Option<std::process::ExitStatus> {
 }
 
 /// How a browser's own proxy is run: on a loopback port the system picks,
-/// announced, with its credential on stdin, gone with its parent, and not
-/// tracing requests. A request trace is every URL in full, paths and queries
+/// announced, with its credential on stdin, gone with its parent, taking its
+/// commands on that same pipe (see [`ProxyControl`]), and not tracing
+/// requests. A request trace is every URL in full, paths and queries
 /// included, and those can hold a search, a token or a password-reset link;
 /// the proxy's other logs show only a URL's origin.
-pub const PROXY_ARGS: [&str; 7] = [
+pub const PROXY_ARGS: [&str; 8] = [
     "run",
     "--exit-with-parent",
     "--listen",
     "127.0.0.1:0",
     "--announce",
     "--auth-stdin",
+    "--control-stdin",
     "--trace-requests=false",
 ];
 
@@ -553,6 +662,74 @@ mod tests {
         assert!(!closed.exists(), "stdin was closed after the frame");
         drop(owned);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_browsers_own_proxy_takes_commands_on_the_pipe_only_it_holds() {
+        assert!(PROXY_ARGS.contains(&"--control-stdin"));
+        assert!(PROXY_ARGS.contains(&"--announce"));
+    }
+
+    /// A stand-in proxy that announces, then answers each line it reads with
+    /// `answer`, after writing a line too long to be an answer and an
+    /// unrelated one.
+    fn answering(answer: &str) -> OwnedProxy {
+        let script = format!(
+            "printf 'SYNDEO-PROXY-READY 1 127.0.0.1:4567\\n'; \
+             while read line; do head -c 4096 /dev/zero | tr '\\0' x; printf '\\n'; \
+             if [ \"$line\" = clear-cache ]; then printf '{answer}\\n'; else printf 'what?\\n'; fi; done; \
+             exec /bin/sleep 60"
+        );
+        start_owned(sh(&script), Duration::from_secs(10), None).unwrap()
+    }
+
+    #[test]
+    fn clearing_the_cache_is_asked_on_stdin_and_answered_on_stdout() {
+        let owned = answering("SYNDEO-PROXY-CLEARED 1 42");
+        let control = owned.control();
+        assert_eq!(control.clear_cache(Duration::from_secs(5)).unwrap(), 42);
+        // And again: each answer is the one to its own question.
+        assert_eq!(control.clear_cache(Duration::from_secs(5)).unwrap(), 42);
+    }
+
+    #[test]
+    fn a_failure_or_any_other_answer_is_an_error() {
+        for answer in [
+            "SYNDEO-PROXY-FAILED 1",
+            "SYNDEO-PROXY-CLEARED 1 ",
+            "SYNDEO-PROXY-CLEARED 1 -1",
+            "SYNDEO-PROXY-CLEARED 2 1",
+            "SYNDEO-PROXY-UNKNOWN 1",
+        ] {
+            let owned = answering(answer);
+            assert!(
+                owned.control().clear_cache(Duration::from_secs(5)).is_err(),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_proxy_that_does_not_answer_is_not_asked_again() {
+        let owned = start_owned(
+            sh("printf 'SYNDEO-PROXY-READY 1 127.0.0.1:4567\\n'; exec /bin/sleep 60"),
+            Duration::from_secs(10),
+            None,
+        )
+        .unwrap();
+        let control = owned.control();
+        let message = control
+            .clear_cache(Duration::from_millis(300))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("did not say"), "{message}");
+        let started = Instant::now();
+        let message = control
+            .clear_cache(Duration::from_secs(5))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("stopped answering"), "{message}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

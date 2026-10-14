@@ -158,10 +158,10 @@ type Sender = SendRequest<h3_quinn::OpenStreams, Bytes>;
 pub struct QuicClient {
     endpoint: quinn::Endpoint,
     dns: Dns,
-    /// One connection per authority. RFC 9114 §3.3 asks clients not to open more
-    /// than one to a given endpoint, and reusing it is also what makes the
-    /// second request to an origin cheap.
-    connections: tokio::sync::Mutex<HashMap<String, Sender>>,
+    /// One connection per authority, and the address it is to. RFC 9114 §3.3
+    /// asks clients not to open more than one to a given endpoint, and reusing
+    /// it is also what makes the second request to an origin cheap.
+    connections: tokio::sync::Mutex<HashMap<String, (Sender, SocketAddr)>>,
 }
 
 impl QuicClient {
@@ -200,7 +200,8 @@ impl QuicClient {
     }
 
     /// One request over HTTP/3. Same shape as the TCP path, so the caller does
-    /// not branch on which one answered.
+    /// not branch on which one answered: the status, the headers, the body,
+    /// and the address the connection that carried it is to.
     ///
     /// A failure says how far it got, because that decides whether the same
     /// request may be sent again over TCP: see [`Failed`].
@@ -210,7 +211,15 @@ impl QuicClient {
         method: &http::Method,
         headers: &HeaderMap,
         body: Bytes,
-    ) -> std::result::Result<(u16, HeaderMap, BoxStream<'static, Result<Bytes>>), Failed> {
+    ) -> std::result::Result<
+        (
+            u16,
+            HeaderMap,
+            BoxStream<'static, Result<Bytes>>,
+            SocketAddr,
+        ),
+        Failed,
+    > {
         let nothing_sent = |error| Failed {
             reached: Reached::Nothing,
             error,
@@ -225,7 +234,7 @@ impl QuicClient {
             .map(|a| a.to_string())
             .ok_or_else(|| nothing_sent(NetError::InvalidUrl(uri.to_string())))?;
 
-        let mut sender = self
+        let (mut sender, from) = self
             .sender_for(uri, &authority)
             .await
             .map_err(nothing_sent)?;
@@ -288,15 +297,16 @@ impl QuicClient {
         })
         .boxed();
 
-        Ok((status, response_headers, body))
+        Ok((status, response_headers, body, from))
     }
 
-    /// An open connection to this authority, or a new one.
-    async fn sender_for(&self, uri: &Uri, authority: &str) -> Result<Sender> {
+    /// An open connection to this authority, or a new one, and the address
+    /// it is to.
+    async fn sender_for(&self, uri: &Uri, authority: &str) -> Result<(Sender, SocketAddr)> {
         {
             let open = self.connections.lock().await;
-            if let Some(sender) = open.get(authority) {
-                return Ok(sender.clone());
+            if let Some(open) = open.get(authority) {
+                return Ok(open.clone());
             }
         }
 
@@ -311,6 +321,7 @@ impl QuicClient {
         let connection = connecting
             .await
             .map_err(|e| NetError::Transport(format!("quic handshake: {e}")))?;
+        let to = connection.remote_address();
 
         let (driver, sender) = h3::client::new(h3_quinn::Connection::new(connection))
             .await
@@ -326,7 +337,10 @@ impl QuicClient {
         });
 
         let mut open = self.connections.lock().await;
-        Ok(open.entry(authority.to_string()).or_insert(sender).clone())
+        Ok(open
+            .entry(authority.to_string())
+            .or_insert((sender, to))
+            .clone())
     }
 
     /// Forget a connection that has stopped working, so the next request opens

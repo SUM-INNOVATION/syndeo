@@ -13,6 +13,7 @@ pub mod dns;
 pub mod error;
 pub mod fetch;
 pub mod h3;
+pub mod reach;
 pub mod service;
 pub mod tls;
 

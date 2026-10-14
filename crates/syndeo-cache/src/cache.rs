@@ -1422,6 +1422,24 @@ impl Cache {
         Ok(evicted)
     }
 
+    /// Remove every stored response and every body, as a person clearing
+    /// their browsing data expects: nothing that was stored is left to be
+    /// served, shared with a peer or found on disk. Counters stay; they say
+    /// how much was asked and answered, not what. Returns how many entries
+    /// there were.
+    ///
+    /// Stores are held off for the whole of it, so none can take a reference
+    /// to a file this is removing. One that finishes afterwards is stored as
+    /// any other; a caller that must not keep a response asked for before the
+    /// clear — the network process does — refuses it itself.
+    pub fn clear(&self) -> Result<u64> {
+        let _exclusive = self.blob_gate.write().unwrap_or_else(|e| e.into_inner());
+        let entries = self.index.clear()?;
+        let bodies = self.blobs.remove_every_body()?;
+        tracing::info!(entries, bodies, "cleared the cache");
+        Ok(entries)
+    }
+
     pub fn stats(&self) -> Result<Stats> {
         let (blobs, unique_bytes, on_disk_bytes, logical_bytes) = self.index.blob_totals()?;
         let mut stats = Stats {
@@ -1613,6 +1631,89 @@ mod tests {
         // And it is a working cache afterwards, not a wedged one.
         stored(&rebuilt, "https://a.test/two", b"world");
         assert_eq!(rebuilt.stats().unwrap().entries, 1);
+    }
+
+    /// Every way a body can be held: two URLs sharing one, a partial body,
+    /// a body found by its integrity, and one a peer may be given.
+    #[test]
+    fn clearing_leaves_nothing_to_serve_share_or_find_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        stored(&cache, "https://a.test/one", b"shared body");
+        stored(&cache, "https://b.test/two", b"shared body");
+        stored(&cache, "https://a.test/three", b"a body of its own");
+        let mut partial = HeaderMap::new();
+        partial.insert(http::header::CACHE_CONTROL, "max-age=600".parse().unwrap());
+        partial.insert(http::header::CONTENT_RANGE, "bytes 0-3/10".parse().unwrap());
+        let now = cache.now();
+        cache
+            .store(
+                None,
+                "GET",
+                "https://a.test/partial",
+                &HeaderMap::new(),
+                206,
+                &partial,
+                b"part",
+                now,
+                now,
+            )
+            .unwrap();
+        let body = b"a body of its own";
+        let integrity = crate::sri::Integrity {
+            hashes: vec![crate::sri::Hash::compute(
+                crate::sri::Algorithm::Sha256,
+                body,
+            )],
+        };
+        let content = ContentId::of(body);
+        assert!(!cache
+            .grant_peer_eligibility(content, &integrity)
+            .unwrap()
+            .is_empty());
+        let before = cache.stats().unwrap();
+        assert!(
+            before.entries >= 4 && before.blobs >= 2 && before.sri_rows > 0,
+            "{before:?}"
+        );
+
+        assert_eq!(cache.clear().unwrap(), before.entries);
+
+        let after = cache.stats().unwrap();
+        assert_eq!(
+            (
+                after.entries,
+                after.blobs,
+                after.on_disk_bytes,
+                after.sri_rows
+            ),
+            (0, 0, 0, 0),
+            "{after:?}"
+        );
+        assert_eq!(after.requests, before.requests, "the counters stay");
+        for url in [
+            "https://a.test/one",
+            "https://b.test/two",
+            "https://a.test/three",
+        ] {
+            assert!(
+                matches!(
+                    cache.lookup(None, "GET", url, &HeaderMap::new()).unwrap(),
+                    Lookup::Miss(_)
+                ),
+                "{url} is still served"
+            );
+        }
+        assert!(cache.peer_eligibility(content).unwrap().is_empty());
+        assert_eq!(
+            cache.blobs.disk_usage().unwrap(),
+            0,
+            "a body is still on disk"
+        );
+
+        // A working cache afterwards, not a wedged one.
+        stored(&cache, "https://a.test/one", b"shared body");
+        assert_eq!(cache.stats().unwrap().entries, 1);
     }
 
     fn with_cookie() -> HeaderMap {
