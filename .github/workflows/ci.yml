@@ -323,11 +323,13 @@ jobs:
           [ "$wrong" = 0 ]
 
       # The route bar, gated against what WebKit actually does: each address
-      # typed, from a fresh WebKit state and with a fresh token, and the way
-      # WebKit went (by which process the origin saw, or the proxy's own
-      # count) and what the bar says both required to be what the app's rule
-      # says, for every route measured before and each direct range's edges.
-      # Then the proxy caching nothing from this Mac, and Clear Browsing Data.
+      # typed, from a fresh WebKit state and with a fresh token. For Direct
+      # and Through Syndeo, the way WebKit went (by which process the origin
+      # saw, or the proxy's own count) and what the bar says are both
+      # required to be what the app's rule says; for Local, where the way
+      # varies, the bar's label, and the proxy's cache taking nothing. Every
+      # route measured before and each range's edges. Then the proxy caching
+      # nothing from this Mac, and Clear Browsing Data.
       # For the time it gates it aliases addresses on lo0 and adds a
       # single-label name to /etc/hosts, and it fails if it cannot put those,
       # or the trust settings, back exactly as they were.

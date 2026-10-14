@@ -857,13 +857,22 @@ is a set of honest limits rather than work waiting to be done:
   been measured in `syndeo-webkit`.
 - WebRTC in `syndeo-webkit` is not covered by the proxy configuration, and
   whether WebKit sends its WebRTC traffic anywhere else has not been measured.
-- WebKit sends some requests directly, not through the proxy: those for
-  `localhost`, and for addresses typed as numbers that are loopback, private,
-  link-local or shared (carrier-grade NAT) space, IPv4 or IPv6. That was
-  measured on CI, range by range, and is not inferred; every name, whatever it
-  resolves to, and every public address went through the proxy. Such requests
-  reach local services without the proxy, and are neither cached nor counted
-  by it. Syndeo.app says which way each page came, in its bar.
+- WebKit sends some requests directly, not through the proxy. Measured on CI,
+  not inferred:
+  - `localhost` and loopback addresses (127/8, ::1) always went directly;
+  - addresses assigned to the Mac itself went directly, except its own
+    network address, which went directly in one run and through the proxy
+    in another;
+  - private, link-local and shared (carrier-grade NAT) addresses that were
+    not the Mac's own went through the proxy;
+  - every name, whatever it resolves to, and every public address went
+    through the proxy.
+
+  A request that goes directly reaches its service without the proxy, and is
+  neither cached nor counted by it, and the proxy caches nothing from a
+  local-network address either. Syndeo.app's bar says Direct for loopback,
+  Local for a local-network address, which may go either way, and Through
+  Syndeo for the rest.
 - The proxy and `syndeo-webkit` share an unpartitioned cache.
 - A plain `syndeo-proxy run` asks for no credential; only the proxy
   `syndeo-webkit` starts does. Neither limits how many connections it accepts.

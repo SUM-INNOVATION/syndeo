@@ -6,9 +6,9 @@
 //!   and Syndeo's (`address::allowed_in_main_frame`), and no IPv6 address
 //!   with a zone, which it refuses as the address field does; keeps the
 //!   window's controls in step with loading; says in the bar how the page on
-//!   screen was reached (`address::route`), from its address once it is
-//!   committed, after any redirect; and shows a failure page when a page
-//!   cannot be opened.
+//!   screen was reached (`address::route`: Direct, Local or Through Syndeo),
+//!   from its address once it is committed, after any redirect; and shows a
+//!   failure page when a page cannot be opened.
 //! - **Its UI delegate.** A page that asks for a new window gets a new tab,
 //!   made the way every other is, never a web view WebKit made for it.
 //! - **The window's delegate**, so a window that closes is let go.
@@ -116,10 +116,12 @@ const CANCELLED: isize = -999;
 const INTERRUPTED: isize = 102;
 
 /// What the bar's route says when someone points at it.
-const ROUTE_HELP: &str = "How this page was reached. Through Syndeo, it came through Syndeo's \
-    proxy, which may cache it; directly, WebKit opened it without the proxy, so Syndeo does \
-    not cache it. Each image, script and other part of the page is reached by its own \
-    address, so parts of it can go the other way.";
+const ROUTE_HELP: &str = "How this page was reached. Through Syndeo: through Syndeo's proxy, \
+    which may cache it. Direct: this Mac's own loopback, which WebKit opens without the proxy, \
+    so Syndeo does not cache it. Local: a local-network address, which WebKit may open \
+    directly or through the proxy; either way Syndeo does not cache it. Each image, script \
+    and other part of the page is classified by its own address, so parts of it can be \
+    reached another way.";
 
 define_class!(
     #[unsafe(super(NSObject))]

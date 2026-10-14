@@ -25,7 +25,8 @@ back.
 - no-editing-guard: the address field is written whenever a page reports
   its address, whoever is typing there. What someone types while a page is
   loading must then be seen overwritten when it arrives.
-- direct-for-every-name: the bar's rule says every name is opened directly.
+- direct-for-every-name: the bar's rule calls every name other than
+  localhost Direct.
   The bar must then be seen saying "Direct — not cached by Syndeo" for a
   page that came through the proxy by a name.
 - zoned-links-followed: a page's link to an IPv6 address with a zone is not
@@ -98,8 +99,8 @@ MUTANTS = {
     "direct-for-every-name": [
         (
             ADDRESS,
-            "        Host::Domain(name) => name == \"localhost\",\n",
-            "        Host::Domain(_) => true,\n",
+            "        Host::Domain(_) => Route::Syndeo,\n",
+            "        Host::Domain(_) => Route::Direct,\n",
         ),
     ],
     "zoned-links-followed": [

@@ -114,8 +114,13 @@ impl Search {
 pub enum Route {
     /// Through Syndeo's proxy, which may cache it.
     Syndeo,
-    /// By WebKit directly, not through the proxy, so Syndeo does not cache it.
+    /// This Mac's own loopback: WebKit opens it directly, never through the
+    /// proxy, so Syndeo does not cache it.
     Direct,
+    /// A local-network address: WebKit may open it directly or through the
+    /// proxy, and either way Syndeo does not cache it, because the proxy
+    /// stores nothing that came from an address that is not public.
+    Local,
 }
 
 impl Route {
@@ -124,57 +129,74 @@ impl Route {
         match self {
             Route::Syndeo => "Through Syndeo",
             Route::Direct => "Direct — not cached by Syndeo",
+            Route::Local => "Local — not cached by Syndeo",
         }
     }
 }
 
-/// The IPv4 ranges WebKit was measured opening directly, never through the
-/// proxy it is configured with: loopback, the private ranges, link-local and
-/// shared (carrier-grade NAT) space. Measured on CI in the runs recorded in
-/// Phase 3 of the desktop plan; `ci/test-app.sh routes` measures them again,
-/// with each range's edges, and fails when the bar disagrees.
-const DIRECT_V4: [(Ipv4Addr, u8); 6] = [
-    (Ipv4Addr::new(127, 0, 0, 0), 8),
+/// Loopback, which WebKit was measured always opening directly: 127/8, and
+/// in IPv6 ::1 and IPv4's loopback carried in IPv6.
+const DIRECT_V4: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 0, 0, 0), 8);
+const DIRECT_V6: [(Ipv6Addr, u8); 2] = [
+    (Ipv6Addr::LOCALHOST, 128),
+    (Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0), 104),
+];
+
+/// Local-network ranges: private, link-local and shared (carrier-grade NAT)
+/// IPv4, and unique local and link-local IPv6. WebKit was measured opening
+/// some of these directly — this Mac's own addresses — and others through
+/// the proxy, so which way it goes is not promised; only that Syndeo does
+/// not cache them.
+const LOCAL_V4: [(Ipv4Addr, u8); 5] = [
     (Ipv4Addr::new(10, 0, 0, 0), 8),
     (Ipv4Addr::new(172, 16, 0, 0), 12),
     (Ipv4Addr::new(192, 168, 0, 0), 16),
     (Ipv4Addr::new(169, 254, 0, 0), 16),
     (Ipv4Addr::new(100, 64, 0, 0), 10),
 ];
-
-/// The IPv6 ranges measured the same way: loopback, unique local and
-/// link-local.
-const DIRECT_V6: [(Ipv6Addr, u8); 3] = [
-    (Ipv6Addr::LOCALHOST, 128),
+const LOCAL_V6: [(Ipv6Addr, u8); 2] = [
     (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
     (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
 ];
 
-/// How WebKit reaches the page at `url`, as measured: directly when its host
-/// is exactly `localhost` or an address in one of the ranges above, and
-/// through the proxy otherwise — every other name, whatever it resolves to
-/// (a `.local` name, one under `.localhost`, a single label, a public name
-/// for this Mac), and every public address. None for a page that is not the
-/// web's, which is not reached at all.
+fn in_v4(ip: Ipv4Addr, (network, length): (Ipv4Addr, u8)) -> bool {
+    let mask = u32::MAX.checked_shl(32 - u32::from(length)).unwrap_or(0);
+    u32::from(ip) & mask == u32::from(network) & mask
+}
+
+fn in_v6(ip: Ipv6Addr, (network, length): (Ipv6Addr, u8)) -> bool {
+    let mask = u128::MAX.checked_shl(128 - u32::from(length)).unwrap_or(0);
+    u128::from(ip) & mask == u128::from(network) & mask
+}
+
+/// How the page at `url` is reached, by the rule its bar follows, from what
+/// was measured on CI and `ci/test-app.sh routes` gates:
 ///
-/// This is the page's own route. What it loads — images, scripts, frames,
-/// and where a redirect leads — is each routed by its own address.
+/// - **Direct** for a host of exactly `localhost` or `localhost.`, or a
+///   loopback address (above).
+/// - **Local** for an address in a local-network range (above).
+/// - **Through Syndeo** for every other name, whatever it resolves to (a
+///   `.local` name, one under `.localhost`, a single label, a public name
+///   for this Mac), and every other address.
+///
+/// None for a page that is not the web's, which is not reached at all.
+///
+/// This is the page's own route. What it loads — images, scripts, frames —
+/// is each reached by its own address, and a redirect is followed to the
+/// address it leads to.
 pub fn route(url: &Url) -> Option<Route> {
     if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
-    let direct = match url.host()? {
-        Host::Domain(name) => name == "localhost",
-        Host::Ipv4(ip) => DIRECT_V4.iter().any(|&(network, length)| {
-            let mask = u32::MAX.checked_shl(32 - u32::from(length)).unwrap_or(0);
-            u32::from(ip) & mask == u32::from(network) & mask
-        }),
-        Host::Ipv6(ip) => DIRECT_V6.iter().any(|&(network, length)| {
-            let mask = u128::MAX.checked_shl(128 - u32::from(length)).unwrap_or(0);
-            u128::from(ip) & mask == u128::from(network) & mask
-        }),
-    };
-    Some(if direct { Route::Direct } else { Route::Syndeo })
+    Some(match url.host()? {
+        Host::Domain("localhost" | "localhost.") => Route::Direct,
+        Host::Domain(_) => Route::Syndeo,
+        Host::Ipv4(ip) if in_v4(ip, DIRECT_V4) => Route::Direct,
+        Host::Ipv4(ip) if LOCAL_V4.iter().any(|&range| in_v4(ip, range)) => Route::Local,
+        Host::Ipv6(ip) if DIRECT_V6.iter().any(|&range| in_v6(ip, range)) => Route::Direct,
+        Host::Ipv6(ip) if LOCAL_V6.iter().any(|&range| in_v6(ip, range)) => Route::Local,
+        Host::Ipv4(_) | Host::Ipv6(_) => Route::Syndeo,
+    })
 }
 
 /// [`route`], for an address as text.
@@ -545,24 +567,38 @@ mod tests {
         route_of(address)
     }
 
-    /// What was measured on CI: each address typed, and whether WebKit
-    /// reached it directly or through the proxy.
+    /// What was measured on CI, each address as typed. Direct: what WebKit
+    /// always opened directly. Local: local-network addresses, which WebKit
+    /// opened directly when they were this Mac's own and through the proxy
+    /// when they were not. Through Syndeo: every name and public address.
     #[test]
     fn the_bar_says_what_was_measured() {
         for direct in [
             "http://localhost:8080/",
-            "http://127.0.0.1:8080/",
-            "http://[::1]:8080/",
-            "http://192.168.64.8:8080/",
-            "http://10.255.42.1:8080/",
-            "http://172.31.42.1:8080/",
-            "http://169.254.42.1:8080/",
-            "http://100.64.42.1:8080/",
-            "http://[fd42:5a7e:6e5d::1]:8080/",
-            "http://[fe80::1]:8080/",
+            "http://localhost.:8080/",
             "https://LOCALHOST/",
+            "http://127.0.0.1:8080/",
+            "http://127.0.0.5:8080/",
+            "http://[::1]:8080/",
+            "http://[::ffff:127.0.0.1]:8080/",
         ] {
             assert_eq!(route_shown(direct), Some(Route::Direct), "{direct}");
+        }
+        for local in [
+            "http://192.168.64.8:8080/",
+            "http://192.168.64.3:8080/",
+            "http://10.255.42.1:8080/",
+            "http://10.200.200.200:8080/",
+            "http://172.31.42.1:8080/",
+            "http://172.20.200.200:8080/",
+            "http://192.168.200.200:8080/",
+            "http://169.254.42.1:8080/",
+            "http://100.64.42.1:8080/",
+            "http://100.100.100.100:8080/",
+            "http://[fd42:5a7e:6e5d::1]:8080/",
+            "http://[fe80::1]:8080/",
+        ] {
+            assert_eq!(route_shown(local), Some(Route::Local), "{local}");
         }
         for through in [
             "http://example.com/",
@@ -572,7 +608,6 @@ mod tests {
             "http://syndeo-probe.localhost:8080/",
             "http://runner.local:8080/",
             "http://127.0.0.1.nip.io:8080/",
-            "http://localhost.:8080/",
             "http://syndeo.local/stats",
         ] {
             assert_eq!(route_shown(through), Some(Route::Syndeo), "{through}");
@@ -587,63 +622,71 @@ mod tests {
             assert_eq!(route_shown(not_the_web), None, "{not_the_web}");
         }
         assert_eq!(Route::Direct.label(), "Direct — not cached by Syndeo");
+        assert_eq!(Route::Local.label(), "Local — not cached by Syndeo");
         assert_eq!(Route::Syndeo.label(), "Through Syndeo");
     }
 
     /// Each range is exactly as wide as it says: its first and last
-    /// addresses are direct, and the addresses either side of it are not.
+    /// addresses are in it, and the addresses either side of it are not.
     #[test]
-    fn each_direct_range_ends_where_it_says() {
-        for (inside, outside) in [
+    fn each_range_ends_where_it_says() {
+        for (route, inside, outside) in [
             (
+                Route::Direct,
                 ["127.0.0.0", "127.255.255.255"],
                 ["126.255.255.255", "128.0.0.0"],
             ),
+            (Route::Direct, ["[::1]", "[::1]"], ["[::]", "[::2]"]),
             (
+                Route::Direct,
+                ["[::ffff:127.0.0.0]", "[::ffff:127.255.255.255]"],
+                ["[::ffff:126.255.255.255]", "[::ffff:128.0.0.0]"],
+            ),
+            (
+                Route::Local,
                 ["10.0.0.0", "10.255.255.255"],
                 ["9.255.255.255", "11.0.0.0"],
             ),
             (
+                Route::Local,
                 ["172.16.0.0", "172.31.255.255"],
                 ["172.15.255.255", "172.32.0.0"],
             ),
             (
+                Route::Local,
                 ["192.168.0.0", "192.168.255.255"],
                 ["192.167.255.255", "192.169.0.0"],
             ),
             (
+                Route::Local,
                 ["169.254.0.0", "169.254.255.255"],
                 ["169.253.255.255", "169.255.0.0"],
             ),
             (
+                Route::Local,
                 ["100.64.0.0", "100.127.255.255"],
                 ["100.63.255.255", "100.128.0.0"],
             ),
             (
+                Route::Local,
                 ["[fc00::]", "[fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]"],
                 ["[fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]", "[fe00::]"],
             ),
             (
+                Route::Local,
                 ["[fe80::]", "[febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff]"],
                 ["[fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff]", "[fec0::]"],
             ),
-            (["[::1]", "[::1]"], ["[::]", "[::2]"]),
         ] {
             for host in inside {
                 let address = format!("http://{host}/");
-                assert_eq!(route_shown(&address), Some(Route::Direct), "{address}");
+                assert_eq!(route_shown(&address), Some(route), "{address}");
             }
             for host in outside {
                 let address = format!("http://{host}/");
                 assert_eq!(route_shown(&address), Some(Route::Syndeo), "{address}");
             }
         }
-        // An IPv4 address carried in IPv6 was not measured, so the bar does
-        // not say it is direct.
-        assert_eq!(
-            route_shown("http://[::ffff:127.0.0.1]/"),
-            Some(Route::Syndeo)
-        );
     }
 
     #[test]

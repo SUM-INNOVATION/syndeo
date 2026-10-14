@@ -84,34 +84,37 @@
 # the proxy caching nothing from this Mac, and Clear Browsing Data. From a
 # fresh WebKit state (Syndeo's WebKit caches and storage removed first) and
 # with a fresh token in every address, so that no cached copy stands in for a
-# fetch, it types each address, and requires both the way WebKit went and
-# what the bar then says to be what address::route says:
-#   - direct, by the process the origin (ci/macos-app/route-origin.py) saw
-#     the request from — WebKit's own networking process, not the proxy — and
-#     the bar saying "Direct — not cached by Syndeo": 127.0.0.1, [::1],
-#     localhost, this Mac's LAN address, and, aliased on lo0 for the time it
-#     gates, 10/8, 172.16/12, 169.254/16 and 100.64/10 addresses measured
-#     before, the first and last host address of each direct IPv4 range,
-#     127/8's included, and IPv6 unique local addresses: one measured before
-#     and fc00/7's first and last;
-#   - through Syndeo, by the origin seeing the proxy, and the bar saying
-#     "Through Syndeo": every name, whatever it resolves to — this Mac's
-#     .local name, a public name for 127.0.0.1, a single label (in
-#     /etc/hosts for that time), a name under .localhost;
-#   - after a redirect, the final page's: a name redirecting to 127.0.0.1 is
-#     direct; 127.0.0.1 redirecting to a public page is through Syndeo;
-#   - by the proxy's own count, for addresses nothing here serves: through
-#     Syndeo for a genuinely remote public address (example.com's, never
-#     aliased) and the addresses just outside each direct range, IPv4 and
-#     IPv6, the bar then saying so on the proxy's own page; direct for
-#     addresses inside the direct ranges that are not this Mac's, so the rule
-#     is seen to be the range and not the Mac's own addresses, the bar then
-#     saying nothing;
+# fetch, it types each address and requires what address::route says:
+#   - Direct, the bar saying "Direct — not cached by Syndeo", and WebKit's own
+#     networking process, not the proxy, seen by the origin
+#     (ci/macos-app/route-origin.py): localhost and localhost., 127.0.0.1,
+#     [::1], [::ffff:127.0.0.1], and 127/8's last host address and 127.0.0.2,
+#     aliased on lo0 for the time it gates; and 127.0.0.5, which is not
+#     assigned, by the proxy's count not moving;
+#   - Through Syndeo, the bar saying "Through Syndeo", and the proxy seen:
+#     every name, whatever it resolves to — this Mac's .local name, a public
+#     name for 127.0.0.1, a single label (in /etc/hosts for that time), a
+#     name under .localhost; and, by the proxy's own count, a genuinely
+#     remote public address (example.com's, never aliased) and the IPv4
+#     addresses just outside each range, the bar saying so on the proxy's
+#     own page;
+#   - Local, where which way WebKit goes varies and is recorded, not
+#     asserted: the bar saying "Local — not cached by Syndeo", and the
+#     proxy's cache taking nothing from a page any cache may keep — this
+#     Mac's LAN address and every local-network address aliased on lo0
+#     (10/8, 172.16/12, 192.168/16, 169.254/16 and 100.64/10 addresses,
+#     each range's first and last host address, and IPv6 unique local ones);
+#     and, by the proxy's count, local-network addresses that are not this
+#     Mac's, the bar saying Local if a page comes back;
+#   - after a redirect, the final page's route: a name redirecting to
+#     127.0.0.1 is Direct, one redirecting to 10.255.42.1 is Local, and
+#     127.0.0.1 redirecting to a public page is Through Syndeo;
 #   - an IPv6 address with a zone is refused, typed and followed from a
 #     page's link, with the same words, and the origin hears of neither;
 #   - an https image from another host, on a page this Mac serves, comes
 #     through the proxy with Syndeo's authority in no trust settings.
-# It measures, without gating, [::] and [::ffff:127.0.0.1] and "localhost.".
+# It measures, without gating, [::], and IPv6 addresses this runner has no
+# route to: just outside the ranges, and unique local and link-local ones.
 # Then: a public page is cached by the proxy, and a cacheable page from this
 # Mac, reached through the proxy by a name, is not; and Settings > Clear
 # Browsing Data asks first, then empties the proxy's cache (the same proxy
@@ -912,8 +915,9 @@ resolution() {
 
 # What the bar says the front window's page came by: see address::Route.
 DIRECT_LABEL='Direct — not cached by Syndeo'
+LOCAL_LABEL='Local — not cached by Syndeo'
 SYNDEO_LABEL='Through Syndeo'
-label_for() { case "$1" in direct) printf '%s' "$DIRECT_LABEL" ;; syndeo) printf '%s' "$SYNDEO_LABEL" ;; *) printf '(nothing)' ;; esac; }
+label_for() { case "$1" in direct) printf '%s' "$DIRECT_LABEL" ;; local) printf '%s' "$LOCAL_LABEL" ;; syndeo) printf '%s' "$SYNDEO_LABEL" ;; *) printf '(nothing)' ;; esac; }
 # bar: what the bar says, or "(nothing)" when it says nothing.
 bar() {
   local said
@@ -939,10 +943,11 @@ record() {
 }
 
 # by_origin LABEL TYPED EXPECT TOKEN [measure]: a page the routing origin
-# serves, typed. Which way WebKit went is the process the origin saw the
-# request from — its own networking process, or the proxy — and that, and
-# what the bar then says, must both be EXPECT (direct or syndeo). With
-# "measure", the two are recorded and compared, and nothing fails.
+# serves, typed, whose route is one of the two that do not vary. Which way
+# WebKit went is the process the origin saw the request from — its own
+# networking process, or the proxy — and that, and what the bar then says,
+# must both be EXPECT (direct or syndeo). With "measure", the two are
+# recorded and compared, and nothing fails.
 by_origin() {
   local label="$1" typed="$2" expect="$3" t="$4" mode="${5:-gate}" from shown went said
   from="$(origin_lines)"
@@ -963,6 +968,31 @@ by_origin() {
   must "$([ "$said" = "$(label_for "$expect")" ] && echo yes)" "the bar for $label says \"$(label_for "$expect")\"" "it says \"$said\""
 }
 
+# by_local LABEL ORIGIN: a local-network address, typed, whose route may
+# vary: ORIGIN/cached?t=<token>, a page the routing origin serves that any
+# cache may keep. Which way WebKit
+# went is recorded and not asserted. The bar must say "Local — not cached by
+# Syndeo", and the proxy's cache must hold no more entries afterwards,
+# whichever way it went. ENTRIES is the proxy's entries just before, and is
+# left as they are after.
+by_local() {
+  local label="$1" origin="$2" t from shown went said before
+  before="$ENTRIES"
+  t="$(token)"
+  from="$(origin_lines)"
+  choose File "Open Location…"
+  "$APPCTL" type "$PID" "$origin/cached?t=$t" >/dev/null || true
+  if wait_for 20 page_says "ROUTE-CACHED-$t"; then shown=yes; else shown=no; fi
+  sleep 1
+  went="$(way "$from" "$t")"
+  said="$(bar)"
+  counted "after: $label"
+  record "$label" "$origin/cached?t=$t" local "$went" "$said" "shown: $shown; the origin saw: $(seen "$from" "$t"); the proxy's entries: ${before:-?} -> ${ENTRIES:-?}"
+  must "$([ "$shown" = yes ] && [ "$said" = "$LOCAL_LABEL" ] && echo yes)" "the bar for $label says \"$LOCAL_LABEL\"" "shown: $shown; it says \"$said\""
+  must "$([ -n "$before" ] && [ "$ENTRIES" = "$before" ] && echo yes)" \
+    "and the proxy did not cache it, though it may be cached: its entries stayed at ${before:-?} (WebKit went $went)" "now ${ENTRIES:-?}"
+}
+
 # conns ADDRESS: the processes holding a TCP connection to ADDRESS, by name,
 # one a line.
 conns() {
@@ -971,18 +1001,28 @@ conns() {
   lsof +c 0 -nP -iTCP@"$at" -Fc 2>/dev/null | sed -n 's/^c//p' | sort -u
 }
 
+# settled: the page in front came from the address, or failed to.
+settled() { bar_said || page_says "couldn't open"; }
+
 # by_count LABEL TYPED EXPECT ADDRESS: an address nothing here serves, typed,
-# from about:blank, with COUNTED the proxy's count just before. Which way
-# WebKit went is whether the proxy's count rose for it, with the processes
-# seen holding a connection to ADDRESS in the first 6 s recorded as well, and
-# it must be EXPECT. For EXPECT syndeo, the proxy's own page says why once it
-# gives up on the address, and the bar must then say "Through Syndeo". For
-# EXPECT direct, no page comes from the address, and the bar must say
-# nothing; a load WebKit is still trying is stopped. Leaves COUNTED the
-# proxy's count after.
+# from about:blank, with COUNTED and ENTRIES the proxy's count and entries
+# just before. Which way WebKit went is whether the proxy's count rose for
+# it; the processes seen holding a connection to ADDRESS in the first 6 s
+# are recorded too. Then, by EXPECT:
+#   - syndeo: it must have gone through the proxy, and the bar must say
+#     "Through Syndeo" on the proxy's own page, once the proxy gives up on
+#     the address;
+#   - direct: it must not have reached the proxy, no page comes from it, and
+#     the bar must say nothing; a load WebKit is still trying is stopped;
+#   - local: which way it went is recorded, not asserted; the proxy's cache
+#     must hold no more entries, and if a page came back, the bar must say
+#     "Local — not cached by Syndeo"; a load still being tried after 25 s is
+#     stopped;
+#   - measure: recorded, and nothing asserted.
+# Leaves COUNTED and ENTRIES the proxy's count and entries after.
 by_count() {
-  local label="$1" typed="$2" expect="$3" address="$4" before seen_by='' said went now
-  before="$COUNTED"
+  local label="$1" typed="$2" expect="$3" address="$4" before entries seen_by='' said went now
+  before="$COUNTED" entries="$ENTRIES"
   blank
   choose File "Open Location…"
   "$APPCTL" type "$PID" "$typed" >/dev/null || true
@@ -992,9 +1032,11 @@ by_count() {
     sleep 0.5
   done
   seen_by="$(printf '%s\n' $seen_by | sort -u | tr '\n' ' ')"
-  if [ "$expect" = syndeo ]; then
-    wait_for 30 bar_said || true
-  else
+  case "$expect" in
+    syndeo) wait_for 30 bar_said || true ;;
+    local | measure) wait_for 25 settled || true ;;
+  esac
+  if ! settled; then
     "$APPCTL" activate "$PID" >/dev/null || true
     "$APPCTL" menu "$PID" View "Stop Loading" >/dev/null 2>&1 || true
   fi
@@ -1002,15 +1044,29 @@ by_count() {
   counted "after: $label"
   went=unknown
   if [ -n "$before" ] && [ -n "$COUNTED" ]; then
-    if [ "$COUNTED" -gt "$before" ]; then went=syndeo; else went=direct; fi
+    if [ "$COUNTED" -gt "$before" ]; then went=syndeo; else went="not the proxy"; fi
   fi
-  record "$label" "$typed" "$expect" "$went" "$said" "the proxy's count: ${before:-?} -> ${COUNTED:-?}; holding a connection to $address: ${seen_by:-nothing seen}"
-  must "$([ "$went" = "$expect" ] && echo yes)" "the route for $label: $expect" "WebKit went: $went; the proxy's count ${before:-?} -> ${COUNTED:-?}; connections: ${seen_by:-none seen}"
-  if [ "$expect" = syndeo ]; then
-    must "$([ "$said" = "$SYNDEO_LABEL" ] && echo yes)" "the bar for $label says \"$SYNDEO_LABEL\"" "it says \"$said\""
-  else
-    must "$([ "$said" = '(nothing)' ] && echo yes)" "the bar for $label says nothing: no page came from it" "it says \"$said\""
-  fi
+  record "$label" "$typed" "$expect" "$went" "$said" "the proxy's count: ${before:-?} -> ${COUNTED:-?}; its entries: ${entries:-?} -> ${ENTRIES:-?}; holding a connection to $address: ${seen_by:-nothing seen}"
+  case "$expect" in
+    syndeo)
+      must "$([ "$went" = syndeo ] && echo yes)" "the route for $label: syndeo" "WebKit went: $went; connections: ${seen_by:-none seen}"
+      must "$([ "$said" = "$SYNDEO_LABEL" ] && echo yes)" "the bar for $label says \"$SYNDEO_LABEL\"" "it says \"$said\""
+      ;;
+    direct)
+      must "$([ "$went" = "not the proxy" ] && echo yes)" "the route for $label: direct, not the proxy" "WebKit went: $went; connections: ${seen_by:-none seen}"
+      must "$([ "$said" = '(nothing)' ] && echo yes)" "the bar for $label says nothing: no page came from it" "it says \"$said\""
+      ;;
+    local)
+      must "$([ -n "$entries" ] && [ "$ENTRIES" = "$entries" ] && echo yes)" \
+        "the proxy's cache is unchanged by $label (WebKit went $went)" "its entries: ${entries:-?} -> ${ENTRIES:-?}"
+      if [ "$said" != '(nothing)' ]; then
+        must "$([ "$said" = "$LOCAL_LABEL" ] && echo yes)" "the bar for $label says \"$LOCAL_LABEL\"" "it says \"$said\""
+      fi
+      ;;
+    measure)
+      printf '  MEASURE  %s: the proxy'"'"'s count %s -> %s, connections: %s, the bar: "%s"\n' "$label" "${before:-?}" "${COUNTED:-?}" "${seen_by:-none seen}" "$said"
+      ;;
+  esac
 }
 
 # The addresses routes adds to this runner for the time it gates, and puts
@@ -1145,19 +1201,17 @@ routes() {
       browses routes
       proxy_pid="$HELPER"
 
-      # Direct, by what the origin saw: loopback, localhost, this Mac's LAN
-      # address, and every address aliased on lo0 for the time it gates.
+      # Direct, by what the origin saw: localhost, with and without its final
+      # dot, loopback by IPv4, IPv6 and IPv4 in IPv6, and 127/8's edges,
+      # aliased on lo0 for the time it gates.
       t="$(token)"; by_origin "127.0.0.1" "http://127.0.0.1:$P/page?t=$t" direct "$t"
       t="$(token)"; by_origin "[::1]" "http://[::1]:$P/page?t=$t" direct "$t"
+      t="$(token)"; by_origin "[::ffff:127.0.0.1], IPv4 loopback in IPv6" "http://[::ffff:127.0.0.1]:$P/page?t=$t" direct "$t"
       t="$(token)"; by_origin "localhost" "http://localhost:$P/page?t=$t" direct "$t"
-      if [ -n "$lan" ]; then t="$(token)"; by_origin "this Mac's LAN address, $lan" "http://$lan:$P/page?t=$t" direct "$t"; fi
-      for a in $ALIASES4; do
+      t="$(token)"; by_origin "localhost., with its final dot" "http://localhost.:$P/page?t=$t" direct "$t"
+      for a in 127.0.0.2 127.255.255.254; do
         added "$a" || continue
         t="$(token)"; by_origin "$a, on lo0" "http://$a:$P/page?t=$t" direct "$t"
-      done
-      for a in $ALIASES6; do
-        added "$a" || continue
-        t="$(token)"; by_origin "[$a], on lo0" "http://[$a]:$P/page?t=$t" direct "$t"
       done
 
       # Through Syndeo, by what the origin saw: every name, whatever it
@@ -1172,31 +1226,50 @@ routes() {
       t="$(token)"; s="$(token)"
       by_origin "a name redirecting to 127.0.0.1, the page it ends on" "http://127.0.0.1.nip.io:$P/redirect?t=$t&to=http://127.0.0.1:$P/page?t=$s" direct "$s"
 
-      # Measured, not gated: forms of local addresses the rule does not name,
-      # and the unspecified IPv6 address just below ::1, which WebKit may
-      # refuse outright.
+      # Measured, not gated: the unspecified IPv6 address just below ::1,
+      # which WebKit may refuse outright.
       t="$(token)"; by_origin "[::], the edge below ::1" "http://[::]:$P/page?t=$t" syndeo "$t" measure
-      t="$(token)"; by_origin "[::ffff:127.0.0.1], IPv4 loopback in IPv6" "http://[::ffff:127.0.0.1]:$P/page?t=$t" syndeo "$t" measure
-      t="$(token)"; by_origin "localhost., with its final dot" "http://localhost.:$P/page?t=$t" syndeo "$t" measure
+
+      # Local, whichever way WebKit goes: the bar says so, and the proxy's
+      # cache takes nothing from a page any cache may keep. This Mac's LAN
+      # address, every local-network address aliased on lo0 (each range's
+      # first and last host address among them), and a name redirecting to
+      # one, which ends local.
+      counted "before the local addresses"
+      if [ -n "$lan" ]; then by_local "this Mac's LAN address, $lan" "http://$lan:$P"; fi
+      for a in $ALIASES4; do
+        case "$a" in 127.*) continue ;; esac
+        added "$a" || continue
+        by_local "$a, on lo0" "http://$a:$P"
+      done
+      for a in $ALIASES6; do
+        added "$a" || continue
+        by_local "[$a], on lo0" "http://[$a]:$P"
+      done
+      # The redirect's own target is the page by_local asks for: what
+      # follows "to=" is that page's address.
+      if added 10.255.42.1; then
+        by_local "a name redirecting to 10.255.42.1, the page it ends on" "http://127.0.0.1.nip.io:$P/redirect?t=$(token)&to=http://10.255.42.1:$P"
+      fi
 
       # Addresses nothing here serves, by the proxy's count, from about:blank.
       counted "before the addresses nothing here serves"
-      # Through Syndeo: a genuinely remote public address, then the
-      # addresses just outside each direct range.
+      # Through Syndeo: a genuinely remote public address, then the IPv4
+      # addresses just outside each range.
       if [ -n "$public" ]; then by_count "a public address, $public (example.com's)" "http://$public/" syndeo "$public"; fi
       for a in 126.255.255.254 128.0.0.1 9.255.255.254 11.0.0.1 172.15.255.254 172.32.0.1 192.167.255.254 192.169.0.1 169.253.255.254 169.255.0.1 100.63.255.254 100.128.0.1; do
-        by_count "$a, just outside a direct range" "http://$a:$P/" syndeo "$a"
+        by_count "$a, just outside a range" "http://$a:$P/" syndeo "$a"
       done
-      for a in fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff fe00::1 fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff fec0::1 ::2; do
-        by_count "[$a], just outside a direct range" "http://[$a]:$P/" syndeo "$a"
+      # Direct: loopback that is not this Mac's assigned address.
+      by_count "127.0.0.5, loopback, not assigned" "http://127.0.0.5:$P/" direct 127.0.0.5
+      # Local: local-network addresses that are not this Mac's own. The
+      # proxy's cache takes nothing, whichever way WebKit goes.
+      for a in 10.200.200.200 172.20.200.200 192.168.200.200 169.254.200.200 100.100.100.100; do
+        by_count "$a, local, not this Mac's" "http://$a:$P/" local "$a"
       done
-      # Direct: addresses inside the direct ranges that are not this Mac's,
-      # so that the rule is seen to be the range, not the Mac's own address.
-      for a in 127.0.0.5 10.200.200.200 172.20.200.200 192.168.200.200 169.254.200.200 100.100.100.100; do
-        by_count "$a, in a direct range and not this Mac's" "http://$a:$P/" direct "$a"
-      done
-      for a in fd00:5a7e::5 fe80::5; do
-        by_count "[$a], in a direct range and not this Mac's" "http://[$a]:$P/" direct "$a"
+      # Measured, not gated: IPv6 addresses this runner has no route to.
+      for a in fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff fe00::1 fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff fec0::1 ::2 fd00:5a7e::5 fe80::5; do
+        by_count "[$a], unreachable IPv6" "http://[$a]:$P/" measure "$a"
       done
 
       # A redirect from 127.0.0.1 to a public page ends through Syndeo.
