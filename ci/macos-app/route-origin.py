@@ -5,8 +5,9 @@ directly can be told from one its proxy fetched.
 
   route-origin.py <log>
 
-Listens on every IPv4 address and, on the same port, on ::1, and prints
-"port <n> v6 <yes|no>" once it is listening. Every request is logged to <log>
+Listens on every IPv4 address and, on the same port, on every IPv6 address
+(link-local ones included, with their scope), and prints "port <n> v6
+<yes|no>" once it is listening. Every request is logged to <log>
 as one JSON line: its path, the t= of its query, its Host, the address it
 came from, and the process at the other end of its connection, found with
 lsof while the connection is open: com.apple.WebKit.Networking for a request
@@ -16,6 +17,8 @@ WebKit made itself, syndeo-proxy for one the proxy made for it.
                                 image from <url> if there is one
   /img?t=<token>                a one-pixel GIF
   /redirect?t=<token>&to=<url>  302 to <url>
+  /links?t=<token>&href=<url>   a page saying ROUTE-LINKS-<token>, with one
+                                link, "go", to <url>
 
 Every response is no-store, so nothing it answers can be served again from a
 cache instead of asking it.
@@ -86,6 +89,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if url.path == "/img":
             body, kind = GIF, "image/gif"
+        elif url.path == "/links":
+            token = html.escape(query.get("t", ""))
+            href = html.escape(query.get("href", ""))
+            body = (
+                f"<!doctype html><meta charset=utf-8><title>Links {token}</title>"
+                f'<p>ROUTE-LINKS-{token}</p><p><a href="{href}">go</a></p>'
+            ).encode()
+            kind = "text/html; charset=utf-8"
         elif url.path == "/page":
             sub = query.get("sub", "")
             image = f'<img src="{html.escape(sub)}" width="1" height="1" alt="">' if sub else ""
@@ -119,6 +130,11 @@ class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
 class Server6(Server):
     address_family = socket.AF_INET6
 
+    def server_bind(self):
+        # IPv6 only: the IPv4 server already holds this port for IPv4.
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        super().server_bind()
+
 
 def main(argv):
     if len(argv) != 1:
@@ -127,7 +143,7 @@ def main(argv):
     four = Server(("0.0.0.0", 0), Handler)
     port = four.server_address[1]
     try:
-        six = Server6(("::1", port), Handler)
+        six = Server6(("::", port), Handler)
     except OSError:
         six = None
     if six is not None:

@@ -322,6 +322,9 @@ jobs:
       # Measured, not gated: what the web views reach directly, through the
       # proxy, or from WebKit's own cache, from a fresh WebKit state and with a
       # fresh token in every address, so no cached copy stands in for a fetch.
+      # For the time it measures it aliases private and special-use addresses
+      # on lo0 and adds a single-label name to /etc/hosts; it fails only if it
+      # cannot put those, or the trust settings, back exactly as they were.
       # The "Direct" state is to be designed from what this finds.
       - name: What the web views reach directly, through the proxy, or from cache (measured, not a gate)
         if: always()

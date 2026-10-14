@@ -73,14 +73,22 @@
 # routes, which only reports: what Syndeo.app's web views reach directly,
 # through its proxy, or from WebKit's own cache. From a fresh WebKit state
 # (Syndeo's WebKit caches and storage removed first) and with a fresh token in
-# every address, so that no cached copy stands in for a fetch, it opens:
-# loopback by IPv4, IPv6 and localhost; this Mac's .local name and LAN
-# address; a public name for 127.0.0.1; redirects from loopback to the web and
-# from a public name to loopback; pages with an image from the other kind of
-# address; and a public page and a loopback page, each twice. For each it
-# reports whether the page was shown, which process the origin
+# every address, so that no cached copy stands in for a fetch, it types:
+# loopback by IPv4, IPv6, localhost and a name under .localhost; this Mac's
+# .local name, LAN address and IPv6 link-local address (with its scope, typed
+# and as a page's link, and without it); a genuinely remote public IPv4
+# address (example.com's, resolved then); 10/8, 172.16/12, 169.254/16,
+# 100.64/10 and IPv6 unique local addresses, aliased on lo0 for the time it
+# measures; a single-label name, in /etc/hosts for that time; a public name
+# for 127.0.0.1; redirects and images between the two kinds of address; and a
+# public page twice. For each it records the address typed, what it resolves
+# to, whether the page was shown, which process the origin
 # (ci/macos-app/route-origin.py) saw each request from, WebKit's own or the
-# proxy, and how the proxy's own count moved.
+# proxy, the connections to a remote address by process, the proxy's own
+# count before and after, the address the field then shows, and Syndeo's
+# error if there was one. Then it puts lo0 and /etc/hosts back and requires
+# them, and the trust settings, exactly as they were: the only things it
+# fails for.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -748,88 +756,206 @@ print("; ".join(f"{n}x {path} from {process}" for (path, process), n in sorted(c
 PY
 }
 
-# route LABEL URL MARKER TOKEN...: open URL, typed as a person would, and
-# report whether MARKER was shown, what the origin saw for TOKEN..., and the
-# proxy's count before and after.
-route() {
-  local label="$1" url="$2" marker="$3" before after shown from saw
-  shift 3
+# resolution NAME: what this Mac resolves NAME to, or "an address" when NAME
+# is an address itself.
+resolution() {
+  local found
+  case "$1" in
+    *[!0-9.]*) ;;
+    *) echo "an address"; return ;;
+  esac
+  case "$1" in *:*) echo "an address"; return ;; esac
+  found="$(dscacheutil -q host -a name "$1" 2>/dev/null | awk '/_address:/ {print $2}' | tr '\n' ' ')"
+  echo "${found:-nothing}"
+}
+
+# probe LABEL TYPED MARKER HOST REMOTE TOKEN...: type TYPED into the address
+# field as a person would, and record: what HOST resolves to; whether MARKER
+# was shown (with MARKER "-", for a page whose text is not known beforehand,
+# what the page says after 12 s); what the origin saw for TOKEN...; for REMOTE, an address not
+# ours ("-" if none), which processes hold a connection to it; the proxy's
+# count before and after; the address the field then shows; and the error,
+# if Syndeo showed its failure page.
+probe() {
+  local label="$1" typed="$2" marker="$3" host="$4" remote="$5" before after shown from saw resolved conns final error
+  shift 5
+  resolved="$(resolution "$host")"
   counted "before: $label"
   before="$COUNTED"
   from="$(wc -l <"$LOGS/routes-origin.jsonl" | tr -d ' ')"
   choose File "Open Location…"
-  "$APPCTL" type "$PID" "$url" >/dev/null || true
-  if wait_for 20 page_says "$marker"; then shown=yes; else shown=no; fi
+  "$APPCTL" type "$PID" "$typed" >/dev/null || true
+  if [ "$marker" = - ]; then
+    sleep 12
+    shown="(nothing known to look for) the page says: $(page_text | head -c 120)"
+  elif wait_for 20 page_says "$marker"; then
+    shown=yes
+  else
+    shown=no
+  fi
   # Its images, or a redirect's second request, by now too.
   sleep 2
   saw="$(seen "$from" "$@")"
+  conns='-'
+  if [ "$remote" != - ]; then
+    conns="$(lsof +c 0 -nP -iTCP@"$remote" -Fc 2>/dev/null | sed -n 's/^c//p' | sort | uniq -c | awk '{printf "%s%sx %s", sep, $1, $2; sep="; "}')"
+    conns="${conns:-none open}"
+  fi
+  final="$("$APPCTL" value "$PID" syndeo.address)"
+  error='-'
+  if page_says "couldn't open"; then error="$(page_text | head -c 200)"; fi
   counted "after: $label"
   after="$COUNTED"
-  printf '  MEASURE  %s: %s\n           shown: %s; the origin saw: %s; the proxy'"'"'s count: %s -> %s\n' \
-    "$label" "$url" "$shown" "$saw" "${before:-?}" "${after:-?}"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$url" "$shown" "$saw" "${before:-?}" "${after:-?}" >>"$LOGS/routes.tsv"
+  printf '  MEASURE  %s\n           typed: %s\n           resolves to: %s; shown: %s; the origin saw: %s; connections to %s: %s\n           the proxy'"'"'s count: %s -> %s; the field then: %s; error: %s\n' \
+    "$label" "$typed" "$resolved" "$shown" "$saw" "$remote" "$conns" "${before:-?}" "${after:-?}" "$final" "$error"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$typed" "$resolved" "$shown" "$saw" "$conns" "${before:-?}" "${after:-?}" "$final" "$error" >>"$LOGS/routes.tsv"
 }
 
-# routes APP: see the top of this script. Reports; never fails for what it
-# finds.
+# The addresses routes adds to this runner for the time it measures, and puts
+# back: four private and special-use IPv4 addresses and one IPv6 unique local
+# address, as aliases on lo0, and a single-label name in /etc/hosts.
+ALIASES4="10.255.42.1 172.31.42.1 169.254.42.1 100.64.42.1"
+ALIAS6="fd42:5a7e:6e5d::1"
+SINGLE="syndeoprobe"
+ADDED=''
+
+# lo0's addresses, one a line, sorted.
+lo0_addresses() { ifconfig lo0 | awk '$1 == "inet" || $1 == "inet6" {print $1, $2}' | sort; }
+
+add_addresses() {
+  local a
+  lo0_addresses >"$LOGS/lo0-before.txt"
+  cp /etc/hosts "$LOGS/hosts-before"
+  for a in $ALIASES4; do
+    if sudo ifconfig lo0 alias "$a" netmask 255.255.255.255; then ADDED="$ADDED $a"; else printf '  could not alias %s on lo0\n' "$a"; fi
+  done
+  if sudo ifconfig lo0 inet6 "$ALIAS6" prefixlen 128 alias; then ADDED="$ADDED $ALIAS6"; else printf '  could not alias %s on lo0\n' "$ALIAS6"; fi
+  if printf '127.0.0.1\t%s\n' "$SINGLE" | sudo tee -a /etc/hosts >/dev/null; then ADDED="$ADDED $SINGLE"; fi
+  sudo dscacheutil -flushcache
+  sudo killall -HUP mDNSResponder 2>/dev/null || true
+  printf '  added for the time it measures:%s\n' "$ADDED"
+}
+
+# put_back: remove what add_addresses added, and require lo0 and /etc/hosts
+# to be exactly as they were and the single-label name to resolve to nothing.
+# Says so either way; returns non-zero if anything is not back.
+put_back() {
+  local a back=yes
+  [ -f "$LOGS/hosts-before" ] || return 0
+  for a in $ALIASES4; do
+    if lo0_addresses | grep -qx "inet $a"; then sudo ifconfig lo0 -alias "$a" || true; fi
+  done
+  if lo0_addresses | grep -q "^inet6 $ALIAS6"; then sudo ifconfig lo0 inet6 "$ALIAS6" -alias || true; fi
+  if ! cmp -s /etc/hosts "$LOGS/hosts-before"; then sudo cp "$LOGS/hosts-before" /etc/hosts || true; fi
+  sudo dscacheutil -flushcache
+  sudo killall -HUP mDNSResponder 2>/dev/null || true
+  lo0_addresses >"$LOGS/lo0-after.txt"
+  if cmp -s "$LOGS/lo0-before.txt" "$LOGS/lo0-after.txt"; then ok "lo0's addresses are exactly as they were"; else bad "put back" "lo0: $(diff "$LOGS/lo0-before.txt" "$LOGS/lo0-after.txt" | grep '^[<>]' | tr '\n' ' ')"; back=no; fi
+  if cmp -s /etc/hosts "$LOGS/hosts-before"; then ok "/etc/hosts is byte for byte as it was"; else bad "put back" "/etc/hosts differs"; back=no; fi
+  if [ "$(resolution "$SINGLE")" = nothing ]; then ok "$SINGLE resolves to nothing again"; else bad "put back" "$SINGLE still resolves to $(resolution "$SINGLE")"; back=no; fi
+  rm -f "$LOGS/hosts-before"
+  [ "$back" = yes ]
+}
+
+# routes APP: see the top of this script. Reports what it finds and never
+# fails for it; fails only if it cannot put this runner's addresses, hosts
+# file or trust settings back exactly as they were.
 routes() {
-  local app d iface lan local_name resolved t s P
+  local app d iface lan lan6 local_name public t s a from P status=0
   [ -d "${1:-}" ] || { say "usage: $0 routes <Syndeo.app>"; exit 2; }
   app="$(cd "$1" && pwd -P)"
   no_app || { say "refusing: $ID is already running"; exit 2; }
   printf '\nwhat Syndeo.app'"'"'s web views reach directly, through its proxy, or from cache (measured; not a gate)\n'
+  security dump-trust-settings >"$LOGS/routes-trust-before.txt" 2>&1 || true
   # A fresh WebKit state: nothing an earlier instance cached or stored.
   for d in "$HOME/Library/Caches/$ID" "$HOME/Library/WebKit/$ID" "$HOME/Library/HTTPStorages/$ID" "$HOME/Library/HTTPStorages/$ID.binarycookies"; do
     if [ -e "$d" ]; then rm -rf "$d" && printf '  cleared %s\n' "$d"; fi
   done
   : >"$LOGS/routes.tsv"
   : >"$LOGS/routes-origin.jsonl"
-  route_origin || return 0
-  P="$ROUTE_PORT"
-  iface="$(/sbin/route -n get default 2>/dev/null | awk '/interface:/ {print $2}')"
-  lan="$([ -n "$iface" ] && ipconfig getifaddr "$iface" 2>/dev/null)"
-  local_name="$(scutil --get LocalHostName 2>/dev/null)"
-  local_name="${local_name:+$local_name.local}"
-  resolved="$([ -n "$local_name" ] && dscacheutil -q host -a name "$local_name" 2>/dev/null | awk '/_address:/ {print $2}' | tr '\n' ' ')"
-  printf '  this runner: the default route on %s, address %s; %s resolves to %s; the origin on port %s, IPv6 %s\n' \
-    "${iface:-?}" "${lan:-none}" "${local_name:-no .local name}" "${resolved:-nothing}" "$P" "$ROUTE_V6"
-  started "$app" routes || { route_origin_stop; return 0; }
-  helper_of "$app" routes
-  browses routes
+  trap 'put_back >/dev/null 2>&1' EXIT
+  add_addresses
+  if route_origin; then
+    P="$ROUTE_PORT"
+    iface="$(/sbin/route -n get default 2>/dev/null | awk '/interface:/ {print $2}')"
+    lan="$([ -n "$iface" ] && ipconfig getifaddr "$iface" 2>/dev/null)"
+    lan6="$([ -n "$iface" ] && ifconfig "$iface" 2>/dev/null | awk '$1 == "inet6" && $2 ~ /^fe80:/ {print $2; exit}')"
+    lan6="${lan6%%%*}"
+    local_name="$(scutil --get LocalHostName 2>/dev/null)"
+    local_name="${local_name:+$local_name.local}"
+    public="$(dig +short A example.com 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | head -n 1)"
+    printf '  this runner: the default route on %s, address %s, link-local %s; %s; example.com resolves to %s; the origin on port %s, IPv6 %s\n' \
+      "${iface:-?}" "${lan:-none}" "${lan6:-none}" "${local_name:-no .local name}" "${public:-nothing}" "$P" "$ROUTE_V6"
+    if started "$app" routes; then
+      helper_of "$app" routes
+      browses routes
 
-  t="$(token)"; route "IPv4 loopback" "http://127.0.0.1:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"
-  if [ "$ROUTE_V6" = yes ]; then t="$(token)"; route "IPv6 loopback" "http://[::1]:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"; fi
-  t="$(token)"; route "localhost" "http://localhost:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"
-  if [ -n "$local_name" ]; then t="$(token)"; route "this Mac's .local name" "http://$local_name:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"; fi
-  if [ -n "$lan" ]; then t="$(token)"; route "this Mac's LAN address" "http://$lan:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"; fi
-  t="$(token)"; route "a public name for 127.0.0.1" "http://127.0.0.1.nip.io:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"
-  t="$(token)"; s="$(token)"
-  route "a redirect from loopback to a public page" "http://127.0.0.1:$P/redirect?t=$t&to=http://example.com/?$s" "$EXAMPLE_BODY" "$t"
-  t="$(token)"; s="$(token)"
-  route "a redirect from a public name to loopback" "http://127.0.0.1.nip.io:$P/redirect?t=$t&to=http://127.0.0.1:$P/page?t=$s" "ROUTE-PAGE-$s" "$t" "$s"
-  t="$(token)"; s="$(token)"
-  route "a loopback page with an image from a public name" "http://127.0.0.1:$P/page?t=$t&sub=http://127.0.0.1.nip.io:$P/img?t=$s" "ROUTE-PAGE-$t" "$t" "$s"
-  t="$(token)"; s="$(token)"
-  route "a public-name page with a loopback image" "http://127.0.0.1.nip.io:$P/page?t=$t&sub=http://127.0.0.1:$P/img?t=$s" "ROUTE-PAGE-$t" "$t" "$s"
-  if [ -n "$lan" ]; then
-    t="$(token)"; s="$(token)"
-    route "a public-name page with an image from the LAN address" "http://127.0.0.1.nip.io:$P/page?t=$t&sub=http://$lan:$P/img?t=$s" "ROUTE-PAGE-$t" "$t" "$s"
-  fi
-  if [ -n "$local_name" ]; then
-    t="$(token)"; s="$(token)"
-    route "a public-name page with an image from the .local name" "http://127.0.0.1.nip.io:$P/page?t=$t&sub=http://$local_name:$P/img?t=$s" "ROUTE-PAGE-$t" "$t" "$s"
-  fi
-  t="$(token)"
-  route "a public page, the first time" "http://example.com/?$t" "$EXAMPLE_BODY" "$t"
-  route "the same public page, again" "http://example.com/?$t" "$EXAMPLE_BODY" "$t"
-  t="$(token)"
-  route "a loopback page, the first time" "http://127.0.0.1:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"
-  route "the same loopback page, again" "http://127.0.0.1:$P/page?t=$t" "ROUTE-PAGE-$t" "$t"
+      # What the first measurement covered, again.
+      t="$(token)"; probe "IPv4 loopback" "http://127.0.0.1:$P/page?t=$t" "ROUTE-PAGE-$t" 127.0.0.1 - "$t"
+      t="$(token)"; probe "IPv6 loopback" "http://[::1]:$P/page?t=$t" "ROUTE-PAGE-$t" ::1 - "$t"
+      t="$(token)"; probe "localhost" "http://localhost:$P/page?t=$t" "ROUTE-PAGE-$t" localhost - "$t"
+      if [ -n "$local_name" ]; then t="$(token)"; probe "this Mac's .local name" "http://$local_name:$P/page?t=$t" "ROUTE-PAGE-$t" "$local_name" - "$t"; fi
+      if [ -n "$lan" ]; then t="$(token)"; probe "this Mac's LAN address" "http://$lan:$P/page?t=$t" "ROUTE-PAGE-$t" "$lan" - "$t"; fi
+      t="$(token)"; probe "a public name for 127.0.0.1" "http://127.0.0.1.nip.io:$P/page?t=$t" "ROUTE-PAGE-$t" 127.0.0.1.nip.io - "$t"
 
-  stopped routes
-  route_origin_stop
-  printf '\n  %d of its own checks failed (reported, not gated)\n' "$fails"
-  return 0
+      # A genuinely remote public IPv4 address: example.com's own, as typed.
+      if [ -n "$public" ]; then
+        t="$(token)"; probe "a public IPv4 address (example.com's)" "http://$public/?$t" - "$public" "$public"
+      fi
+
+      # Private and special-use ranges, aliased on lo0 for the time it measures.
+      for a in $ALIASES4; do
+        case " $ADDED " in *" $a "*) ;; *) continue ;; esac
+        t="$(token)"; probe "$a, aliased on lo0" "http://$a:$P/page?t=$t" "ROUTE-PAGE-$t" "$a" - "$t"
+      done
+      case " $ADDED " in *" $ALIAS6 "*)
+        t="$(token)"; probe "$ALIAS6 (IPv6 unique local), aliased on lo0" "http://[$ALIAS6]:$P/page?t=$t" "ROUTE-PAGE-$t" "$ALIAS6" - "$t" ;;
+      esac
+
+      # IPv6 link-local: with its scope, typed and as a page's link; without it.
+      if [ -n "$lan6" ] && [ -n "$iface" ]; then
+        t="$(token)"; probe "IPv6 link-local with its scope, typed" "http://[$lan6%25$iface]:$P/page?t=$t" "ROUTE-PAGE-$t" "$lan6" - "$t"
+        t="$(token)"; s="$(token)"
+        probe "a loopback page with a link to IPv6 link-local with its scope" "http://127.0.0.1:$P/links?t=$t&href=http://[$lan6%2525$iface]:$P/page?t=$s" "ROUTE-LINKS-$t" 127.0.0.1 - "$t"
+        from="$(wc -l <"$LOGS/routes-origin.jsonl" | tr -d ' ')"
+        "$APPCTL" press-web "$PID" "go" >/dev/null 2>&1 || true
+        sleep 4
+        printf '  MEASURE  ...its link, pressed: the origin saw: %s; the field then: %s; error: %s\n' \
+          "$(seen "$from" "$s")" "$("$APPCTL" value "$PID" syndeo.address)" "$(page_says "couldn't open" && page_text | head -c 200 || echo -)"
+        t="$(token)"; probe "IPv6 link-local without a scope, typed" "http://[$lan6]:$P/page?t=$t" "ROUTE-PAGE-$t" "$lan6" - "$t"
+      fi
+
+      # Names: a single label (in /etc/hosts for the time it measures), and
+      # one under .localhost (in no hosts file).
+      case " $ADDED " in *" $SINGLE "*)
+        t="$(token)"; probe "a single-label name, $SINGLE (127.0.0.1 in /etc/hosts)" "http://$SINGLE:$P/page?t=$t" "ROUTE-PAGE-$t" "$SINGLE" - "$t" ;;
+      esac
+      t="$(token)"; probe "a name under .localhost" "http://syndeo-probe.localhost:$P/page?t=$t" "ROUTE-PAGE-$t" syndeo-probe.localhost - "$t"
+
+      # Redirects, images and repeats, as the first measurement had them.
+      t="$(token)"; s="$(token)"
+      probe "a redirect from loopback to a public page" "http://127.0.0.1:$P/redirect?t=$t&to=http://example.com/?$s" "$EXAMPLE_BODY" 127.0.0.1 - "$t"
+      t="$(token)"; s="$(token)"
+      probe "a redirect from a public name to loopback" "http://127.0.0.1.nip.io:$P/redirect?t=$t&to=http://127.0.0.1:$P/page?t=$s" "ROUTE-PAGE-$s" 127.0.0.1.nip.io - "$t" "$s"
+      t="$(token)"; s="$(token)"
+      probe "a public-name page with a loopback image" "http://127.0.0.1.nip.io:$P/page?t=$t&sub=http://127.0.0.1:$P/img?t=$s" "ROUTE-PAGE-$t" 127.0.0.1.nip.io - "$t" "$s"
+      t="$(token)"; s="$(token)"
+      probe "a public-name page with an image from 10.255.42.1" "http://127.0.0.1.nip.io:$P/page?t=$t&sub=http://10.255.42.1:$P/img?t=$s" "ROUTE-PAGE-$t" 127.0.0.1.nip.io - "$t" "$s"
+      t="$(token)"
+      probe "a public page, the first time" "http://example.com/?$t" "$EXAMPLE_BODY" example.com - "$t"
+      probe "the same public page, again" "http://example.com/?$t" "$EXAMPLE_BODY" example.com - "$t"
+
+      stopped routes
+    fi
+    route_origin_stop
+  fi
+  printf '\nputting this runner back\n'
+  put_back || status=1
+  trap - EXIT
+  security dump-trust-settings >"$LOGS/routes-trust-after.txt" 2>&1 || true
+  if cmp -s "$LOGS/routes-trust-before.txt" "$LOGS/routes-trust-after.txt"; then ok "the user's trust settings are as they were"; else bad "trust settings" "they changed"; status=1; fi
+  printf '\n  %d of its own checks failed (reported; only putting back and the trust settings fail this)\n' "$fails"
+  return "$status"
 }
 
 # measure: report what this runner allows; fail only if it cannot put the
