@@ -21,12 +21,19 @@
 #     answers, rises for it (example.com, with a query of this instance's
 #     own, so that no copy WebKit cached for another instance stands in for
 #     it); Back and Forward
-#     work, by the bar's button and by History > Forward; words and a file:
-#     address are refused with Syndeo's own page, not sent anywhere; File >
+#     work, by the bar's button and by History > Forward; a file: address is
+#     refused with Syndeo's own page; File >
 #     New Tab opens a tab with the start page, beside the first in one window,
 #     and File's one enabled ⌘W item, whatever AppKit titles it (Close, or
 #     Close Tab once it has seen the tabs), closes that tab and no other,
 #     letting its window go and leaving the first as it was;
+#   - search: Syndeo > Settings… offers DuckDuckGo, Startpage, Brave Search,
+#     Google, Bing and Off, with DuckDuckGo chosen before anyone chooses, and
+#     keeps what is chosen; with Off, a word is refused with Syndeo's own page
+#     and the proxy's count does not move; with DuckDuckGo, words typed, and
+#     the field then left, send nothing, and Return opens DuckDuckGo's fixed
+#     https address with them encoded, through the proxy; the log says a
+#     search was made with DuckDuckGo and nothing of what was searched for;
 #   - nothing of a visited page's path or query is in the app's log or its
 #     proxy's, for a page that opened and one whose host does not exist, nor
 #     the query of any example.com page opened;
@@ -53,7 +60,8 @@
 #   - opened again, all of that holds again, and quitting again leaves nothing;
 #   - it made no keystore changes: no keystore in its home and no keychain
 #     item for one;
-#   - the user's trust settings are as they were.
+#   - the user's trust settings are as they were, and the search engine it
+#     chose is removed again.
 #
 # refuse, which gates: a bundle whose proxy cannot start opens all the same,
 # its window says it cannot browse and holds no web view, and no helper runs.
@@ -67,28 +75,49 @@
 # catch it fail, at least one, and no other check does: https for
 # no-pinning-delegate (while http, rendered and counted, still works), a
 # page's links in the window for no-navigation-policy, in a new tab for
-# any-scheme-in-a-new-tab, and typing kept through a page's arrival for
-# no-editing-guard. Any other failure is a failure.
+# any-scheme-in-a-new-tab, typing kept through a page's arrival for
+# no-editing-guard, the bar for a name for direct-for-every-name, and a link
+# to an IPv6 address with a zone for zoned-links-followed. Any other failure
+# is a failure.
 #
-# routes, which only reports: what Syndeo.app's web views reach directly,
-# through its proxy, or from WebKit's own cache. From a fresh WebKit state
-# (Syndeo's WebKit caches and storage removed first) and with a fresh token in
-# every address, so that no cached copy stands in for a fetch, it types:
-# loopback by IPv4, IPv6, localhost and a name under .localhost; this Mac's
-# .local name, LAN address and IPv6 link-local address (with its scope, typed
-# and as a page's link, and without it); a genuinely remote public IPv4
-# address (example.com's, resolved then); 10/8, 172.16/12, 169.254/16,
-# 100.64/10 and IPv6 unique local addresses, aliased on lo0 for the time it
-# measures; a single-label name, in /etc/hosts for that time; a public name
-# for 127.0.0.1; redirects and images between the two kinds of address; and a
-# public page twice. For each it records the address typed, what it resolves
-# to, whether the page was shown, which process the origin
-# (ci/macos-app/route-origin.py) saw each request from, WebKit's own or the
-# proxy, the connections to a remote address by process, the proxy's own
-# count before and after, the address the field then shows, and Syndeo's
-# error if there was one. Then it puts lo0 and /etc/hosts back and requires
-# them, and the trust settings, exactly as they were: the only things it
-# fails for.
+# routes, which gates: the bar's route against what WebKit actually does,
+# the proxy caching nothing from this Mac, and Clear Browsing Data. From a
+# fresh WebKit state (Syndeo's WebKit caches and storage removed first) and
+# with a fresh token in every address, so that no cached copy stands in for a
+# fetch, it types each address, and requires both the way WebKit went and
+# what the bar then says to be what address::route says:
+#   - direct, by the process the origin (ci/macos-app/route-origin.py) saw
+#     the request from — WebKit's own networking process, not the proxy — and
+#     the bar saying "Direct — not cached by Syndeo": 127.0.0.1, [::1],
+#     localhost, this Mac's LAN address, and, aliased on lo0 for the time it
+#     gates, 10/8, 172.16/12, 169.254/16 and 100.64/10 addresses measured
+#     before, the first and last host address of each direct IPv4 range,
+#     127/8's included, and IPv6 unique local addresses: one measured before
+#     and fc00/7's first and last;
+#   - through Syndeo, by the origin seeing the proxy, and the bar saying
+#     "Through Syndeo": every name, whatever it resolves to — this Mac's
+#     .local name, a public name for 127.0.0.1, a single label (in
+#     /etc/hosts for that time), a name under .localhost;
+#   - after a redirect, the final page's: a name redirecting to 127.0.0.1 is
+#     direct; 127.0.0.1 redirecting to a public page is through Syndeo;
+#   - by the proxy's own count, for addresses nothing here serves: through
+#     Syndeo for a genuinely remote public address (example.com's, never
+#     aliased) and the addresses just outside each direct range, IPv4 and
+#     IPv6, the bar then saying so on the proxy's own page; direct for
+#     addresses inside the direct ranges that are not this Mac's, so the rule
+#     is seen to be the range and not the Mac's own addresses, the bar then
+#     saying nothing;
+#   - an IPv6 address with a zone is refused, typed and followed from a
+#     page's link, with the same words, and the origin hears of neither;
+#   - an https image from another host, on a page this Mac serves, comes
+#     through the proxy with Syndeo's authority in no trust settings.
+# It measures, without gating, [::] and [::ffff:127.0.0.1] and "localhost.".
+# Then: a public page is cached by the proxy, and a cacheable page from this
+# Mac, reached through the proxy by a name, is not; and Settings > Clear
+# Browsing Data asks first, then empties the proxy's cache (the same proxy
+# runs on) and website storage, and WebKit's cache stops answering for a page
+# it had kept. It puts lo0 and /etc/hosts back and requires them, and the
+# trust settings, exactly as they were.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -281,6 +310,7 @@ shortcuts() {
     have="$("$APPCTL" shortcut "$PID" "$menu" "$item")"
     must "$([ "$(printf '%s' "$have" | tr '[:lower:]' '[:upper:]')" = "$key 0" ] && echo yes)" "$menu > $item is ⌘$key" "${have:-no such item}"
   done <<'EOF'
+Syndeo|Settings…|,
 Syndeo|Quit Syndeo|Q
 File|New Tab|T
 File|New Window|N
@@ -365,11 +395,86 @@ origin_stop() {
 }
 
 # counted WHEN: open the proxy's own page, which only the proxy answers, and
-# set COUNTED to the requests it has counted so far.
-COUNTED=''
+# set COUNTED to the requests it has counted so far, and ENTRIES to how many
+# entries its cache holds.
+COUNTED='' ENTRIES=''
 counted() {
   visit "http://syndeo.local/stats" "http://syndeo.local/stats" 'requests [0-9]+' "the proxy's own page opens ($1)"
   COUNTED="$(front | grep -oE 'requests [0-9]+' | head -n 1 | cut -d' ' -f2)"
+  ENTRIES="$(front | grep -oE 'entries [0-9]+' | head -n 1 | cut -d' ' -f2)"
+}
+
+# settings_open WHEN: Syndeo > Settings…, and the Settings window in front.
+settings_open() {
+  choose Syndeo "Settings…"
+  if wait_for 10 "$APPCTL" value "$PID" syndeo.search; then
+    ok "Syndeo > Settings… opens Settings ($1)"
+  else
+    bad "Settings ($1)" "no Settings window in front: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+}
+
+# settings_close WHEN: close the Settings window as File > Close would,
+# leaving a browser window in front.
+settings_close() {
+  "$APPCTL" activate "$PID" >/dev/null || true
+  "$APPCTL" menu-key "$PID" File W >/dev/null || bad "closing Settings ($1)" "File has not exactly one enabled ⌘W item"
+  if wait_for 10 "$APPCTL" value "$PID" syndeo.address; then
+    ok "closing Settings leaves a browser window in front ($1)"
+  else
+    bad "closing Settings ($1)" "no address field in front: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+}
+
+# chosen ENGINE: the stored search engine is ENGINE.
+chosen() { [ "$(defaults read "$ID" SearchEngine 2>/dev/null)" = "$1" ]; }
+
+# searching LOG: Settings offers the six choices, DuckDuckGo chosen before
+# anyone chose; with Off, a word is refused and nothing is sent; with
+# DuckDuckGo, words typed are sent nowhere, and leaving the field sends
+# nothing either, until Return, which opens DuckDuckGo's fixed https address
+# with them encoded, through the proxy; and nothing of what was searched for
+# is in a log.
+searching() {
+  local log="$1" before items query='syndeo search & test' expected='https://duckduckgo.com/?q=syndeo+search+%26+test'
+  must "$(defaults read "$ID" SearchEngine >/dev/null 2>&1 && echo no || echo yes)" "no search engine has been chosen yet" "$(defaults read "$ID" SearchEngine 2>&1)"
+  settings_open "search"
+  must "$([ "$("$APPCTL" value "$PID" syndeo.search)" = DuckDuckGo ] && echo yes)" \
+    "Settings shows DuckDuckGo as the search engine, before anyone chose one" "it shows '$("$APPCTL" value "$PID" syndeo.search)'"
+  items="$("$APPCTL" popup-items "$PID" syndeo.search | tr '\n' '|')"
+  must "$([ "$items" = 'DuckDuckGo|Startpage|Brave Search|Google|Bing|Off — Syndeo does not search|' ] && echo yes)" \
+    "it offers DuckDuckGo, Startpage, Brave Search, Google, Bing and Off" "$items"
+  "$APPCTL" pick "$PID" syndeo.search "Off — Syndeo does not search" || bad "choosing Off" "no such item to choose"
+  if wait_for 5 chosen off; then ok "choosing Off is kept"; else bad "choosing Off" "the setting is '$(defaults read "$ID" SearchEngine 2>&1)'"; fi
+  settings_close "search off"
+  counted "before a word, with search off"
+  before="$COUNTED"
+  visit "bread" "bread" 'does not search' "with search off, a word is refused by Syndeo's own page, which says it was not sent anywhere"
+  counted "after a word, with search off"
+  must "$([ -n "$before" ] && [ "$COUNTED" = "$before" ] && echo yes)" "and nothing was sent: the proxy's count stayed at ${before:-?}" "now ${COUNTED:-?}"
+
+  settings_open "search on"
+  "$APPCTL" pick "$PID" syndeo.search "DuckDuckGo" || bad "choosing DuckDuckGo" "no such item to choose"
+  if wait_for 5 chosen duckduckgo; then ok "choosing DuckDuckGo is kept"; else bad "choosing DuckDuckGo" "the setting is '$(defaults read "$ID" SearchEngine 2>&1)'"; fi
+  settings_close "search on"
+  counted "before typing words"
+  before="$COUNTED"
+  choose File "Open Location…"
+  "$APPCTL" type-only "$PID" "$query" >/dev/null || bad "typing words" "pid $PID could not be brought to the front"
+  sleep 3
+  "$APPCTL" tab "$PID" >/dev/null || bad "Tab" "pid $PID could not be brought to the front"
+  arrive "http://syndeo.local/stats" 'requests [0-9]+' "words typed, then the field left without Return: the page stays, and the field shows its address again"
+  counted "after typing words without Return"
+  must "$([ -n "$before" ] && [ "$COUNTED" = "$before" ] && echo yes)" \
+    "nothing was sent while the words were typed or when the field was left: the proxy's count stayed at ${before:-?}" "now ${COUNTED:-?}"
+  visit "$query" "$expected" '^AXWebArea' "words, on Return, are a search at DuckDuckGo's fixed https address, encoded: $expected"
+  sleep 3
+  counted "after a search"
+  risen "$before" "and the search went through the proxy"
+  must "$(grep 'a search, on Return' "$log" | grep -qE 'engine="?duckduckgo' && echo yes)" "the app logged a search with DuckDuckGo, and which engine only" \
+    "$(grep 'a search' "$log" | tail -n 1)"
+  must "$(grep -qiE 'syndeo( |\+|%20)search' "$log" && echo no || echo yes)" "nothing of what was searched for is in the app's log or its proxy's" \
+    "$(grep -ciE 'syndeo( |\+|%20)search' "$log") lines"
 }
 
 # pinned: https through the proxy, whose authority is in no trust settings
@@ -540,7 +645,7 @@ browsing() {
   arrive "http://example.com/?$FRESH" "$EXAMPLE_BODY" "the bar's Back button goes back"
   choose History Forward
   arrive "http://syndeo.local/stats" 'requests [1-9]' "History > Forward goes forward"
-  visit "bread" "bread" 'does not search' "a word is refused by Syndeo's own page, which says it was not sent anywhere"
+  searching "$log"
   visit "file:///etc/passwd" "file:///etc/passwd" 'not file: ones' "a file: address is refused"
   must "$(page_says 'root:' && echo no || echo yes)" "and nothing of that file is shown"
 
@@ -632,6 +737,8 @@ launch() {
   must "$([ "$keystore_before" = absent ] && [ "$(keystore_item)" = absent ] && echo yes)" "no keychain item for a keystore, before or after" "before: $keystore_before, after: $(keystore_item)"
   security dump-trust-settings >"$LOGS/trust-after.txt" 2>&1 || true
   must "$(cmp -s "$LOGS/trust-before.txt" "$LOGS/trust-after.txt" && echo yes)" "the user's trust settings are as they were" "$(diff "$LOGS/trust-before.txt" "$LOGS/trust-after.txt" | head -5)"
+  defaults delete "$ID" SearchEngine >/dev/null 2>&1 || true
+  must "$(defaults read "$ID" SearchEngine >/dev/null 2>&1 && echo no || echo yes)" "the search engine this test chose is removed again"
   printf '\n%d failed\n' "$fails"
   [ "$fails" = 0 ]
 }
@@ -677,6 +784,8 @@ mutant() {
     no-navigation-policy) intended='^policy: .* is refused in the window$' ;;
     any-scheme-in-a-new-tab) intended='^policy: .* is refused and opens no tab$' ;;
     no-editing-guard) intended="^typing in the address field while a page loads" ;;
+    direct-for-every-name) intended='^the bar for a name' ;;
+    zoned-links-followed) intended='^a link to an IPv6 address with a zone' ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
   if started "$app" "mutant-$name"; then
@@ -686,10 +795,12 @@ mutant() {
     case "$name" in
       no-pinning-delegate) plain_http; pinned; unlogged "$log" ;;
       no-editing-guard) editing ;;
+      direct-for-every-name | zoned-links-followed) routes_lite ;;
       *) policy "$log" ;;
     esac
   fi
   origin_stop
+  route_origin_stop
   stopped "mutant-$name"
   printf '\n'
   caught="$(printf '%s' "$FAILED" | grep -E "$intended")"
@@ -710,6 +821,7 @@ mutant() {
 # also answers on ::1, and its pid.
 ROUTE_PORT='' ROUTE_V6='' ROUTE_PID=''
 route_origin() {
+  : >"$LOGS/routes-origin.jsonl"
   python3 -I -u "$here/macos-app/route-origin.py" "$LOGS/routes-origin.jsonl" >"$LOGS/routes-origin.out" 2>&1 &
   ROUTE_PID=$!
   if ! wait_for 10 grep -q '^port [0-9]' "$LOGS/routes-origin.out"; then
@@ -740,6 +852,9 @@ route_origin_stop() {
 # A fresh token, for one address: random, and nothing else.
 token() { printf 'r%s' "$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"; }
 
+# The origin's log lines so far, to read only what comes after.
+origin_lines() { wc -l <"$LOGS/routes-origin.jsonl" | tr -d ' '; }
+
 # seen FROM TOKEN...: what the origin was asked, after its first FROM log
 # lines, for these tokens: each path, how many times, and from which process.
 seen() {
@@ -756,6 +871,32 @@ print("; ".join(f"{n}x {path} from {process}" for (path, process), n in sorted(c
 PY
 }
 
+# way FROM TOKEN: which way the requests for TOKEN after the origin's first
+# FROM lines came: "direct" if every one came from WebKit's own networking
+# process, "syndeo" if every one came from the proxy, "none" if there were
+# none, and what there was otherwise.
+way() {
+  python3 -I - "$LOGS/routes-origin.jsonl" "$1" "$2" <<'PY'
+import json, sys
+log, start, token = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+with open(log, encoding="utf-8") as f:
+    found = {json.loads(line)["process"] for line in f.readlines()[start:] if json.loads(line)["t"] == token}
+names = {"com.apple.WebKit.Networking": "direct", "syndeo-proxy": "syndeo"}
+print("none" if not found else names.get(next(iter(found)), "other") if len(found) == 1 else "both")
+PY
+}
+
+# times FROM TOKEN: how many requests for TOKEN the origin saw after its
+# first FROM lines.
+times() {
+  python3 -I - "$LOGS/routes-origin.jsonl" "$1" "$2" <<'PY'
+import json, sys
+log, start, token = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+with open(log, encoding="utf-8") as f:
+    print(sum(1 for line in f.readlines()[start:] if json.loads(line)["t"] == token))
+PY
+}
+
 # resolution NAME: what this Mac resolves NAME to, or "an address" when NAME
 # is an address itself.
 resolution() {
@@ -769,53 +910,114 @@ resolution() {
   echo "${found:-nothing}"
 }
 
-# probe LABEL TYPED MARKER HOST REMOTE TOKEN...: type TYPED into the address
-# field as a person would, and record: what HOST resolves to; whether MARKER
-# was shown (with MARKER "-", for a page whose text is not known beforehand,
-# what the page says after 12 s); what the origin saw for TOKEN...; for REMOTE, an address not
-# ours ("-" if none), which processes hold a connection to it; the proxy's
-# count before and after; the address the field then shows; and the error,
-# if Syndeo showed its failure page.
-probe() {
-  local label="$1" typed="$2" marker="$3" host="$4" remote="$5" before after shown from saw resolved conns final error
-  shift 5
-  resolved="$(resolution "$host")"
-  counted "before: $label"
-  before="$COUNTED"
-  from="$(wc -l <"$LOGS/routes-origin.jsonl" | tr -d ' ')"
+# What the bar says the front window's page came by: see address::Route.
+DIRECT_LABEL='Direct — not cached by Syndeo'
+SYNDEO_LABEL='Through Syndeo'
+label_for() { case "$1" in direct) printf '%s' "$DIRECT_LABEL" ;; syndeo) printf '%s' "$SYNDEO_LABEL" ;; *) printf '(nothing)' ;; esac; }
+# bar: what the bar says, or "(nothing)" when it says nothing.
+bar() {
+  local said
+  said="$("$APPCTL" value "$PID" syndeo.route 2>/dev/null)"
+  printf '%s' "${said:-(nothing)}"
+}
+# The bar says nothing: hidden, or empty.
+bar_empty() { [ "$(bar)" = '(nothing)' ]; }
+# The bar says something.
+bar_said() { [ "$(bar)" != '(nothing)' ]; }
+
+# blank: about:blank, typed, so that the bar says nothing until the next page.
+blank() {
   choose File "Open Location…"
-  "$APPCTL" type "$PID" "$typed" >/dev/null || true
-  if [ "$marker" = - ]; then
-    sleep 12
-    shown="(nothing known to look for) the page says: $(page_text | head -c 120)"
-  elif wait_for 20 page_says "$marker"; then
-    shown=yes
-  else
-    shown=no
-  fi
-  # Its images, or a redirect's second request, by now too.
-  sleep 2
-  saw="$(seen "$from" "$@")"
-  conns='-'
-  if [ "$remote" != - ]; then
-    conns="$(lsof +c 0 -nP -iTCP@"$remote" -Fc 2>/dev/null | sed -n 's/^c//p' | sort | uniq -c | awk '{printf "%s%sx %s", sep, $1, $2; sep="; "}')"
-    conns="${conns:-none open}"
-  fi
-  final="$("$APPCTL" value "$PID" syndeo.address)"
-  error='-'
-  if page_says "couldn't open"; then error="$(page_text | head -c 200)"; fi
-  counted "after: $label"
-  after="$COUNTED"
-  printf '  MEASURE  %s\n           typed: %s\n           resolves to: %s; shown: %s; the origin saw: %s; connections to %s: %s\n           the proxy'"'"'s count: %s -> %s; the field then: %s; error: %s\n' \
-    "$label" "$typed" "$resolved" "$shown" "$saw" "$remote" "$conns" "${before:-?}" "${after:-?}" "$final" "$error"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$typed" "$resolved" "$shown" "$saw" "$conns" "${before:-?}" "${after:-?}" "$final" "$error" >>"$LOGS/routes.tsv"
+  "$APPCTL" type "$PID" "about:blank" >/dev/null || true
+  wait_for 10 bar_empty || bad "about:blank" "the bar still says \"$(bar)\""
 }
 
-# The addresses routes adds to this runner for the time it measures, and puts
-# back: four private and special-use IPv4 addresses and one IPv6 unique local
-# address, as aliases on lo0, and a single-label name in /etc/hosts.
-ALIASES4="10.255.42.1 172.31.42.1 169.254.42.1 100.64.42.1"
-ALIAS6="fd42:5a7e:6e5d::1"
+# record LABEL TYPED EXPECTED MEASURED BAR DETAIL: a line of the gate's table.
+record() {
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$LOGS/routes.tsv"
+  printf '  ROUTE  %s\n         typed: %s; expected: %s; WebKit went: %s; the bar: %s; %s\n' "$@"
+}
+
+# by_origin LABEL TYPED EXPECT TOKEN [measure]: a page the routing origin
+# serves, typed. Which way WebKit went is the process the origin saw the
+# request from — its own networking process, or the proxy — and that, and
+# what the bar then says, must both be EXPECT (direct or syndeo). With
+# "measure", the two are recorded and compared, and nothing fails.
+by_origin() {
+  local label="$1" typed="$2" expect="$3" t="$4" mode="${5:-gate}" from shown went said
+  from="$(origin_lines)"
+  choose File "Open Location…"
+  "$APPCTL" type "$PID" "$typed" >/dev/null || true
+  if wait_for 20 page_says "ROUTE-PAGE-$t"; then shown=yes; else shown=no; fi
+  # Its arrival reported, and the bar set from it.
+  sleep 1
+  went="$(way "$from" "$t")"
+  said="$(bar)"
+  record "$label" "$typed" "$expect" "$went" "$said" "shown: $shown; the origin saw: $(seen "$from" "$t")"
+  if [ "$mode" = measure ]; then
+    printf '  MEASURE  %s: WebKit went %s, the bar says "%s" (%s)\n' "$label" "$went" "$said" \
+      "$([ "$said" = "$(label_for "$went")" ] && echo agreeing || echo NOT agreeing)"
+    return 0
+  fi
+  must "$([ "$shown" = yes ] && [ "$went" = "$expect" ] && echo yes)" "the route for $label: $expect" "shown: $shown; WebKit went: $went"
+  must "$([ "$said" = "$(label_for "$expect")" ] && echo yes)" "the bar for $label says \"$(label_for "$expect")\"" "it says \"$said\""
+}
+
+# conns ADDRESS: the processes holding a TCP connection to ADDRESS, by name,
+# one a line.
+conns() {
+  local at="$1"
+  case "$at" in *:*) at="[$at]" ;; esac
+  lsof +c 0 -nP -iTCP@"$at" -Fc 2>/dev/null | sed -n 's/^c//p' | sort -u
+}
+
+# by_count LABEL TYPED EXPECT ADDRESS: an address nothing here serves, typed,
+# from about:blank, with COUNTED the proxy's count just before. Which way
+# WebKit went is whether the proxy's count rose for it, with the processes
+# seen holding a connection to ADDRESS in the first 6 s recorded as well, and
+# it must be EXPECT. For EXPECT syndeo, the proxy's own page says why once it
+# gives up on the address, and the bar must then say "Through Syndeo". For
+# EXPECT direct, no page comes from the address, and the bar must say
+# nothing; a load WebKit is still trying is stopped. Leaves COUNTED the
+# proxy's count after.
+by_count() {
+  local label="$1" typed="$2" expect="$3" address="$4" before seen_by='' said went now
+  before="$COUNTED"
+  blank
+  choose File "Open Location…"
+  "$APPCTL" type "$PID" "$typed" >/dev/null || true
+  for _ in $(seq 1 12); do
+    now="$(conns "$address" | tr '\n' ' ')"
+    [ -z "$now" ] || seen_by="$seen_by $now"
+    sleep 0.5
+  done
+  seen_by="$(printf '%s\n' $seen_by | sort -u | tr '\n' ' ')"
+  if [ "$expect" = syndeo ]; then
+    wait_for 30 bar_said || true
+  else
+    "$APPCTL" activate "$PID" >/dev/null || true
+    "$APPCTL" menu "$PID" View "Stop Loading" >/dev/null 2>&1 || true
+  fi
+  said="$(bar)"
+  counted "after: $label"
+  went=unknown
+  if [ -n "$before" ] && [ -n "$COUNTED" ]; then
+    if [ "$COUNTED" -gt "$before" ]; then went=syndeo; else went=direct; fi
+  fi
+  record "$label" "$typed" "$expect" "$went" "$said" "the proxy's count: ${before:-?} -> ${COUNTED:-?}; holding a connection to $address: ${seen_by:-nothing seen}"
+  must "$([ "$went" = "$expect" ] && echo yes)" "the route for $label: $expect" "WebKit went: $went; the proxy's count ${before:-?} -> ${COUNTED:-?}; connections: ${seen_by:-none seen}"
+  if [ "$expect" = syndeo ]; then
+    must "$([ "$said" = "$SYNDEO_LABEL" ] && echo yes)" "the bar for $label says \"$SYNDEO_LABEL\"" "it says \"$said\""
+  else
+    must "$([ "$said" = '(nothing)' ] && echo yes)" "the bar for $label says nothing: no page came from it" "it says \"$said\""
+  fi
+}
+
+# The addresses routes adds to this runner for the time it gates, and puts
+# back: on lo0, the four measured before, and each direct range's first and
+# last host addresses; and a single-label name in /etc/hosts.
+ALIASES4="10.255.42.1 172.31.42.1 169.254.42.1 100.64.42.1 127.0.0.2 127.255.255.254 10.0.0.1 10.255.255.254 172.16.0.1 172.31.255.254 192.168.0.1 192.168.255.254 169.254.0.1 169.254.255.254 100.64.0.1 100.127.255.254"
+ALIASES6="fd42:5a7e:6e5d::1 fc00::1 fdff:ffff:ffff:ffff:ffff:ffff:ffff:fffe"
 SINGLE="syndeoprobe"
 ADDED=''
 
@@ -827,13 +1029,15 @@ add_addresses() {
   lo0_addresses >"$LOGS/lo0-before.txt"
   cp /etc/hosts "$LOGS/hosts-before"
   for a in $ALIASES4; do
-    if sudo ifconfig lo0 alias "$a" netmask 255.255.255.255; then ADDED="$ADDED $a"; else printf '  could not alias %s on lo0\n' "$a"; fi
+    if sudo ifconfig lo0 alias "$a" netmask 255.255.255.255; then ADDED="$ADDED $a"; else bad "alias $a" "could not alias it on lo0"; fi
   done
-  if sudo ifconfig lo0 inet6 "$ALIAS6" prefixlen 128 alias; then ADDED="$ADDED $ALIAS6"; else printf '  could not alias %s on lo0\n' "$ALIAS6"; fi
+  for a in $ALIASES6; do
+    if sudo ifconfig lo0 inet6 "$a" prefixlen 128 alias; then ADDED="$ADDED $a"; else bad "alias $a" "could not alias it on lo0"; fi
+  done
   if printf '127.0.0.1\t%s\n' "$SINGLE" | sudo tee -a /etc/hosts >/dev/null; then ADDED="$ADDED $SINGLE"; fi
   sudo dscacheutil -flushcache
   sudo killall -HUP mDNSResponder 2>/dev/null || true
-  printf '  added for the time it measures:%s\n' "$ADDED"
+  printf '  added for the time it gates:%s\n' "$ADDED"
 }
 
 # put_back: remove what add_addresses added, and require lo0 and /etc/hosts
@@ -845,7 +1049,9 @@ put_back() {
   for a in $ALIASES4; do
     if lo0_addresses | grep -qx "inet $a"; then sudo ifconfig lo0 -alias "$a" || true; fi
   done
-  if lo0_addresses | grep -q "^inet6 $ALIAS6"; then sudo ifconfig lo0 inet6 "$ALIAS6" -alias || true; fi
+  for a in $ALIASES6; do
+    if lo0_addresses | grep -q "^inet6 $a\$"; then sudo ifconfig lo0 inet6 "$a" -alias || true; fi
+  done
   if ! cmp -s /etc/hosts "$LOGS/hosts-before"; then sudo cp "$LOGS/hosts-before" /etc/hosts || true; fi
   sudo dscacheutil -flushcache
   sudo killall -HUP mDNSResponder 2>/dev/null || true
@@ -857,93 +1063,220 @@ put_back() {
   [ "$back" = yes ]
 }
 
-# routes APP: see the top of this script. Reports what it finds and never
-# fails for it; fails only if it cannot put this runner's addresses, hosts
-# file or trust settings back exactly as they were.
+added() { case " $ADDED " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# The text Syndeo shows for an IPv6 address with a zone (address::ZONED).
+ZONED_TEXT="link-local addresses that name a network interface"
+
+# zoned P: an IPv6 address with a zone (lo0's own link-local address, on
+# which the routing origin answers) is refused typed, and refused followed
+# from a page's link, with the same words, and the origin hears of neither.
+zoned() {
+  local P="$1" t s from
+  t="$(token)"
+  from="$(origin_lines)"
+  visit "http://[fe80::1%25lo0]:$P/page?t=$t" "http://[fe80::1%25lo0]:$P/page?t=$t" "$ZONED_TEXT" \
+    "an IPv6 address with a zone, typed, is refused with Syndeo's own page"
+  must "$(bar_empty && echo yes)" "and the bar says nothing of a route" "it says \"$(bar)\""
+  must "$([ "$(times "$from" "$t")" = 0 ] && echo yes)" "and the origin did not hear of it" "the origin saw: $(seen "$from" "$t")"
+  t="$(token)"; s="$(token)"
+  from="$(origin_lines)"
+  choose File "Open Location…"
+  "$APPCTL" type "$PID" "http://127.0.0.1:$P/links?t=$t&href=http://[fe80::1%2525lo0]:$P/page?t=$s" >/dev/null || true
+  if wait_for 20 page_says "ROUTE-LINKS-$t"; then ok "a page with a link to an IPv6 address with a zone opens"; else bad "a page with a link to an IPv6 address with a zone opens" "page: $(page_text)"; fi
+  "$APPCTL" press-web "$PID" "go" || bad "a link to an IPv6 address with a zone is followed" "no link to press: $(page_text)"
+  if wait_for 10 page_says "$ZONED_TEXT"; then
+    ok "a link to an IPv6 address with a zone is refused with the same words as typing it"
+  else
+    bad "a link to an IPv6 address with a zone is refused with the same words as typing it" "address field: '$(address)'; page: $(page_text)"
+  fi
+  sleep 1
+  must "$([ "$(times "$from" "$s")" = 0 ] && echo yes)" \
+    "a link to an IPv6 address with a zone reaches nothing: the origin did not hear of it" "the origin saw: $(seen "$from" "$t" "$s")"
+}
+
+# entries: the proxy's cache entries, from its own page, which counted read.
+ENTRIES=''
+
+# cached LABEL HOST P: a page this test serves that any cache may keep, by a
+# name for this Mac that only the proxy reaches: the proxy fetches it, and
+# its cache has no more entries afterwards. Sets CACHED to the token.
+CACHED=''
+cached() {
+  local label="$1" host="$2" P="$3" t from before
+  counted "before: $label"
+  before="$ENTRIES"
+  t="$(token)"; CACHED="$t"
+  from="$(origin_lines)"
+  visit "http://$host:$P/cached?t=$t" "http://$host:$P/cached?t=$t" "ROUTE-CACHED-$t" "$label opens"
+  sleep 1
+  must "$([ "$(way "$from" "$t")" = syndeo ] && echo yes)" "and it came through the proxy" "the origin saw: $(seen "$from" "$t")"
+  counted "after: $label"
+  must "$([ -n "$before" ] && [ "$ENTRIES" = "$before" ] && echo yes)" \
+    "and the proxy did not cache it: its cache's entries stayed at ${before:-?}" "now ${ENTRIES:-?}"
+}
+
+# routes APP: see the top of this script.
 routes() {
-  local app d iface lan lan6 local_name public t s a from P status=0
+  local app d iface lan local_name public t s a from P status=0 before repeat_hits after_hits proxy_pid
   [ -d "${1:-}" ] || { say "usage: $0 routes <Syndeo.app>"; exit 2; }
   app="$(cd "$1" && pwd -P)"
   no_app || { say "refusing: $ID is already running"; exit 2; }
-  printf '\nwhat Syndeo.app'"'"'s web views reach directly, through its proxy, or from cache (measured; not a gate)\n'
+  printf '\nthe route bar, against what WebKit does; the proxy caching nothing from this Mac; Clear Browsing Data\n'
   security dump-trust-settings >"$LOGS/routes-trust-before.txt" 2>&1 || true
   # A fresh WebKit state: nothing an earlier instance cached or stored.
   for d in "$HOME/Library/Caches/$ID" "$HOME/Library/WebKit/$ID" "$HOME/Library/HTTPStorages/$ID" "$HOME/Library/HTTPStorages/$ID.binarycookies"; do
     if [ -e "$d" ]; then rm -rf "$d" && printf '  cleared %s\n' "$d"; fi
   done
   : >"$LOGS/routes.tsv"
-  : >"$LOGS/routes-origin.jsonl"
   trap 'put_back >/dev/null 2>&1' EXIT
   add_addresses
   if route_origin; then
     P="$ROUTE_PORT"
     iface="$(/sbin/route -n get default 2>/dev/null | awk '/interface:/ {print $2}')"
     lan="$([ -n "$iface" ] && ipconfig getifaddr "$iface" 2>/dev/null)"
-    lan6="$([ -n "$iface" ] && ifconfig "$iface" 2>/dev/null | awk '$1 == "inet6" && $2 ~ /^fe80:/ {print $2; exit}')"
-    lan6="${lan6%%%*}"
     local_name="$(scutil --get LocalHostName 2>/dev/null)"
     local_name="${local_name:+$local_name.local}"
     public="$(dig +short A example.com 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | head -n 1)"
-    printf '  this runner: the default route on %s, address %s, link-local %s; %s; example.com resolves to %s; the origin on port %s, IPv6 %s\n' \
-      "${iface:-?}" "${lan:-none}" "${lan6:-none}" "${local_name:-no .local name}" "${public:-nothing}" "$P" "$ROUTE_V6"
+    printf '  this runner: the default route on %s, address %s; %s; example.com resolves to %s; the origin on port %s, IPv6 %s\n' \
+      "${iface:-?}" "${lan:-none}" "${local_name:-no .local name}" "${public:-nothing}" "$P" "$ROUTE_V6"
     if started "$app" routes; then
       helper_of "$app" routes
       browses routes
+      proxy_pid="$HELPER"
 
-      # What the first measurement covered, again.
-      t="$(token)"; probe "IPv4 loopback" "http://127.0.0.1:$P/page?t=$t" "ROUTE-PAGE-$t" 127.0.0.1 - "$t"
-      t="$(token)"; probe "IPv6 loopback" "http://[::1]:$P/page?t=$t" "ROUTE-PAGE-$t" ::1 - "$t"
-      t="$(token)"; probe "localhost" "http://localhost:$P/page?t=$t" "ROUTE-PAGE-$t" localhost - "$t"
-      if [ -n "$local_name" ]; then t="$(token)"; probe "this Mac's .local name" "http://$local_name:$P/page?t=$t" "ROUTE-PAGE-$t" "$local_name" - "$t"; fi
-      if [ -n "$lan" ]; then t="$(token)"; probe "this Mac's LAN address" "http://$lan:$P/page?t=$t" "ROUTE-PAGE-$t" "$lan" - "$t"; fi
-      t="$(token)"; probe "a public name for 127.0.0.1" "http://127.0.0.1.nip.io:$P/page?t=$t" "ROUTE-PAGE-$t" 127.0.0.1.nip.io - "$t"
-
-      # A genuinely remote public IPv4 address: example.com's own, as typed.
-      if [ -n "$public" ]; then
-        t="$(token)"; probe "a public IPv4 address (example.com's)" "http://$public/?$t" - "$public" "$public"
-      fi
-
-      # Private and special-use ranges, aliased on lo0 for the time it measures.
+      # Direct, by what the origin saw: loopback, localhost, this Mac's LAN
+      # address, and every address aliased on lo0 for the time it gates.
+      t="$(token)"; by_origin "127.0.0.1" "http://127.0.0.1:$P/page?t=$t" direct "$t"
+      t="$(token)"; by_origin "[::1]" "http://[::1]:$P/page?t=$t" direct "$t"
+      t="$(token)"; by_origin "localhost" "http://localhost:$P/page?t=$t" direct "$t"
+      if [ -n "$lan" ]; then t="$(token)"; by_origin "this Mac's LAN address, $lan" "http://$lan:$P/page?t=$t" direct "$t"; fi
       for a in $ALIASES4; do
-        case " $ADDED " in *" $a "*) ;; *) continue ;; esac
-        t="$(token)"; probe "$a, aliased on lo0" "http://$a:$P/page?t=$t" "ROUTE-PAGE-$t" "$a" - "$t"
+        added "$a" || continue
+        t="$(token)"; by_origin "$a, on lo0" "http://$a:$P/page?t=$t" direct "$t"
       done
-      case " $ADDED " in *" $ALIAS6 "*)
-        t="$(token)"; probe "$ALIAS6 (IPv6 unique local), aliased on lo0" "http://[$ALIAS6]:$P/page?t=$t" "ROUTE-PAGE-$t" "$ALIAS6" - "$t" ;;
-      esac
+      for a in $ALIASES6; do
+        added "$a" || continue
+        t="$(token)"; by_origin "[$a], on lo0" "http://[$a]:$P/page?t=$t" direct "$t"
+      done
 
-      # IPv6 link-local: with its scope, typed and as a page's link; without it.
-      if [ -n "$lan6" ] && [ -n "$iface" ]; then
-        t="$(token)"; probe "IPv6 link-local with its scope, typed" "http://[$lan6%25$iface]:$P/page?t=$t" "ROUTE-PAGE-$t" "$lan6" - "$t"
-        t="$(token)"; s="$(token)"
-        probe "a loopback page with a link to IPv6 link-local with its scope" "http://127.0.0.1:$P/links?t=$t&href=http://[$lan6%2525$iface]:$P/page?t=$s" "ROUTE-LINKS-$t" 127.0.0.1 - "$t"
-        from="$(wc -l <"$LOGS/routes-origin.jsonl" | tr -d ' ')"
-        "$APPCTL" press-web "$PID" "go" >/dev/null 2>&1 || true
-        sleep 4
-        printf '  MEASURE  ...its link, pressed: the origin saw: %s; the field then: %s; error: %s\n' \
-          "$(seen "$from" "$s")" "$("$APPCTL" value "$PID" syndeo.address)" "$(page_says "couldn't open" && page_text | head -c 200 || echo -)"
-        t="$(token)"; probe "IPv6 link-local without a scope, typed" "http://[$lan6]:$P/page?t=$t" "ROUTE-PAGE-$t" "$lan6" - "$t"
-      fi
+      # Through Syndeo, by what the origin saw: every name, whatever it
+      # resolves to.
+      if [ -n "$local_name" ]; then t="$(token)"; by_origin "a name: this Mac's .local name" "http://$local_name:$P/page?t=$t" syndeo "$t"; fi
+      t="$(token)"; by_origin "a name for 127.0.0.1 (127.0.0.1.nip.io)" "http://127.0.0.1.nip.io:$P/page?t=$t" syndeo "$t"
+      if added "$SINGLE"; then t="$(token)"; by_origin "a name of one label, $SINGLE (in /etc/hosts)" "http://$SINGLE:$P/page?t=$t" syndeo "$t"; fi
+      t="$(token)"; by_origin "a name under .localhost" "http://syndeo-probe.localhost:$P/page?t=$t" syndeo "$t"
 
-      # Names: a single label (in /etc/hosts for the time it measures), and
-      # one under .localhost (in no hosts file).
-      case " $ADDED " in *" $SINGLE "*)
-        t="$(token)"; probe "a single-label name, $SINGLE (127.0.0.1 in /etc/hosts)" "http://$SINGLE:$P/page?t=$t" "ROUTE-PAGE-$t" "$SINGLE" - "$t" ;;
-      esac
-      t="$(token)"; probe "a name under .localhost" "http://syndeo-probe.localhost:$P/page?t=$t" "ROUTE-PAGE-$t" syndeo-probe.localhost - "$t"
+      # After a redirect, the bar is the final page's: a name that redirects
+      # to 127.0.0.1 ends direct.
+      t="$(token)"; s="$(token)"
+      by_origin "a name redirecting to 127.0.0.1, the page it ends on" "http://127.0.0.1.nip.io:$P/redirect?t=$t&to=http://127.0.0.1:$P/page?t=$s" direct "$s"
 
-      # Redirects, images and repeats, as the first measurement had them.
-      t="$(token)"; s="$(token)"
-      probe "a redirect from loopback to a public page" "http://127.0.0.1:$P/redirect?t=$t&to=http://example.com/?$s" "$EXAMPLE_BODY" 127.0.0.1 - "$t"
-      t="$(token)"; s="$(token)"
-      probe "a redirect from a public name to loopback" "http://127.0.0.1.nip.io:$P/redirect?t=$t&to=http://127.0.0.1:$P/page?t=$s" "ROUTE-PAGE-$s" 127.0.0.1.nip.io - "$t" "$s"
-      t="$(token)"; s="$(token)"
-      probe "a public-name page with a loopback image" "http://127.0.0.1.nip.io:$P/page?t=$t&sub=http://127.0.0.1:$P/img?t=$s" "ROUTE-PAGE-$t" 127.0.0.1.nip.io - "$t" "$s"
-      t="$(token)"; s="$(token)"
-      probe "a public-name page with an image from 10.255.42.1" "http://127.0.0.1.nip.io:$P/page?t=$t&sub=http://10.255.42.1:$P/img?t=$s" "ROUTE-PAGE-$t" 127.0.0.1.nip.io - "$t" "$s"
+      # Measured, not gated: forms of local addresses the rule does not name,
+      # and the unspecified IPv6 address just below ::1, which WebKit may
+      # refuse outright.
+      t="$(token)"; by_origin "[::], the edge below ::1" "http://[::]:$P/page?t=$t" syndeo "$t" measure
+      t="$(token)"; by_origin "[::ffff:127.0.0.1], IPv4 loopback in IPv6" "http://[::ffff:127.0.0.1]:$P/page?t=$t" syndeo "$t" measure
+      t="$(token)"; by_origin "localhost., with its final dot" "http://localhost.:$P/page?t=$t" syndeo "$t" measure
+
+      # Addresses nothing here serves, by the proxy's count, from about:blank.
+      counted "before the addresses nothing here serves"
+      # Through Syndeo: a genuinely remote public address, then the
+      # addresses just outside each direct range.
+      if [ -n "$public" ]; then by_count "a public address, $public (example.com's)" "http://$public/" syndeo "$public"; fi
+      for a in 126.255.255.254 128.0.0.1 9.255.255.254 11.0.0.1 172.15.255.254 172.32.0.1 192.167.255.254 192.169.0.1 169.253.255.254 169.255.0.1 100.63.255.254 100.128.0.1; do
+        by_count "$a, just outside a direct range" "http://$a:$P/" syndeo "$a"
+      done
+      for a in fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff fe00::1 fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff fec0::1 ::2; do
+        by_count "[$a], just outside a direct range" "http://[$a]:$P/" syndeo "$a"
+      done
+      # Direct: addresses inside the direct ranges that are not this Mac's,
+      # so that the rule is seen to be the range, not the Mac's own address.
+      for a in 127.0.0.5 10.200.200.200 172.20.200.200 192.168.200.200 169.254.200.200 100.100.100.100; do
+        by_count "$a, in a direct range and not this Mac's" "http://$a:$P/" direct "$a"
+      done
+      for a in fd00:5a7e::5 fe80::5; do
+        by_count "[$a], in a direct range and not this Mac's" "http://[$a]:$P/" direct "$a"
+      done
+
+      # A redirect from 127.0.0.1 to a public page ends through Syndeo.
       t="$(token)"
-      probe "a public page, the first time" "http://example.com/?$t" "$EXAMPLE_BODY" example.com - "$t"
-      probe "the same public page, again" "http://example.com/?$t" "$EXAMPLE_BODY" example.com - "$t"
+      before="$COUNTED"
+      visit "http://127.0.0.1:$P/redirect?t=$t&to=http://example.com/?$t" "http://example.com/?$t" "$EXAMPLE_BODY" \
+        "127.0.0.1 redirecting to a public page ends on that page"
+      a="$(bar)"
+      counted "after the redirect to a public page"
+      record "127.0.0.1 redirecting to example.com, the page it ends on" "http://127.0.0.1:$P/redirect?..." syndeo \
+        "$([ -n "$before" ] && [ "${COUNTED:-0}" -gt "$before" ] && echo syndeo || echo direct)" "$a" "the proxy's count: ${before:-?} -> ${COUNTED:-?}"
+      must "$([ "$a" = "$SYNDEO_LABEL" ] && echo yes)" "the bar for the page a redirect to a public page ends on says \"$SYNDEO_LABEL\"" "it says \"$a\""
+
+      zoned "$P"
+
+      # No trust settings needed for a page's parts either: an https image
+      # from another host, on a page this Mac serves, comes through the
+      # proxy, though Syndeo's authority is in no trust settings. The proxy
+      # counts a request only once TLS inside its tunnel has succeeded, so its
+      # count rising says WebKit accepted the proxy's certificate for it.
+      counted "before a page with an https image from another host"
+      before="$COUNTED"
+      t="$(token)"; s="$(token)"
+      choose File "Open Location…"
+      "$APPCTL" type "$PID" "http://127.0.0.1:$P/page?t=$t&sub=https://example.com/?$s" >/dev/null || true
+      if wait_for 20 page_says "ROUTE-PAGE-$t"; then ok "a page from this Mac with an https image from example.com opens"; else bad "a page with an https image opens" "page: $(page_text)"; fi
+      sleep 3
+      counted "after a page with an https image from another host"
+      must "$([ -n "$before" ] && [ -n "$COUNTED" ] && [ "$COUNTED" -gt "$before" ] && echo yes)" \
+        "its https image from another host came through the proxy, with Syndeo's authority in no trust settings: the proxy's count went from ${before:-?} to ${COUNTED:-?}"
+
+      # The proxy caches what came from the public internet, and nothing
+      # from this Mac, reached by name.
+      counted "before a public page"
+      before="$ENTRIES"
+      visit "http://example.com/?$FRESH" "http://example.com/?$FRESH" "$EXAMPLE_BODY" "a public page opens"
+      counted "after a public page"
+      must "$([ -n "$before" ] && [ -n "$ENTRIES" ] && [ "$ENTRIES" -gt "$before" ] && echo yes)" \
+        "and the proxy cached it: its cache's entries went from ${before:-?} to ${ENTRIES:-?}"
+      cached "a cacheable page from this Mac, by a name under .localhost" syndeo-probe.localhost "$P"
+      cached "a cacheable page from this Mac, by a public name for 127.0.0.1" 127.0.0.1.nip.io "$P"
+
+      # Clear Browsing Data. Before it: a page in WebKit's cache, opened
+      # again (measured: whether WebKit's own cache answered), and a value
+      # in website storage.
+      from="$(origin_lines)"
+      visit "http://127.0.0.1.nip.io:$P/cached?t=$CACHED" "http://127.0.0.1.nip.io:$P/cached?t=$CACHED" "ROUTE-CACHED-$CACHED" "the cacheable page, opened again"
+      repeat_hits="$(times "$from" "$CACHED")"
+      printf '  MEASURE  opened again, the origin was asked %s time(s): %s\n' "$repeat_hits" \
+        "$([ "$repeat_hits" = 0 ] && echo "WebKit's own cache answered" || echo "WebKit asked again")"
+      t="$(token)"; s="$(token)"
+      visit "http://127.0.0.1:$P/storage?t=$t" "http://127.0.0.1:$P/storage?t=$t" "ROUTE-STORAGE-new:$t" "a page keeps a value in website storage"
+      visit "http://127.0.0.1:$P/storage?t=$s" "http://127.0.0.1:$P/storage?t=$s" "ROUTE-STORAGE-$t" "and finds it there on its next visit"
+
+      settings_open "before clearing"
+      if "$APPCTL" press "$PID" syndeo.clear; then ok "Settings > Clear Browsing Data… is pressed"; else bad "Clear Browsing Data…" "no button to press"; fi
+      if wait_for 10 "$APPCTL" press "$PID" syndeo.clear-confirm; then ok "and asks first; Clear is pressed"; else bad "Clear Browsing Data" "no Clear in a sheet to press: $(front | head -c 300)"; fi
+      if wait_for 40 sh -c '"$1" value "$2" syndeo.clear-status | grep -q "^Browsing data cleared"' _ "$APPCTL" "$PID"; then
+        ok "Settings says the browsing data is cleared"
+      else
+        bad "Clear Browsing Data" "Settings says: $("$APPCTL" value "$PID" syndeo.clear-status)"
+      fi
+      must "$(grep -q 'browsing data cleared' "$LOGS/app-routes.stderr" && echo yes)" "and the app logged that both stores were cleared" \
+        "$(plain_log "$LOGS/app-routes.stderr" | grep -i 'clear' | tail -n 2 | tr '\n' ' ')"
+      settings_close "after clearing"
+
+      counted "after clearing"
+      must "$([ "$ENTRIES" = 0 ] && echo yes)" "after clearing, the proxy's cache has no entries" "${ENTRIES:-?}"
+      must "$([ "$(pgrep -P "$PID" | tr -d '\n')" = "$proxy_pid" ] && echo yes)" "and it is the same proxy, pid $proxy_pid, still running"
+      t="$(token)"
+      visit "http://127.0.0.1:$P/storage?t=$t" "http://127.0.0.1:$P/storage?t=$t" "ROUTE-STORAGE-new:$t" "after clearing, website storage is empty"
+      from="$(origin_lines)"
+      visit "http://127.0.0.1.nip.io:$P/cached?t=$CACHED" "http://127.0.0.1.nip.io:$P/cached?t=$CACHED" "ROUTE-CACHED-$CACHED" "the cacheable page, after clearing"
+      after_hits="$(times "$from" "$CACHED")"
+      if [ "$repeat_hits" = 0 ]; then
+        must "$([ "$after_hits" -ge 1 ] && echo yes)" "after clearing, WebKit's cache no longer answers for it: the origin was asked again" "asked $after_hits time(s)"
+      else
+        printf '  MEASURE  after clearing, the origin was asked %s time(s) (WebKit had asked again before clearing too)\n' "$after_hits"
+      fi
+      visit "http://example.com/?$FRESH" "http://example.com/?$FRESH" "$EXAMPLE_BODY" "browsing goes on after clearing"
 
       stopped routes
     fi
@@ -953,9 +1286,22 @@ routes() {
   put_back || status=1
   trap - EXIT
   security dump-trust-settings >"$LOGS/routes-trust-after.txt" 2>&1 || true
-  if cmp -s "$LOGS/routes-trust-before.txt" "$LOGS/routes-trust-after.txt"; then ok "the user's trust settings are as they were"; else bad "trust settings" "they changed"; status=1; fi
-  printf '\n  %d of its own checks failed (reported; only putting back and the trust settings fail this)\n' "$fails"
-  return "$status"
+  if cmp -s "$LOGS/routes-trust-before.txt" "$LOGS/routes-trust-after.txt"; then ok "the user's trust settings are as they were"; else bad "trust settings" "they changed"; fi
+  printf '\n%d failed\n' "$fails"
+  [ "$fails" = 0 ] && [ "$status" = 0 ]
+}
+
+# routes_lite APP: the part of routes that needs nothing changed on this
+# runner, for the mutants it is meant to catch: 127.0.0.1 and a name for it,
+# and an IPv6 address with a zone, typed and as a link.
+routes_lite() {
+  local t
+  route_origin || return 1
+  t="$(token)"; by_origin "127.0.0.1" "http://127.0.0.1:$ROUTE_PORT/page?t=$t" direct "$t"
+  t="$(token)"; by_origin "a name for 127.0.0.1 (127.0.0.1.nip.io)" "http://127.0.0.1.nip.io:$ROUTE_PORT/page?t=$t" syndeo "$t"
+  t="$(token)"; by_origin "a name under .localhost" "http://syndeo-probe.localhost:$ROUTE_PORT/page?t=$t" syndeo "$t"
+  zoned "$ROUTE_PORT"
+  route_origin_stop
 }
 
 # measure: report what this runner allows; fail only if it cannot put the

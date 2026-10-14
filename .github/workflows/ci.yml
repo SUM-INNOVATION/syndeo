@@ -211,14 +211,16 @@ jobs:
     # binaries, signed ad hoc (the helper first, then the bundle), opened with
     # `open`, checked through Launch Services, the window server and
     # Accessibility; browsed in, by keystrokes and presses as a person would:
-    # addresses, Back and Forward, refusals, a tab opened and closed, no
-    # private URL in any log, https pinned through the proxy, a page's own
-    # links to other schemes refused; its last window closed and brought back
-    # by opening it again, quit as the Quit menu item would, and opened again;
-    # four mutants, each of which the test has to catch; and a copy
-    # whose proxy cannot start, which has to refuse to browse. Unsigned with a Developer
-    # ID, and with no secrets: a pull request never signs. Then, reported and
-    # not gated, what this runner allows an onboarding test to do.
+    # addresses, Back and Forward, refusals, search as Settings chooses it, a
+    # tab opened and closed, no private URL in any log, https pinned through
+    # the proxy, a page's own links to other schemes refused; its last window
+    # closed and brought back by opening it again, quit as the Quit menu item
+    # would, and opened again; six mutants, each of which the test has to
+    # catch; a copy whose proxy cannot start, which has to refuse to browse;
+    # and the route bar against what WebKit does, the proxy's cache keeping
+    # nothing from this Mac, and Clear Browsing Data. Unsigned with a
+    # Developer ID, and with no secrets: a pull request never signs. Then,
+    # reported and not gated, what this runner allows an onboarding test to do.
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -269,12 +271,13 @@ jobs:
 
       # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
       # mutants.py): the pinning delegate, the main frame's navigation policy,
-      # the schemes a new tab may open, the address field's guard for typing.
-      # Each is built from this tree, which is then put back, and the test has
-      # to catch each by the checks meant to, with every other check passing.
-      # All four are run whatever any one
-      # does, each recorded on its own and cleaned up after; the step fails at
-      # the end if any was not caught exactly as intended.
+      # the schemes a new tab may open, the address field's guard for typing,
+      # the bar's rule for names, and the refusal of a link to an IPv6 address
+      # with a zone. Each is built from this tree, which is then put back, and
+      # the test has to catch each by the checks meant to, with every other
+      # check passing. All six are run whatever any one does, each recorded
+      # on its own and cleaned up after; the step fails at the end if any was
+      # not caught exactly as intended.
       - name: Build each mutant, and require the test to catch it
         shell: bash
         run: |
@@ -319,14 +322,16 @@ jobs:
           printf '  %s\n' "${results[@]}"
           [ "$wrong" = 0 ]
 
-      # Measured, not gated: what the web views reach directly, through the
-      # proxy, or from WebKit's own cache, from a fresh WebKit state and with a
-      # fresh token in every address, so no cached copy stands in for a fetch.
-      # For the time it measures it aliases private and special-use addresses
-      # on lo0 and adds a single-label name to /etc/hosts; it fails only if it
-      # cannot put those, or the trust settings, back exactly as they were.
-      # The "Direct" state is to be designed from what this finds.
-      - name: What the web views reach directly, through the proxy, or from cache (measured, not a gate)
+      # The route bar, gated against what WebKit actually does: each address
+      # typed, from a fresh WebKit state and with a fresh token, and the way
+      # WebKit went (by which process the origin saw, or the proxy's own
+      # count) and what the bar says both required to be what the app's rule
+      # says, for every route measured before and each direct range's edges.
+      # Then the proxy caching nothing from this Mac, and Clear Browsing Data.
+      # For the time it gates it aliases addresses on lo0 and adds a
+      # single-label name to /etc/hosts, and it fails if it cannot put those,
+      # or the trust settings, back exactly as they were.
+      - name: The route bar against WebKit's routes, the proxy's cache, and Clear Browsing Data
         if: always()
         run: bash ci/test-app.sh routes "$PWD/dist/Syndeo.app"
 

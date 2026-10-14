@@ -25,11 +25,18 @@ back.
 - no-editing-guard: the address field is written whenever a page reports
   its address, whoever is typing there. What someone types while a page is
   loading must then be seen overwritten when it arrives.
+- direct-for-every-name: the bar's rule says every name is opened directly.
+  The bar must then be seen saying "Direct — not cached by Syndeo" for a
+  page that came through the proxy by a name.
+- zoned-links-followed: a page's link to an IPv6 address with a zone is not
+  refused, and a failure to open one is not described as a refusal. The
+  link must then be seen not refused with the words typing it gets.
 """
 import os
 import sys
 
 BROWSER = "crates/syndeo-app/src/browser_macos.rs"
+ADDRESS = "crates/syndeo-app/src/address.rs"
 
 MUTANTS = {
     "no-pinning-delegate": [
@@ -57,12 +64,18 @@ MUTANTS = {
             "            let main_frame = unsafe { action.targetFrame() }.is_some_and(|frame| unsafe { frame.isMainFrame() });\n"
             "            let request = unsafe { action.request() };\n"
             "            let scheme = scheme_of(&request);\n"
-            "            let allowed = !main_frame || address::allowed_in_main_frame(&scheme);\n"
-            "            if !allowed {\n"
+            "            let target = address_of(&request);\n"
+            "            // Refused wherever it would load, as typing it is.\n"
+            "            let zoned = address::has_zone(&target);\n"
+            "            let allowed = (!main_frame || address::allowed_in_main_frame(&scheme)) && !zoned;\n"
+            "            if !allowed && main_frame {\n"
             "                self.ivars().refused.set(true);\n"
-            "                tracing::info!(scheme = %scheme, \"refused a page that is not the web's own in a window\");\n"
+            "                tracing::info!(scheme = %scheme, zoned, \"refused a page in a window\");\n"
             "            }\n"
             "            handler.call((if allowed { WKNavigationActionPolicy::Allow } else { WKNavigationActionPolicy::Cancel },));\n"
+            "            if zoned && main_frame {\n"
+            "                self.show_page(&target, address::ZONED);\n"
+            "            }\n"
             "        }\n"
             "\n",
             "",
@@ -80,6 +93,25 @@ MUTANTS = {
             BROWSER,
             "        if self.ivars().typing.get() {\n",
             "        if false {\n",
+        ),
+    ],
+    "direct-for-every-name": [
+        (
+            ADDRESS,
+            "        Host::Domain(name) => name == \"localhost\",\n",
+            "        Host::Domain(_) => true,\n",
+        ),
+    ],
+    "zoned-links-followed": [
+        (
+            BROWSER,
+            "            let zoned = address::has_zone(&target);\n",
+            "            let zoned = false;\n",
+        ),
+        (
+            BROWSER,
+            "        let why = if address::has_zone(&address) {\n",
+            "        let why = if false {\n",
         ),
     ],
 }

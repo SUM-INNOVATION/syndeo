@@ -41,6 +41,11 @@
 //                                would; exits 1 if there is none
 //   appctl apps                  the bundle identifier of each running application
 //                                that has a Dock icon, sorted, one a line
+//   appctl pick <pid> <id> <title>    open the pop-up button with that identifier in
+//                                pid's front window and choose its item <title>, as
+//                                a person would; exits 1 if there is no such item
+//   appctl popup-items <pid> <id>     open that pop-up, print each item's title, one a
+//                                line, and close it again choosing nothing
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -152,6 +157,25 @@ func menuItems(_ pid: Int32, _ menu: String) -> [AXUIElement] {
 /// The menu bar item `menu`'s item `title`.
 func menuItem(_ pid: Int32, _ menu: String, _ title: String) -> AXUIElement? {
     menuItems(pid, menu).first { oneLine(attribute($0, kAXTitleAttribute)) == title }
+}
+
+/// Open the pop-up button with identifier `id` in pid's front window, and
+/// wait for its items.
+func openPopUp(_ pid: Int32, _ id: String) -> (AXUIElement, [AXUIElement])? {
+    guard let popup = identified(pid, id),
+          AXUIElementPerformAction(popup, kAXPressAction as CFString) == .success else { return nil }
+    let app = AXUIElementCreateApplication(pid)
+    for _ in 0..<30 {
+        // Its menu, while open: under the button, or under the application.
+        for root in [popup, app] {
+            if let menu = find(root, depth: 3, { (attribute($0, kAXRoleAttribute) as? String) == "AXMenu" }) {
+                let items = children(menu).filter { (attribute($0, kAXRoleAttribute) as? String) == "AXMenuItem" }
+                if !items.isEmpty { return (menu, items) }
+            }
+        }
+        usleep(100_000)
+    }
+    return nil
 }
 
 let args = CommandLine.arguments
@@ -294,6 +318,22 @@ case "apps" where args.count == 2:
         .filter { $0.activationPolicy == .regular }
         .compactMap { $0.bundleIdentifier }
     print(Set(ids).sorted().joined(separator: "\n"))
+case "pick" where args.count == 5:
+    guard let pid = Int32(args[2]), activate(pid), let (menu, items) = openPopUp(pid, args[3]) else { exit(1) }
+    guard let item = items.first(where: { oneLine(attribute($0, kAXTitleAttribute)) == args[4] }) else {
+        _ = AXUIElementPerformAction(menu, kAXCancelAction as CFString)
+        exit(1)
+    }
+    exit(AXUIElementPerformAction(item, kAXPressAction as CFString) == .success ? 0 : 1)
+case "popup-items" where args.count == 4:
+    guard let pid = Int32(args[2]), activate(pid), let (menu, items) = openPopUp(pid, args[3]) else { exit(1) }
+    for item in items {
+        print(oneLine(attribute(item, kAXTitleAttribute)))
+    }
+    // Closed by Cancel, or by Escape if the menu does not take Cancel.
+    if AXUIElementPerformAction(menu, kAXCancelAction as CFString) != .success {
+        key(pid, 53, "\u{1b}")
+    }
 default:
     exit(2)
 }

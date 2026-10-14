@@ -19,9 +19,15 @@ WebKit made itself, syndeo-proxy for one the proxy made for it.
   /redirect?t=<token>&to=<url>  302 to <url>
   /links?t=<token>&href=<url>   a page saying ROUTE-LINKS-<token>, with one
                                 link, "go", to <url>
+  /cached?t=<token>             a page saying ROUTE-CACHED-<token> that any
+                                cache may keep for ten minutes
+  /storage?t=<token>            a page that keeps <token> in its origin's
+                                local storage unless something is there
+                                already, then says ROUTE-STORAGE- and what is
+                                there: "new:<token>" when it was empty
 
-Every response is no-store, so nothing it answers can be served again from a
-cache instead of asking it.
+Every other response is no-store, so nothing it answers can be served again
+from a cache instead of asking it.
 """
 import html
 import http.server
@@ -87,8 +93,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        cache = "no-store"
         if url.path == "/img":
             body, kind = GIF, "image/gif"
+        elif url.path == "/cached":
+            token = html.escape(query.get("t", ""))
+            body = (
+                f"<!doctype html><meta charset=utf-8><title>Cached {token}</title>"
+                f"<p>ROUTE-CACHED-{token}</p>"
+            ).encode()
+            kind = "text/html; charset=utf-8"
+            cache = "public, max-age=600"
+        elif url.path == "/storage":
+            # Letters and digits only: it goes into a script.
+            token = json.dumps("".join(c for c in query.get("t", "") if c.isascii() and c.isalnum()))
+            body = (
+                "<!doctype html><meta charset=utf-8><title>Storage</title><p id=o>...</p>"
+                "<script>var v = localStorage.getItem('syndeo');"
+                f"if (!v) {{ localStorage.setItem('syndeo', {token}); v = 'new:' + {token}; }}"
+                "document.getElementById('o').textContent = 'ROUTE-STORAGE-' + v;</script>"
+            ).encode()
+            kind = "text/html; charset=utf-8"
         elif url.path == "/links":
             token = html.escape(query.get("t", ""))
             href = html.escape(query.get("href", ""))
@@ -114,7 +139,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", kind)
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
