@@ -577,7 +577,13 @@ mod tests {
         ] {
             assert_eq!(route_shown(through), Some(Route::Syndeo), "{through}");
         }
-        for not_the_web in ["about:blank", "file:///etc/passwd", "data:text/html,x"] {
+        for not_the_web in [
+            "about:blank",
+            "file:///etc/passwd",
+            "data:text/html,x",
+            "ftp://example.com/",
+            "ws://127.0.0.1/",
+        ] {
             assert_eq!(route_shown(not_the_web), None, "{not_the_web}");
         }
         assert_eq!(Route::Direct.label(), "Direct — not cached by Syndeo");

@@ -692,6 +692,26 @@ mod tests {
         assert_eq!(control.clear_cache(Duration::from_secs(5)).unwrap(), 42);
     }
 
+    /// A line the proxy wrote before the question is not its answer.
+    #[test]
+    fn an_answer_from_before_the_question_is_not_taken_for_its_answer() {
+        let owned = start_owned(
+            sh(
+                "printf 'SYNDEO-PROXY-READY 1 127.0.0.1:4567\\nSYNDEO-PROXY-CLEARED 1 99\\n'; \
+                read line; printf 'SYNDEO-PROXY-CLEARED 1 42\\n'; exec /bin/sleep 60",
+            ),
+            Duration::from_secs(10),
+            None,
+        )
+        .unwrap();
+        // Long enough for the stray line to have arrived.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            owned.control().clear_cache(Duration::from_secs(5)).unwrap(),
+            42
+        );
+    }
+
     #[test]
     fn a_failure_or_any_other_answer_is_an_error() {
         for answer in [

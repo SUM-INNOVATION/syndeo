@@ -1762,6 +1762,45 @@ mod tests {
         assert!(anything.admits(None).is_some());
     }
 
+    /// The address an answer came from is the connection's own, reported
+    /// for a new connection and for one reused from the pool.
+    #[tokio::test]
+    async fn an_answer_says_which_address_it_came_from() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(|_| async {
+                        Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(
+                            Bytes::from_static(b"here"),
+                        )))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let net = Net::new(NetConfig {
+            cache_root: dir.path().to_path_buf(),
+            ..NetConfig::default()
+        })
+        .unwrap();
+        for host in ["127.0.0.1", "localhost", "127.0.0.1"] {
+            let request = FetchRequest::get(format!("http://{host}:{port}/"));
+            let answer = origin_request(&net.client, &net.config, &request, &[])
+                .await
+                .unwrap();
+            assert!(
+                answer.from.is_some_and(|ip| ip.is_loopback()),
+                "{host}: {:?}",
+                answer.from
+            );
+        }
+    }
+
     #[test]
     fn nothing_asked_for_before_a_clear_is_kept_after_it() {
         let (cleared, keep) = keeping(false);
