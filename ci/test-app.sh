@@ -103,7 +103,8 @@
 #     proxy's cache taking nothing from a page any cache may keep — this
 #     Mac's LAN address and every local-network address aliased on lo0
 #     (10/8, 172.16/12, 192.168/16, 169.254/16 and 100.64/10 addresses,
-#     each range's first and last host address, and IPv6 unique local ones);
+#     each range's first and last host address, IPv6 unique local ones, and
+#     one carried in IPv6 as ::ffff:10.255.42.1);
 #     and, by the proxy's count, local-network addresses that are not this
 #     Mac's, the bar saying Local if a page comes back;
 #   - after a redirect, the final page's route: a name redirecting to
@@ -113,8 +114,9 @@
 #     page's link, with the same words, and the origin hears of neither;
 #   - an https image from another host, on a page this Mac serves, comes
 #     through the proxy with Syndeo's authority in no trust settings.
-# It measures, without gating, [::], and IPv6 addresses this runner has no
-# route to: just outside the ranges, and unique local and link-local ones.
+# It measures, without gating, [::], a public address carried in IPv6, and
+# IPv6 addresses this runner has no route to: just outside the ranges, and
+# unique local and link-local ones.
 # Then: a public page is cached by the proxy, and a cacheable page from this
 # Mac, reached through the proxy by a name, is not; and Settings > Clear
 # Browsing Data asks first, then empties the proxy's cache (the same proxy
@@ -1246,6 +1248,7 @@ routes() {
         added "$a" || continue
         by_local "[$a], on lo0" "http://[$a]:$P"
       done
+      if added 10.255.42.1; then by_local "[::ffff:10.255.42.1], a local address carried in IPv6" "http://[::ffff:10.255.42.1]:$P"; fi
       # The redirect's own target is the page by_local asks for: what
       # follows "to=" is that page's address.
       if added 10.255.42.1; then
@@ -1267,7 +1270,9 @@ routes() {
       for a in 10.200.200.200 172.20.200.200 192.168.200.200 169.254.200.200 100.100.100.100; do
         by_count "$a, local, not this Mac's" "http://$a:$P/" local "$a"
       done
-      # Measured, not gated: IPv6 addresses this runner has no route to.
+      # Measured, not gated: a public address carried in IPv6, whose route
+      # has not been measured, and IPv6 addresses this runner has no route to.
+      if [ -n "$public" ]; then by_count "[::ffff:$public], a public address carried in IPv6" "http://[::ffff:$public]/" measure "$public"; fi
       for a in fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff fe00::1 fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff fec0::1 ::2 fd00:5a7e::5 fe80::5; do
         by_count "[$a], unreachable IPv6" "http://[$a]:$P/" measure "$a"
       done

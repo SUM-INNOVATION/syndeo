@@ -135,12 +135,9 @@ impl Route {
 }
 
 /// Loopback, which WebKit was measured always opening directly: 127/8, and
-/// in IPv6 ::1 and IPv4's loopback carried in IPv6.
+/// ::1. (IPv4's loopback carried in IPv6 is 127/8: see [`route`].)
 const DIRECT_V4: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 0, 0, 0), 8);
-const DIRECT_V6: [(Ipv6Addr, u8); 2] = [
-    (Ipv6Addr::LOCALHOST, 128),
-    (Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0), 104),
-];
+const DIRECT_V6: (Ipv6Addr, u8) = (Ipv6Addr::LOCALHOST, 128);
 
 /// Local-network ranges: private, link-local and shared (carrier-grade NAT)
 /// IPv4, and unique local and link-local IPv6. WebKit was measured opening
@@ -179,6 +176,10 @@ fn in_v6(ip: Ipv6Addr, (network, length): (Ipv6Addr, u8)) -> bool {
 ///   `.local` name, one under `.localhost`, a single label, a public name
 ///   for this Mac), and every other address.
 ///
+/// An IPv4 address carried in IPv6 (`::ffff:a.b.c.d`) is that IPv4 address,
+/// and is classified as one: mapped loopback is Direct, a mapped
+/// local-network address Local, and a mapped public address Through Syndeo.
+///
 /// None for a page that is not the web's, which is not reached at all.
 ///
 /// This is the page's own route. What it loads — images, scripts, frames —
@@ -188,12 +189,16 @@ pub fn route(url: &Url) -> Option<Route> {
     if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
-    Some(match url.host()? {
+    let host = match url.host()? {
+        Host::Ipv6(ip) => ip.to_ipv4_mapped().map_or(Host::Ipv6(ip), Host::Ipv4),
+        host => host,
+    };
+    Some(match host {
         Host::Domain("localhost" | "localhost.") => Route::Direct,
         Host::Domain(_) => Route::Syndeo,
         Host::Ipv4(ip) if in_v4(ip, DIRECT_V4) => Route::Direct,
         Host::Ipv4(ip) if LOCAL_V4.iter().any(|&range| in_v4(ip, range)) => Route::Local,
-        Host::Ipv6(ip) if DIRECT_V6.iter().any(|&range| in_v6(ip, range)) => Route::Direct,
+        Host::Ipv6(ip) if in_v6(ip, DIRECT_V6) => Route::Direct,
         Host::Ipv6(ip) if LOCAL_V6.iter().any(|&range| in_v6(ip, range)) => Route::Local,
         Host::Ipv4(_) | Host::Ipv6(_) => Route::Syndeo,
     })
@@ -687,6 +692,65 @@ mod tests {
                 assert_eq!(route_shown(&address), Some(Route::Syndeo), "{address}");
             }
         }
+    }
+
+    /// An IPv4 address carried in IPv6 is classified as that IPv4 address:
+    /// each IPv4 range's first and last addresses, and the addresses either
+    /// side of it, say the same mapped as they do plain.
+    #[test]
+    fn an_ipv4_address_carried_in_ipv6_is_classified_as_itself() {
+        for (route, inside, outside) in [
+            (
+                Route::Direct,
+                ["127.0.0.0", "127.255.255.255"],
+                ["126.255.255.255", "128.0.0.0"],
+            ),
+            (
+                Route::Local,
+                ["10.0.0.0", "10.255.255.255"],
+                ["9.255.255.255", "11.0.0.0"],
+            ),
+            (
+                Route::Local,
+                ["172.16.0.0", "172.31.255.255"],
+                ["172.15.255.255", "172.32.0.0"],
+            ),
+            (
+                Route::Local,
+                ["192.168.0.0", "192.168.255.255"],
+                ["192.167.255.255", "192.169.0.0"],
+            ),
+            (
+                Route::Local,
+                ["169.254.0.0", "169.254.255.255"],
+                ["169.253.255.255", "169.255.0.0"],
+            ),
+            (
+                Route::Local,
+                ["100.64.0.0", "100.127.255.255"],
+                ["100.63.255.255", "100.128.0.0"],
+            ),
+        ] {
+            for (v4, expected) in inside
+                .iter()
+                .map(|a| (a, route))
+                .chain(outside.iter().map(|a| (a, Route::Syndeo)))
+            {
+                let plain = format!("http://{v4}/");
+                let mapped = format!("http://[::ffff:{v4}]/");
+                assert_eq!(route_shown(&plain), Some(expected), "{plain}");
+                assert_eq!(route_shown(&mapped), Some(expected), "{mapped}");
+            }
+        }
+        for public in ["104.20.23.154", "93.184.215.14", "1.1.1.1", "8.8.8.8"] {
+            let mapped = format!("https://[::ffff:{public}]/");
+            assert_eq!(route_shown(&mapped), Some(Route::Syndeo), "{mapped}");
+        }
+        // Only the mapped form: the old IPv4-compatible one (::a.b.c.d) is an
+        // IPv6 address like any other, and ::1 is loopback, not 0.0.0.1.
+        assert_eq!(route_shown("http://[::127.0.0.1]/"), Some(Route::Syndeo));
+        assert_eq!(route_shown("http://[::10.0.0.1]/"), Some(Route::Syndeo));
+        assert_eq!(route_shown("http://[::1]/"), Some(Route::Direct));
     }
 
     #[test]

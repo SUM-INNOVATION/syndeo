@@ -1748,9 +1748,24 @@ mod tests {
         assert!(keep
             .admits(Some("93.184.215.14".parse().unwrap()))
             .is_some());
-        for from in ["127.0.0.1", "::1", "10.1.2.3", "192.168.64.8", "fe80::1"] {
+        for from in [
+            "127.0.0.1",
+            "::1",
+            "10.1.2.3",
+            "192.168.64.8",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.1.2.3",
+            "::ffff:172.16.0.1",
+            "::ffff:192.168.64.8",
+            "::ffff:169.254.42.1",
+            "::ffff:100.64.0.1",
+        ] {
             assert!(keep.admits(Some(from.parse().unwrap())).is_none(), "{from}");
         }
+        assert!(keep
+            .admits(Some("::ffff:93.184.215.14".parse().unwrap()))
+            .is_some());
         assert!(
             keep.admits(None).is_none(),
             "an address nobody reported counts as not public"

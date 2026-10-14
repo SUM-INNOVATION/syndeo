@@ -220,6 +220,44 @@ mod tests {
                 assert!(public(address), "{address} is outside it");
             }
         }
+        // An IPv4 address carried in IPv6 is exactly as public as itself, at
+        // every edge of every block, which is how an answer from a peer
+        // reported in that form is judged.
+        for (inside, outside) in [
+            (
+                ["127.0.0.0", "127.255.255.255"],
+                ["126.255.255.255", "128.0.0.0"],
+            ),
+            (
+                ["10.0.0.0", "10.255.255.255"],
+                ["9.255.255.255", "11.0.0.0"],
+            ),
+            (
+                ["172.16.0.0", "172.31.255.255"],
+                ["172.15.255.255", "172.32.0.0"],
+            ),
+            (
+                ["192.168.0.0", "192.168.255.255"],
+                ["192.167.255.255", "192.169.0.0"],
+            ),
+            (
+                ["169.254.0.0", "169.254.255.255"],
+                ["169.253.255.255", "169.255.0.0"],
+            ),
+            (
+                ["100.64.0.0", "100.127.255.255"],
+                ["100.63.255.255", "100.128.0.0"],
+            ),
+        ] {
+            for address in inside {
+                let mapped = format!("::ffff:{address}");
+                assert!(!public(&mapped), "{mapped} is inside a block");
+            }
+            for address in outside {
+                let mapped = format!("::ffff:{address}");
+                assert!(public(&mapped), "{mapped} is outside it");
+            }
+        }
         // IPv6's public space is 2000::/3 and nothing else.
         assert!(!public("1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"));
         assert!(public("2000::1"));
