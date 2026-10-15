@@ -108,7 +108,8 @@ sudo installer -pkg syndeo-<version>-aarch64-apple-darwin.pkg -target /
   the startup disk, always in `/Applications`.
 - **Its two scripts.**
   - The preinstall writes nothing. It refuses:
-    - while Syndeo or its helper runs from `/Applications`;
+    - while Syndeo or its helper runs from `/Applications`, or any program of
+      the v0.1.x package runs from its own tree (below);
     - a `Syndeo.app` there that no Syndeo package installed;
     - one changed since it was signed, or not what its receipt says;
     - a package older than the one installed.
@@ -130,6 +131,8 @@ sudo installer -pkg syndeo-<version>-aarch64-apple-darwin.pkg -target /
     stays, harmlessly;
   - its receipt, last.
 
+  Quit anything of it first: the package refuses while any of its programs
+  runs from `/usr/local/libexec/syndeo`, however it was started.
   `/usr/local/bin` itself and everything else in it stay. Without that
   receipt, nothing in `/usr/local` is looked at, so the commands `install.sh`
   puts there, or anywhere, are never touched. In any other state the package
@@ -145,7 +148,14 @@ sudo installer -pkg syndeo-<version>-aarch64-apple-darwin.pkg -target /
     the old receipt. Install the same package again to finish it. Until then
     every other package, older or newer, is refused, and so is the
     uninstaller.
-- **Downgrading is refused.** Remove Syndeo.app first.
+- **Downgrading is refused.** Remove Syndeo.app with its uninstaller first,
+  which also forgets the package's receipt. After Syndeo.app is moved to the
+  Trash, its receipt remains, and an older package is still refused until
+  that receipt is forgotten:
+
+  ```sh
+  sudo /usr/sbin/pkgutil --forget com.sum.syndeo.app --volume /
+  ```
 - **Removing it**, either way:
   - With the uninstaller, which removes the application and the package's
     receipt:
@@ -162,9 +172,10 @@ sudo installer -pkg syndeo-<version>-aarch64-apple-darwin.pkg -target /
     ```sh
     sudo /usr/sbin/pkgutil --forget com.sum.syndeo.app --volume /
     ```
-  - By moving Syndeo.app to the Trash. The receipt stays behind, harmlessly,
-    and installing the package again puts the application back in
-    `/Applications`.
+  - By moving Syndeo.app to the Trash. The receipt stays behind, harmlessly.
+    Installing the same version or a newer one puts the application back in
+    `/Applications`; an older one is refused until the receipt is forgotten
+    (above).
 
   Neither touches your settings or data: `~/Library/Application Support/Syndeo`,
   preferences, cookies, caches and search settings are kept, and so are
@@ -189,9 +200,12 @@ sudo installer -pkg syndeo-<version>-aarch64-apple-darwin.pkg -target /
     them refused, and an interrupted removal finished;
   - the commands `install.sh` put in `/usr/local/bin`, left alone;
   - upgrades, a failed upgrade and its repair, a downgrade refused, a
-    reinstall and a refusal while the app runs;
-  - the Trash, the uninstaller, and a receipt that cannot be forgotten, with
-    the user's data kept throughout;
+    reinstall, and refusals while the app runs and while a v0.1.x program
+    runs;
+  - the Trash: an older package refused, the same one reinstalled, and a
+    deliberate downgrade once the receipt is forgotten;
+  - the uninstaller, and a receipt that cannot be forgotten, with the user's
+    data kept throughout;
   - the runner put back afterwards.
 
   A signed release runs the same test on its signed package, where

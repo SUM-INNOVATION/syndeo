@@ -50,7 +50,9 @@ There are two ways to remove it:
 
   Move Syndeo.app to the Trash.
       The application goes; the package's receipt stays behind, harmlessly.
-      Installing a Syndeo.app package later works the same either way.
+      The same version or a newer one installs later as it would anyway. An
+      older one is refused until that receipt is forgotten:
+      sudo /usr/sbin/pkgutil --forget $APP_RECEIPT --volume /
 
 Quit Syndeo first. Nothing is changed unless everything is as the package
 left it. Your settings and data are kept, either way:

@@ -33,17 +33,20 @@
 #    change to its installation is refused, nothing changed; then <pkg>
 #    removes it, exactly, /usr/local/libexec with it, and nothing else. Over
 #    0.1.7, install.sh's commands put over its links are refused; repaired with
-#    the 0.1.7 package, its removal is interrupted by a faulty stand-in after
-#    the seven links, which leaves what the runner has to refuse from any other
-#    package, and the same stand-in again finishes it.
+#    the 0.1.7 package, it is refused while its syndeo-net runs, started
+#    through its command link; then its removal is interrupted by a faulty
+#    stand-in after the seven links, which leaves what the runner has to
+#    refuse from any other package, and the same stand-in again finishes it.
 # 3. Stand-ins (0.0.1 to 0.0.3, made from <pkg>'s own bundle): an upgrade; an
 #    upgrade whose postinstall fails, what it leaves, the packages refused
 #    over it, and its repair; a downgrade refused; a reinstall; a changed
 #    bundle refused; <pkg> over all of that.
 # 4. Moved to the Trash as Finder moves it: the receipt stays, the trashed
-#    copy's uninstaller refuses, saying how to forget it; <pkg> installs into
-#    /Applications again, the trashed copy untouched, and opening it opens the
-#    one in /Applications.
+#    copy's uninstaller refuses, saying how to forget it; an older package is
+#    refused; <pkg> installs into /Applications again, the trashed copy
+#    untouched, and opening it opens the one in /Applications. Moved to the
+#    Trash again, the receipt forgotten as the refusal says, an older package
+#    installs, and <pkg> upgrades it.
 # 5. Removal: a receipt that cannot be forgotten (exit 2, and the command to
 #    forget it), then forgotten as it says; a foreign application where
 #    Syndeo.app goes, refused; a last install, and its uninstaller, with the
@@ -272,6 +275,31 @@ legacy_left() {
   local p n=0
   while IFS= read -r p; do present "$p" && n=$((n + 1)); done < <(legacy_paths "$1")
   echo "$n"
+}
+
+# legacy_hold V NAME: the v0.1.x package V's NAME, started as a person would,
+# through its command link in /usr/local/bin, with a home of its own and a
+# pipe nobody writes to for its standard input, so that it waits. Sets HELD;
+# legacy_unhold stops it.
+legacy_hold() {
+  local v="$1" n="$2" fifo
+  fifo="$(ST)/legacy-stdin"
+  [ -p "$fifo" ] || mkfifo "$fifo" || fail "making a pipe for $n"
+  exec 7<>"$fifo"
+  mkdir -p "$(ST)/legacy-home"
+  HOME="$(ST)/legacy-home" SYNDEO_HOME="$(ST)/legacy-home" "$BIN/$n" --home "$(ST)/legacy-home" \
+    <"$fifo" >"$(ST)/logs/legacy-$n.log" 2>&1 &
+  HELD=$!
+  echo "$HELD" >>"$(ST)/pids"
+  wait_for 20 sh -c "[ -n \"\$(/usr/sbin/lsof -a -d txt -t -- '$D/$v/$n' 2>/dev/null)\" ]" ||
+    { sed 's/^/      | /' "$(ST)/logs/legacy-$n.log"; fail "the v0.1.x $n did not stay running"; }
+}
+
+legacy_unhold() {
+  kill "$HELD" 2>/dev/null
+  wait "$HELD" 2>/dev/null
+  exec 7>&-
+  return 0
 }
 
 # legacy_exact V: the v0.1.x package V installed exactly as its package left
@@ -822,6 +850,10 @@ run() {
   cli_remove "$BIN"
   legacy_install v0.1.7-repaired "$p017"
   must "v0.1.7, repaired by its own package, exactly as it leaves it" legacy_exact 0.1.7
+  legacy_hold 0.1.7 syndeo-net
+  refused legacy-running "$pkg" "the v0.1.x command-line package 0.1.7 is running from $D/0.1.7 (process $HELD): quit it first"
+  must "  ... its syndeo-net still runs, from its tree" eval "[ \"\$(image_of $HELD)\" = '$D/0.1.7/syndeo-net' ]"
+  legacy_unhold
 
   section "its removal interrupted, and finished by the same package"
   before_is "installing 0.0.1, and removing the v0.1.x command-line package 0.1.7" || fail "before the interrupted removal, the runner is not v0.1.7 alone"
@@ -858,6 +890,7 @@ run() {
   must "  ... the trashed copy's uninstaller refuses, saying how to forget the receipt, changing nothing" eval \
     "! sudo -n /bin/sh '$trashed/Contents/Resources/uninstall.sh' >'$st/logs/uninstall-trashed' 2>&1 && grep -qF '    sudo /usr/sbin/pkgutil --forget $APP_ID --volume /' '$st/logs/uninstall-trashed' && [ \"\$(package_state)\" = \"\$before\" ]"
   as_root find "$trashed" -exec stat -f '%N|%HT|%u|%g|%Lp|%i|%z' {} + | LC_ALL=C sort >"$st/trashed.before"
+  refused after-the-trash-older "$s3" "Syndeo.app $version is no longer in /Applications, but its package's receipt remains, and this package is the older 0.0.3"
   installed after-the-trash "$pkg" "installing $version; Syndeo.app $version, which the receipt names, is no longer in /Applications" "$version"
   must "  ... the trashed copy untouched" eval "[ \"\$(as_root find '$trashed' -exec stat -f '%N|%HT|%u|%g|%Lp|%i|%z' {} + | LC_ALL=C sort)\" = \"\$(cat '$st/trashed.before')\" ]"
   opened after-the-trash
@@ -866,6 +899,17 @@ run() {
   "$LSREGISTER" -u "$trashed" >/dev/null 2>&1 || true
   as_root rm -rf "$trashed"
   must "the trashed copy, the test's own, emptied from the Trash" test ! -e "$trashed"
+
+  section "a deliberate downgrade, after the Trash"
+  as_root mv "$APP" "$trashed" || fail "moving Syndeo.app to the Trash again"
+  "$LSREGISTER" -f "$trashed" >/dev/null 2>&1 || true
+  as_root /usr/sbin/pkgutil --forget "$APP_ID" --volume / >/dev/null || fail "forgetting the receipt, as the refusal says"
+  must "the receipt forgotten, as the refusal says to" no_receipt "$APP_ID"
+  installed downgrade-after-forgetting "$s3" "installing 0.0.3" 0.0.3
+  installed upgrade-after-downgrade "$pkg" "upgrading from 0.0.3 to $version" "$version"
+  "$LSREGISTER" -u "$trashed" >/dev/null 2>&1 || true
+  as_root rm -rf "$trashed"
+  must "the trashed copy emptied from the Trash" test ! -e "$trashed"
 
   section "5. removal"
   forget_fails "$version"
@@ -961,6 +1005,9 @@ cleanup() {
   st="$(ST)"
   [ -d "$st/before" ] || { say "cleanup: nothing was recorded"; return 0; }
   section "cleanup"
+  if [ -f "$st/pids" ]; then
+    while read -r p; do kill "$p" 2>/dev/null; done <"$st/pids"
+  fi
   quit_app
   pkill -f '/Syndeo.app/Contents/Helpers/syndeo-proxy' 2>/dev/null || true
   if mount | grep -q " on $ALT "; then

@@ -56,11 +56,14 @@ from the tarball and the install script above, and no longer from this
 package. Quit Syndeo before installing or upgrading. If the v0.1.6 or v0.1.7
 command-line package is installed, exactly as its package left it, this
 package removes it: its commands in \`/usr/local/bin\`, its files under
-\`/usr/local/libexec\`, and its receipt. If it is installed in any other
-state, this package refuses, and touches none of it. To remove Syndeo.app,
+\`/usr/local/libexec\`, and its receipt. Quit its programs first. If it is
+installed in any other state, this package refuses, and touches none of it.
+To remove Syndeo.app,
 either run \`sudo /bin/sh /Applications/Syndeo.app/Contents/Resources/uninstall.sh\`,
 which also forgets the package's receipt, or move it to the Trash. Your
-settings and data are kept either way.
+settings and data are kept either way. After the Trash, the same version or
+a newer one installs again; an older one is refused until the receipt is
+forgotten: \`sudo /usr/sbin/pkgutil --forget com.sum.syndeo.app --volume /\`.
 
 ### Signing
 

@@ -356,6 +356,41 @@ EOF
     return 0
 }
 
+# legacy_running: the process IDs, one per line, of anything running one of
+# the v0.1.x package's seven programs from its own tree,
+# /usr/local/libexec/syndeo/<version>/, however it was started: through its
+# link in /usr/local/bin, through `current`, or directly, its program text is
+# that file. As for Syndeo.app, a process counts when lsof finds that file its
+# program text and it is called by that program's name, so that a scan of the
+# file does not. Only a path that is a regular file is looked up.
+legacy_running() {
+    for _lr_n in $SYNDEO_NAMES; do
+        _lr_p="$SYNDEO_DIR/$legacy_v/$_lr_n"
+        if [ -f "$_lr_p" ] && [ ! -L "$_lr_p" ]; then
+            for _lr_pid in $(/usr/sbin/lsof -a -d txt -t -- "$_lr_p" 2>/dev/null); do
+                _lr_c=$(/bin/ps -o comm= -p "$_lr_pid" 2>/dev/null) || continue
+                if [ "${_lr_c##*/}" = "$_lr_n" ]; then
+                    echo "$_lr_pid"
+                fi
+            done
+        fi
+    done | LC_ALL=C /usr/bin/sort -u
+}
+
+# check_legacy_not_running: nothing of the v0.1.x package that legacy_plan
+# found to remove is running.
+check_legacy_not_running() {
+    case "$legacy" in
+        whole | partial) ;;
+        *) return 0 ;;
+    esac
+    _ln=$(legacy_running)
+    if [ -n "$_ln" ]; then
+        finding "the v0.1.x command-line package $legacy_v is running from $SYNDEO_DIR/$legacy_v (process $(printf '%s' "$_ln" | /usr/bin/tr '\n' ' ' | /usr/bin/sed 's/ $//')): quit it first"
+    fi
+    return 0
+}
+
 # legacy_step_name N: the path of step N.
 legacy_step_name() {
     legacy_steps "$legacy_v" | /usr/bin/sed -n "${1}p" | /usr/bin/tr -d '\n'

@@ -20,12 +20,17 @@
 #   resume it;
 # - receipt X, P exactly X and listed exactly by it: upgrade to a newer V,
 #   reinstall the same one, or refuse an older one;
-# - receipt X, P gone (moved to the Trash): install V;
+# - receipt X, P gone (moved to the Trash): install the same X or a newer V,
+#   and refuse an older one: to go back to an older version, forget that
+#   receipt first;
 # - receipt X, P exactly a newer W: an upgrade to W failed. Only W's package
 #   may finish it; any other is refused until it has.
 # Anything else at P is refused: a bundle that is not Syndeo's, not exactly
 # as packaged, changed since it was signed, or not what its receipt says.
 # Move it to the Trash, and install again.
+#
+# Refused too: Syndeo.app or its helper running from /Applications, and any
+# of the v0.1.x package's programs running from its own tree.
 #
 # And the discontinued v0.1.x command-line package, com.sum.syndeo.pkg: with
 # no receipt for it, nothing in /usr/local is looked at, and nothing there is
@@ -94,7 +99,13 @@ else
     check_app_receipt_meta
     refuse_if_found
     if ! is_present "$APP"; then
-        decision="installing $INCOMING; Syndeo.app $ar_version, which the receipt names, is no longer in $APP_DIR"
+        # Moved to the Trash: the receipt still says which version was
+        # installed, and an older one is a downgrade like any other.
+        if [ "$(syndeo_version_cmp "$INCOMING" "$ar_version")" = lt ]; then
+            finding "Syndeo.app $ar_version is no longer in $APP_DIR, but its package's receipt remains, and this package is the older $INCOMING. To install an older version, first forget that receipt: sudo /usr/sbin/pkgutil --forget $APP_RECEIPT --volume /"
+        else
+            decision="installing $INCOMING; Syndeo.app $ar_version, which the receipt names, is no longer in $APP_DIR"
+        fi
     else
         found=$(app_info CFBundleShortVersionString)
         if syndeo_version_valid "$found" && [ "$found" != "$ar_version" ] &&
@@ -121,7 +132,7 @@ else
             else
                 case "$(syndeo_version_cmp "$INCOMING" "$ar_version")" in
                     lt)
-                        finding "Syndeo.app $ar_version is installed, and this package is the older $INCOMING. Remove $ar_version first: run sudo /bin/sh $APP/Contents/Resources/uninstall.sh, or move Syndeo.app to the Trash"
+                        finding "Syndeo.app $ar_version is installed, and this package is the older $INCOMING. Remove $ar_version first: run sudo /bin/sh $APP/Contents/Resources/uninstall.sh"
                         ;;
                     eq)
                         decision="reinstalling $INCOMING"
@@ -143,6 +154,7 @@ legacy_plan "$is_incoming"
 if [ "$nfindings" != "$app_findings" ]; then
     legacy_refusal
 fi
+check_legacy_not_running
 refuse_if_found
 case "$legacy" in
     whole) decision="$decision, and removing the v0.1.x command-line package $legacy_v" ;;

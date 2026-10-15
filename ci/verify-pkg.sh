@@ -1150,6 +1150,27 @@ st_hold() {
   return 1
 }
 
+# st_legacy_hold NAME [link]: the v0.1.x tree's NAME replaced by a program
+# that waits, of the same name, and started from the tree itself, or with
+# link, through its command link in /usr/local/bin. held is its process ID.
+st_legacy_hold() {
+  local f="$D/0.1.7/$1"
+  cp "$T/hold" "$f"
+  chmod 755 "$f"
+  if [ "${2:-}" = link ]; then
+    "$R/usr/local/bin/$1" 120 &
+  else
+    "$f" 120 &
+  fi
+  held=$!
+  echo "$held" >>"$T/held"
+  for _ in $(seq 1 50); do
+    [ -n "$(/usr/sbin/lsof -a -d txt -t -- "$f" 2>/dev/null)" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 st_unhold() {
   kill "$held" 2>/dev/null
   wait "$held" 2>/dev/null
@@ -1208,9 +1229,13 @@ st_preinstall() {
   st_new; st_app_installed 0.0.9; pre_case "upgrade 0.0.9 to 0.0.10, numerically" 0 "upgrading from 0.0.9 to 0.0.10" 0.0.10
   st_new; st_app_installed 0.1.7; pre_case "the same version again" 0 "reinstalling 0.1.7" 0.1.7
   st_new; st_app_installed 0.1.7 yes; pre_case "the same version again, stapled" 0 "reinstalling 0.1.7" 0.1.7
-  st_new; st_app_installed 0.1.7; pre_case "refused: a downgrade" 1 "$p Syndeo.app 0.1.7 is installed, and this package is the older 0.0.3. Remove 0.1.7 first: run sudo /bin/sh $A/Contents/Resources/uninstall.sh, or move Syndeo.app to the Trash" 0.0.3
+  st_new; st_app_installed 0.1.7; pre_case "refused: a downgrade" 1 "$p Syndeo.app 0.1.7 is installed, and this package is the older 0.0.3. Remove 0.1.7 first: run sudo /bin/sh $A/Contents/Resources/uninstall.sh" 0.0.3
   st_new; st_app_receipt 0.0.2; pre_case "the bundle moved to the Trash: installed again" 0 "installing 0.1.7; Syndeo.app 0.0.2, which the receipt names, is no longer in $R/Applications" 0.1.7
-  st_new; st_app_receipt 0.1.7; pre_case "the bundle moved to the Trash: an older one may be installed" 0 "installing 0.0.3; Syndeo.app 0.1.7, which the receipt names, is no longer in $R/Applications" 0.0.3
+  st_new; st_app_receipt 0.1.7; pre_case "the bundle moved to the Trash: the same version installed again" 0 "installing 0.1.7; Syndeo.app 0.1.7, which the receipt names, is no longer in $R/Applications" 0.1.7
+  st_new; st_app_receipt 0.1.7
+  pre_case "refused: the bundle moved to the Trash, and an older package, its receipt still there" 1 "$p Syndeo.app 0.1.7 is no longer in $R/Applications, but its package's receipt remains, and this package is the older 0.0.3. To install an older version, first forget that receipt: sudo /usr/sbin/pkgutil --forget com.sum.syndeo.app --volume /" 0.0.3
+  st_new; st_app_receipt 0.1.7; rm "$DB/com.sum.syndeo.app.info" "$DB/com.sum.syndeo.app.files"
+  pre_case "  ... that receipt forgotten: the older package installed" 0 "syndeo preinstall: installing 0.0.3" 0.0.3
   st_new; st_app 0.0.3; st_app_receipt 0.0.2
   pre_case "a failed upgrade: the same package completes it" 0 "completing the failed upgrade from 0.0.2 to 0.0.3" 0.0.3
   st_new; st_app 0.0.3; st_app_receipt 0.0.2
@@ -1356,6 +1381,54 @@ st_preinstall() {
   pre_case "refused: a gap in what is left" 1 "$R/usr/local/bin/syndeo-agent: is missing, and the receipt for 0.1.7 lists it" 0.1.7
   st_new; st_legacy 0.1.7; st_legacy_cut 0.1.7 1; ln -s ../libexec/syndeo/current/syndeo "$R/usr/local/bin/syndeo"; rm "$R/usr/local/bin/syndeo-net"; st_app 0.1.7
   pre_case "refused: a link back where the removal had been" 1 "$R/usr/local/bin/syndeo-net: is missing" 0.1.7
+  if [ -x "$T/hold" ]; then
+    st_new; st_legacy 0.1.7
+    if st_legacy_hold syndeo-net; then
+      pre_case "refused: one of its programs running from its tree" 1 "$p the v0.1.x command-line package 0.1.7 is running from $D/0.1.7 (process $held): quit it first" 0.1.7
+    else
+      expect "preinstall: a v0.1.x program running (the held program did not start)" false
+    fi
+    st_unhold
+    st_new; st_legacy 0.1.7
+    if st_legacy_hold syndeo-proxy link; then
+      pre_case "refused: one of its programs running, started through its command link" 1 "$p the v0.1.x command-line package 0.1.7 is running from $D/0.1.7 (process $held): quit it first" 0.1.7
+    else
+      expect "preinstall: a v0.1.x program running through its link (the held program did not start)" false
+    fi
+    st_unhold
+    st_new; st_legacy 0.1.7; st_legacy_cut 0.1.7 8; st_app 0.1.7
+    if st_legacy_hold syndeo-ui; then
+      pre_case "refused: what is left of its removal, one of its programs running" 1 "$p the v0.1.x command-line package 0.1.7 is running from $D/0.1.7 (process $held): quit it first" 0.1.7
+    else
+      expect "preinstall: a v0.1.x program running after an interrupted removal (the held program did not start)" false
+    fi
+    st_unhold
+    # Not running: a program of the same name, elsewhere, holding the file
+    # open; and the file mapped by a process of another name, as a scan may.
+    st_new; st_legacy 0.1.7
+    mkdir -p "$C/elsewhere"
+    cp "$T/hold" "$C/elsewhere/syndeo-net"
+    # It holds the file open on its standard input, and never reads it.
+    "$C/elsewhere/syndeo-net" 120 <"$D/0.1.7/syndeo-net" &
+    held=$!
+    echo "$held" >>"$T/held"
+    pre_case "a program named syndeo-net that only reads its file: not running, removed" 0 "and removing the v0.1.x command-line package 0.1.7" 0.1.7
+    st_unhold
+    st_new; st_legacy 0.1.7
+    cp "$T/hold" "$D/0.1.7/syndeo-agent"
+    chmod 755 "$D/0.1.7/syndeo-agent"
+    ( exec -a mdworker_shared "$D/0.1.7/syndeo-agent" 120 ) &
+    held=$!
+    echo "$held" >>"$T/held"
+    for _ in $(seq 1 50); do
+      [ -n "$(/usr/sbin/lsof -a -d txt -t -- "$D/0.1.7/syndeo-agent" 2>/dev/null)" ] && break
+      sleep 0.1
+    done
+    pre_case "its program mapped by a process of another name, as a scan may: not running, removed" 0 "and removing the v0.1.x command-line package 0.1.7" 0.1.7
+    st_unhold
+  else
+    expect "preinstall: a v0.1.x program running (needs cc, to build a program to hold)" false
+  fi
   st_new; st_legacy 0.2.0
   pre_case "refused: a receipt for a version that is not 0.1.x" 1 "the receipt for com.sum.syndeo.pkg is for 0.2.0, which is not a v0.1.x command-line package" 0.1.7
   st_new; st_legacy 0.1.7; echo usr/local/extra >>"$DB/com.sum.syndeo.pkg.files"
@@ -1454,6 +1527,18 @@ st_postinstall() {
   expect "  ... and gone" st_legacy_gone
   st_new; st_app 0.1.7; st_legacy 0.1.7; st_legacy_cut 0.1.7 22; rmdir "$R/usr/local/libexec"
   post_case "interrupted after /usr/local/libexec went: its receipt forgotten" 0 "the v0.1.x command-line package 0.1.7 is removed" 0.1.7
+  if [ -x "$T/hold" ]; then
+    st_new; st_app 0.1.7; st_legacy 0.1.7
+    if st_legacy_hold syndeo-net; then
+      post_case "refused: one of its programs running, and nothing of it removed" 1 "the v0.1.x command-line package 0.1.7 is running from $D/0.1.7 (process $held): quit it first" 0.1.7
+      expect "  ... nothing changed" test "$changed" = no
+    else
+      expect "postinstall: a v0.1.x program running (the held program did not start)" false
+    fi
+    st_unhold
+  else
+    expect "postinstall: a v0.1.x program running (needs cc, to build a program to hold)" false
+  fi
   st_new; st_app 0.1.7; st_legacy 0.1.7; echo x >"$D/0.1.7/notes.txt"
   post_case "refused: a file more in its tree, and nothing of it removed" 1 "$D/0.1.7/notes.txt: is not part of Syndeo 0.1.7" 0.1.7
   expect "  ... nothing changed" test "$changed" = no
@@ -1756,6 +1841,16 @@ st_decisions() {
   decision_case "legacy-first-link-missing" preinstall 0.1.7 1 "$p the v0.1.x 0.1.6 command-line package is only partly there: $R/usr/local/bin/syndeo is gone, and everything removed before it"
   st_new; st_legacy 0.1.6; rm "$R/usr/local/bin/syndeo-agent"
   decision_case "legacy-link-missing" preinstall 0.1.7 1 "$p $R/usr/local/bin/syndeo-agent: is missing, and the receipt for 0.1.6 lists it"
+  if [ -x "$T/hold" ]; then
+    st_new; st_legacy 0.1.7
+    if st_legacy_hold syndeo-net link; then
+      decision_case "legacy-running" preinstall 0.1.7 1 "$p the v0.1.x command-line package 0.1.7 is running from $D/0.1.7 (process $held): quit it first"
+    fi
+    st_unhold
+  else
+    decided="$decided legacy-running"
+    expect "decision: legacy-running (needs cc, to build a program to hold)" false
+  fi
   st_new; st_legacy 0.1.6
   decision_case "migrate-v0.1.6" preinstall 0.1.7 0 "syndeo preinstall: installing 0.1.7, and removing the v0.1.x command-line package 0.1.6"
   st_new; st_app 0.1.7; st_legacy 0.1.6
@@ -1788,13 +1883,19 @@ st_decisions() {
   st_new; st_app 0.0.3; st_app_receipt 0.0.2
   decision_case "fault-the-same-package-again" preinstall 0.0.3 0 "syndeo preinstall: completing the failed upgrade from 0.0.2 to 0.0.3"
   st_new; st_app_installed 0.0.3
-  decision_case "downgrade" preinstall 0.0.2 1 "$p Syndeo.app 0.0.3 is installed, and this package is the older 0.0.2. Remove 0.0.3 first: run sudo /bin/sh $A/Contents/Resources/uninstall.sh, or move Syndeo.app to the Trash"
+  decision_case "downgrade" preinstall 0.0.2 1 "$p Syndeo.app 0.0.3 is installed, and this package is the older 0.0.2. Remove 0.0.3 first: run sudo /bin/sh $A/Contents/Resources/uninstall.sh"
   st_new; st_app_installed 0.0.3
   decision_case "reinstall-0.0.3" preinstall 0.0.3 0 "syndeo preinstall: reinstalling 0.0.3"
   st_new; st_app_installed 0.0.3; echo x >"$A/Contents/Resources/extra"; st_sign
   decision_case "modified-bundle" preinstall 0.0.3 1 "$p $A: is not Syndeo.app 0.0.3 as its package installed it. Move it to the Trash, then install this package"
   st_new; st_app_installed 0.0.3
   decision_case "upgrade-real" preinstall 0.1.7 0 "syndeo preinstall: upgrading from 0.0.3 to 0.1.7"
+  st_new; st_app_receipt 0.1.7
+  decision_case "after-the-trash-older" preinstall 0.0.3 1 "$p Syndeo.app 0.1.7 is no longer in $R/Applications, but its package's receipt remains, and this package is the older 0.0.3. To install an older version, first forget that receipt: sudo /usr/sbin/pkgutil --forget com.sum.syndeo.app --volume /"
+  st_new
+  decision_case "downgrade-after-forgetting" preinstall 0.0.3 0 "syndeo preinstall: installing 0.0.3"
+  st_new; st_app_installed 0.0.3
+  decision_case "upgrade-after-downgrade" preinstall 0.1.7 0 "syndeo preinstall: upgrading from 0.0.3 to 0.1.7"
   st_new; st_app_receipt 0.1.7
   decision_case "after-the-trash" preinstall 0.1.7 0 "syndeo preinstall: installing 0.1.7; Syndeo.app 0.1.7, which the receipt names, is no longer in $R/Applications"
   st_new; st_app 0.1.7 no com.example.other; plutil -replace CFBundleIdentifier -string com.example.other "$A/Contents/Info.plist"; st_sign com.example.other

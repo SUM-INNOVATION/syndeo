@@ -11,7 +11,7 @@
 # left it when it stopped.
 #
 # The removal looks at everything first, remembers each path, and changes
-# nothing unless all of it is right. Then, in a fixed order, each path looked
+# nothing unless all of it is right, and nothing of it is running. Then, in a fixed order, each path looked
 # at again just before it goes: the seven command links in /usr/local/bin,
 # `current`, the version's files, its directories and the private directory,
 # directories with rmdir. Then /usr/local/libexec, only if it is exactly as
@@ -57,6 +57,7 @@ legacy_plan yes
 if [ "$nfindings" != 0 ]; then
     legacy_refusal
 fi
+check_legacy_not_running
 refuse_if_found
 if [ "$legacy" = none ]; then
     say "Syndeo.app $INCOMING is installed in $APP_DIR"
