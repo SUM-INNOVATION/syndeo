@@ -210,11 +210,14 @@ sudo installer -pkg Syndeo-<version>.pkg -target /
 
   A signed release runs the same test on its signed package, where
   Gatekeeper has to accept it.
-- **What was not tested:**
-  - installing by opening the package in Finder, which runs Installer's
-    window and asks for an administrator's password;
-  - the refusal of Intel Macs and of macOS before 13, which rests on the
-    package's metadata alone, with no such runners to try it on.
+- **Checked by hand, for every signed release:** installing by opening the
+  package in Finder, which runs Installer's window and asks for an
+  administrator's password, then opening Syndeo.app from `/Applications`. CI
+  cannot drive either, so it is a required manual check before the release's
+  tag (see [Releasing](#releasing)), not something a pull request waits on.
+- **What was not tested:** the refusal of Intel Macs and of macOS before 13,
+  which rests on the package's metadata alone, with no such runners to try
+  it on.
 
 ## The three boundaries
 
@@ -855,6 +858,16 @@ package.
   what they should say. Only then is it published.
 - **A `workflow_dispatch` run is a dry run.** It does all of this, but
   rehearses the publication on a draft it deletes, and publishes nothing.
+- **Finder, by hand, before a signed release is tagged.** CI installs the
+  package with `installer`; it cannot drive Installer's window or its
+  password prompt. So for every signed release:
+  1. Download the signed dry run's `Syndeo-<version>.pkg` in a browser, on a
+     Mac with no Syndeo on it.
+  2. Open it in Finder, and install it through Installer's window.
+  3. Open Syndeo.app from `/Applications`, and browse a page.
+
+  Gatekeeper has to accept both without a warning. A tag waits for this,
+  and its result is recorded with the release's evidence.
 - **Checks on every pull request.** `ci/check-workflows.py` checks that no
   pull request can see a secret, and that release.yml keeps them to that one
   job.
