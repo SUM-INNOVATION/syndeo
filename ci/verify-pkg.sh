@@ -2311,7 +2311,7 @@ st_release() {
   fresh
   rel sums "$d/dist" "$v"
   expect "sums: the four assets of the version: SHA256SUMS written, in order" eval \
-    "[ $status = 0 ] && [ \"\$(sed 's/^[0-9a-f]*  //' '$d/dist/SHA256SUMS')\" = \"\$named\" ] && (cd '$d/dist' && shasum -a 256 -c SHA256SUMS >/dev/null)"
+    "[ $status = 0 ] && [ \"\$(sed 's/^[0-9a-f]*  //' '$d/dist/SHA256SUMS')\" = '$named' ] && (cd '$d/dist' && shasum -a 256 -c SHA256SUMS >/dev/null)"
   fresh; rm "$d/dist/syndeo-$v-aarch64-unknown-linux-gnu.tar.gz"
   rel sums "$d/dist" "$v"
   expect "sums: a tarball missing: refused, nothing written" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'missing syndeo-$v-aarch64-unknown-linux-gnu.tar.gz' && [ ! -e '$d/dist/SHA256SUMS' ]"
