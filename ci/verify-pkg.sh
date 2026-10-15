@@ -1542,6 +1542,8 @@ st_postinstall() {
   st_new; st_app 0.1.7; st_legacy 0.1.7; echo x >"$D/0.1.7/notes.txt"
   post_case "refused: a file more in its tree, and nothing of it removed" 1 "$D/0.1.7/notes.txt: is not part of Syndeo 0.1.7" 0.1.7
   expect "  ... nothing changed" test "$changed" = no
+  st_new; st_app 0.1.7; st_legacy 0.1.7; echo x >"$D/0.1.7/notes.txt"
+  post_case "  ... and it says how to repair or remove it" 1 "nothing of the v0.1.x command-line package 0.1.7 is removed unless it is exactly as its package left it: repair it by installing the Syndeo 0.1.7 package again, or remove it with sudo /bin/sh $D/0.1.7/uninstall.sh; then install this package" 0.1.7
   st_new; st_app 0.1.7; st_legacy 0.1.7; touch "$DB/forget-fails"
   post_case "its receipt cannot be forgotten: fails, saying how" 1 "    sudo /usr/sbin/pkgutil --forget com.sum.syndeo.pkg --volume /" 0.1.7
   expect "  ... every path of it gone, the receipt still there" eval "[ \"\$(st_legacy_left 0.1.7)\" = 0 ] && [ -f '$DB/com.sum.syndeo.pkg.info' ]"
@@ -2293,7 +2295,7 @@ self_test() {
 # against stand-in assets.
 st_release() {
   printf '\n  this script: the assets and notes of a release\n'
-  local d="$T/release" v=0.9.1 f out status
+  local d="$T/release" v=0.9.1 f out status named
   # rel ARGS...: this script's release mode; sets out and status.
   rel() { out="$(bash "$here/verify-pkg.sh" release "$@" 2>&1)" && status=0 || status=$?; }
   fresh() {
@@ -2302,10 +2304,14 @@ st_release() {
     for f in $(release_assets "$v"); do printf '%s\n' "$f" >"$d/dist/$f"; done
   }
 
+  # By name here, not by release_assets, so that a name changed there is
+  # caught.
+  named="$(printf '%s\n' "syndeo-$v-aarch64-apple-darwin.tar.gz" "syndeo-$v-aarch64-unknown-linux-gnu.tar.gz" \
+    "syndeo-$v-x86_64-unknown-linux-gnu.tar.gz" "Syndeo-$v.pkg")"
   fresh
   rel sums "$d/dist" "$v"
   expect "sums: the four assets of the version: SHA256SUMS written, in order" eval \
-    "[ $status = 0 ] && [ \"\$(sed 's/^[0-9a-f]*  //' '$d/dist/SHA256SUMS')\" = \"\$(release_assets $v)\" ] && (cd '$d/dist' && shasum -a 256 -c SHA256SUMS >/dev/null)"
+    "[ $status = 0 ] && [ \"\$(sed 's/^[0-9a-f]*  //' '$d/dist/SHA256SUMS')\" = \"\$named\" ] && (cd '$d/dist' && shasum -a 256 -c SHA256SUMS >/dev/null)"
   fresh; rm "$d/dist/syndeo-$v-aarch64-unknown-linux-gnu.tar.gz"
   rel sums "$d/dist" "$v"
   expect "sums: a tarball missing: refused, nothing written" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'missing syndeo-$v-aarch64-unknown-linux-gnu.tar.gz' && [ ! -e '$d/dist/SHA256SUMS' ]"
