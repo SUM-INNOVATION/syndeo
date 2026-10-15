@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Sign the macOS installer package, and, once Apple has accepted it, staple
-# it. Notarization itself is ci/notarize.py's, between the two.
+# it; and staple Syndeo.app, which Apple accepted with the binaries, before
+# the package is built from it. Notarization itself is ci/notarize.py's.
 #
+#   ci/sign-macos-pkg.sh staple-app <Syndeo.app.zip> <out-dir> <diagnostics-dir>
 #   ci/sign-macos-pkg.sh sign <unsigned.pkg> <signed.pkg> <state-dir>
 #   ci/sign-macos-pkg.sh finish <signed.pkg> <state-dir> <notarization-record> <diagnostics-dir>
 #   ci/sign-macos-pkg.sh --self-test
@@ -45,9 +47,29 @@
 # In either mode, on any failure <signed.pkg> is removed, so nothing half-done
 # can be shipped, and the exit status is the first failure's.
 #
+# staple-app, after notarize-binaries' one submission, which carried
+# Syndeo.app with the seven executables, was accepted, and release.yml has
+# checked <Syndeo.app.zip> is the bundle that submission carried, by its
+# SHA-256:
+#  A1. unpack it into <out-dir>, which must not exist yet, and record every
+#      path in the bundle with its bytes, mode and owner;
+#  A2. staple the ticket to it, once, and validate it, validation retried as
+#      in 5;
+#  A3. require the stapled bundle identical to the one unpacked, but for one
+#      file stapler adds, Contents/CodeResources, the ticket;
+#  A4. require its code signature to verify, strictly, with everything nested
+#      in it;
+#  A5. require Gatekeeper to accept it to run, as Notarized Developer ID, from
+#      a Developer ID Application identity of MACOS_TEAM_ID.
+# If it fails once stapling has begun, it keeps, in <diagnostics-dir>, the
+# stapled bundle as a ZIP with its SHA-256, stapler's output, codesign's and
+# Gatekeeper's, with the identity's name left out, and the trust settings;
+# and it removes <out-dir>, so no package is built from it.
+#
 # The secrets: sign uses MACOS_INSTALLER_CERTIFICATE_P12_BASE64,
 # MACOS_INSTALLER_CERTIFICATE_PASSWORD, MACOS_INSTALLER_SIGNING_IDENTITY and
-# MACOS_TEAM_ID; finish uses MACOS_INSTALLER_SIGNING_IDENTITY. Nothing is
+# MACOS_TEAM_ID; finish uses MACOS_INSTALLER_SIGNING_IDENTITY; staple-app
+# uses MACOS_TEAM_ID. Nothing is
 # traced, and no value is printed. The tools are found on PATH, which is how
 # the self-test puts stand-ins in their place.
 set -euo pipefail
@@ -345,6 +367,136 @@ cleanup_finish() {
   exit "$status"
 }
 
+# ------------------------------------------------------------------ staple-app
+
+# validated LOG PATH: stapler validate PATH, retried as finish retries it.
+# Prints the attempt it passed on; fails after five.
+validated() {
+  local log="$1" path="$2" delay attempt=0
+  for delay in 0 15 30 60 120; do
+    attempt=$((attempt + 1))
+    if [ "$delay" != 0 ]; then
+      say "the stapled ticket did not validate; validating again in ${delay}s (attempt $attempt of 5)" >&2
+      sleep "$delay"
+    fi
+    if recorded "$log" xcrun stapler validate "$path" >&2; then
+      echo "$attempt"
+      return 0
+    fi
+  done
+  return 1
+}
+
+staple_app() {
+  case "$-" in *x*) die "refusing: tracing is on, and would print the secrets" ;; esac
+  [ "$#" = 3 ] || die "usage: $0 staple-app <Syndeo.app.zip> <out-dir> <diagnostics-dir>"
+  local zip="$1" team attempt
+  out_dir="$2"
+  diag="$3"
+  umask 022
+  work=''
+  succeeded=no
+  stapling=no
+  made=no
+  app=''
+  trap cleanup_staple_app EXIT
+  trap 'exit 130' INT TERM HUP
+  signed_yes
+  not_blank MACOS_TEAM_ID
+  team="$MACOS_TEAM_ID"
+  [[ "$team" =~ ^[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10}$ ]] || die "refusing: MACOS_TEAM_ID is not ten capital letters and digits"
+  [ -f "$zip" ] || die "no $zip"
+  [ ! -e "$out_dir" ] && [ ! -L "$out_dir" ] || die "$out_dir exists"
+  [ ! -e "$diag" ] || die "refusing: $diag already exists, and diagnostics are only ever written fresh"
+
+  mkdir -p "$out_dir"
+  made=yes
+  ditto -x -k "$zip" "$out_dir" || die "A1. could not unpack $zip"
+  app="$out_dir/Syndeo.app"
+  [ "$(cd "$out_dir" && ls -A)" = Syndeo.app ] && [ -d "$app" ] && [ ! -L "$app" ] || die "A1. $zip does not hold Syndeo.app alone"
+  work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sign-macos-pkg.XXXXXX")"
+  manifest "$app" >"$work/before.manifest"
+  [ ! -e "$app/Contents/CodeResources" ] || die "A1. the bundle holds a ticket already"
+  say "A1. unpacked Syndeo.app, $(wc -l <"$work/before.manifest" | tr -d ' ') paths"
+
+  : >"$work/stapler.txt"
+  stapling=yes
+  recorded "$work/stapler.txt" xcrun stapler staple "$app" || die "A2. could not staple the ticket"
+  attempt="$(validated "$work/stapler.txt" "$app")" || die "A2. the stapled ticket does not validate, after 5 attempts"
+  say "A2. the ticket is stapled and validates (validation attempt $attempt)"
+
+  manifest "$app" >"$work/after.manifest"
+  if ! grep -vE '^\./Contents/CodeResources file ' "$work/after.manifest" | cmp -s - "$work/before.manifest" ||
+    [ "$(grep -cE '^\./Contents/CodeResources file 644 ' "$work/after.manifest")" != 1 ]; then
+    diff "$work/before.manifest" "$work/after.manifest" | grep '^[<>]' | head -10 >&2 || true
+    die "A3. stapling changed the bundle other than by adding its ticket, Contents/CodeResources"
+  fi
+  say "A3. the stapled bundle is the one Apple accepted, byte for byte, with its ticket added"
+
+  codesign --verify --strict --deep "$app" >"$work/codesign.txt" 2>&1 || die "A4. its code signature does not verify"
+  say "A4. its code signature verifies, strictly, with everything nested in it"
+
+  local assessed=yes result origin
+  spctl -a -vv -t execute "$app" >"$work/spctl" 2>&1 || assessed=no
+  result="$(cat "$work/spctl")"
+  origin="$(printf '%s\n' "$result" | sed -n 's/^origin=//p')"
+  if [ "$assessed" = yes ] && printf '%s\n' "$result" | grep -qxF "$app: accepted" &&
+    printf '%s\n' "$result" | grep -qx 'source=Notarized Developer ID' &&
+    [[ "$origin" =~ ^Developer\ ID\ Application:\ .+\ \(([ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10})\)$ ]] &&
+    [ "${BASH_REMATCH[1]}" = "$team" ]; then
+    say "A5. Gatekeeper accepts it to run: Notarized Developer ID, from a Developer ID Application identity of the team"
+  else
+    printf '%s\n' "$result" | sed 's/^origin=.*/origin=<an identity, not shown>/' | sed 's/^/    /' >&2
+    die "A5. Gatekeeper does not accept it to run as Notarized Developer ID from a Developer ID Application identity of the team"
+  fi
+  succeeded=yes
+  say "stapled: $app"
+}
+
+# keep_app_diagnostics: what staple-app keeps once stapling has begun and it
+# fails, in $diag, and nothing else. Never changing the exit status.
+keep_app_diagnostics() {
+  local failed=0
+  mkdir -p "$diag" || return 1
+  if [ -d "$app" ]; then
+    ditto -c -k --keepParent "$app" "$diag/Syndeo.app.zip" || failed=1
+    (cd "$diag" && shasum -a 256 Syndeo.app.zip) >"$diag/Syndeo.app.zip.sha256" || failed=1
+    codesign -dv --verbose=4 "$app" 2>&1 | sed 's/^Authority=Developer ID Application: .*/Authority=<the Application identity, not shown>/' \
+      >"$diag/codesign.txt"
+    spctl -a -vv -t execute "$app" 2>&1 | sed 's/^origin=.*/origin=<an identity, not shown>/' >"$diag/gatekeeper.txt"
+  fi
+  cp "$work/stapler.txt" "$diag/stapler.txt" || failed=1
+  {
+    printf '== security dump-trust-settings (user)\n'
+    security dump-trust-settings 2>&1
+    printf '== security dump-trust-settings -d (admin)\n'
+    security dump-trust-settings -d 2>&1
+    printf '== security dump-trust-settings -s (system)\n'
+    security dump-trust-settings -s 2>&1
+  } >"$diag/trust-settings.txt"
+  say "kept the diagnostics in $diag: $(cd "$diag" && ls | tr '\n' ' ')"
+  return "$failed"
+}
+
+cleanup_staple_app() {
+  local status=$?
+  set +e
+  if [ "$succeeded" != yes ] && [ "$stapling" = yes ]; then
+    keep_app_diagnostics || printf 'sign-macos-pkg: could not keep all of the diagnostics in %s\n' "$diag" >&2
+  fi
+  [ -z "$work" ] || rm -rf "$work"
+  if [ "$succeeded" != yes ]; then
+    # Only what this made: an output directory that was there is refused,
+    # and left alone.
+    if [ "$made" = yes ]; then
+      rm -rf "${out_dir:?}" 2>/dev/null || true
+      [ ! -e "$out_dir" ] || printf 'sign-macos-pkg: could not remove %s\n' "$out_dir" >&2
+    fi
+    [ "$status" != 0 ] || status=1
+  fi
+  exit "$status"
+}
+
 # ------------------------------------------------------------------ self-test
 
 # The tools, as stand-ins that log what they were asked and do what the case
@@ -406,7 +558,14 @@ case "$1 $2" in
     echo "xcrun stapler staple" >>"$STANDIN_CALLS"
     echo "Processing: $3"
     if [ "${STANDIN_STAPLE_FAILS:-no}" = yes ]; then echo "The staple and validate action failed! Error 65."; exit 65; fi
-    [ -z "${STANDIN_STAPLE:-}" ] || cp "$STANDIN_STAPLE" "$3"
+    case "$3" in
+      *.app)
+        # A ticket, as stapler adds one to a bundle; or not, or another
+        # change besides, as the case says.
+        [ "${STANDIN_APP_STAPLE:-ticket}" = none ] || { printf 'ticket' >"$3/Contents/CodeResources"; chmod 644 "$3/Contents/CodeResources"; }
+        [ "${STANDIN_APP_STAPLE:-ticket}" != changes ] || printf 'changed' >>"$3/Contents/Info.plist" ;;
+      *) [ -z "${STANDIN_STAPLE:-}" ] || cp "$STANDIN_STAPLE" "$3" ;;
+    esac
     echo "The staple and validate action worked!" ;;
   "stapler validate")
     echo "xcrun stapler validate" >>"$STANDIN_CALLS"
@@ -438,6 +597,14 @@ EOF
 #!/bin/bash
 echo "pkgutil $1" >>"$STANDIN_CALLS"
 exec /usr/sbin/pkgutil "$@"
+EOF
+  cat >"$bin/codesign" <<'EOF'
+#!/bin/bash
+echo "codesign $1" >>"$STANDIN_CALLS"
+case "$1" in
+  --verify) [ "${STANDIN_UNVERIFIED:-no}" != yes ] ;;
+  -dv) echo "Authority=Developer ID Application: SECRETVALUE Org (AB12CD34EF)" >&2 ;;
+esac
 EOF
   cat >"$bin/sleep" <<'EOF'
 #!/bin/bash
@@ -721,8 +888,89 @@ self_test() {
   chmod 755 "$T/readonly"
   diag_path=
 
+  # A bundle, zipped as build-macos hands it on, for staple-app.
+  mkdir -p "$T/bundle/Syndeo.app/Contents/MacOS" "$T/bundle/Syndeo.app/Contents/_CodeSignature"
+  printf 'plist' >"$T/bundle/Syndeo.app/Contents/Info.plist"
+  printf 'app' >"$T/bundle/Syndeo.app/Contents/MacOS/Syndeo"
+  printf 'seal' >"$T/bundle/Syndeo.app/Contents/_CodeSignature/CodeResources"
+  chmod 755 "$T/bundle/Syndeo.app/Contents/MacOS/Syndeo"
+  ditto -c -k --keepParent "$T/bundle/Syndeo.app" "$T/Syndeo.app.zip"
+  local app_origin="Developer ID Application: SECRETVALUE Org ($team)"
+
+  # app_case LABEL WANT-STATUS WANT-CALLS WANT-TEXT [NAME=VALUE...]:
+  # staple-app exits WANT-STATUS, calls exactly WANT-CALLS, says WANT-TEXT,
+  # never prints a secret, never notarizes, leaves nothing in RUNNER_TEMP,
+  # leaves the stapled bundle only on success, and keeps the diagnostics
+  # exactly when it failed once stapling had begun.
+  app_case() {
+    local label="$1" want="$2" calls="$3" text="$4" status out verdict=yes got
+    shift 4
+    rm -rf "$T/run"
+    mkdir -p "$T/run/temp"
+    : >"$T/run/calls"
+    out="$(env -i PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$T/run" RUNNER_TEMP="$T/run/temp" \
+      STANDIN_CALLS="$T/run/calls" STANDIN_ORIGIN="$app_origin" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID="$team" "$@" \
+      bash "$0" staple-app "$T/Syndeo.app.zip" "$T/run/app" "$T/run/diag" 2>&1)" && status=0 || status=$?
+    got="$(paste -sd, - <"$T/run/calls")"
+    [ "$status" = "$want" ] || verdict=no
+    [ "$got" = "$calls" ] || verdict=no
+    says "$out" "$text" || verdict=no
+    if printf '%s' "$out" | grep -qE 'SECRETVALUE|U0VDUkVU'; then verdict=no; fi
+    if grep -rqE 'SECRETVALUE|U0VDUkVU' "$T/run/diag" 2>/dev/null; then verdict=no; fi
+    if grep -q notarytool "$T/run/calls"; then verdict=no; fi
+    [ -z "$(ls -A "$T/run/temp")" ] || verdict=no
+    if [ "$want" = 0 ]; then
+      [ -f "$T/run/app/Syndeo.app/Contents/CodeResources" ] && [ ! -e "$T/run/diag" ] || verdict=no
+    else
+      [ ! -e "$T/run/app" ] || verdict=no
+      if grep -qx 'xcrun stapler staple' "$T/run/calls"; then
+        [ "$(cd "$T/run/diag" 2>/dev/null && ls -A | LC_ALL=C sort | tr '\n' ' ')" = \
+          "Syndeo.app.zip Syndeo.app.zip.sha256 codesign.txt gatekeeper.txt stapler.txt trust-settings.txt " ] || verdict=no
+      else
+        [ ! -e "$T/run/diag" ] || verdict=no
+      fi
+    fi
+    verdict_of "$label" "$verdict" "$got" "$out"
+  }
+  local stapled="xcrun stapler staple,xcrun stapler validate,codesign --verify,spctl"
+  local app_diagnosed="codesign -dv,spctl,security dump-trust-settings,security dump-trust-settings,security dump-trust-settings"
+
+  printf '\n  staple-app: the bundle Apple accepted, stapled, and nothing else changed\n'
+  app_case "accepted with the binaries: unpack, staple, validate, compare, verify, Gatekeeper" \
+    0 "$stapled" "A1. unpacked Syndeo.app|A2. the ticket is stapled|A3. the stapled bundle is the one Apple accepted|A4. its code signature verifies|A5. Gatekeeper accepts it to run|stapled:"
+  app_case "SYNDEO_EXPECT_SIGNED=no: refused before anything is unpacked" 1 "" "SYNDEO_EXPECT_SIGNED is not yes" SYNDEO_EXPECT_SIGNED=no
+  app_case "validation failing once, then passing: stapled once, validated twice" \
+    0 "xcrun stapler staple,xcrun stapler validate,sleep 15,xcrun stapler validate,codesign --verify,spctl" "validation attempt 2" STANDIN_VALIDATE_FAILS=1
+  app_case "validation failing every time: fails closed after five, the diagnostics kept, the bundle removed" \
+    1 "xcrun stapler staple,$retried,$app_diagnosed" "does not validate, after 5 attempts|kept the diagnostics in" STANDIN_VALIDATE_FAILS=all
+  app_case "stapling failing: fails closed, the diagnostics kept" \
+    1 "xcrun stapler staple,$app_diagnosed" "A2. could not staple the ticket" STANDIN_STAPLE_FAILS=yes
+  app_case "stapling that adds no ticket: caught" \
+    1 "xcrun stapler staple,xcrun stapler validate,$app_diagnosed" "A3. stapling changed the bundle other than by adding its ticket" STANDIN_APP_STAPLE=none
+  app_case "stapling that changes another file: caught" \
+    1 "xcrun stapler staple,xcrun stapler validate,$app_diagnosed" "A3. stapling changed the bundle other than by adding its ticket" STANDIN_APP_STAPLE=changes
+  app_case "a signature that does not verify: fails, the diagnostics kept" \
+    1 "xcrun stapler staple,xcrun stapler validate,codesign --verify,$app_diagnosed" "A4. its code signature does not verify" STANDIN_UNVERIFIED=yes
+  app_case "Gatekeeper: Developer ID, not notarized: fails, the identity not shown" \
+    1 "$stapled,$app_diagnosed" "A5. Gatekeeper does not accept it|origin=<an identity, not shown>" "STANDIN_SOURCE=Developer ID"
+  app_case "Gatekeeper: another team's Application identity: fails" \
+    1 "$stapled,$app_diagnosed" "A5. Gatekeeper does not accept it" "STANDIN_ORIGIN=Developer ID Application: SECRETVALUE Org (ZZ99ZZ99ZZ)"
+  app_case "Gatekeeper: an Installer identity of the team: fails" \
+    1 "$stapled,$app_diagnosed" "A5. Gatekeeper does not accept it" "STANDIN_ORIGIN=Developer ID Installer: SECRETVALUE Org ($team)"
+  app_case "Gatekeeper rejects it: fails" 1 "$stapled,$app_diagnosed" "A5. Gatekeeper does not accept it" STANDIN_SPCTL=rejected
+  mkdir -p "$T/run2"
+  out="$(env -i PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" RUNNER_TEMP="$T/run2" STANDIN_CALLS="$T/run2/calls" \
+    SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID="$team" bash "$0" staple-app "$T/Syndeo.app.zip" "$T/run2" "$T/run2/diag" 2>&1)" && status=0 || status=$?
+  cases=$((cases + 1))
+  if [ "$status" = 1 ] && printf '%s' "$out" | grep -qF "$T/run2 exists" && [ -d "$T/run2" ] && [ ! -e "$T/run2/calls" ]; then
+    printf '  ok    %s\n' "an output directory that exists: refused, and left alone"
+  else
+    printf '  WRONG %s (exit %s)\n' "an output directory that exists: refused, and left alone" "$status"
+    wrong=$((wrong + 1))
+  fi
+
   local out status mode
-  for mode in sign finish; do
+  for mode in sign finish staple-app; do
     out="$(env -i PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" "${signing[@]}" STANDIN_CALLS="$T/run/calls" STANDIN_LIST="$T/run/list" \
       bash -x "$0" "$mode" "$d/unsigned.pkg" "$T/run/x.pkg" "$T/run/x" 2>&1)" && status=0 || status=$?
     cases=$((cases + 1))
@@ -739,7 +987,8 @@ self_test() {
 
 case "${1:-}" in
   --self-test) self_test ;;
+  staple-app) shift; staple_app "$@" ;;
   sign) shift; sign "$@" ;;
   finish) shift; finish "$@" ;;
-  *) die "usage: $0 sign <unsigned.pkg> <signed.pkg> <state-dir> | finish <signed.pkg> <state-dir> <notarization-record> | --self-test" ;;
+  *) die "usage: $0 staple-app <Syndeo.app.zip> <out-dir> <diagnostics-dir> | sign <unsigned.pkg> <signed.pkg> <state-dir> | finish <signed.pkg> <state-dir> <notarization-record> <diagnostics-dir> | --self-test" ;;
 esac

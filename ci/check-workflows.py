@@ -29,10 +29,15 @@ is not an approval gate. Checked:
 - the macOS release runs in order: build-macos, then notarize-binaries, then
   package, then pkg-install and checksums, with exactly the needs that make
   it so, and no job-level `if:` but publish's and rehearse's;
-- the tarball's provenance: build-macos uploads it and gives its SHA-256;
-  notarize-binaries requires those bytes; package requires the bytes
-  notarize-binaries checked, requires their notarization accepted, and
-  builds the package from that tarball only afterwards;
+- the tarball's and Syndeo.app's provenance: build-macos uploads each, the
+  bundle as a ZIP, and gives their SHA-256s; notarize-binaries requires those
+  bytes, and puts that bundle in its one submission with the seven
+  executables; package requires the bytes notarize-binaries checked, requires
+  their notarization accepted, staples that bundle (if signed) or unpacks it,
+  and builds the package from it only afterwards;
+- every signed binary and the signed bundle checked and run before Apple
+  sees any of them: in build-macos once signed, and in notarize-binaries
+  before the ZIP and the submission;
 - Apple is asked once per file: one `notarize.py submit`, then one `wait`,
   in notarize-binaries and in package and nowhere else, and notarytool is
   never called directly; package signs before it submits and staples
@@ -340,27 +345,49 @@ def check_order(jobs):
         for n, c in lines:
             if c.startswith("    if:") and JOB_IFS.get(name) != c.strip():
                 found.append("release.yml:%d %s has a job-level %r; only publish and rehearse may have one" % (n, name, c.strip()))
-    # Provenance: one tarball, by its SHA-256, from build-macos to package.
+    # Provenance: one tarball and one Syndeo.app, each by its SHA-256, from
+    # build-macos to package.
     b, nb, pk = jobs["build-macos"], jobs["notarize-binaries"], jobs["package"]
     if not any(c.strip() == "name: internal-macos-tarball" for _, c in b) or \
             not any("tarball-sha256: ${{ steps.tarball.outputs.sha256 }}" in c for _, c in b):
         found.append("release.yml: build-macos does not hand on the tarball (internal-macos-tarball) with its SHA-256")
-    for name, lines, upstream in (("notarize-binaries", nb, "needs.build-macos.outputs.tarball-sha256"),
-                                  ("package", pk, "needs.notarize-binaries.outputs.tarball-sha256")):
-        if not any(c.strip() == "name: internal-macos-tarball" for _, c in lines):
-            found.append("release.yml: %s does not take the internal-macos-tarball artifact" % name)
-        checked = [st for st in steps(lines)
-                   if any(upstream in c for _, c in st) and any("shasum -a 256 -c" in c for _, c in st)]
-        if not checked:
-            found.append("release.yml: %s does not require the tarball's SHA-256 to be %s" % (name, upstream))
+    if not any(c.strip() == "name: internal-macos-app" for _, c in b) or \
+            not any("app-sha256: ${{ steps.tarball.outputs.app-sha256 }}" in c for _, c in b):
+        found.append("release.yml: build-macos does not hand on Syndeo.app (internal-macos-app) with its SHA-256")
+    if not any("app-sha256: ${{ steps.tarball.outputs.app-sha256 }}" in c for _, c in nb):
+        found.append("release.yml: notarize-binaries does not hand on Syndeo.app's SHA-256")
+    checks = {}
+    for name, lines, frm in (("notarize-binaries", nb, "build-macos"), ("package", pk, "notarize-binaries")):
+        for what, artifact, var, path, output in (
+                ("the tarball", "internal-macos-tarball", "WANT", "dist/$TARBALL", "tarball-sha256"),
+                ("Syndeo.app", "internal-macos-app", "WANT_APP", "dist/$APPZIP", "app-sha256")):
+            if not any(c.strip() == "name: %s" % artifact for _, c in lines):
+                found.append("release.yml: %s does not take the %s artifact" % (name, artifact))
+            upstream = "needs.%s.outputs.%s" % (frm, output)
+            checked = [st for st in steps(lines)
+                       if any(c.strip() == "%s: ${{ %s }}" % (var, upstream) for _, c in st)
+                       and any('"$%s" "%s" | shasum -a 256 -c -' % (var, path) in c for _, c in st)]
+            if not checked:
+                found.append("release.yml: %s does not require %s's SHA-256 to be %s" % (name, what, upstream))
+            else:
+                checks[(name, what)] = min(n for n, _ in checked[0])
     if not any("needs.notarize-binaries.outputs.notarization" in c for _, c in pk):
         found.append("release.yml: package does not require the binaries' notarization")
-    sha = first_line(pk, "needs.notarize-binaries.outputs.tarball-sha256")
-    build = first_line(pk, "ci/package-macos-pkg.sh")
-    if build is None or not any('ci/package-macos-pkg.sh "$VERSION" "dist/$TARBALL"' in c for _, c in joined(pk)):
-        found.append("release.yml: package does not build the package from dist/$TARBALL")
-    elif sha is None or build < sha:
-        found.append("release.yml: package builds the package before checking the tarball")
+    app = '"$RUNNER_TEMP/app/Syndeo.app"'
+    unpack = '/usr/bin/ditto -x -k "dist/$APPZIP" "$RUNNER_TEMP/app"'
+    staple = 'ci/sign-macos-pkg.sh staple-app "dist/$APPZIP" "$RUNNER_TEMP/app" diagnostics/stapling'
+    build = first_line(pk, 'ci/package-macos-pkg.sh "$VERSION" ' + app)
+    if first_line(pk, "ci/package-macos-pkg.sh") is None or build is None:
+        found.append("release.yml: package does not build the package from $RUNNER_TEMP/app/Syndeo.app")
+    else:
+        sha = [checks.get(("package", w)) for w in ("the tarball", "Syndeo.app")]
+        if None in sha or build < max(sha):
+            found.append("release.yml: package builds the package before checking the tarball and Syndeo.app")
+        stapled, unpacked = first_line(pk, staple), first_line(pk, unpack)
+        if stapled is None or unpacked is None or build < max(stapled, unpacked) or \
+                checks.get(("package", "Syndeo.app")) is None or min(stapled, unpacked) < checks[("package", "Syndeo.app")]:
+            found.append("release.yml: package does not staple Syndeo.app (or, unsigned, unpack it) after checking it "
+                         "and before building the package from it")
     # Apple: once per file, submit then wait, in these two jobs only.
     for name, lines in jobs.items():
         cmds = joined(lines)
@@ -389,6 +416,12 @@ def check_order(jobs):
     submitted = first_line(nb, "ci/notarize.py submit")
     if zipped is None or submitted is None or zipped > submitted:
         found.append("release.yml: notarize-binaries does not make the binaries' ZIP before it submits")
+    if first_line(nb, 'ci/notarize.py binaries-zip "dist/$TARBALL" "$VERSION" %s' % app) is None:
+        found.append("release.yml: notarize-binaries' ZIP does not carry Syndeo.app with the seven")
+    nb_unpack = first_line(nb, unpack)
+    if nb_unpack is None or checks.get(("notarize-binaries", "Syndeo.app")) is None or \
+            nb_unpack < checks[("notarize-binaries", "Syndeo.app")] or zipped is None or nb_unpack > zipped:
+        found.append("release.yml: notarize-binaries does not unpack Syndeo.app after checking it and before the ZIP")
     # Every signed binary checked and run before Apple sees any of them: in
     # build-macos once they are signed, and in notarize-binaries before the
     # ZIP is made and anything is submitted. macOS kills a binary it refuses
@@ -400,10 +433,19 @@ def check_order(jobs):
     ran = first_line(nb, run)
     if ran is None or zipped is None or submitted is None or ran > zipped or ran > submitted:
         found.append("release.yml: notarize-binaries does not run the signed binaries (%s) before the ZIP and the submission" % run)
-    order = [first_line(pk, x) for x in ("ci/sign-macos-pkg.sh sign", "ci/notarize.py submit", "ci/notarize.py wait",
-                                          "ci/sign-macos-pkg.sh finish", "ci/verify-pkg.sh inspect")]
+    run = 'ci/verify-pkg.sh signed-app %s "$VERSION" --tarball "dist/$TARBALL"' % app
+    signing, ran = first_line(b, "ci/sign-macos.sh"), first_line(b, run)
+    if signing is None or ran is None or ran < signing:
+        found.append("release.yml: build-macos does not check the signed Syndeo.app and run its helper (%s) once it has signed it" % run)
+    ran = first_line(nb, run)
+    if ran is None or zipped is None or submitted is None or ran > zipped or ran > submitted:
+        found.append("release.yml: notarize-binaries does not check the signed Syndeo.app (%s) before the ZIP and the submission" % run)
+    order = [first_line(pk, x) for x in (staple, "ci/package-macos-pkg.sh", "ci/sign-macos-pkg.sh sign", "ci/notarize.py submit",
+                                          "ci/notarize.py wait", "ci/sign-macos-pkg.sh finish", "ci/verify-pkg.sh inspect")]
     if None in order or order != sorted(order):
-        found.append("release.yml: package does not sign, submit, wait, staple and inspect, in that order")
+        found.append("release.yml: package does not staple the app, build, sign, submit, wait, staple and inspect, in that order")
+    if first_line(pk, 'ci/verify-pkg.sh inspect "dist/$PKG" "$VERSION" --app %s' % app) is None:
+        found.append("release.yml: package does not inspect the package against the Syndeo.app it was built from")
     # Stapling's diagnostics: written by finish to one directory, uploaded
     # only when the package job fails, from that directory alone, for at most
     # a week, and read by no other job. Nothing that inspects the package or
@@ -589,6 +631,40 @@ def self_test(directory):
     case("notarize-binaries not checking the tarball's SHA-256", ci,
          in_job(rel, "notarize-binaries", "          printf '%s  %s\\n' \"$WANT\" \"dist/$TARBALL\" | shasum -a 256 -c -\n", ""),
          "notarize-binaries does not require the tarball's SHA-256")
+    case("notarize-binaries not checking Syndeo.app's SHA-256", ci,
+         in_job(rel, "notarize-binaries", "          printf '%s  %s\\n' \"$WANT_APP\" \"dist/$APPZIP\" | shasum -a 256 -c -\n", ""),
+         "notarize-binaries does not require Syndeo.app's SHA-256")
+    case("build-macos not handing on Syndeo.app", ci,
+         in_job(rel, "build-macos", "          name: internal-macos-app\n", "          name: macos-app\n"),
+         "build-macos does not hand on Syndeo.app")
+    case("notarize-binaries not handing on Syndeo.app's SHA-256", ci,
+         in_job(rel, "notarize-binaries", "      app-sha256: ${{ steps.tarball.outputs.app-sha256 }}\n", ""),
+         "notarize-binaries does not hand on Syndeo.app's SHA-256")
+    case("package checking Syndeo.app against build-macos, not against what was notarized", ci,
+         in_job(rel, "package", "WANT_APP: ${{ needs.notarize-binaries.outputs.app-sha256 }}",
+                "WANT_APP: ${{ needs.build-macos.outputs.app-sha256 }}"),
+         "package does not require Syndeo.app's SHA-256")
+    case("package not checking Syndeo.app's SHA-256", ci,
+         in_job(rel, "package", "          printf '%s  %s\\n' \"$WANT_APP\" \"dist/$APPZIP\" | shasum -a 256 -c -\n", ""),
+         "package does not require Syndeo.app's SHA-256")
+    case("notarize-binaries' ZIP without Syndeo.app", ci,
+         in_job(rel, "notarize-binaries", 'binaries-zip "dist/$TARBALL" "$VERSION" "$RUNNER_TEMP/app/Syndeo.app"',
+                'binaries-zip "dist/$TARBALL" "$VERSION" "$RUNNER_TEMP/other/Syndeo.app"'),
+         "notarize-binaries' ZIP does not carry Syndeo.app")
+    case("package not stapling Syndeo.app", ci,
+         in_job(rel, "package", 'run: ./ci/sign-macos-pkg.sh staple-app "dist/$APPZIP" "$RUNNER_TEMP/app" diagnostics/stapling', "run: true"),
+         "package does not staple Syndeo.app")
+    case("build-macos not checking the signed Syndeo.app", ci,
+         in_job(rel, "build-macos", '        run: bash ci/verify-pkg.sh signed-app "$RUNNER_TEMP/app/Syndeo.app" "$VERSION" --tarball "dist/$TARBALL"\n',
+                "        run: true\n"),
+         "build-macos does not check the signed Syndeo.app")
+    case("notarize-binaries not checking the signed Syndeo.app", ci,
+         in_job(rel, "notarize-binaries", '          bash ci/verify-pkg.sh signed-app "$RUNNER_TEMP/app/Syndeo.app" "$VERSION" --tarball "dist/$TARBALL"\n',
+                "          true\n"),
+         "notarize-binaries does not check the signed Syndeo.app")
+    case("package inspecting without the bundle it was built from", ci,
+         in_job(rel, "package", '--app "$RUNNER_TEMP/app/Syndeo.app"', '--app "$RUNNER_TEMP/other/Syndeo.app"'),
+         "package does not inspect the package against the Syndeo.app")
     case("package checking the tarball against build-macos, not against what was notarized", ci,
          in_job(rel, "package", "WANT: ${{ needs.notarize-binaries.outputs.tarball-sha256 }}",
                 "WANT: ${{ needs.build-macos.outputs.tarball-sha256 }}"),
@@ -596,17 +672,22 @@ def self_test(directory):
     case("package not requiring the binaries' notarization", ci,
          in_job(rel, "package", "          NOTARIZATION: ${{ needs.notarize-binaries.outputs.notarization }}\n", ""),
          "package does not require the binaries' notarization")
-    case("package building from another tarball", ci,
-         in_job(rel, "package", './ci/package-macos-pkg.sh "$VERSION" "dist/$TARBALL"', './ci/package-macos-pkg.sh "$VERSION" "$RUNNER_TEMP/other.tar.gz"'),
-         "package does not build the package from dist/$TARBALL")
+    case("package building from another bundle", ci,
+         in_job(rel, "package", './ci/package-macos-pkg.sh "$VERSION" "$RUNNER_TEMP/app/Syndeo.app"',
+                './ci/package-macos-pkg.sh "$VERSION" "$RUNNER_TEMP/other/Syndeo.app"'),
+         "package does not build the package from $RUNNER_TEMP/app/Syndeo.app")
     a, b = job(rel, "package")
     text = rel[a:b]
-    sha_at = text.index("      - name: The tarball Apple accepted, byte for byte\n")
-    build_at = text.index("      - name: The package, from that tarball\n")
+    sha_at = text.index("      - name: The tarball and Syndeo.app Apple accepted, byte for byte\n")
+    staple_at = text.index("      - name: Staple Syndeo.app, which Apple accepted with the binaries, and ask Gatekeeper\n")
+    build_at = text.index("      - name: The package, from that Syndeo.app\n")
     sign_at = text.index("      - name: Sign the package\n")
     early = text[:sha_at] + text[build_at:sign_at] + text[sha_at:build_at] + text[sign_at:]
-    case("package building before it checks the tarball", ci, rel[:a] + early + rel[b:],
-         "package builds the package before checking the tarball")
+    case("package building before it checks the tarball and the bundle", ci, rel[:a] + early + rel[b:],
+         "package builds the package before checking the tarball and Syndeo.app")
+    unstapled = text[:staple_at] + text[build_at:sign_at] + text[staple_at:build_at] + text[sign_at:]
+    case("package building before it staples the bundle", ci, rel[:a] + unstapled + rel[b:],
+         "package does not staple Syndeo.app (or, unsigned, unpack it) after checking it and before building")
     case("a second submission of the binaries", ci,
          in_job(rel, "notarize-binaries", "      - name: Wait for Apple's verdict on the binaries\n",
                 "      - run: python3 -I ci/notarize.py submit \"$RUNNER_TEMP/notarize.zip\" --record notarization/again\n"
@@ -620,7 +701,7 @@ def self_test(directory):
     unsigned_at = text.index("      - name: The package, unsigned, as the configuration decided\n")
     staple_early = text[:submit_at] + text[finish_at:unsigned_at] + text[submit_at:finish_at] + text[unsigned_at:]
     case("package stapling before Apple's verdict", ci, rel[:a] + staple_early + rel[b:],
-         "package does not sign, submit, wait, staple and inspect, in that order")
+         "package does not staple the app, build, sign, submit, wait, staple and inspect, in that order")
     case("build-macos notarizing", ci,
          in_job(rel, "build-macos", "      - name: The tarball\n",
                 "      - run: python3 -I ci/notarize.py submit dist/x.zip --record r\n      - name: The tarball\n"),
@@ -654,9 +735,9 @@ def self_test(directory):
          "build-macos does not run the signed binaries")
     a, b = job(rel, "build-macos")
     text = rel[a:b]
-    sign_at = text.index("      - name: Sign the binaries\n")
+    sign_at = text.index("      - name: Sign the binaries, then Syndeo.app\n")
     check_at = text.index("      - name: Check the signed binaries in the tarball, and run each of them\n")
-    sum_at = text.index("      - name: The tarball's SHA-256\n")
+    sum_at = text.index("      - name: Check the signed Syndeo.app, and run its helper\n")
     early = text[:sign_at] + text[check_at:sum_at] + text[sign_at:check_at] + text[sum_at:]
     case("build-macos running the binaries before it signs them", ci, rel[:a] + early + rel[b:],
          "build-macos does not run the signed binaries")
@@ -666,7 +747,7 @@ def self_test(directory):
     a, b = job(rel, "notarize-binaries")
     text = rel[a:b]
     check_at = text.index("      - name: Check and run the signed binaries again, before Apple sees them\n")
-    zip_at = text.index("      - name: The ZIP of exactly the seven executables\n")
+    zip_at = text.index("      - name: The ZIP of exactly the seven executables and Syndeo.app\n")
     wait_at = text.index("      - name: Wait for Apple's verdict on the binaries\n")
     late = text[:check_at] + text[zip_at:wait_at] + text[check_at:zip_at] + text[wait_at:]
     case("notarize-binaries running the binaries only after it submits them", ci, rel[:a] + late + rel[b:],
@@ -757,8 +838,9 @@ def main():
         return 1
     print("check-workflows: ci.yml reads no secret and no environment; in release.yml only signing-config, build-macos, "
           "notarize-binaries and package, behind release-macos, read secrets, each only its own share, each gating first; "
-          "the macOS release runs build, notarize the binaries, package, in order, on one tarball by its SHA-256, runs "
-          "every signed binary before Apple sees any of them, with one "
+          "the macOS release runs build, notarize the binaries and Syndeo.app, package, in order, on one tarball and one "
+          "Syndeo.app by their SHA-256s, runs every signed binary and checks the signed bundle before Apple sees any of them, "
+          "staples the bundle before the package is built from it, with one "
           "submission per file inside each job's time; every release is created a draft, publish checks it before making "
           "it public, and rehearse only deletes its own")
     return 0

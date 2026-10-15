@@ -49,8 +49,10 @@ jobs:
       - uses: actions/checkout@v4
       - run: bash ci/test-install.sh
       - run: bash ci/verify-release.sh --self-test
-      # The macOS package's root scripts, under a temporary root, and the
-      # switch under load; on Linux, the version grammar and the rendering.
+      # The macOS package's root scripts, under a temporary root, with
+      # stand-ins for pkgutil and codesign, over every state they handle; a
+      # package built from a compiled stand-in Syndeo.app, inspected; on
+      # Linux, the version grammar, the rendering and the release's assets.
       - run: bash ci/verify-pkg.sh --self-test
       # The signing configuration gate, every partial and contradictory state
       # of it; and the package's signing order, with stand-ins for the tools
@@ -62,10 +64,12 @@ jobs:
       - run: python3 -I ci/notarize.py --self-test
       # The binaries' signing, with stand-ins for the tools: all seven alike,
       # and none with an entitlement, which a standalone executable cannot
-      # carry without being killed at launch.
+      # carry without being killed at launch; and Syndeo.app after them, its
+      # helper not signed again.
       - run: bash ci/sign-macos.sh --self-test
-      # Syndeo.app's assembly: exactly its five files, and every way a bundle
-      # can differ from that caught (macOS only).
+      # Syndeo.app's assembly: exactly its six files, its uninstaller
+      # included, signed or stapled, and every way a bundle can differ from
+      # that caught (macOS only).
       - run: bash ci/package-macos-app.sh --self-test
       # The app's mutants, which the app job builds and has to catch: each
       # still applies to the source exactly once.
@@ -137,17 +141,20 @@ jobs:
 
   macos-package:
     name: macOS package (installed and removed on a disposable runner)
-    # The release binaries, built as release.yml builds them; the tarball and
-    # the installer package from them; the package inspected without
-    # installing it; then installed for real and taken through every state it
-    # handles, as root and as runner; and the runner put back, whatever
-    # happened. Unsigned, with no secrets: a pull request never signs. Only
-    # the logs are kept, never the package.
+    # The release binaries and Syndeo.app, built as release.yml's build-macos
+    # builds them, the app assembled and signed ad hoc by ci/sign-macos.sh
+    # --app as an unsigned release is, and the tarball made; the installer
+    # package built from the app, and inspected without installing it; then
+    # installed for real, opened, and taken through every state the package
+    # handles, the published v0.1.x packages and install.sh's commands
+    # included; and the runner put back, whatever happened. Unsigned, with no
+    # secrets: a pull request never signs, and Gatekeeper has to reject what
+    # it builds. Only the logs are kept, never the package.
     runs-on: macos-15
     timeout-minutes: 90
     env:
       SYNDEO_ALLOW_SYSTEM_INSTALL_TEST: "yes"
-      PRESERVE: SYNDEO_ALLOW_SYSTEM_INSTALL_TEST,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_WORKSPACE
+      SYNDEO_EXPECT_SIGNED: "no"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -157,52 +164,53 @@ jobs:
         with:
           key: macos-package
 
-      - name: Build the release binaries
+      - name: Build the release binaries and the app
         run: |
           cargo build --release --locked --target aarch64-apple-darwin \
             -p syndeo-shell -p syndeo-net -p syndeo-keystore \
-            -p syndeo-agent -p syndeo-proxy -p syndeo-ui
+            -p syndeo-agent -p syndeo-proxy -p syndeo-ui -p syndeo-app
           cargo build --release --locked --target aarch64-apple-darwin \
             -p syndeo-webkit
 
-      - name: The tarball, and the package built from it
+      - name: Syndeo.app, signed ad hoc, the tarball, and the package built from the app
         shell: bash
         run: |
           set -euo pipefail
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           {
             echo "VERSION=$version"
-            echo "TARBALL=$GITHUB_WORKSPACE/dist/syndeo-$version-aarch64-apple-darwin.tar.gz"
+            echo "APP=$GITHUB_WORKSPACE/dist/app/Syndeo.app"
             echo "PKG=$GITHUB_WORKSPACE/dist/syndeo-$version-aarch64-apple-darwin.pkg"
           } >> "$GITHUB_ENV"
+          mkdir -p dist/app
+          bash ci/sign-macos.sh target/aarch64-apple-darwin/release --app "$version" dist/app
           ./ci/package.sh "$version" aarch64-apple-darwin
-          ./ci/package-macos-pkg.sh "$version" "dist/syndeo-$version-aarch64-apple-darwin.tar.gz" dist
+          ./ci/package-macos-pkg.sh "$version" dist/app/Syndeo.app dist
+
+      - name: The app's helper is the tarball's syndeo-proxy, byte for byte
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tarball"
+          tar -xzf "dist/syndeo-$VERSION-aarch64-apple-darwin.tar.gz" -C "$RUNNER_TEMP/tarball"
+          cmp "$APP/Contents/Helpers/syndeo-proxy" "$RUNNER_TEMP/tarball/syndeo-$VERSION-aarch64-apple-darwin/syndeo-proxy"
 
       - name: Inspect the package without installing it
-        run: SYNDEO_EXPECT_SIGNED=no bash ci/verify-pkg.sh inspect "$PKG" "$VERSION" --tarball "$TARBALL"
+        run: bash ci/verify-pkg.sh inspect "$PKG" "$VERSION" --app "$APP"
 
-      - name: Install it, through refusals, upgrades in use, failed upgrades and their repair (root)
-        run: sudo --preserve-env="$PRESERVE" bash ci/test-pkg-install.sh --system-before "$PKG" "$VERSION"
-
-      - name: Use it from PATH (runner)
-        run: bash ci/test-pkg-install.sh --user "$VERSION"
-
-      - name: Reinstalls, refusals, a missing path, the uninstaller, and removal (root)
-        run: sudo --preserve-env="$PRESERVE" bash ci/test-pkg-install.sh --system-after "$PKG" "$VERSION"
+      - name: Install it, open it, upgrade, break, repair, move to the Trash and remove it, over the v0.1.x packages and install.sh's commands
+        run: bash ci/test-pkg-install.sh run "$PKG" "$VERSION"
 
       - name: Put the runner back, whatever happened
         if: always()
-        run: sudo --preserve-env="$PRESERVE" bash ci/test-pkg-install.sh --cleanup
+        run: bash ci/test-pkg-install.sh cleanup
 
       - name: Keep the logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: macos-package-logs
-          path: |
-            ${{ runner.temp }}/syndeo-pkg-test/logs/
-            ${{ runner.temp }}/syndeo-pkg-user/*.log
-            ${{ runner.temp }}/syndeo-pkg-user/doctor
+          path: ${{ runner.temp }}/syndeo-pkg-test/logs/
           if-no-files-found: warn
 
   macos-app:
@@ -347,48 +355,6 @@ jobs:
         with:
           name: macos-app-logs
           path: ${{ runner.temp }}/syndeo-app-test/
-          if-no-files-found: warn
-
-  macos-app-pkg-measure:
-    name: Syndeo.app's package, measured (not a gate)
-    # Phase 4's first step, measured and not gated: what Installer,
-    # LaunchServices and Gatekeeper do with an application package (probe
-    # packages of Syndeo.app, signed ad hoc), and exactly what the published
-    # v0.1.6 and v0.1.7 packages leave. See ci/measure-app-pkg.sh. No secret,
-    # no environment: a pull request never signs. It fails only if it cannot
-    # put the runner back exactly as it found it.
-    runs-on: macos-15
-    timeout-minutes: 45
-    env:
-      SYNDEO_ALLOW_SYSTEM_INSTALL_TEST: "yes"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: macos-app
-
-      - name: Build the app and its helper
-        run: cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app -p syndeo-proxy
-
-      - name: Probe packages of Syndeo.app, 0.0.1 to 0.0.4
-        run: bash ci/measure-app-pkg.sh build target/aarch64-apple-darwin/release "$RUNNER_TEMP/probe-pkgs"
-
-      - name: The v0.1.x packages, then the probes installed, opened, upgraded, failed and moved to the Trash (measured)
-        run: bash ci/measure-app-pkg.sh run "$RUNNER_TEMP/probe-pkgs"
-
-      - name: Put the runner back exactly as found (the only gate)
-        if: always()
-        run: bash ci/measure-app-pkg.sh cleanup
-
-      - name: Keep the measurements and diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-app-pkg-measure
-          path: ${{ runner.temp }}/syndeo-app-pkg-measure/
           if-no-files-found: warn
 
   deny:

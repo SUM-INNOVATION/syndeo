@@ -1,6 +1,6 @@
 """Submit one file to Apple's notary service, once, and wait for its verdict.
 
-    python3 -I ci/notarize.py binaries-zip TARBALL VERSION OUT.zip
+    python3 -I ci/notarize.py binaries-zip TARBALL VERSION APP OUT.zip
     python3 -I ci/notarize.py submit FILE --record DIR
     python3 -I ci/notarize.py wait --record DIR --deadline-minutes N [--interval-seconds S]
     python3 -I ci/notarize.py --self-test
@@ -31,7 +31,10 @@ Every outcome is written to DIR/result.json. Nothing in DIR holds a secret.
 
 `binaries-zip` writes the ZIP Apple is sent for the release's binaries:
 exactly the seven executables of TARBALL (syndeo-VERSION-aarch64-apple-
-darwin.tar.gz), made with ditto, as Apple's notary expects.
+darwin.tar.gz) and APP, Syndeo.app VERSION, signed, as
+ci/package-macos-app.sh --check finds it, and nothing else, made with ditto,
+as Apple's notary expects. The bundle goes in whole, its signature as it is,
+so that the ticket Apple issues for it staples to the same bytes.
 
 The credentials come from MACOS_NOTARY_KEY_BASE64, MACOS_NOTARY_KEY_ID and
 MACOS_NOTARY_ISSUER_ID. The key is written to a private temporary file,
@@ -245,12 +248,27 @@ def wait(record, deadline_s, interval_s):
             time.sleep(max(0.0, min(interval_s, (deadline - now()).total_seconds())))
 
 
-def binaries_zip(tarball, version, out):
+def bundle_files(state):
+    """The files of Syndeo.app, signed or stapled, as the ZIP lists them."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    listed = subprocess.run(["bash", os.path.join(here, "package-macos-app.sh"), "--manifest", state],
+                            capture_output=True, text=True, check=True).stdout.splitlines()
+    return ["notarize/Syndeo.app/" + line.split()[0] for line in listed if line.split()[1] == "f"]
+
+
+def binaries_zip(tarball, version, app, out):
     name = "syndeo-%s-aarch64-apple-darwin" % version
+    here = os.path.dirname(os.path.abspath(__file__))
     if os.path.basename(tarball) != name + ".tar.gz":
         raise SystemExit("notarize: %s is not %s.tar.gz" % (tarball, name))
+    if os.path.basename(app.rstrip("/")) != "Syndeo.app" or os.path.islink(app) or not os.path.isdir(app):
+        raise SystemExit("notarize: %s is not a Syndeo.app" % app)
     if os.path.exists(out):
         raise SystemExit("notarize: %s exists" % out)
+    checked = subprocess.run(["bash", os.path.join(here, "package-macos-app.sh"), "--check", app, version, "signed"],
+                             capture_output=True, text=True)
+    if checked.returncode != 0:
+        raise SystemExit("notarize: %s is not exactly Syndeo.app %s, signed:\n%s" % (app, version, checked.stdout + checked.stderr))
     work = tempfile.mkdtemp(prefix="binaries.")
     try:
         stage = os.path.join(work, "notarize")
@@ -266,13 +284,15 @@ def binaries_zip(tarball, version, out):
                 with open(dst, "wb") as f:
                     shutil.copyfileobj(src, f)
                 os.chmod(dst, 0o755)
+        subprocess.run(["/usr/bin/ditto", app, os.path.join(stage, "Syndeo.app")], check=True)
         subprocess.run(["/usr/bin/ditto", "-c", "-k", "--keepParent", stage, out], check=True)
-        listed = subprocess.run(["/usr/bin/zipinfo", "-1", out], capture_output=True, text=True, check=True).stdout.split()
+        listed = subprocess.run(["/usr/bin/zipinfo", "-1", out], capture_output=True, text=True, check=True).stdout.splitlines()
         files = sorted(x for x in listed if not x.endswith("/"))
-        if files != sorted("notarize/" + n for n in NAMES):
+        want = sorted(["notarize/" + n for n in NAMES] + bundle_files("signed"))
+        if files != want:
             os.remove(out)
-            raise SystemExit("notarize: the ZIP holds %s, not exactly the seven executables" % files)
-        say("%s: exactly the seven executables of %s" % (out, os.path.basename(tarball)))
+            raise SystemExit("notarize: the ZIP holds %s, not exactly the seven executables and Syndeo.app" % files)
+        say("%s: exactly the seven executables of %s, and Syndeo.app %s" % (out, os.path.basename(tarball), version))
         return 0
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -505,10 +525,35 @@ def self_test():
             subprocess.run(["tar", "-C", os.path.join(d, "src"), "-czf", path, os.path.basename(top)], check=True)
             return path
 
-        def zip_case(label, path, want_rc, want_text, want_files=None):
+        here = os.path.dirname(os.path.abspath(__file__))
+
+        def bundle(version="0.9.1", extra=None):
+            """Syndeo.app VERSION as ci/package-macos-app.sh assembles it, with
+            its signature's two paths: what --check calls signed."""
+            d = tempfile.mkdtemp(dir=root)
+            os.mkdir(os.path.join(d, "bins"))
+            for n in ("syndeo-app", "syndeo-proxy"):
+                with open(os.path.join(d, "bins", n), "w") as f:
+                    f.write("#!/bin/sh\n")
+            subprocess.run(["bash", os.path.join(here, "package-macos-app.sh"), version, os.path.join(d, "bins"), d],
+                           check=True, capture_output=True)
+            app = os.path.join(d, "Syndeo.app")
+            os.mkdir(os.path.join(app, "Contents", "_CodeSignature"), 0o755)
+            with open(os.path.join(app, "Contents", "_CodeSignature", "CodeResources"), "w") as f:
+                f.write("seal")
+            os.chmod(os.path.join(app, "Contents", "_CodeSignature", "CodeResources"), 0o644)
+            if extra:
+                with open(os.path.join(app, "Contents", "Resources", extra), "w") as f:
+                    f.write("extra")
+            return app
+
+        good_app = bundle()
+
+        def zip_case(label, path, want_rc, want_text, want_files=None, app=None):
             nonlocal cases, wrong
             out = os.path.join(tempfile.mkdtemp(dir=root), "notarize.zip")
-            r = subprocess.run([sys.executable, "-I", me, "binaries-zip", path, "0.9.1", out], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", me, "binaries-zip", path, "0.9.1", app or good_app, out],
+                               capture_output=True, text=True)
             problems = []
             if r.returncode != want_rc:
                 problems.append("exit %s" % r.returncode)
@@ -527,10 +572,17 @@ def self_test():
                 print("  WRONG %s: %s" % (label, "; ".join(problems)))
             else:
                 print("  ok    %s" % label)
-        zip_case("exactly the seven executables, nothing else from the tarball", tarball(list(NAMES)), 0,
-                 "exactly the seven executables", sorted("notarize/" + n for n in NAMES))
+        zip_case("exactly the seven executables, nothing else from the tarball, and Syndeo.app whole", tarball(list(NAMES)), 0,
+                 "exactly the seven executables", sorted(["notarize/" + n for n in NAMES] + bundle_files("signed")))
         zip_case("a tarball missing syndeo-webkit: refused, no ZIP", tarball(NAMES[:-1]), 1, "no regular file syndeo-webkit")
         zip_case("a tarball of another version: refused, no ZIP", tarball(list(NAMES), "0.9.2"), 1, "is not syndeo-0.9.1")
+        zip_case("Syndeo.app of another version: refused, no ZIP", tarball(list(NAMES)), 1, "is not exactly Syndeo.app 0.9.1",
+                 app=bundle("0.9.2"))
+        zip_case("Syndeo.app with a file more: refused, no ZIP", tarball(list(NAMES)), 1, "is not exactly Syndeo.app 0.9.1",
+                 app=bundle(extra="extra"))
+        unsigned = bundle()
+        shutil.rmtree(os.path.join(unsigned, "Contents", "_CodeSignature"))
+        zip_case("Syndeo.app unsigned: refused, no ZIP", tarball(list(NAMES)), 1, "is not exactly Syndeo.app 0.9.1", app=unsigned)
 
     shutil.rmtree(root, ignore_errors=True)
     print("\n  %d cases, %d wrong\n" % (cases, wrong))
@@ -547,6 +599,7 @@ def main():
     z = sub.add_parser("binaries-zip")
     z.add_argument("tarball")
     z.add_argument("version")
+    z.add_argument("app")
     z.add_argument("out")
     s = sub.add_parser("submit")
     s.add_argument("file")
@@ -560,7 +613,7 @@ def main():
     a = ap.parse_args()
     try:
         if a.cmd == "binaries-zip":
-            return binaries_zip(a.tarball, a.version, a.out)
+            return binaries_zip(a.tarball, a.version, a.app, a.out)
         if a.cmd == "submit":
             return submit(a.file, a.record)
         deadline = a.deadline_seconds if a.deadline_seconds is not None else a.deadline_minutes * 60

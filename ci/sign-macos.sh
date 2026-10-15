@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Sign and notarize the macOS binaries.
+# Sign and notarize the macOS binaries, and sign Syndeo.app.
 #
-#   ci/sign-macos.sh <directory of built binaries>
+#   ci/sign-macos.sh <directory of built binaries> [--app <version> <out-dir>]
 #   ci/sign-macos.sh --self-test
 #
 # A no-op, loudly, when the signing secrets are not configured: an unsigned
@@ -15,6 +15,19 @@
 # keystore was killed at launch (the signed 0.1.6 dry run). Signed or not, the
 # keystore uses the ordinary keychain, reports platform presence as
 # unenforced, and requires the passphrase; `syndeo-keystore status` says so.
+#
+# --app also assembles Syndeo.app <version> in <out-dir> with
+# ci/package-macos-app.sh, from the directory's syndeo-app and its
+# syndeo-proxy, once the seven are signed, and signs the bundle: Developer ID
+# Application, the hardened runtime, a secure timestamp and no entitlements,
+# as the seven are. Its helper is not signed again: it is the tarball's own
+# syndeo-proxy, byte for byte, signed with the seven. Without a certificate
+# the bundle is signed ad hoc, with the hardened runtime, and its helper is
+# the syndeo-proxy as built, with the signature the linker gave it; a pull
+# request's package is built from that. Either way the bundle is then
+# verified, strictly, with everything nested in it. Notarizing it is
+# release.yml's notarize-binaries' job, with the seven, in one submission; this
+# script refuses --app with a notary key.
 #
 # Secrets this reads, all of them secrets of the release-macos environment,
 # and only after ci/check-signing-config.sh has found all ten consistent.
@@ -70,16 +83,23 @@ EOF
     want="${want}codesign --force --timestamp --options runtime --sign $identity $T/release/$n"$'\n'
     want="${want}codesign --verify --strict --verbose=2 $T/release/$n"$'\n'
   done
+  # And with --app, the bundle after them, and never its helper on its own.
+  local app="$T/app/Syndeo.app" want_app want_adhoc
+  want_app="${want}codesign --force --timestamp --options runtime --sign $identity $app"$'\n'
+  want_app="${want_app}codesign --verify --strict --deep --verbose=2 $app"$'\n'
+  want_adhoc="codesign --force --sign - --options runtime $app"$'\n'
+  want_adhoc="${want_adhoc}codesign --verify --strict --deep --verbose=2 $app"$'\n'
 
   # sign_case LABEL WANT-STATUS WANT-CODESIGN TEXT [NAME=VALUE...]: exits
   # WANT-STATUS, asks codesign exactly WANT-CODESIGN, never --entitlements,
-  # says TEXT, and never prints a secret.
+  # says TEXT, and never prints a secret. APP_ARGS, when set, are --app and
+  # its two arguments.
   sign_case() {
     local label="$1" status_want="$2" codesign_want="$3" text="$4" out status verdict=yes got
     shift 4
-    rm -rf "$T/temp" && mkdir -p "$T/temp" && : >"$T/calls"
+    rm -rf "$T/temp" "$T/app" && mkdir -p "$T/temp" && : >"$T/calls"
     out="$(env -i PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" RUNNER_TEMP="$T/temp" STANDIN_CALLS="$T/calls" "$@" \
-      bash "$0" "$T/release" 2>&1)" && status=0 || status=$?
+      bash "$0" "$T/release" ${APP_ARGS[@]+"${APP_ARGS[@]}"} 2>&1)" && status=0 || status=$?
     got="$(grep '^codesign ' "$T/calls" || true)"
     [ "$status" = "$status_want" ] || verdict=no
     [ "$got" = "${codesign_want%$'\n'}" ] || verdict=no
@@ -104,6 +124,29 @@ EOF
     1 "" "MACOS_CERTIFICATE_PASSWORD is required" CERTIFICATE=U0VDUkVUVkFMVUUtYXBwbGljYXRpb24= "SIGNING_IDENTITY=$identity" TEAM_ID=AB12CD34EF
   sign_case "a certificate without an identity: refused before anything is signed" \
     1 "" "MACOS_SIGNING_IDENTITY is required" CERTIFICATE=U0VDUkVUVkFMVUUtYXBwbGljYXRpb24= CERTIFICATE_PASSWORD=SECRETVALUE-application-password TEAM_ID=AB12CD34EF
+  if [ "$(uname -s)" = Darwin ]; then
+    printf '#!/bin/sh\n' >"$T/release/syndeo-app"
+    APP_ARGS=(--app 0.2.0 "$T/app")
+    sign_case "--app: the seven, then Syndeo.app assembled and signed alike, verified deeply, its helper not signed again" \
+      0 "$want_app" "Syndeo.app signed" "${signing[@]}"
+    cases=$((cases + 1))
+    if [ -f "$T/app/Syndeo.app/Contents/Helpers/syndeo-proxy" ] && cmp -s "$T/release/syndeo-proxy" "$T/app/Syndeo.app/Contents/Helpers/syndeo-proxy"; then
+      printf '  ok    %s\n' "  ... the bundle assembled, its helper the directory's syndeo-proxy, byte for byte"
+    else
+      printf '  WRONG %s\n' "  ... the bundle assembled, its helper the directory's syndeo-proxy, byte for byte"
+      wrong=$((wrong + 1))
+    fi
+    sign_case "--app with no certificate: the seven untouched, Syndeo.app signed ad hoc and verified deeply" \
+      0 "$want_adhoc" "Syndeo.app signed ad hoc" 
+    sign_case "--app with a notary key: refused before anything is signed" \
+      1 "" "does not notarize Syndeo.app" "${signing[@]}" NOTARY_KEY=U0VDUkVUVkFMVUUtbm90YXJ5
+    APP_ARGS=(--app 0.2 "$T/app")
+    sign_case "--app with a version that is not one: refused before anything is signed" \
+      1 "" "is not a version" "${signing[@]}"
+    APP_ARGS=()
+  else
+    printf '  on %s: --app assembles a bundle with macOS tools; not run\n' "$(uname -s)"
+  fi
   # The guard itself: the stand-in really does refuse an entitlement.
   cases=$((cases + 1))
   : >"$T/calls"
@@ -118,11 +161,45 @@ EOF
 }
 
 if [ "${1:-}" = --self-test ]; then
+  APP_ARGS=()
   self_test
   exit
 fi
 
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 release="${1:?directory of built binaries}"
+app_version=''
+app_out=''
+case "$#:${2:-}" in
+  1:) ;;
+  4:--app)
+    app_version="$3"
+    app_out="$4"
+    # shellcheck source=ci/macos-pkg/version.sh
+    . "$here/macos-pkg/version.sh"
+    syndeo_version_valid "$app_version" || { echo "sign-macos: '$app_version' is not a version" >&2; exit 1; }
+    if [ -n "${NOTARY_KEY:-}" ]; then
+      echo "sign-macos: this script does not notarize Syndeo.app; release.yml's notarize-binaries does, with the seven" >&2
+      exit 1
+    fi
+    ;;
+  *) echo "usage: $0 <directory of built binaries> [--app <version> <out-dir>] | --self-test" >&2; exit 1 ;;
+esac
+
+# sign_app IDENTITY: Syndeo.app assembled from the directory's syndeo-app and
+# syndeo-proxy, as they are now, and the bundle signed as IDENTITY, or ad hoc
+# for -; then verified, strictly, with everything nested in it.
+sign_app() {
+  local app="$app_out/Syndeo.app"
+  mkdir -p "$app_out"
+  bash "$here/package-macos-app.sh" "$app_version" "$release" "$app_out"
+  if [ "$1" = - ]; then
+    codesign --force --sign - --options runtime "$app"
+  else
+    codesign --force --timestamp --options runtime --sign "$1" "$app"
+  fi
+  codesign --verify --strict --deep --verbose=2 "$app"
+}
 # Every macOS executable in the tarball, and the list used for signing,
 # verifying and notarizing alike, so none of them can be shipped unsigned
 # beside the others.
@@ -132,6 +209,10 @@ if [ -z "${CERTIFICATE:-}" ]; then
   echo "No MACOS_CERTIFICATE_P12_BASE64 set: shipping unsigned binaries."
   echo "The keystore uses the ordinary keychain and reports platform presence"
   echo "as unenforced, which makes the passphrase mandatory, signed or not."
+  if [ -n "$app_out" ]; then
+    sign_app -
+    echo "Syndeo.app signed ad hoc: Gatekeeper rejects it, and its package, when downloaded."
+  fi
   exit 0
 fi
 
@@ -169,6 +250,11 @@ for binary in "${binaries[@]}"; do
     --sign "$SIGNING_IDENTITY" "${release}/${binary}"
   codesign --verify --strict --verbose=2 "${release}/${binary}"
 done
+
+if [ -n "$app_out" ]; then
+  sign_app "$SIGNING_IDENTITY"
+  echo "Syndeo.app signed with the Developer ID Application identity; notarize-binaries notarizes it."
+fi
 
 if [ -z "${NOTARY_KEY:-}" ]; then
   echo "Signed but not notarized: MACOS_NOTARY_KEY_BASE64 is not set."

@@ -1,79 +1,81 @@
 #!/usr/bin/env bash
-# Install Syndeo's macOS package for real on a disposable GitHub-hosted
-# runner, take it through every state the package has to handle, and put the
-# runner back as it was.
+# The logs are the runner's: sudo runs each command, never the redirect into
+# a log, on purpose.
+# shellcheck disable=SC2024
+# Install Syndeo.app's package for real on a disposable GitHub-hosted runner,
+# take it through every state the package has to handle, and put the runner
+# back as it was.
 #
-#   sudo --preserve-env=SYNDEO_ALLOW_SYSTEM_INSTALL_TEST,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_WORKSPACE \
-#     bash ci/test-pkg-install.sh --system-before <pkg> <version>
-#   SYNDEO_ALLOW_SYSTEM_INSTALL_TEST=yes bash ci/test-pkg-install.sh --user <version>
-#   sudo --preserve-env=... bash ci/test-pkg-install.sh --system-after <pkg> <version>
-#   sudo --preserve-env=... bash ci/test-pkg-install.sh --cleanup
+#   SYNDEO_ALLOW_SYSTEM_INSTALL_TEST=yes bash ci/test-pkg-install.sh run <pkg> <version>
+#   SYNDEO_ALLOW_SYSTEM_INSTALL_TEST=yes bash ci/test-pkg-install.sh cleanup
 #
-# The four are separate workflow steps, the last one `if: always()`.
+# Two workflow steps, the second `if: always()`. Both run as the runner's own
+# user, and use sudo for what needs root, as a person's administrator account
+# would; Syndeo.app is opened in the runner's own session. SYNDEO_EXPECT_SIGNED
+# (no by default) says whether <pkg> is a signed, notarized and stapled
+# release, which Gatekeeper has to accept, or a pull request's, which it has
+# to reject.
 #
-# --system-before, as root:
-# - installing on another volume is refused;
-# - foreign commands are refused, and left exactly as they were;
-# - unsafe parent directories are refused;
-# - an orphaned private directory is refused;
-# - an interrupted first install is resumed, then removed again;
-# - with /usr/local/bin owned by runner:admin, mode 0775, stand-in packages:
-#   - 0.0.9, then 0.0.10 and 0.0.11 while the commands are started over and
-#     over: while Installer runs they fail only with ENOENT or EINVAL, every
-#     one that starts is one whole version, and none fails afterwards. One
-#     version is left, and /usr/local/bin's owner and mode are untouched;
-#   - an older package refused;
-#   - 0.0.12, whose postinstall fails at its entry, and 0.0.13, whose
-#     postinstall fails just after its switch: each leaves the state measured
-#     on a runner, in which verify-pkg installed fails, the uninstaller
-#     refuses, an older and a newer package are refused, all changing
-#     nothing, and the same package again completes the upgrade;
-#   - 0.0.15, made of the real binaries;
-# - the real package is installed over that, while a 0.0.15 syndeo doctor,
-#   held after it found its directory, waits: afterwards every sibling it
-#   looks for is refused as removed during an upgrade, and it starts nothing.
-# It leaves the real package installed.
+# run:
+# 1. The command-line tools as install.sh installs them, from the published
+#    v0.1.7 tarball, into /usr/local/bin. Then <pkg>, copied to ~/Downloads and
+#    quarantined as a browser leaves a download: Gatekeeper's verdict on it,
+#    installed, Gatekeeper's verdict on the installed bundle, and install.sh's
+#    commands untouched. Opened by its bundle identifier, as Finder or
+#    Launchpad opens it: the application and its helper run from the
+#    bundle, the helper byte for byte the one the package carried, and nothing
+#    from /usr/local. The package installed again while it runs is refused, as
+#    is its uninstaller; quit, nothing of it left running. Reinstalled.
+#    Installed on another volume: refused. Removed with its uninstaller,
+#    Syndeo's user data kept.
+# 2. The published v0.1.6 and v0.1.7 command-line packages, downloaded and
+#    checked against their releases' SHA256SUMS. Over 0.1.6, every kind of
+#    change to its installation is refused, nothing changed; then <pkg>
+#    removes it, exactly, /usr/local/libexec with it, and nothing else. Over
+#    0.1.7, install.sh's commands put over its links are refused; repaired with
+#    the 0.1.7 package, its removal is interrupted by a faulty stand-in after
+#    the seven links, which leaves what the runner has to refuse from any other
+#    package, and the same stand-in again finishes it.
+# 3. Stand-ins (0.0.1 to 0.0.3, made from <pkg>'s own bundle): an upgrade; an
+#    upgrade whose postinstall fails, what it leaves, the packages refused
+#    over it, and its repair; a downgrade refused; a reinstall; a changed
+#    bundle refused; <pkg> over all of that.
+# 4. Moved to the Trash as Finder moves it: the receipt stays, the trashed
+#    copy's uninstaller refuses, saying how to forget it; <pkg> installs into
+#    /Applications again, the trashed copy untouched, and opening it opens the
+#    one in /Applications.
+# 5. Removal: a receipt that cannot be forgotten (exit 2, and the command to
+#    forget it), then forgotten as it says; a foreign application where
+#    Syndeo.app goes, refused; a last install, and its uninstaller, with the
+#    user's data kept throughout.
 #
-# --user, as runner: the commands from PATH, doctor and its siblings, the
-# example tools seeded on first run, the agent listing them, a fetch and a
-# cache hit, a supervisor's children, and syndeo-webkit's proxy. That last one
-# uses a throwaway keychain holding the proxy's authority without trust
-# settings, and the user's keychain search list is restored by a trap.
-#
-# --system-after, as root:
-# - a same-version reinstall, then reinstalls refused over every kind of
-#   altered tree;
-# - a path the receipt lists, missing: verify-pkg installed fails and the
-#   uninstaller refuses, changing nothing; the same package repairs it;
-# - a downgrade refused;
-# - disagreement between current, the receipt and the commands refused, and
-#   a second version beside the installed one;
-# - the uninstaller refusing, all or nothing, with content planted in each
-#   place;
-# - a receipt that cannot be forgotten;
-# - and finally a clean removal.
-#
-# --cleanup, as root, whatever happened: it undoes everything the steps
-# recorded, removes only planted paths that still match what was planted,
-# and then checks every affected path. That covers existence, owner, group,
-# mode, ACL, flags and extended attributes, the keychain search lists, the
-# trust settings, the receipts and the homes. It fails if anything differs.
+# cleanup, whatever happened: it quits Syndeo, undoes every alteration the run
+# recorded, removes only what the run planted and only if it is still what
+# was planted, removes the bundles, receipts and v0.1.x paths that were not
+# there before, and then requires the runner to be exactly as run found it:
+# receipts, /Applications, /usr/local, the user's Syndeo paths,
+# LaunchServices' records for the bundle, keychains, trust settings and
+# Syndeo's defaults. It fails if anything differs.
 #
 # The checks on the environment below prevent accidents; they are not
-# security. Every mode refuses unless all of them hold, and the system modes
-# also need root and a runner with no trace of Syndeo when they start.
+# security.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NAMES="syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-ui syndeo-webkit"
-ID=com.sum.syndeo.pkg
+BUNDLE_ID=com.sum.syndeo
+APP_ID=com.sum.syndeo.app
+OLD_ID=com.sum.syndeo.pkg
+APP=/Applications/Syndeo.app
 BIN=/usr/local/bin
 LIBEXEC=/usr/local/libexec
 D=/usr/local/libexec/syndeo
 ALT=/Volumes/SyndeoAltTest
-RUNNER=runner
+REPO_URL=https://github.com/SUM-INNOVATION/syndeo/releases/download
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
 
 say() { printf '%s\n' "$*"; }
+section() { printf '\n%s\n' "$*"; }
 pass() { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; exit 1; }
 # must DESCRIPTION COMMAND...: the test stops at the first thing that is wrong.
@@ -82,8 +84,9 @@ must() {
   if "$@"; then pass "$what"; else fail "$what"; fi
 }
 refuse() { printf 'test-pkg-install: refusing: %s\n' "$1" >&2; exit 2; }
+as_root() { sudo -n "$@"; }
 
-guard_runner() {
+guard() {
   [ "${SYNDEO_ALLOW_SYSTEM_INSTALL_TEST:-}" = yes ] || refuse "SYNDEO_ALLOW_SYSTEM_INSTALL_TEST is not yes"
   [ "${GITHUB_ACTIONS:-}" = true ] || refuse "GITHUB_ACTIONS is not true"
   [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] || refuse "RUNNER_ENVIRONMENT is not github-hosted"
@@ -95,24 +98,33 @@ guard_runner() {
     /Users/runner/work/?*) ;;
     *) refuse "GITHUB_WORKSPACE is not under /Users/runner/work/" ;;
   esac
-  [ -d /Users/runner ] || refuse "there is no /Users/runner"
   [ "$(uname -sm)" = "Darwin arm64" ] || refuse "this is not Darwin arm64"
-}
-
-guard_root() {
-  guard_runner
-  [ "$(id -u)" = 0 ] || refuse "not root"
+  [ "$(id -un)" = runner ] && [ "$HOME" = /Users/runner ] || refuse "not the runner's own user"
+  sudo -n true 2>/dev/null || refuse "sudo needs a password here"
+  case "${SYNDEO_EXPECT_SIGNED:-no}" in yes | no) ;; *) refuse "SYNDEO_EXPECT_SIGNED is neither yes nor no" ;; esac
 }
 
 ST() { printf '%s' "$RUNNER_TEMP/syndeo-pkg-test"; }
-US() { printf '%s' "$RUNNER_TEMP/syndeo-pkg-user"; }
 
 present() { [ -e "$1" ] || [ -L "$1" ]; }
+
+# The user's paths a launched Syndeo.app may create, and the download.
+user_paths() {
+  printf '%s\n' \
+    "$HOME/Library/Application Support/Syndeo" \
+    "$HOME/Library/Preferences/$BUNDLE_ID.plist" \
+    "$HOME/Library/Caches/$BUNDLE_ID" \
+    "$HOME/Library/WebKit/$BUNDLE_ID" \
+    "$HOME/Library/HTTPStorages/$BUNDLE_ID" \
+    "$HOME/Library/HTTPStorages/$BUNDLE_ID.binarycookies" \
+    "$HOME/Library/Saved Application State/$BUNDLE_ID.savedState" \
+    "$HOME/.Trash/Syndeo.app"
+}
 
 # ------------------------------------------------------------------ records
 #
 # Everything the test changes is written down before it is changed, so that
-# --cleanup can undo it whatever happened in between.
+# cleanup can undo it whatever happened in between.
 
 # meta PATH: what a planted path is, to tell later whether it is still that.
 meta() {
@@ -122,23 +134,25 @@ meta() {
   elif [ -d "$p" ]; then
     printf 'dir|%s' "$(stat -f '%u|%g|%Lp|%i' "$p")"
   elif [ -f "$p" ]; then
-    printf 'file|%s|%s' "$(stat -f '%u|%g|%Lp|%i|%z' "$p")" "$(shasum -a 256 "$p" | cut -d' ' -f1)"
+    printf 'file|%s|%s' "$(stat -f '%u|%g|%Lp|%i|%z' "$p")" "$(as_root shasum -a 256 "$p" | cut -d' ' -f1)"
   else
     printf 'absent'
   fi
 }
 
+record_plant() { printf '%s\t%s\n' "$1" "$(meta "$1")" >>"$(ST)/planted"; }
+
 # plant KIND PATH [CONTENT|TARGET] [OWNER] [MODE]: create a path the package
-# must find, and write down exactly what it is.
+# must find, as root, and write down exactly what it is.
 plant() {
   local kind="$1" p="$2" arg="${3:-}" owner="${4:-root:wheel}" mode="${5:-}"
   present "$p" && fail "planting $p: it already exists"
   case "$kind" in
-    file) printf '%s' "$arg" >"$p"; chown "$owner" "$p"; chmod "${mode:-644}" "$p" ;;
-    link) ln -s "$arg" "$p"; chown -h "$owner" "$p" ;;
-    dir) mkdir "$p"; chown "$owner" "$p"; chmod "${mode:-755}" "$p" ;;
-  esac
-  printf '%s\t%s\n' "$p" "$(meta "$p")" >>"$(ST)/planted"
+    file) printf '%s' "$arg" | as_root tee "$p" >/dev/null && as_root chown "$owner" "$p" && as_root chmod "${mode:-644}" "$p" ;;
+    link) as_root ln -s "$arg" "$p" && as_root chown -h "$owner" "$p" ;;
+    dir) as_root mkdir "$p" && as_root chown "$owner" "$p" && as_root chmod "${mode:-755}" "$p" ;;
+  esac || fail "planting $p"
+  record_plant "$p"
 }
 
 # planted_meta PATH: what PATH was when planted, matched on the whole path.
@@ -152,47 +166,34 @@ unplant() {
   want="$(planted_meta "$p")"
   [ -n "$want" ] || fail "unplanting $p: it was never planted"
   [ "$(meta "$p")" = "$want" ] || fail "unplanting $p: it is no longer what was planted"
-  if [ -d "$p" ] && [ ! -L "$p" ]; then rmdir "$p"; else rm -f "$p"; fi
+  if [ -d "$p" ] && [ ! -L "$p" ]; then as_root rmdir "$p"; else as_root rm -f "$p"; fi
   forget_plant "$p"
 }
 
-# consumed PATH: a planted path the package has since taken over; it is not
-# the test's to remove any more.
+# forget_plant PATH: a planted path the package or the test has since taken
+# over; it is not cleanup's to remove any more.
 forget_plant() {
   awk -F'\t' -v p="$1" '$1 != p' "$(ST)/planted" >"$(ST)/planted.new"
   mv -f "$(ST)/planted.new" "$(ST)/planted"
 }
 
-# alter KIND PATH VALUE: change a path's mode, owner, ACL, flags or link,
+# alter KIND PATH VALUE: change a path's mode, or move it aside to VALUE,
 # recording how to undo it; restore_last undoes the newest alteration.
 alter() {
   local kind="$1" p="$2" value="$3" undo
   case "$kind" in
-    mode) undo="$(stat -f '%Mp%Lp' "$p")"; chmod "$value" "$p" ;;
-    owner) undo="$(stat -f '%Su:%Sg' "$p")"; chown -h "$value" "$p" ;;
-    acl) undo="$value"; chmod +a "$value" "$p" ;;
-    flags) undo=nouchg; chflags uchg "$p" ;;
-    link) undo="$(readlink "$p")"; rm -f "$p"; ln -s "$value" "$p"; chown -h root:wheel "$p" ;;
-    aside) undo="$value"; mv "$p" "$value" ;;
-  esac
+    mode) undo="$(stat -f '%Mp%Lp' "$p")"; as_root chmod "$value" "$p" ;;
+    aside) undo="$value"; as_root mv "$p" "$value" ;;
+  esac || fail "altering $p"
   printf '%s\t%s\t%s\n' "$kind" "$p" "$undo" >>"$(ST)/altered"
 }
 
 undo_line() {
   local kind="$1" p="$2" undo="$3"
   case "$kind" in
-    mode) chmod "$undo" "$p" ;;
-    owner) chown -h "$undo" "$p" ;;
-    acl) chmod -a "$undo" "$p" ;;
-    flags) chflags nouchg "$p" ;;
-    link) rm -f "$p"; ln -s "$undo" "$p"; chown -h root:wheel "$p" ;;
-    aside) mv "$undo" "$p" ;;
+    mode) as_root chmod "$undo" "$p" ;;
+    aside) as_root mv "$undo" "$p" ;;
   esac
-}
-
-# forget_last: the newest alteration is no longer the test's to undo.
-forget_last() {
-  sed '$d' "$(ST)/altered" >"$(ST)/altered.new" && mv -f "$(ST)/altered.new" "$(ST)/altered"
 }
 
 restore_last() {
@@ -216,98 +217,111 @@ snap_path() {
   fi
 }
 
-# parents: every directory the package writes into, and everything else
-# /usr/local/bin holds.
-parents() {
-  local e n
-  snap_path /usr/local
-  snap_path "$BIN"
-  snap_path "$LIBEXEC"
-  if [ -d "$BIN" ]; then
-    for e in "$BIN"/* "$BIN"/.[!.]* "$BIN"/..?*; do
-      present "$e" || continue
-      n="${e##*/}"
-      case " $NAMES " in *" $n "*) continue ;; esac
-      printf '%s\t%s\n' "$e" "$(stat -f '%HT|%u|%g|%Lp|%i|%z|%m' "$e")"
-    done
-  fi
-  if [ -d "$LIBEXEC" ]; then
-    for e in "$LIBEXEC"/* "$LIBEXEC"/.[!.]* "$LIBEXEC"/..?*; do
-      present "$e" || continue
-      [ "${e##*/}" = syndeo ] && continue
-      printf '%s\t%s\n' "$e" "$(stat -f '%HT|%u|%g|%Lp|%i' "$e")"
-    done
-  fi
+# The LaunchServices records that mention com.sum.syndeo, whole.
+ls_records() {
+  "$LSREGISTER" -dump 2>/dev/null | python3 -I -c '
+import re, sys
+text = sys.stdin.read()
+for block in re.split(r"\n-{40,}\n", text):
+    if "com.sum.syndeo" in block:
+        print(block.strip())
+        print("-" * 40)
+'
 }
 
-security_state() {
-  sudo -u "$RUNNER" security list-keychains -d user
-  security list-keychains -d system
-  printf 'user trust %s\n' "$(sudo -u "$RUNNER" security dump-trust-settings 2>&1 | shasum | cut -c1-16)"
-  printf 'admin trust %s\n' "$(security dump-trust-settings -d 2>&1 | shasum | cut -c1-16)"
-  printf 'system trust %s\n' "$(security dump-trust-settings -s 2>&1 | shasum | cut -c1-16)"
+# snapshot DIR: what cleanup has to restore, as comparable text.
+snapshot() {
+  local d="$1" p
+  mkdir -p "$d"
+  pkgutil --pkgs 2>/dev/null | LC_ALL=C sort >"$d/receipts.txt"
+  { ls -1A /Applications | LC_ALL=C sort; snap_path /Applications; } >"$d/applications.txt"
+  snapshot_usr_local >"$d/usr-local.txt"
+  while IFS= read -r p; do
+    if present "$p"; then echo "present $p"; else echo "absent $p"; fi
+  done < <(user_paths) >"$d/user-paths.txt"
+  ls_records | sed -n 's/^path: *//p' | grep -E "^($APP|$HOME/.Trash/Syndeo.app)( |\(|$)" | LC_ALL=C sort -u >"$d/lsregister.txt"
+  {
+    security list-keychains -d user
+    security list-keychains -d system
+    printf 'user trust %s\n' "$(security dump-trust-settings 2>&1 | shasum | cut -c1-16)"
+    printf 'admin trust %s\n' "$(security dump-trust-settings -d 2>&1 | shasum | cut -c1-16)"
+  } >"$d/security.txt"
+  if defaults read "$BUNDLE_ID" >/dev/null 2>&1; then echo present; else echo absent; fi >"$d/defaults.txt"
 }
 
-homes() { ls -d /Users/*/.syndeo /var/root/.syndeo 2>/dev/null || true; }
+SNAPSHOTS="receipts applications usr-local user-paths lsregister security defaults"
 
-receipts() { pkgutil --pkgs | grep -i syndeo || true; }
+receipt_version() { pkgutil --pkg-info "$1" 2>/dev/null | sed -n 's/^version: //p'; }
+receipt_is() { [ "$(receipt_version "$1")" = "$2" ]; }
+no_receipt() { ! pkgutil --pkg-info "$1" >/dev/null 2>&1; }
+app_version() { plutil -extract CFBundleShortVersionString raw -o - "$APP/Contents/Info.plist" 2>/dev/null; }
+app_is() { [ -d "$APP" ] && [ "$(app_version)" = "$1" ]; }
+
+# legacy_paths V: the v0.1.x paths of V, every one.
+legacy_paths() {
+  local n
+  for n in $NAMES; do echo "$BIN/$n"; done
+  echo "$D/current"
+  for n in $NAMES README.md LICENSE tools/wordcount.wat tools uninstall.sh; do echo "$D/$1/$n"; done
+  echo "$D/$1"
+  echo "$D"
+}
+
+# legacy_left V: how many of them are there.
+legacy_left() {
+  local p n=0
+  while IFS= read -r p; do present "$p" && n=$((n + 1)); done < <(legacy_paths "$1")
+  echo "$n"
+}
+
+# legacy_exact V: the v0.1.x package V installed exactly as its package left
+# it, judged by the same library the application package's scripts embed.
+legacy_exact() {
+  [ -f "$(ST)/libraries.sh" ] || bash "$here/package-macos-pkg.sh" --library "$(ST)/libraries.sh" || return 1
+  bash -c '
+    ROOT="" EXPECT_UID=0 EXPECT_GID=0 PKGUTIL=/usr/sbin/pkgutil CODESIGN=/usr/bin/codesign SCRIPT=test
+    . "$1"
+    legacy_plan no
+    [ "$nfindings" = 0 ] && [ "$legacy" = whole ] && [ "$legacy_v" = "$2" ] || { printf "%s\n" "$findings" >&2; exit 1; }
+  ' _ "$(ST)/libraries.sh" "$1"
+}
 
 # package_state: everything of Syndeo's, to compare before and after a step
 # that should change nothing.
 package_state() {
-  local n p
-  pkgutil --pkg-info "$ID" 2>&1 | grep -v '^install-time'
-  pkgutil --files "$ID" 2>&1
+  local id n
+  for id in $APP_ID $OLD_ID; do
+    pkgutil --pkg-info "$id" 2>&1 | grep -v '^install-time'
+    pkgutil --files "$id" 2>&1
+  done
+  if present "$APP"; then
+    as_root find "$APP" -exec stat -f '%N|%HT|%u|%g|%Lp|%Mp|%Sf|%i|%z' {} + | LC_ALL=C sort
+    as_root find "$APP" -type f -exec shasum -a 256 {} + | LC_ALL=C sort
+  fi
   for n in $NAMES; do
-    p="$BIN/$n"
-    if present "$p"; then
-      printf '%s\t%s\t%s\n' "$p" "$(stat -f '%HT|%u|%g|%Lp|%Sf|%i' "$p")" "$(readlink "$p" 2>/dev/null)"
-    else
-      printf '%s\tabsent\n' "$p"
-    fi
+    snap_path "$BIN/$n"
+    [ -L "$BIN/$n" ] && readlink "$BIN/$n"
+    [ -f "$BIN/$n" ] && shasum -a 256 "$BIN/$n"
   done
   if present "$D"; then
     find "$D" -exec stat -f '%N|%HT|%u|%g|%Lp|%Mp|%Sf|%i|%z|%Y' {} + | LC_ALL=C sort
     find "$D" -type f -exec shasum -a 256 {} + | LC_ALL=C sort
-    for e in "$D" "$D"/*; do
-      present "$e" && ls -lde "$e" | sed 1d
-    done
   fi
-  parents
+  snap_path /usr/local
+  snap_path "$BIN"
+  snap_path "$LIBEXEC"
+  snap_path /Applications
 }
 
+# pristine: nothing of Syndeo's on the runner.
 pristine() {
   local n
-  pkgutil --pkg-info "$ID" >/dev/null 2>&1 && return 1
+  no_receipt "$APP_ID" && no_receipt "$OLD_ID" || return 1
+  present "$APP" && return 1
   present "$D" && return 1
   for n in $NAMES; do present "$BIN/$n" && return 1; done
   return 0
 }
-
-current_is() { [ "$(readlink "$D/current" 2>/dev/null)" = "$1" ]; }
-
-# commands_say V: every command, started from /usr/local/bin with a clean
-# environment, says it is V.
-commands_say() {
-  local n
-  for n in $NAMES; do
-    [ "$(env -i PATH=/usr/bin:/bin "$BIN/$n" --version 2>&1 | head -n 1)" = "$n $1" ] || return 1
-  done
-}
-receipt_is() { [ "$(pkgutil --pkg-info "$ID" 2>/dev/null | sed -n 's/^version: //p')" = "$1" ]; }
-
-# commands_fail_closed: every command, started from /usr/local/bin, fails to
-# start, and only because what its link leads to is not there.
-commands_fail_closed() {
-  local n out
-  for n in $NAMES; do
-    if out="$(env -i PATH=/usr/bin:/bin "$BIN/$n" --version 2>&1)"; then return 1; fi
-    case "$out" in *"$BIN/$n: No such file or directory"*) ;; *) return 1 ;; esac
-  done
-}
-
-# alone V: the private directory holds V and current, and nothing else.
-alone() { [ "$(ls -A "$D" | tr '\n' ' ')" = "$1 current " ]; }
 
 # ------------------------------------------------------------------ installing
 
@@ -317,12 +331,11 @@ alone() { [ "$(ls -A "$D" | tr '\n' ' ')" = "$1 current " ]; }
 INSTALL_LOG=/var/log/install.log
 SAID_TRIES=10
 
-# install LABEL PKG [TARGET]: installer(8), with -dumplog, so that its own
-# detailed log comes back with this invocation, on stderr. Everything it
-# printed is kept in LOG.installer, whole, one file per invocation: the
-# numbering carries on across the steps and an existing file is never
-# written over. What /var/log/install.log gained meanwhile is kept whole too,
-# in LOG.install-log, as supplementary evidence.
+# install LABEL PKG [TARGET]: installer(8), as root, with -dumplog, so that
+# its own detailed log comes back with this invocation, on stderr.
+# Everything it printed is kept in LOG.installer, whole, one file per
+# invocation, and what /var/log/install.log gained meanwhile in
+# LOG.install-log, as supplementary evidence.
 install() {
   local label="$1" pkg="$2" target="${3:-/}" before status n log
   n="$(cat "$(ST)/installs" 2>/dev/null || echo 0)"
@@ -331,7 +344,7 @@ install() {
   log="$(ST)/logs/$(printf '%02d' "$n")-$label"
   [ -e "$log.installer" ] && fail "$log.installer exists; not writing over it"
   before="$(wc -l <"$INSTALL_LOG" | tr -d ' ')"
-  /usr/sbin/installer -dumplog -pkg "$pkg" -target "$target" >"$log.installer" 2>&1
+  sudo -n /usr/sbin/installer -dumplog -pkg "$pkg" -target "$target" >"$log.installer" 2>&1
   status=$?
   last_log="$log"
   last_before="$before"
@@ -374,31 +387,34 @@ note_said() {
   printf '%s' "$where"
 }
 
-# before_is DECISION: the package's state is the one the preinstall decides
+# before_is DECISION: the runner is in the state the preinstall decides
 # DECISION on, as ci/macos-pkg/preinstall.in's matrix reads it.
 before_is() {
-  local x v
-  case "$1" in
-    "installing "*) pristine ;;
-    "resuming an interrupted installation of "*)
-      v="${1##* }"
-      ! pkgutil --pkg-info "$ID" >/dev/null 2>&1 && [ "$(ls -A "$D" 2>/dev/null)" = "$v" ]
-      ;;
+  local app="${1%%, and *}" legacy='' x v
+  case "$1" in *", and "*) legacy="${1#*, and }" ;; esac
+  case "$app" in
+    "installing "*"; Syndeo.app "*", which the receipt names, is no longer in /Applications")
+      x="${app#*; Syndeo.app }"; x="${x%%,*}"
+      receipt_is "$APP_ID" "$x" && ! present "$APP" || return 1 ;;
+    "installing "*) no_receipt "$APP_ID" && ! present "$APP" || return 1 ;;
+    "resuming an interrupted installation of "*) no_receipt "$APP_ID" && app_is "${app##* }" || return 1 ;;
     "upgrading from "*)
-      x="${1#upgrading from }"
-      x="${x%% *}"
-      receipt_is "$x" && alone "$x" && current_is "$x"
-      ;;
-    "reinstalling "* | "repairing "*)
-      v="${1##* }"
-      receipt_is "$v" && alone "$v" && current_is "$v"
-      ;;
+      x="${app#upgrading from }"; x="${x%% *}"
+      receipt_is "$APP_ID" "$x" && app_is "$x" || return 1 ;;
+    "reinstalling "*) receipt_is "$APP_ID" "${app##* }" && app_is "${app##* }" || return 1 ;;
     "completing the failed upgrade from "*)
-      x="${1#completing the failed upgrade from }"
-      v="${x##* }"
-      x="${x%% *}"
-      receipt_is "$x" && alone "$v" && { current_is "$x" || current_is "$v"; }
-      ;;
+      x="${app#completing the failed upgrade from }"; v="${x##* }"; x="${x%% *}"
+      receipt_is "$APP_ID" "$x" && app_is "$v" || return 1 ;;
+    *) return 1 ;;
+  esac
+  case "$legacy" in
+    '') no_receipt "$OLD_ID" ;;
+    "removing the v0.1.x command-line package "*)
+      x="${legacy##* }"
+      receipt_is "$OLD_ID" "$x" && legacy_exact "$x" ;;
+    "finishing the removal of the v0.1.x command-line package "*)
+      x="${legacy##* }"
+      receipt_is "$OLD_ID" "$x" && [ "$(legacy_left "$x")" -lt 22 ] ;;
     *) return 1 ;;
   esac
 }
@@ -424,66 +440,88 @@ refused() {
 }
 
 # installed LABEL PKG DECISION VERSION: from the state the preinstall decides
-# DECISION on, the install succeeds and leaves exactly VERSION. DECISION
-# itself is asserted by ci/verify-pkg.sh's st_decisions; here it is only
-# noted.
+# DECISION on, the install succeeds and leaves exactly VERSION, as
+# verify-pkg.sh installed checks it. DECISION itself is asserted by
+# ci/verify-pkg.sh's st_decisions; here it is only noted.
 installed() {
   local label="$1" pkg="$2" text="$3" version="$4" seen
-  before_is "$text" || fail "$label: before installing, the package is not in the state that \"$text\" is decided on"
+  before_is "$text" || fail "$label: before installing, the runner is not in the state that \"$text\" is decided on"
   install "$label" "$pkg" || { sed 's/^/      | /' "$last_log.installer" "$last_log.install-log"; fail "$label: the install failed"; }
   seen="$(note_said "$text")"
-  bash "$here/verify-pkg.sh" installed "$version" >"$last_log.verify" 2>&1 ||
+  # The stand-ins' helper is the real one, which says the real version.
+  bash "$here/verify-pkg.sh" installed "$version" --helper-says "$REAL_VERSION" >"$last_log.verify" 2>&1 ||
     { sed 's/^/      | /' "$last_log.verify"; fail "$label: the installation is not exactly $version"; }
   pass "$label: installed from the state \"$text\" is decided on, and verify-pkg installed $version passes ($seen)"
 }
 
-# standin VERSION: a package of shell stand-ins, from the real builder.
-standin() {
-  local v="$1" dir name n
-  dir="$(ST)/standins/$v"
-  name="syndeo-$v-aarch64-apple-darwin"
-  mkdir -p "$dir/src/$name/tools"
-  for n in $NAMES; do
-    printf '#!/bin/sh\necho "%s %s"\n' "$n" "$v" >"$dir/src/$name/$n"
-    chmod 755 "$dir/src/$name/$n"
-  done
-  cp "$here/../README.md" "$here/../LICENSE" "$dir/src/$name/"
-  cp "$here/../crates/syndeo-agent/tools/wordcount.wat" "$dir/src/$name/tools/"
-  tar -C "$dir/src" --format=ustar -czf "$dir/$name.tar.gz" "$name"
-  build_standin "$v" "$dir"
+# failed_install LABEL PKG: a faulty stand-in, whose postinstall fails its
+# first run.
+failed_install() {
+  local label="$1" pkg="$2"
+  if install "$label" "$pkg"; then fail "$label: the faulty package installed"; fi
+  note_said "syndeo postinstall: test fault" >/dev/null
+  pass "$label: the install failed, as its fault makes it"
 }
 
-# build_standin V DIR: the package for DIR/syndeo-V-aarch64-apple-darwin.tar.gz.
-build_standin() {
-  local v="$1" dir="$2" repo
-  # The checkout is the runner's and this is root: git would refuse it.
-  repo="$(cd "$here/.." && pwd)"
-  SOURCE_DATE_EPOCH="$(git -c safe.directory="$repo" -C "$repo" log -1 --format=%ct)" \
-    "$here/package-macos-pkg.sh" "$v" "$dir/syndeo-$v-aarch64-apple-darwin.tar.gz" "$dir" >/dev/null ||
-    fail "building the stand-in $v"
+# legacy_install LABEL PKG: one of the published v0.1.x packages, installed;
+# what it decides is its own.
+legacy_install() {
+  install "$1" "$2" || { sed 's/^/      | /' "$last_log.installer"; fail "$1: the published package did not install"; }
+  pass "$1: installed"
+}
+
+# failed_upgrade LABEL PKG X W OLDER NEWER: install PKG, a faulty W, over X.
+# It fails and leaves what was measured: X's receipt, W's bundle. Everything
+# that must refuse that state does, changing nothing, OLDER and NEWER packages
+# included; then PKG again completes it.
+failed_upgrade() {
+  local label="$1" pkg="$2" x="$3" w="$4" older="$5" newer="$6" before
+  must "$label: before, Syndeo.app $x with its receipt" eval "receipt_is $APP_ID $x && app_is $x"
+  failed_install "$label" "$pkg"
+  must "  ... Installer left the receipt at $x, and Syndeo.app $w in its place" eval "receipt_is $APP_ID $x && app_is $w"
+  must "  ... verify-pkg installed fails: the receipt is $x's" eval \
+    "! bash '$here/verify-pkg.sh' installed $w >'$(ST)/logs/$label.verify' 2>&1 && grep -q \"version '$x'\" '$(ST)/logs/$label.verify'"
+  before="$(package_state)"
+  must "  ... $w's uninstaller refuses, saying to finish the upgrade" eval \
+    "! sudo -n /bin/sh '$APP/Contents/Resources/uninstall.sh' >'$(ST)/logs/$label.uninstall' 2>&1 && grep -q 'the upgrade from $x to $w did not finish' '$(ST)/logs/$label.uninstall'"
+  must "  ... changing nothing" test "$(package_state)" = "$before"
+  refused "$label-older-package" "$older" "an upgrade from $x to $w did not finish: install the Syndeo $w package again"
+  refused "$label-newer-package" "$newer" "an upgrade from $x to $w did not finish: install the Syndeo $w package again"
+  installed "$label-the-same-package-again" "$pkg" "completing the failed upgrade from $x to $w" "$w"
+}
+
+# ------------------------------------------------------------------ packages
+
+# payload_app PKG DIR: the bundle in PKG's payload, expanded into DIR.
+payload_app() {
+  rm -rf "$2"
+  pkgutil --expand-full "$1" "$2" >/dev/null || fail "expanding $1"
+  [ -d "$2/Syndeo.pkg/Payload/Syndeo.app" ] || fail "no Syndeo.app in $1's payload"
+}
+
+# standin V: a package of Syndeo.app V, made from the real package's own
+# bundle: its versions changed, its uninstaller rendered for V, the stapled
+# ticket dropped, the helper and then the bundle signed again ad hoc, and
+# built by the real builder.
+standin() {
+  local v="$1" dir app
+  dir="$(ST)/standins/$v"
+  app="$dir/app/Syndeo.app"
+  mkdir -p "$dir/app"
+  ditto "$(ST)/real-payload/Syndeo.pkg/Payload/Syndeo.app" "$app" || return 1
+  rm -f "$app/Contents/CodeResources"
+  plutil -replace CFBundleShortVersionString -string "$v" "$app/Contents/Info.plist" &&
+    plutil -replace CFBundleVersion -string "$v" "$app/Contents/Info.plist" || return 1
+  bash "$here/package-macos-pkg.sh" --render uninstall "$v" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign \
+    "$app/Contents/Resources/uninstall.sh" || return 1
+  codesign --force --sign - --options runtime "$app/Contents/Helpers/syndeo-proxy" >/dev/null 2>&1 &&
+    codesign --force --sign - --options runtime "$app" >/dev/null 2>&1 || return 1
+  SOURCE_DATE_EPOCH="$(date +%s)" bash "$here/package-macos-pkg.sh" "$v" "$app" "$dir" >"$dir/build.log" 2>&1 ||
+    { sed 's/^/      | /' "$dir/build.log" >&2; return 1; }
   printf '%s' "$dir/syndeo-$v-aarch64-apple-darwin.pkg"
 }
 
-# real_standin V PKG VERSION: a stand-in package for V whose seven commands
-# are the real binaries in PKG, the package of VERSION.
-real_standin() {
-  local v="$1" pkg="$2" real="$3" dir name n from
-  dir="$(ST)/standins/$v"
-  name="syndeo-$v-aarch64-apple-darwin"
-  expand_payload "$pkg" "$(ST)/real-payload"
-  from="$(ST)/real-payload/syndeo.pkg/Payload/usr/local/libexec/syndeo/$real"
-  mkdir -p "$dir/src/$name/tools"
-  for n in $NAMES; do
-    cp "$from/$n" "$dir/src/$name/$n" || fail "copying the real $n"
-    chmod 755 "$dir/src/$name/$n"
-  done
-  cp "$here/../README.md" "$here/../LICENSE" "$dir/src/$name/"
-  cp "$here/../crates/syndeo-agent/tools/wordcount.wat" "$dir/src/$name/tools/"
-  tar -C "$dir/src" --format=ustar -czf "$dir/$name.tar.gz" "$name"
-  build_standin "$v" "$dir"
-}
-
-# fault_pkg PKG entry|after-switch: PKG, a stand-in, with a test fault in its
+# fault_pkg PKG entry|mid-removal: PKG, a stand-in, with a test fault in its
 # postinstall that fails the first run only (ci/pkg-test-fault.sh).
 fault_pkg() {
   local pkg="$1" where="$2" dir
@@ -494,96 +532,437 @@ fault_pkg() {
   printf '%s' "$dir/$(basename "$pkg")"
 }
 
-# failed_upgrade LABEL PKG X W AT OLDER NEWER: install PKG, a faulty W, over
-# X. It fails and leaves what was measured: X's receipt, X gone, W in place,
-# current at AT. Everything that must refuse that state does, changing
-# nothing, OLDER and NEWER packages included; then PKG again completes it.
-failed_upgrade() {
-  local label="$1" pkg="$2" x="$3" w="$4" at="$5" older="$6" newer="$7" before
-  must "$label: before, $x alone, with its receipt and current" eval "receipt_is $x && alone $x && current_is $x"
-  if install "$label" "$pkg"; then fail "$label: the faulty package installed"; fi
-  note_said "syndeo postinstall: test fault" >/dev/null
-  must "$label: Installer left the receipt at $x, $x gone, $w in place, current -> $at" eval "receipt_is $x && alone $w && current_is $at"
-  if [ "$at" = "$x" ]; then
-    must "  ... every command fails to start, only because it is not there" commands_fail_closed
+# old_release V: the published v0.1.x package V, downloaded with its
+# release's SHA256SUMS, and checked against it.
+old_release() {
+  local v="$1" name dir
+  name="syndeo-$v-aarch64-apple-darwin.pkg"
+  dir="$(ST)/releases/$v"
+  mkdir -p "$dir"
+  curl -fsSL --retry 3 -o "$dir/$name" "$REPO_URL/v$v/$name" || fail "downloading $name"
+  curl -fsSL --retry 3 -o "$dir/SHA256SUMS" "$REPO_URL/v$v/SHA256SUMS" || fail "downloading v$v's SHA256SUMS"
+  (cd "$dir" && shasum -a 256 -c SHA256SUMS --ignore-missing) >"$dir/sums.log" 2>&1 ||
+    fail "$name does not match its release's SHA256SUMS: $(cat "$dir/sums.log")"
+  [ "$(grep -c "  $name\$" "$dir/SHA256SUMS")" = 1 ] || fail "v$v's SHA256SUMS does not list $name once"
+  pass "v$v: $name, $(shasum -a 256 "$dir/$name" | cut -c1-16)..., matches its release's SHA256SUMS"
+  OLD_PKG="$dir/$name"
+}
+
+# ------------------------------------------------------------------ install.sh
+
+# cli_install DIR: the command-line tools as install.sh installs them, from
+# the published v0.1.7 tarball, into DIR, and each command written down as
+# the test's own.
+cli_install() {
+  local dir="$1" n
+  SYNDEO_VERSION=0.1.7 SYNDEO_INSTALL_DIR="$dir" SYNDEO_HOME="$(ST)/cli-home" \
+    sh "$here/../install.sh" >"$(ST)/logs/install-sh-$(date +%s).log" 2>&1 || fail "install.sh into $dir"
+  for n in $NAMES; do
+    [ -f "$dir/$n" ] && [ ! -L "$dir/$n" ] || fail "install.sh did not put a regular file at $dir/$n"
+    forget_plant "$dir/$n"
+    record_plant "$dir/$n"
+  done
+}
+
+# cli_untouched DIR: every command install.sh put in DIR is still exactly
+# what it was.
+cli_untouched() {
+  local n
+  for n in $NAMES; do
+    [ "$(meta "$1/$n")" = "$(planted_meta "$1/$n")" ] || return 1
+  done
+}
+
+cli_remove() {
+  local n
+  for n in $NAMES; do unplant "$1/$n"; done
+}
+
+# ------------------------------------------------------------------ the app
+
+image_of() {
+  python3 -I -c '
+import ctypes, sys
+proc = ctypes.CDLL("/usr/lib/libproc.dylib")
+buf = ctypes.create_string_buffer(4096)
+n = proc.proc_pidpath(int(sys.argv[1]), buf, 4096)
+print(buf.value.decode() if n > 0 else "(gone)")' "$1"
+}
+
+appctl() {
+  local bin
+  bin="$(ST)/appctl"
+  if [ ! -x "$bin" ]; then
+    swiftc -O -o "$bin" "$here/macos-app/appctl.swift" >"$(ST)/logs/swiftc.log" 2>&1 || return 1
+  fi
+  "$bin" "$@"
+}
+
+wait_for() {
+  local until=$((SECONDS + $1))
+  shift
+  while ! "$@" >/dev/null 2>&1; do
+    [ "$SECONDS" -lt "$until" ] || return 1
+    sleep 0.5
+  done
+}
+
+running() { [ -n "$(appctl pids "$BUNDLE_ID")" ]; }
+none_running() {
+  [ -z "$(appctl pids "$BUNDLE_ID")" ] && ! pgrep -f '/Syndeo.app/Contents/MacOS/Syndeo' >/dev/null &&
+    ! pgrep -f '/Syndeo.app/Contents/Helpers/syndeo-proxy' >/dev/null
+}
+
+# descendants PID: PID and every process under it.
+descendants() {
+  local p c
+  echo "$1"
+  for c in $(pgrep -P "$1"); do descendants "$c"; done
+  return 0
+}
+
+# opened LABEL: open the application through LaunchServices by its bundle
+# identifier, as Finder or Launchpad would; it, and every process under it,
+# runs from /Applications/Syndeo.app, its helper among them, and nothing from
+# /usr/local; a window shows. Sets RUNNING_PID.
+opened() {
+  local label="$1" pid helper p img
+  open -b "$BUNDLE_ID" >"$(ST)/logs/open-$label.log" 2>&1 || fail "$label: open -b $BUNDLE_ID: $(cat "$(ST)/logs/open-$label.log")"
+  wait_for 30 running || fail "$label: nothing running 30 seconds after open"
+  pid="$(appctl pids "$BUNDLE_ID" | head -n 1)"
+  must "$label: Syndeo runs $APP/Contents/MacOS/Syndeo" test "$(image_of "$pid")" = "$APP/Contents/MacOS/Syndeo"
+  must "  ... a window shows" wait_for 30 appctl windows "$pid"
+  wait_for 30 sh -c "pgrep -P $pid >/dev/null" || fail "$label: no helper 30 seconds after open"
+  helper=''
+  for p in $(descendants "$pid"); do
+    img="$(image_of "$p")"
+    printf '%s %s\n' "$p" "$img" >>"$(ST)/logs/open-$label.processes"
+    case "$img" in
+      "$APP/Contents/MacOS/Syndeo") ;;
+      "$APP/Contents/Helpers/syndeo-proxy") helper="$p" ;;
+      *) fail "$label: process $p, under Syndeo, runs $img, not from the bundle" ;;
+    esac
+  done
+  must "  ... its helper runs $APP/Contents/Helpers/syndeo-proxy, and every process under it runs from the bundle, none from /usr/local" test -n "$helper"
+  must "  ... the helper is byte for byte the one the package carried" \
+    cmp -s "$APP/Contents/Helpers/syndeo-proxy" "$(ST)/real-payload/Syndeo.pkg/Payload/Syndeo.app/Contents/Helpers/syndeo-proxy"
+  RUNNING_PID="$pid"
+}
+
+quit_app() {
+  appctl quit "$BUNDLE_ID" >/dev/null 2>&1 || true
+  wait_for 20 none_running || appctl stop "$BUNDLE_ID" >/dev/null 2>&1 || true
+  wait_for 10 none_running
+}
+
+# user_data: Syndeo's user data, every path and every file's bytes, as text.
+user_data() {
+  local p
+  while IFS= read -r p; do
+    case "$p" in "$HOME/.Trash/"*) continue ;; esac
+    present "$p" || continue
+    find "$p" -exec stat -f '%N|%HT|%Lp|%z' {} + | LC_ALL=C sort
+    find "$p" -type f -exec shasum -a 256 {} + | LC_ALL=C sort
+  done < <(user_paths)
+}
+
+# settled_user_data: user_data, once it has stopped changing: WebKit's
+# processes may still write to Syndeo's caches for a moment after it quits.
+# Two reads two seconds apart that agree, within a minute.
+settled_user_data() {
+  local a b
+  b="$(user_data)"
+  for _ in $(seq 1 30); do
+    a="$b"
+    sleep 2
+    b="$(user_data)"
+    [ "$a" = "$b" ] && break
+  done
+  printf '%s\n' "$b"
+}
+
+# user_data_kept BEFORE: the user's data are byte for byte BEFORE; says how
+# they differ if not.
+user_data_kept() {
+  [ "$(user_data)" = "$1" ] && return 0
+  diff <(printf '%s\n' "$1") <(user_data) | sed 's/^/      | /'
+  return 1
+}
+
+# gatekeeper SLUG WHAT PATH TYPE: Gatekeeper's verdict on PATH, kept in
+# logs/spctl-SLUG, and what it has to be: accepted as Notarized Developer ID
+# for a signed release, rejected otherwise.
+gatekeeper() {
+  local slug="$1" what="$2" path="$3" type="$4" out status
+  out="$(spctl --assess -vv --type "$type" "$path" 2>&1)" && status=0 || status=$?
+  printf '%s\nexit %s\n' "$out" "$status" >"$(ST)/logs/spctl-$slug"
+  if [ "${SYNDEO_EXPECT_SIGNED:-no}" = yes ]; then
+    must "Gatekeeper accepts $what as Notarized Developer ID" eval \
+      "[ $status = 0 ] && grep -qx 'source=Notarized Developer ID' '$(ST)/logs/spctl-$slug'"
   else
-    must "  ... every command runs $w" commands_say "$w"
+    must "Gatekeeper rejects $what, unsigned with a Developer ID as a pull request's is ($(printf '%s' "$out" | head -n 1 | sed 's/^[^:]*: //'))" test "$status" != 0
   fi
-  must "  ... verify-pkg installed fails: the receipt is $x's, and the paths it lists are missing" eval \
-    "! bash '$here/verify-pkg.sh' installed $w >'$(ST)/logs/$label.verify' 2>&1 && grep -q 'is missing, and the receipt for $x lists it' '$(ST)/logs/$label.verify'"
+}
+
+# ------------------------------------------------------------------ run
+
+run() {
+  local pkg="$1" version="$2" st n q s1 s2 s3 f1 f3 trashed before
+  guard
+  st="$(ST)"
+  [ -e "$st" ] && refuse "$st exists: this runner has been used for this test before"
+  pristine || refuse "Syndeo is already on this runner"
+  present "$HOME/.Trash/Syndeo.app" && refuse "there is a Syndeo.app in the Trash already"
+  mount | grep -q " on $ALT " && refuse "$ALT is already mounted"
+  [ "$(syndeo_cmp "$version" 0.0.3)" = gt ] || refuse "$version is not newer than the stand-ins, 0.0.1 to 0.0.3"
+  REAL_VERSION="$version"
+  mkdir -p "$st/logs"
+  : >"$st/planted"
+  : >"$st/altered"
+  snapshot "$st/before"
+  cp -R "$st/before" "$st/logs/before"
+
+  say "Installing $pkg ($version) on this runner, again and again. It writes only:"
+  pkgutil --payload-files "$pkg" | sed 's|^\.|  /Applications|'
+  say "The test also installs the published v0.1.6 and v0.1.7 packages, install.sh's commands in $BIN,"
+  say "stand-in packages 0.0.1 to 0.0.3, and a disk image mounted at $ALT; cleanup removes all of it."
+  payload_app "$pkg" "$st/real-payload"
+  s1="$(standin 0.0.1)" || fail "building the stand-in 0.0.1"
+  s2="$(standin 0.0.2)" || fail "building the stand-in 0.0.2"
+  s3="$(standin 0.0.3)" || fail "building the stand-in 0.0.3"
+  f1="$(fault_pkg "$s1" mid-removal)" || fail "building 0.0.1 with a fault in its removal of v0.1.x"
+  f3="$(fault_pkg "$s3" entry)" || fail "building 0.0.3 with a fault at its postinstall's entry"
+
+  section "1. the first install, as a person makes it"
+  cli_install "$BIN"
+  pass "install.sh put the v0.1.7 command-line tools in $BIN, as regular files"
+  q="$HOME/Downloads/$(basename "$pkg")"
+  present "$q" && fail "$q is there already"
+  cp "$pkg" "$q" || fail "copying the package to ~/Downloads"
+  xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;$(uuidgen)" "$q"
+  record_plant "$q"
+  xattr -l "$q" >"$st/logs/download-xattr" 2>&1
+  pkgutil --check-signature "$q" >"$st/logs/download-signature" 2>&1 || true
+  gatekeeper download "the download, quarantined as Safari leaves it" "$q" install
+  installed quarantined-download "$q" "installing $version" "$version"
+  must "  ... install.sh's commands in $BIN untouched" cli_untouched "$BIN"
+  must "  ... /Applications kept its owner, mode and ACL" test "$(snap_path /Applications)" = "$(tail -n 1 "$st/before/applications.txt")"
+  must "  ... the installed bundle carries no quarantine" eval "! as_root xattr -r '$APP' 2>/dev/null | grep -q com.apple.quarantine"
+  gatekeeper installed-app "the installed Syndeo.app" "$APP" execute
+  if [ "${SYNDEO_EXPECT_SIGNED:-no}" = yes ]; then
+    must "  ... its notarization ticket is stapled, and validates" xcrun stapler validate "$APP"
+  fi
+  opened first
   before="$(package_state)"
-  must "  ... $w's uninstaller refuses, saying to finish the upgrade" eval \
-    "! /bin/sh '$D/$w/uninstall.sh' >'$(ST)/logs/$label.uninstall' 2>&1 && grep -q 'the upgrade from $x to $w did not finish' '$(ST)/logs/$label.uninstall'"
-  must "  ... changing nothing" test "$(package_state)" = "$before"
-  refused "$label-older-package" "$older" "an upgrade from $x to $w did not finish: install the Syndeo $w package again"
-  refused "$label-newer-package" "$newer" "an upgrade from $x to $w did not finish: install the Syndeo $w package again"
-  installed "$label-the-same-package-again" "$pkg" "completing the failed upgrade from $x to $w" "$w"
-  must "  ... $w alone, with its receipt, current, the links and every command" eval "alone $w && receipt_is $w && current_is $w && commands_say $w"
+  refused while-it-runs "$pkg" "Syndeo is running from $APP (process $RUNNING_PID): quit it first"
+  must "  ... Syndeo still runs, the same process" test "$(image_of "$RUNNING_PID")" = "$APP/Contents/MacOS/Syndeo"
+  must "  ... and its uninstaller refuses too, changing nothing" eval \
+    "! sudo -n /bin/sh '$APP/Contents/Resources/uninstall.sh' >'$st/logs/uninstall-while-it-runs' 2>&1 && grep -q 'Syndeo is running from $APP' '$st/logs/uninstall-while-it-runs' && [ \"\$(package_state)\" = \"\$before\" ]"
+  quit_app
+  must "quit: nothing of Syndeo left running, no helper" none_running
+  user_data >"$st/logs/user-data-after-first-open"
+  installed reinstall "$pkg" "reinstalling $version" "$version"
+
+  section "another volume"
+  hdiutil create -size 64m -fs APFS -volname SyndeoAltTest "$st/alt.dmg" >/dev/null || fail "creating a disk image"
+  hdiutil attach "$st/alt.dmg" -nobrowse -mountpoint "$ALT" >/dev/null || fail "attaching it"
+  if install another-volume "$pkg" "$ALT"; then fail "installing on $ALT succeeded"; fi
+  must "installing on another volume is refused, and writes nothing there" eval \
+    "! present '$ALT/Applications/Syndeo.app' && ! pkgutil --pkgs --volume '$ALT' 2>/dev/null | grep -q syndeo"
+  hdiutil detach "$ALT" >/dev/null || fail "detaching $ALT"
+  rm -f "$st/alt.dmg"
+
+  section "removed with its uninstaller"
+  uninstalled "$version"
+
+  section "2. the published v0.1.x command-line packages"
+  cli_remove "$BIN"
+  old_release 0.1.6
+  local p016="$OLD_PKG"
+  old_release 0.1.7
+  local p017="$OLD_PKG"
+  legacy_install v0.1.6 "$p016"
+  must "v0.1.6, exactly as its package leaves it" legacy_exact 0.1.6
+  plant file "$D/0.1.6/notes.txt" "notes
+"
+  refused legacy-extra-file "$pkg" "$D/0.1.6/notes.txt: is not part of Syndeo 0.1.6"
+  unplant "$D/0.1.6/notes.txt"
+  alter mode "$D/0.1.6/syndeo-net" 775
+  refused legacy-mode-changed "$pkg" "$D/0.1.6/syndeo-net: is not a Regular File owned by root:wheel with mode 755"
+  restore_last
+  plant link "$D/.current.new" 0.1.6
+  refused legacy-current-new "$pkg" "$D/.current.new: is there, from a switch that did not finish"
+  unplant "$D/.current.new"
+  plant dir "$D/0.0.99"
+  refused legacy-second-version "$pkg" "$D: holds 0.0.99 0.1.6; only 0.1.6 may be there"
+  unplant "$D/0.0.99"
+  alter aside "$D/0.1.6/README.md" "$st/aside-README.md"
+  refused legacy-file-missing "$pkg" "$D/0.1.6/README.md: is missing, and the receipt for 0.1.6 lists it"
+  restore_last
+  alter aside "$BIN/syndeo" "$st/aside-syndeo"
+  refused legacy-first-link-missing "$pkg" "the v0.1.x 0.1.6 command-line package is only partly there"
+  restore_last
+  alter aside "$BIN/syndeo-agent" "$st/aside-syndeo-agent"
+  refused legacy-link-missing "$pkg" "$BIN/syndeo-agent: is missing, and the receipt for 0.1.6 lists it"
+  restore_last
+  must "v0.1.6, after all of that, still exactly as its package left it" legacy_exact 0.1.6
+  installed migrate-v0.1.6 "$pkg" "installing $version, and removing the v0.1.x command-line package 0.1.6" "$version"
+  note_said "removed $LIBEXEC, which the v0.1.x package created, empty" >/dev/null
+  must "  ... nothing of v0.1.6 left, its receipt forgotten" eval "[ \"\$(legacy_left 0.1.6)\" = 0 ] && no_receipt $OLD_ID"
+  must "  ... /usr/local exactly as the runner had it before any package: $LIBEXEC, which v0.1.6 created, removed, and $BIN untouched" \
+    usr_local_as_before
+  uninstalled "$version"
+
+  section "v0.1.7, with install.sh's commands put over its links"
+  legacy_install v0.1.7 "$p017"
+  must "v0.1.7, exactly as its package leaves it" legacy_exact 0.1.7
+  cli_install "$BIN"
+  refused legacy-install-sh-over-links "$pkg" "$BIN/syndeo: is not what the v0.1.x 0.1.7 package put there"
+  must "  ... install.sh's commands untouched" cli_untouched "$BIN"
+  cli_remove "$BIN"
+  legacy_install v0.1.7-repaired "$p017"
+  must "v0.1.7, repaired by its own package, exactly as it leaves it" legacy_exact 0.1.7
+
+  section "its removal interrupted, and finished by the same package"
+  before_is "installing 0.0.1, and removing the v0.1.x command-line package 0.1.7" || fail "before the interrupted removal, the runner is not v0.1.7 alone"
+  failed_install migration-interrupted "$f1"
+  must "  ... it stopped after the seven links: the rest of v0.1.7 and its receipt left, Syndeo.app 0.0.1 with no receipt" eval \
+    "[ \"\$(legacy_left 0.1.7)\" = 15 ] && receipt_is $OLD_ID 0.1.7 && no_receipt $APP_ID && app_is 0.0.1"
+  before="$(package_state)"
+  must "  ... 0.0.1's uninstaller refuses, with no receipt to go by, changing nothing" eval \
+    "! sudo -n /bin/sh '$APP/Contents/Resources/uninstall.sh' >'$st/logs/uninstall-interrupted' 2>&1 && grep -q 'no Syndeo.app package is installed' '$st/logs/uninstall-interrupted' && [ \"\$(package_state)\" = \"\$before\" ]"
+  refused migration-interrupted-other-package "$pkg" "$APP: is Syndeo.app 0.0.1, with no receipt"
+  note_said "the v0.1.x 0.1.7 command-line package is only partly there" >/dev/null
+  installed migration-resumed "$f1" "resuming an interrupted installation of 0.0.1, and finishing the removal of the v0.1.x command-line package 0.1.7" 0.0.1
+  must "  ... nothing of v0.1.7 left, its receipt forgotten, /usr/local as the runner had it" eval \
+    "[ \"\$(legacy_left 0.1.7)\" = 0 ] && no_receipt $OLD_ID && usr_local_as_before"
+
+  section "3. upgrades, a failed one, a downgrade, a reinstall"
+  installed upgrade-0.0.2 "$s2" "upgrading from 0.0.1 to 0.0.2" 0.0.2
+  failed_upgrade fault "$f3" 0.0.2 0.0.3 "$s2" "$pkg"
+  refused downgrade "$s2" "Syndeo.app 0.0.3 is installed, and this package is the older 0.0.2"
+  installed reinstall-0.0.3 "$s3" "reinstalling 0.0.3" 0.0.3
+  plant file "$APP/Contents/Resources/extra" "extra
+"
+  refused modified-bundle "$s3" "$APP: is not Syndeo.app 0.0.3 as its package installed it. Move it to the Trash, then install this package"
+  unplant "$APP/Contents/Resources/extra"
+  installed upgrade-real "$pkg" "upgrading from 0.0.3 to $version" "$version"
+
+  section "4. moved to the Trash, as Finder moves it"
+  trashed="$HOME/.Trash/Syndeo.app"
+  mkdir -p "$HOME/.Trash"
+  as_root mv "$APP" "$trashed" || fail "moving Syndeo.app to the Trash"
+  "$LSREGISTER" -f "$trashed" >/dev/null 2>&1 || true
+  must "the receipt stays behind" receipt_is "$APP_ID" "$version"
+  before="$(package_state)"
+  must "  ... the trashed copy's uninstaller refuses, saying how to forget the receipt, changing nothing" eval \
+    "! sudo -n /bin/sh '$trashed/Contents/Resources/uninstall.sh' >'$st/logs/uninstall-trashed' 2>&1 && grep -qF '    sudo /usr/sbin/pkgutil --forget $APP_ID --volume /' '$st/logs/uninstall-trashed' && [ \"\$(package_state)\" = \"\$before\" ]"
+  as_root find "$trashed" -exec stat -f '%N|%HT|%u|%g|%Lp|%i|%z' {} + | LC_ALL=C sort >"$st/trashed.before"
+  installed after-the-trash "$pkg" "installing $version; Syndeo.app $version, which the receipt names, is no longer in /Applications" "$version"
+  must "  ... the trashed copy untouched" eval "[ \"\$(as_root find '$trashed' -exec stat -f '%N|%HT|%u|%g|%Lp|%i|%z' {} + | LC_ALL=C sort)\" = \"\$(cat '$st/trashed.before')\" ]"
+  opened after-the-trash
+  quit_app
+  must "quit again: nothing left running" none_running
+  "$LSREGISTER" -u "$trashed" >/dev/null 2>&1 || true
+  as_root rm -rf "$trashed"
+  must "the trashed copy, the test's own, emptied from the Trash" test ! -e "$trashed"
+
+  section "5. removal"
+  forget_fails "$version"
+  plant dir "$APP"
+  plant dir "$APP/Contents"
+  plant file "$APP/Contents/Info.plist" '<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.example.other</string><key>CFBundleShortVersionString</key><string>1.0.0</string></dict></plist>
+'
+  refused foreign-app "$pkg" "$APP: is there, and no Syndeo.app package installed it. Move it to the Trash, then install this package"
+  unplant "$APP/Contents/Info.plist"
+  unplant "$APP/Contents"
+  unplant "$APP"
+  installed final "$pkg" "installing $version" "$version"
+  uninstalled "$version"
+  must "nothing of Syndeo's left on the runner, and /usr/local as it had it" eval "pristine && usr_local_as_before"
 }
 
-# tree V [subset]: plant a version tree owned and moded as the package lays
-# one down. What the files hold does not matter to the scripts, which judge
-# names, types, owners and modes, and Installer replaces them when it resumes.
-tree() {
-  local v="$1" n
-  plant dir "$D/$v"
-  plant dir "$D/$v/tools"
-  for n in $NAMES uninstall.sh; do
-    if [ "${2:-}" = subset ] && [ "$n" != syndeo ] && [ "$n" != syndeo-net ]; then continue; fi
-    plant file "$D/$v/$n" "#!/bin/sh
-" root:wheel 755
-  done
-  plant file "$D/$v/README.md" "placeholder
-" root:wheel 644
-  if [ "${2:-}" != subset ]; then
-    plant file "$D/$v/LICENSE" "placeholder
-" root:wheel 644
-    plant file "$D/$v/tools/wordcount.wat" "(module)
-" root:wheel 644
-  fi
+# syndeo_cmp A B: lt, eq or gt.
+syndeo_cmp() {
+  # shellcheck source=ci/macos-pkg/version.sh
+  ( . "$here/macos-pkg/version.sh"; syndeo_version_cmp "$1" "$2" )
 }
 
-untree() {
-  local v="$1" n
-  for n in $NAMES uninstall.sh README.md LICENSE tools/wordcount.wat; do
-    if [ -n "$(planted_meta "$D/$v/$n")" ]; then unplant "$D/$v/$n"; fi
-  done
-  unplant "$D/$v/tools"
-  unplant "$D/$v"
+usr_local_as_before() {
+  local now
+  now="$(snapshot_usr_local)"
+  [ "$now" = "$(cat "$(ST)/before/usr-local.txt")" ] || { diff "$(ST)/before/usr-local.txt" <(printf '%s\n' "$now") | sed 's/^/      | /'; return 1; }
 }
 
-expand_payload() {
-  local pkg="$1" out="$2"
-  rm -rf "$out"
-  pkgutil --expand-full "$pkg" "$out" >/dev/null || fail "expanding $pkg"
+snapshot_usr_local() {
+  find /usr/local -maxdepth 2 -exec stat -f '%N|%HT|%Su:%Sg|%Lp|%Sf' {} + 2>/dev/null | LC_ALL=C sort
+  snap_path /usr/local
+  snap_path "$BIN"
+  snap_path "$LIBEXEC"
+}
+
+# uninstalled V: the bundle's own uninstaller removes Syndeo.app V and its
+# receipt, and nothing else: the user's data are byte for byte as they were.
+uninstalled() {
+  local v="$1" log data
+  log="$(ST)/logs/uninstall-$(date +%s)"
+  data="$(settled_user_data)"
+  [ -n "$data" ] || fail "no user data of Syndeo's to keep: it has not been opened"
+  sudo -n /bin/sh "$APP/Contents/Resources/uninstall.sh" >"$log" 2>&1 ||
+    { sed 's/^/      | /' "$log"; fail "the uninstaller failed"; }
+  must "the uninstaller removed Syndeo.app $v, and its receipt" eval "! present '$APP' && no_receipt $APP_ID && grep -q 'removed Syndeo.app $v' '$log'"
+  must "  ... the user's data kept, byte for byte" user_data_kept "$data"
+}
+
+# forget_fails V: the uninstaller, as a stand-in pkgutil makes forgetting the
+# receipt fail and nothing else, exits 2, says the exact command, and has
+# removed the bundle; the command then does what it says.
+forget_fails() {
+  local v="$1" fake out status data
+  fake="$(ST)/fake-pkgutil"
+  data="$(settled_user_data)"
+  as_root mkdir -p "$fake"
+  as_root tee "$fake/pkgutil" >/dev/null <<EOF
+#!/bin/sh
+if [ "\$*" = "--forget $APP_ID --volume /" ]; then
+  echo "pkgutil (stand-in): could not forget" >&2
+  exit 1
+fi
+exec /usr/sbin/pkgutil "\$@"
+EOF
+  as_root chown -R root:wheel "$fake" && as_root chmod 755 "$fake" "$fake/pkgutil" || fail "making the stand-in pkgutil"
+  bash "$here/package-macos-pkg.sh" --render uninstall "$v" '' 0 0 "$fake/pkgutil" /usr/bin/codesign "$(ST)/uninstall-forget-fails" ||
+    fail "rendering the uninstaller with the stand-in"
+  out="$(sudo -n /bin/sh "$(ST)/uninstall-forget-fails" 2>&1)" && status=0 || status=$?
+  printf '%s\n' "$out" >"$(ST)/logs/uninstall-forget-fails"
+  must "the receipt cannot be forgotten: the uninstaller exits 2" test "$status" = 2
+  must "  ... saying the exact command" eval "printf '%s\n' \"\$out\" | grep -qxF 'syndeo uninstall:     sudo /usr/sbin/pkgutil --forget $APP_ID --volume /'"
+  must "  ... the bundle removed, the receipt still there" eval "! present '$APP' && receipt_is $APP_ID $v"
+  must "  ... the user's data kept, byte for byte" user_data_kept "$data"
+  as_root /usr/sbin/pkgutil --forget "$APP_ID" --volume / >/dev/null || fail "the command it gave"
+  must "  ... and the command it gave forgets it" no_receipt "$APP_ID"
+  as_root rm -rf "$fake"
 }
 
 # ------------------------------------------------------------------ cleanup
 
+was_absent() { grep -qxF "absent $1" "$(ST)/before/user-paths.txt" 2>/dev/null; }
+
+is_syndeo_bundle() {
+  [ -d "$1" ] && [ "$(plutil -extract CFBundleIdentifier raw -o - "$1/Contents/Info.plist" 2>/dev/null)" = "$BUNDLE_ID" ]
+}
+
 # cleanup: undo everything recorded, whatever happened, then check the runner
 # is as it was. Safe to run any number of times.
 cleanup() {
-  local st problems="" line p kind undo v
+  local st problems="" kind p undo want id n t f
+  guard
   st="$(ST)"
-  [ -d "$st" ] || { say "cleanup: nothing was recorded"; return 0; }
-  say ""
-  say "cleanup"
-  # Processes the steps started, if any are left.
-  for p in "$(US)/pids" "$st/pids"; do
-    [ -f "$p" ] || continue
-    while read -r pid; do kill "$pid" 2>/dev/null; done <"$p"
-  done
-  # The user's keychain search list and the throwaway keychain.
-  if [ -f "$(US)/keychain-list" ]; then
-    # shellcheck disable=SC2046
-    sudo -u "$RUNNER" security list-keychains -d user -s $(tr -d '"' <"$(US)/keychain-list") ||
-      problems="$problems; could not restore the keychain search list"
-  fi
-  if [ -f "$(US)/keychain" ] && [ -e "$(cat "$(US)/keychain")" ]; then
-    sudo -u "$RUNNER" security delete-keychain "$(cat "$(US)/keychain")" ||
-      problems="$problems; could not delete the throwaway keychain"
-  fi
-  # The alternate volume.
+  [ -d "$st/before" ] || { say "cleanup: nothing was recorded"; return 0; }
+  section "cleanup"
+  quit_app
+  pkill -f '/Syndeo.app/Contents/Helpers/syndeo-proxy' 2>/dev/null || true
   if mount | grep -q " on $ALT "; then
     hdiutil detach "$ALT" -force >/dev/null || problems="$problems; could not detach $ALT"
   fi
@@ -595,645 +974,90 @@ cleanup() {
     done
     : >"$st/altered"
   fi
-  # Planted paths, newest first: those inside the package's tree first, so
-  # its uninstaller finds only what the package left, then the rest. Each is
-  # removed only if it is still exactly what was planted.
-  local inside
-  for inside in yes no; do
-    [ -s "$st/planted" ] || break
+  # Planted paths, newest first, each only if it is still what was planted.
+  if [ -s "$st/planted" ]; then
     tail -r "$st/planted" | while IFS='	' read -r p want; do
-      case "$p" in "$D" | "$D"/*) [ "$inside" = yes ] || continue ;; *) [ "$inside" = no ] || continue ;; esac
       if [ "$(meta "$p")" = "$want" ]; then
-        if [ -d "$p" ] && [ ! -L "$p" ]; then rmdir "$p" 2>/dev/null || continue; else rm -f "$p"; fi
+        if [ -d "$p" ] && [ ! -L "$p" ]; then as_root rmdir "$p" 2>/dev/null || continue; else as_root rm -f "$p"; fi
+        forget_plant "$p"
+      elif ! present "$p"; then
         forget_plant "$p"
       fi
     done
+  fi
+  # The bundles, in /Applications and in the Trash, and their receipt.
+  for p in "$APP" "$HOME/.Trash/Syndeo.app"; do
+    if is_syndeo_bundle "$p"; then
+      "$LSREGISTER" -u "$p" >/dev/null 2>&1 || true
+      as_root rm -rf "$p"
+      say "cleanup: removed $p"
+    fi
   done
-  # The package, by its own uninstaller, once it is checked to be the one the
-  # repository renders.
-  if pkgutil --pkg-info "$ID" >/dev/null 2>&1; then
-    v="$(pkgutil --pkg-info "$ID" | sed -n 's/^version: //p')"
-    if [ -d "$D/$v" ] && ! current_is "$v"; then
-      rm -f "$D/current"; ln -s "$v" "$D/current"; chown -h root:wheel "$D/current"
-    fi
-    "$here/package-macos-pkg.sh" --render uninstall "$v" '' 0 0 /usr/sbin/pkgutil "$st/uninstall.expected" >/dev/null
-    if cmp -s "$st/uninstall.expected" "$D/$v/uninstall.sh" && /bin/sh "$D/$v/uninstall.sh"; then
-      :
-    else
-      # A failed upgrade, or a step that stopped halfway: the uninstaller
-      # refuses those by design, or is not the repository's to run.
-      say "cleanup: the package's own uninstaller did not remove it; removing what the package put down"
-      remove_leftovers
-    fi
-  elif present "$D"; then
-    say "cleanup: $D is there with no receipt; removing what the package put down"
-    remove_leftovers
-  fi
-  # A planted path that no longer exists has nothing left to restore: the
-  # package took it over, and its uninstaller removed it.
-  if [ -s "$st/planted" ]; then
-    cut -f1 "$st/planted" | while IFS= read -r p; do
-      present "$p" || forget_plant "$p"
+  # The v0.1.x paths, only those exactly as its package names them, and the
+  # receipts.
+  for n in $NAMES; do
+    p="$BIN/$n"
+    if [ -L "$p" ] && [ "$(readlink "$p")" = "../libexec/syndeo/current/$n" ]; then as_root rm -f "$p"; fi
+  done
+  if [ -d "$D" ] && [ ! -L "$D" ]; then
+    for p in "$D/current" "$D/.current.new"; do
+      if [ -L "$p" ]; then as_root rm -f "$p"; fi
     done
+    for t in "$D"/*; do
+      [ -d "$t" ] && [ ! -L "$t" ] || continue
+      case "${t##*/}" in '' | *[!0-9.]*) continue ;; esac
+      for f in $NAMES uninstall.sh README.md LICENSE tools/wordcount.wat; do
+        if [ -f "$t/$f" ] && [ ! -L "$t/$f" ]; then as_root rm -f "$t/$f"; fi
+      done
+      as_root rmdir "$t/tools" 2>/dev/null
+      as_root rmdir "$t" 2>/dev/null
+    done
+    as_root rmdir "$D" 2>/dev/null
   fi
+  for id in $APP_ID $OLD_ID; do
+    if pkgutil --pkg-info "$id" >/dev/null 2>&1 && ! grep -qxF "$id" "$st/before/receipts.txt"; then
+      as_root /usr/sbin/pkgutil --forget "$id" --volume / >/dev/null 2>&1 || problems="$problems; could not forget $id"
+    fi
+  done
   # Directories that did not exist before and were made while testing.
-  if [ -f "$st/initial.parents" ]; then
-    for p in "$LIBEXEC" "$BIN"; do
-      if grep -qx "$p	absent" "$st/initial.parents" && [ -d "$p" ] && [ -z "$(ls -A "$p")" ]; then
-        rmdir "$p"
-      fi
-    done
-    # And then everything, compared.
-    if [ -s "$st/planted" ]; then
-      problems="$problems; planted paths no longer as planted: $(cut -f1 "$st/planted" | tr '\n' ' ')"
+  for t in "$LIBEXEC" "$BIN" /usr/local; do
+    if grep -qxF "$t	absent" "$st/before/usr-local.txt" && [ -d "$t" ] && [ -z "$(ls -A "$t")" ]; then
+      as_root rmdir "$t"
     fi
-    [ "$(parents)" = "$(cat "$st/initial.parents")" ] ||
-      { diff "$st/initial.parents" <(parents) | sed 's/^/      | /'; problems="$problems; a parent directory differs"; }
-    [ "$(security_state)" = "$(cat "$st/initial.security")" ] ||
-      { diff "$st/initial.security" <(security_state) | sed 's/^/      | /'; problems="$problems; keychains or trust settings differ"; }
-    [ "$(homes)" = "$(cat "$st/initial.homes")" ] || problems="$problems; a home's .syndeo differs"
-    [ "$(receipts)" = "$(cat "$st/initial.receipts")" ] || problems="$problems; the receipts differ"
+  done
+  # What the application made for the runner's user.
+  while IFS= read -r p; do
+    if present "$p" && was_absent "$p"; then rm -rf "$p" 2>/dev/null || as_root rm -rf "$p"; fi
+  done < <(user_paths)
+  if grep -qx absent "$st/before/defaults.txt"; then defaults delete "$BUNDLE_ID" >/dev/null 2>&1 || true; fi
+  as_root rm -rf "$st/fake-pkgutil" "$st/cli-home"
+  # And then everything, compared.
+  if [ -s "$st/planted" ]; then
+    problems="$problems; planted paths no longer as planted: $(cut -f1 "$st/planted" | tr '\n' ' ')"
   fi
+  snapshot "$st/after"
+  cp -R "$st/after" "$st/logs/after"
+  for f in $SNAPSHOTS; do
+    if cmp -s "$st/before/$f.txt" "$st/after/$f.txt"; then
+      pass "$f: exactly as the runner had it"
+    else
+      diff "$st/before/$f.txt" "$st/after/$f.txt" | sed 's/^/      | /'
+      problems="$problems; $f differs"
+    fi
+  done
   pristine || problems="$problems; Syndeo is still installed"
   if [ -n "$problems" ]; then
     say "cleanup: FAILED$problems"
     return 1
   fi
-  say "cleanup: the runner is as it was: no receipt, no payload, no keychain or trust change, every parent the same"
+  say "cleanup: the runner is as it was: no receipt, no bundle, nothing in /usr/local, no user data, no LaunchServices record, keychains and trust as they were"
   return 0
-}
-
-# remove_leftovers: what the package put down, in whatever state a stopped
-# step left it, when its uninstaller cannot remove it: the seven links if they
-# are the package's, `current` and `.current.new`, version directories holding
-# only the package's names, the private directory, and the receipt. Anything
-# else is left, for the checks that follow to report.
-remove_leftovers() {
-  local n p v
-  for n in $NAMES; do
-    p="$BIN/$n"
-    if [ -L "$p" ] && [ "$(readlink "$p")" = "../libexec/syndeo/current/$n" ]; then rm -f "${p:?}"; fi
-  done
-  if [ -d "$D" ] && [ ! -L "$D" ]; then
-    for p in "$D/current" "$D/.current.new"; do
-      if [ -L "$p" ]; then rm -f "${p:?}"; fi
-    done
-    for v in "$D"/*; do
-      [ -d "$v" ] && [ ! -L "$v" ] || continue
-      case "${v##*/}" in '' | *[!0-9.]*) continue ;; esac
-      for n in $NAMES uninstall.sh README.md LICENSE tools/wordcount.wat; do
-        if [ -f "$v/$n" ] && [ ! -L "$v/$n" ]; then rm -f "${v:?}/${n:?}"; fi
-      done
-      if [ -d "$v/tools" ] && [ ! -L "$v/tools" ]; then rmdir "${v:?}/tools" 2>/dev/null; fi
-      rmdir "${v:?}" 2>/dev/null
-    done
-    rmdir "${D:?}" 2>/dev/null
-  fi
-  if pkgutil --pkg-info "$ID" >/dev/null 2>&1; then
-    pkgutil --forget "$ID" --volume / >/dev/null 2>&1
-  fi
-  return 0
-}
-
-# on_exit: a system step that fails cleans up after itself; one that
-# succeeds leaves its state for the next step, and --cleanup comes last.
-on_exit() {
-  local status=$?
-  trap - EXIT INT TERM HUP
-  if [ "$status" -ne 0 ]; then
-    say "the step failed (status $status); cleaning up"
-    cleanup || say "cleanup failed too"
-  fi
-  exit "$status"
-}
-
-# ------------------------------------------------------------------ before
-
-system_before() {
-  local pkg="$1" version="$2" st
-  guard_root
-  st="$(ST)"
-  [ -e "$st" ] && refuse "$st exists: this runner has been used for this test before"
-  pristine || refuse "Syndeo is already on this runner"
-  mount | grep -q " on $ALT " && refuse "$ALT is already mounted"
-  mkdir -p "$st/logs"
-  : >"$st/planted"
-  : >"$st/altered"
-  trap on_exit EXIT
-  trap 'exit 130' INT TERM HUP
-
-  say "Installing $pkg ($version) on this runner. Package identifier $ID. It will write:"
-  pkgutil --payload-files "$pkg" | sed 's|^\.|  |'
-  say "and it will plant and alter, then restore, entries in /usr/local, $BIN, $LIBEXEC and $D,"
-  say "and a disk image mounted at $ALT."
-
-  parents >"$st/initial.parents"
-  security_state >"$st/initial.security"
-  homes >"$st/initial.homes"
-  receipts >"$st/initial.receipts"
-  cp "$st/initial.parents" "$st/logs/initial.parents"
-
-  # /usr/local and /usr/local/libexec have to be strict for the package to
-  # install at all; a runner image that has them otherwise is normalized here
-  # and put back by cleanup.
-  local p
-  for p in /usr/local "$LIBEXEC"; do
-    present "$p" || continue
-    [ -n "$(ls -lde "$p" | sed 1d)" ] && refuse "$p has an ACL; not changing that"
-    [ "$(stat -f %u "$p")" = 0 ] || alter owner "$p" root:wheel
-    case "$(stat -f %Lp "$p")" in *[2367]? | *[2367]) alter mode "$p" 755 ;; esac
-  done
-  # A parent the runner lacks is made plainly, as Installer would make it,
-  # and cleanup removes it again if it is empty at the end.
-  for p in "$BIN" "$LIBEXEC"; do
-    if ! present "$p"; then
-      mkdir "$p" && chown root:wheel "$p" && chmod 755 "$p" || fail "making $p"
-    fi
-  done
-
-  say ""
-  say "another volume"
-  hdiutil create -size 64m -fs APFS -volname SyndeoAltTest "$st/alt.dmg" >/dev/null || fail "creating a disk image"
-  hdiutil attach "$st/alt.dmg" -nobrowse -mountpoint "$ALT" >/dev/null || fail "attaching it"
-  if install another-volume "$pkg" "$ALT"; then fail "installing on $ALT succeeded"; fi
-  must "installing on another volume is refused, and writes nothing there or on /" \
-    eval "! present '$ALT/usr/local/libexec/syndeo' && ! pkgutil --pkgs --volume '$ALT' 2>/dev/null | grep -q syndeo && pristine"
-  hdiutil detach "$ALT" >/dev/null || fail "detaching $ALT"
-  rm -f "$st/alt.dmg"
-
-  say ""
-  say "commands that are not the package's"
-  plant file "$st/foreign-target" "a foreign program
-" root:wheel 755
-  plant file "$BIN/syndeo" "foreign
-" root:wheel 755
-  refused foreign-file "$pkg" "syndeo preinstall: refusing: $BIN/syndeo: exists, and no Syndeo package is installed"
-  unplant "$BIN/syndeo"
-  plant link "$BIN/syndeo-net" "$st/foreign-target"
-  refused foreign-link "$pkg" "refusing: $BIN/syndeo-net: exists"
-  unplant "$BIN/syndeo-net"
-  must "  ... and its target is byte-identical" test "$(meta "$st/foreign-target")" = "$(planted_meta "$st/foreign-target")"
-  plant link "$BIN/syndeo-proxy" ../libexec/other/syndeo-proxy
-  refused foreign-dangling-link "$pkg" "refusing: $BIN/syndeo-proxy: exists"
-  unplant "$BIN/syndeo-proxy"
-  plant dir "$BIN/syndeo-ui"
-  refused foreign-directory "$pkg" "refusing: $BIN/syndeo-ui: exists"
-  unplant "$BIN/syndeo-ui"
-  plant link "$BIN/syndeo-agent" ../libexec/syndeo/current/syndeo-agent
-  refused package-shaped-link-without-receipt "$pkg" "refusing: $BIN/syndeo-agent: exists, and no Syndeo package is installed"
-  unplant "$BIN/syndeo-agent"
-  unplant "$st/foreign-target"
-
-  say ""
-  say "the directories around it"
-  alter mode "$BIN" "$(printf '%o' $((0$(stat -f %Lp "$BIN") | 02)))"
-  refused bin-world-writable "$pkg" "$BIN: can be written by everyone"
-  restore_last
-  alter acl "$BIN" "everyone allow add_file"
-  refused bin-acl "$pkg" "$BIN: has an access control list"
-  restore_last
-  must "  ... and the ACL is gone again" test -z "$(ls -lde "$BIN" | sed 1d)"
-  alter mode "$LIBEXEC" 775
-  refused libexec-group-writable "$pkg" "$LIBEXEC: can be written by its group or by everyone"
-  restore_last
-  plant dir "$st/elsewhere"
-  plant link "$D" "$st/elsewhere"
-  refused private-directory-is-a-link "$pkg" "$D: is a Symbolic Link, not a directory"
-  unplant "$D"
-  unplant "$st/elsewhere"
-
-  say ""
-  say "a private directory with no receipt"
-  plant dir "$D"
-  tree 0.0.7
-  plant link "$D/current" 0.0.7
-  refused orphan "$pkg" "$D: exists, and no Syndeo package is installed"
-  unplant "$D/current"
-  untree 0.0.7
-  unplant "$D"
-
-  say ""
-  say "an interrupted first install, resumed"
-  plant dir "$D"
-  tree "$version" subset
-  installed resume "$pkg" "resuming an interrupted installation of $version" "$version"
-  # The package owns those paths now.
-  forget_plant "$D"
-  local n
-  for n in "$version" "$version/tools" "$version/syndeo" "$version/syndeo-net" "$version/uninstall.sh" "$version/README.md"; do
-    forget_plant "$D/$n"
-  done
-  /bin/sh "$D/$version/uninstall.sh" >"$st/logs/resume-uninstall" 2>&1 ||
-    { sed 's/^/      | /' "$st/logs/resume-uninstall"; fail "removing the resumed install"; }
-  must "  ... and its uninstaller removes it entirely" pristine
-
-  say ""
-  say "stand-ins: upgrades with the commands in use, two failed upgrades, and their repair"
-  local s9 s10 s11 s12 s13 s14 f12 f13
-  s9="$(standin 0.0.9)" || fail "building the stand-in 0.0.9"
-  s10="$(standin 0.0.10)" || fail "building the stand-in 0.0.10"
-  s11="$(standin 0.0.11)" || fail "building the stand-in 0.0.11"
-  s12="$(standin 0.0.12)" || fail "building the stand-in 0.0.12"
-  s13="$(standin 0.0.13)" || fail "building the stand-in 0.0.13"
-  s14="$(standin 0.0.14)" || fail "building the stand-in 0.0.14"
-  f12="$(fault_pkg "$s12" entry)" || fail "building 0.0.12 with a fault at its postinstall's entry"
-  f13="$(fault_pkg "$s13" after-switch)" || fail "building 0.0.13 with a fault just after its switch"
-  alter owner "$BIN" "$RUNNER:admin"
-  alter mode "$BIN" 775
-  local bin_before out status
-  bin_before="$(snap_path "$BIN")"
-  installed standin-0.0.9 "$s9" "installing 0.0.9" 0.0.9
-  must "  ... $BIN is still $RUNNER:admin 0775: overwrite-permissions=\"false\" held" test "$(snap_path "$BIN")" = "$bin_before"
-
-  say ""
-  say "upgrades, with the commands started over and over"
-  out="$(python3 -I "$here/upgrade-stress.py" --private "$D" --command "$BIN/syndeo" --from 0.0.9 \
-    --install 0.0.10 "$s10" --install 0.0.11 "$s11" --expect-output 'syndeo {version}' \
-    --expect-file $'#!/bin/sh\necho "syndeo {version}"\n' --log "$st/logs/upgrade-stress" 2>&1)"
-  status=$?
-  printf '%s\n' "$out" | tee "$st/logs/upgrade-stress" | sed 's/^/      | /'
-  must "0.0.9 to 0.0.10 to 0.0.11: while Installer ran, failures only ENOENT or EINVAL and every start one whole version; none afterwards" test "$status" = 0
-  bash "$here/verify-pkg.sh" installed 0.0.11 >"$st/logs/after-upgrade-stress" 2>&1 ||
-    { sed 's/^/      | /' "$st/logs/after-upgrade-stress"; fail "after the upgrades, the installation is not exactly 0.0.11"; }
-  must "  ... 0.0.11 alone, and verify-pkg installed 0.0.11 passes" alone 0.0.11
-  must "  ... $BIN is still $RUNNER:admin 0775" test "$(snap_path "$BIN")" = "$bin_before"
-  refused older-package "$s10" "Syndeo 0.0.11 is installed, and this package is the older 0.0.10"
-
-  say ""
-  say "an upgrade whose postinstall fails at its entry, before the switch"
-  failed_upgrade fault-at-entry "$f12" 0.0.11 0.0.12 0.0.11 "$s11" "$s13"
-
-  say ""
-  say "an upgrade whose postinstall fails just after its switch"
-  failed_upgrade fault-after-switch "$f13" 0.0.12 0.0.13 0.0.13 "$s12" "$s14"
-
-  say ""
-  say "a running syndeo across an upgrade, with the real binaries"
-  local r15 late
-  r15="$(real_standin 0.0.15 "$pkg" "$version")" || fail "building 0.0.15 from the real binaries"
-  before_is "upgrading from 0.0.13 to 0.0.15" || fail "before 0.0.15, the package is not 0.0.13 alone"
-  install real-binaries-0.0.15 "$r15" || { sed 's/^/      | /' "$last_log.installer" "$last_log.install-log"; fail "installing 0.0.15"; }
-  note_said "upgrading from 0.0.13 to 0.0.15" >/dev/null
-  # Its commands are the real ones, which report the real version.
-  bash "$here/verify-pkg.sh" installed 0.0.15 --commands-say "$version" >"$last_log.verify" 2>&1 ||
-    { sed 's/^/      | /' "$last_log.verify"; fail "the installation is not exactly 0.0.15"; }
-  must "0.0.15, the real binaries: alone, its receipt, tree, links and current exact (verify-pkg installed)" eval "alone 0.0.15 && receipt_is 0.0.15 && current_is 0.0.15"
-  python3 -I "$here/late-lookup.py" --command "$BIN/syndeo" --user "$RUNNER" --home "$st/late-home" \
-    --private "$D" --old 0.0.15 --new "$version" --held "$st/late.held" --go "$st/late.go" >"$st/logs/late-lookup" 2>&1 &
-  late=$!
-  echo "$late" >>"$st/pids"
-  for _ in $(seq 1 600); do
-    [ -f "$st/late.held" ] && break
-    kill -0 "$late" 2>/dev/null || break
-    sleep 0.1
-  done
-  [ -f "$st/late.held" ] || { sed 's/^/      | /' "$st/logs/late-lookup"; fail "the 0.0.15 syndeo doctor was not held"; }
-  pass "a 0.0.15 syndeo doctor runs, held after it found its directory and before it looked for any sibling"
-
-  say ""
-  say "the real package, over all of that"
-  installed real "$pkg" "upgrading from 0.0.15 to $version" "$version"
-  : >"$st/late.go"
-  wait "$late"
-  status=$?
-  reaped "$st/pids" "$late"
-  sed 's/^/      | /' "$st/logs/late-lookup"
-  must "the 0.0.15 doctor, after the upgrade: every sibling it looked for refused as removed during an upgrade, and nothing started" test "$status" = 0
-  must "  ... $BIN is still $RUNNER:admin 0775" test "$(snap_path "$BIN")" = "$bin_before"
-  must "  ... no home has a .syndeo it did not have" test "$(homes)" = "$(cat "$st/initial.homes")"
-  must "  ... keychains and trust settings are as they were" test "$(security_state)" = "$(cat "$st/initial.security")"
-  # The stand-ins' paths, for --system-after. Beside $st/standins/, the
-  # directory they are built in.
-  printf '%s\n' "$s9" "$s10" >"$st/standins.list"
-}
-
-# ------------------------------------------------------------------ user
-
-user_finish() {
-  local status=$?
-  trap - EXIT INT TERM HUP
-  local us problems=""
-  us="$(US)"
-  # agent_tools's descriptor and FIFO, if it stopped between opening and
-  # closing them.
-  exec 9<&- 2>/dev/null
-  if [ -p "$us/agent-stdin.fifo" ]; then rm -f "${us:?}/agent-stdin.fifo"; fi
-  if [ -f "$us/pids" ]; then
-    while read -r p; do kill "$p" 2>/dev/null; done <"$us/pids"
-  fi
-  if [ -f "$us/keychain-list" ]; then
-    # shellcheck disable=SC2046
-    security list-keychains -d user -s $(tr -d '"' <"$us/keychain-list") || problems="could not restore the search list"
-    [ "$(security list-keychains -d user)" = "$(cat "$us/keychain-list")" ] || problems="$problems; the search list differs"
-  fi
-  if [ -f "$us/keychain" ] && [ -e "$(cat "$us/keychain")" ]; then
-    security delete-keychain "$(cat "$us/keychain")" || problems="$problems; could not delete the keychain"
-  fi
-  if [ -n "$problems" ]; then
-    say "user cleanup: $problems"
-    [ "$status" -eq 0 ] && status=1
-  else
-    say "user cleanup: keychain search list restored, throwaway keychain deleted, processes stopped"
-  fi
-  exit "$status"
-}
-
-# agent_tools TOOLS: `syndeo-agent --task tools` on TOOLS, from /usr/local/bin.
-# Sets agent_out to what it said and agent_status to how it exited.
-#
-# The agent takes end-of-file on its stdin to mean that whoever started it is
-# gone (syndeo_ipc::exit_when_parent_does), and exits at once, saying
-# nothing; a CI step's stdin is already at end-of-file. It is given what the
-# shell gives it: a pipe whose other end stays open while it runs. Here that is
-# a private FIFO, opened read and write on descriptor 9, so the open never
-# waits and no timer or helper process holds it. The descriptor is closed and
-# the FIFO removed however the agent did; user_finish does both again.
-agent_tools() {
-  local fifo
-  fifo="$(US)/agent-stdin.fifo"
-  agent_out=''
-  agent_status=1
-  mkfifo -m 600 "$fifo" || return 1
-  exec 9<>"$fifo"
-  agent_out="$(clean_env syndeo-agent --net-socket "$(US)/net.sock" --shell-socket "$(US)/shell.sock" \
-    --task tools --tools "$1" 2>&1 <&9 9<&-)"
-  agent_status=$?
-  exec 9<&-
-  rm -f "${fifo:?}"
-}
-
-# reaped FILE PID: PID has been waited for, so it is no longer this test's to
-# kill; a pid left in FILE could name someone else's process by the time a
-# cleanup reads it.
-reaped() {
-  awk -v pid="$2" '$0 != pid' "$1" >"$1.new" && mv -f "$1.new" "$1"
-}
-
-# clean_env ...: a command from /usr/local/bin with nothing of the step's
-# environment but HOME, PATH and, if set, SYNDEO_HOME.
-clean_env() {
-  env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" ${SYNDEO_HOME:+SYNDEO_HOME="$SYNDEO_HOME"} "$@"
-}
-
-# spawn LOG COMMAND...: clean_env in the background, as its own process, so
-# that $! is the program's pid and its children are its own.
-spawn() {
-  local log="$1"; shift
-  ( exec env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" ${SYNDEO_HOME:+SYNDEO_HOME="$SYNDEO_HOME"} "$@" ) >"$log" 2>&1 &
-  spawned=$!
-  echo "$spawned" >>"$(US)/pids"
-}
-
-# same_file A B: one file, by device and inode. The kernel may name
-# /usr/local as /System/Volumes/Data/usr/local.
-same_file() { [ "$(stat -f '%d:%i' "$1" 2>/dev/null)" = "$(stat -f '%d:%i' "$2" 2>/dev/null)" ] && [ -n "$(stat -f %i "$1" 2>/dev/null)" ]; }
-
-# runs_from PID PATH: the process's executable, as started, is PATH.
-runs_from() { same_file "$(ps -o args= -p "$1" | cut -d' ' -f1)" "$2"; }
-
-wait_child() {
-  local parent="$1" name="$2" c
-  for _ in $(seq 1 100); do
-    for c in $(pgrep -P "$parent" 2>/dev/null); do
-      case "$(ps -o args= -p "$c")" in *"/$name "* | *"/$name") printf '%s' "$c"; return 0 ;; esac
-    done
-    sleep 0.2
-  done
-  return 1
-}
-
-user() {
-  local version="$1" us h out n child pid ready
-  guard_runner
-  [ "$(id -u)" != 0 ] && [ "$(id -un)" = "$RUNNER" ] || refuse "run --user as $RUNNER, not root"
-  receipt_is "$version" || refuse "Syndeo $version is not installed"
-  us="$(US)"
-  [ -e "$us" ] && refuse "$us exists already"
-  mkdir -p "$us"
-  : >"$us/pids"
-  trap user_finish EXIT
-  trap 'exit 130' INT TERM HUP
-  h="$us/home with space"
-
-  say ""
-  say "the commands, from PATH"
-  for n in $NAMES; do
-    must "$n --version says $version" test "$(clean_env "$n" --version | head -n 1)" = "$n $version"
-  done
-
-  say ""
-  say "doctor, and the first run's example tools"
-  must "no home yet" eval "! present '$h'"
-  out="$(SYNDEO_HOME="$h" clean_env syndeo doctor 2>&1)"
-  printf '%s\n' "$out" >"$us/doctor"
-  for n in syndeo-net syndeo-keystore syndeo-agent; do
-    must "doctor finds $n in $D/$version" same_file "$(printf '%s\n' "$out" | awk -v n="$n" '$1 == n { print $2 }')" "$D/$version/$n"
-  done
-  must "the keystore starts and answers" eval "printf '%s\n' \"\$out\" | grep -qE '^keystore .*initialized'"
-  must "the first run seeded $h/tools/wordcount.wat: $RUNNER's, 0644, a regular file, the installed bytes" eval \
-    "[ -d '$h/tools' ] && [ ! -L '$h/tools/wordcount.wat' ] && [ -f '$h/tools/wordcount.wat' ] && [ \"\$(stat -f '%Su %Lp' '$h/tools/wordcount.wat')\" = '$RUNNER 644' ] && cmp -s '$h/tools/wordcount.wat' '$D/$version/tools/wordcount.wat'"
-  agent_tools "$h/tools"
-  printf '%s\n' "$agent_out" >"$us/agent.log"
-  ready=no
-  if [ "$agent_status" = 0 ] && grep -qE 'wordcount +ready' "$us/agent.log"; then ready=yes; fi
-  must "the agent lists wordcount as ready" test "$ready" = yes
-  must "  ... and its stdin FIFO is closed and gone" eval "! present '$us/agent-stdin.fifo' && ! { : >&9; } 2>/dev/null"
-  printf '(module)\n' >"$h/tools/wordcount.wat"
-  SYNDEO_HOME="$h" clean_env syndeo doctor >/dev/null 2>&1
-  must "an edited tool is not overwritten" test "$(cat "$h/tools/wordcount.wat")" = "(module)"
-  mkdir -p "$us/empty/tools"
-  SYNDEO_HOME="$us/empty" clean_env syndeo doctor >/dev/null 2>&1
-  must "an existing empty tools directory is left empty" test -z "$(ls -A "$us/empty/tools")"
-  mkdir -p "$us/linked" "$us/elsewhere"
-  ln -s "$us/elsewhere" "$us/linked/tools"
-  SYNDEO_HOME="$us/linked" clean_env syndeo doctor >/dev/null 2>&1
-  must "a symlinked tools directory is not followed" test -z "$(ls -A "$us/elsewhere")"
-
-  say ""
-  say "fetching through the installed process model"
-  out="$(SYNDEO_HOME="$h" clean_env syndeo browse https://www.rust-lang.org/ --twice 2>/dev/null)"
-  must "a fetch, then a cache hit" eval "printf '%s\n' \"\$out\" | grep -qE '^  200' && printf '%s\n' \"\$out\" | grep -q 'again   cache'"
-  SYNDEO_HOME="$h" spawn "$us/peer.log" syndeo peer serve --serve-only --listen /ip4/127.0.0.1/tcp/0
-  pid=$spawned
-  child="$(wait_child "$pid" syndeo-net)" || { sed 's/^/      | /' "$us/peer.log"; fail "syndeo peer serve started no syndeo-net"; }
-  must "a long-running syndeo started from $BIN runs syndeo-net from $D/$version" runs_from "$child" "$D/$version/syndeo-net"
-  kill "$pid"; wait "$pid" 2>/dev/null
-  reaped "$us/pids" "$pid"
-
-  say ""
-  say "syndeo-webkit's proxy, with a throwaway keychain"
-  SYNDEO_HOME="$h" clean_env syndeo-proxy ca >/dev/null 2>&1
-  [ -f "$h/proxy/syndeo-ca.pem" ] || fail "syndeo-proxy ca made no authority"
-  security list-keychains -d user >"$us/keychain-list"
-  local kc="$us/webkit-test.keychain-db"
-  echo "$kc" >"$us/keychain"
-  security create-keychain -p "$(openssl rand -hex 16)" "$kc" || fail "creating the throwaway keychain"
-  security import "$h/proxy/syndeo-ca.pem" -k "$kc" -t cert >/dev/null || fail "importing the authority, without trust"
-  # shellcheck disable=SC2046
-  security list-keychains -d user -s "$kc" $(tr -d '"' <"$us/keychain-list") || fail "adding the keychain to the search list"
-  SYNDEO_HOME="$h" spawn "$us/webkit.log" syndeo-webkit --home "$h" https://www.rust-lang.org/
-  pid=$spawned
-  child="$(wait_child "$pid" syndeo-proxy)" || { sed 's/^/      | /' "$us/webkit.log"; fail "syndeo-webkit started no syndeo-proxy"; }
-  must "syndeo-webkit started from $BIN runs syndeo-proxy from $D/$version" runs_from "$child" "$D/$version/syndeo-proxy"
-  kill "$pid"; wait "$pid" 2>/dev/null
-  reaped "$us/pids" "$pid"
-  for _ in $(seq 1 50); do kill -0 "$child" 2>/dev/null || break; sleep 0.2; done
-  must "  ... and the proxy goes when the browser does" eval "! kill -0 $child 2>/dev/null"
-}
-
-# ------------------------------------------------------------------ after
-
-system_after() {
-  local pkg="$1" version="$2" st before out
-  guard_root
-  st="$(ST)"
-  [ -d "$st" ] || refuse "--system-before has not run"
-  receipt_is "$version" || refuse "Syndeo $version is not installed"
-  trap on_exit EXIT
-  trap 'exit 130' INT TERM HUP
-  local s10
-  s10="$(sed -n 2p "$st/standins.list")"
-
-
-  say ""
-  say "the same version again"
-  local hashes
-  hashes="$(find "$D/$version" -type f -exec shasum -a 256 {} + | sort)"
-  installed reinstall "$pkg" "reinstalling $version" "$version"
-  must "  ... every file is the same bytes" test "$(find "$D/$version" -type f -exec shasum -a 256 {} + | sort)" = "$hashes"
-  alter mode "$D/$version/syndeo-net" 775
-  refused reinstall-over-a-changed-mode "$pkg" "$D/$version/syndeo-net: is not a Regular File"
-  restore_last
-  alter owner "$D/$version/README.md" "$RUNNER:wheel"
-  refused reinstall-over-a-changed-owner "$pkg" "$D/$version/README.md: is not a Regular File"
-  restore_last
-  plant file "$D/$version/notes.txt" "extra
-"
-  refused reinstall-over-an-extra-file "$pkg" "$D/$version/notes.txt: is not part of Syndeo $version"
-  unplant "$D/$version/notes.txt"
-  plant link "$D/$version/tools/linked.wat" ../README.md
-  refused reinstall-over-an-internal-symlink "$pkg" "$D/$version/tools/linked.wat: is not part of Syndeo $version"
-  unplant "$D/$version/tools/linked.wat"
-  alter acl "$D/$version/README.md" "everyone allow read"
-  refused reinstall-over-an-acl "$pkg" "$D/$version/README.md: is not a Regular File"
-  restore_last
-  alter flags "$D/$version/README.md" uchg
-  refused reinstall-over-an-immutable-file "$pkg" "$D/$version/README.md: is not a Regular File"
-  restore_last
-
-  say ""
-  say "a path the receipt lists, missing"
-  mkdir -p "$st/aside"
-  alter aside "$D/$version/README.md" "$st/aside/README.md"
-  must "verify-pkg installed fails, naming it" eval \
-    "! bash '$here/verify-pkg.sh' installed '$version' >'$st/logs/missing-path.verify' 2>&1 && grep -q '$D/$version/README.md: is missing, and the receipt for $version lists it' '$st/logs/missing-path.verify'"
-  before="$(package_state)"
-  must "the uninstaller refuses, naming it" eval \
-    "! /bin/sh '$D/$version/uninstall.sh' >'$st/logs/missing-path.uninstall' 2>&1 && grep -q '$D/$version/README.md: is missing, and the receipt for $version lists it' '$st/logs/missing-path.uninstall'"
-  must "  ... changing nothing" test "$(package_state)" = "$before"
-  installed repair "$pkg" "repairing $version" "$version"
-  # The package put it back; the copy set aside is the test's to delete.
-  forget_last
-  rm -f "$st/aside/README.md"
-  rmdir "$st/aside"
-
-  say ""
-  say "downgrades and disagreement"
-  refused downgrade "$s10" "this package is the older 0.0.10"
-  alter link "$D/current" 0.0.10
-  refused current-at-another-version "$pkg" "points at '0.0.10', not the installed $version"
-  restore_last
-  alter link "$BIN/syndeo-ui" /Applications/Foreign.app/Contents/MacOS/foreign
-  refused foreign-command-with-a-receipt "$pkg" "$BIN/syndeo-ui: is not a link this package writes"
-  restore_last
-  bash "$here/verify-pkg.sh" installed "$version" >"$st/logs/after-refusals" 2>&1 || fail "the installation changed during the refusals"
-
-  plant dir "$D/0.0.99"
-  refused a-second-version "$pkg" "with $version installed, it may hold nothing else"
-  unplant "$D/0.0.99"
-
-  say ""
-  say "the uninstaller, all or nothing"
-  local what
-  plant dir "$LIBEXEC/someone-else"
-  for what in tools-extra tree-extra private-file private-dir bad-version second-version foreign-command mode acl pending; do
-    case "$what" in
-      tools-extra) plant file "$D/$version/tools/extra.wat" "x" ;;
-      tree-extra) plant file "$D/$version/notes.txt" "x" ;;
-      private-file) plant file "$D/notes.txt" "x" ;;
-      private-dir) plant dir "$D/backup" ;;
-      bad-version) plant dir "$D/0.1" ;;
-      second-version) plant dir "$D/0.0.99" ;;
-      foreign-command) alter link "$BIN/syndeo-ui" /Applications/Foreign.app/Contents/MacOS/foreign ;;
-      mode) alter mode "$D/$version/syndeo-agent" 775 ;;
-      acl) alter acl "$D/$version" "everyone allow list" ;;
-      pending) plant link "$D/.current.new" elsewhere ;;
-    esac
-    before="$(package_state)"
-    if /bin/sh "$D/$version/uninstall.sh" >"$st/logs/uninstall-$what" 2>&1; then
-      fail "the uninstaller ran with $what planted"
-    fi
-    grep -q 'refusing:' "$st/logs/uninstall-$what" || fail "the uninstaller failed with $what planted, without refusing"
-    must "with $what: refused, nothing changed, the receipt kept" eval "[ \"\$(package_state)\" = \"\$before\" ] && receipt_is '$version'"
-    case "$what" in
-      tools-extra) unplant "$D/$version/tools/extra.wat" ;;
-      tree-extra) unplant "$D/$version/notes.txt" ;;
-      private-file) unplant "$D/notes.txt" ;;
-      private-dir) unplant "$D/backup" ;;
-      bad-version) unplant "$D/0.1" ;;
-      second-version) unplant "$D/0.0.99" ;;
-      pending) unplant "$D/.current.new" ;;
-      *) restore_last ;;
-    esac
-  done
-
-  say ""
-  say "a receipt that cannot be forgotten"
-  # The fault is injected into a scratch copy of this version's uninstaller,
-  # never into what is installed: the copy is the same template rendered with
-  # PKGUTIL naming a test-only stand-in, which fails exactly the uninstaller's
-  # forget and hands every other call, unchanged, to the real pkgutil. Neither
-  # is part of any package.
-  local fake="$st/pkgutil-forget-fails" scratch="$st/uninstall-forget-fails.sh" n gone
-  cat >"$fake" <<'FAKE'
-#!/bin/sh
-# Test only, written by ci/test-pkg-install.sh: fails the one call that
-# forgets Syndeo's receipt, and is the real pkgutil for every other.
-if [ "$#" -eq 4 ] && [ "$1" = --forget ] && [ "$2" = com.sum.syndeo.pkg ] && [ "$3" = --volume ] && [ "$4" = / ]; then
-    echo "pkgutil-forget-fails (test only): not forgetting com.sum.syndeo.pkg" >&2
-    exit 1
-fi
-exec /usr/sbin/pkgutil "$@"
-FAKE
-  chown root:wheel "$fake" && chmod 755 "$fake" || fail "setting up $fake"
-  must "the test's stand-in pkgutil is root:wheel, writable by root alone" test "$(stat -f '%Su:%Sg %Lp' "$fake")" = "root:wheel 755"
-  "$here/package-macos-pkg.sh" --render uninstall "$version" '' 0 0 "$fake" "$scratch" >/dev/null || fail "rendering the scratch uninstaller"
-  must "the scratch uninstaller differs from the installed one only in its PKGUTIL" \
-    test "$(diff "$D/$version/uninstall.sh" "$scratch" | grep '^[<>]')" = "< PKGUTIL='/usr/sbin/pkgutil'
-> PKGUTIL='$fake'"
-  /bin/sh "$scratch" >"$st/logs/forget-fails" 2>&1
-  status=$?
-  must "exit 2, and the exact command to finish" eval \
-    "[ $status = 2 ] && grep -qxF 'syndeo uninstall:     sudo /usr/sbin/pkgutil --forget $ID --volume /' '$st/logs/forget-fails'"
-  gone=yes
-  present "$D" && gone=no
-  for n in $NAMES; do present "$BIN/$n" && gone=no; done
-  must "  ... every payload path gone, and the receipt still there" eval "[ $gone = yes ] && receipt_is '$version'"
-  # The command it printed, exactly as printed.
-  sudo /usr/sbin/pkgutil --forget "$ID" --volume / >/dev/null || fail "the printed command did not finish"
-  must "  ... and the printed command finishes it" pristine
-  rm -f "${fake:?}" "${scratch:?}"
-  must "$LIBEXEC/someone-else is still there" test -d "$LIBEXEC/someone-else"
-  unplant "$LIBEXEC/someone-else"
-  must "no home has a .syndeo it did not have" test "$(homes)" = "$(cat "$st/initial.homes")"
 }
 
 case "${1:-}" in
-  # verify-pkg.sh's self-test borrows the functions above.
-  --source-only) return 0 ;;
-  --system-before) [ "$#" = 3 ] || refuse "--system-before <pkg> <version>"; system_before "$2" "$3" ;;
-  --user) [ "$#" = 2 ] || refuse "--user <version>"; user "$2" ;;
-  --system-after) [ "$#" = 3 ] || refuse "--system-after <pkg> <version>"; system_after "$2" "$3" ;;
-  --cleanup) guard_root; cleanup ;;
-  *) refuse "usage: $0 --system-before <pkg> <version> | --user <version> | --system-after <pkg> <version> | --cleanup" ;;
+  # For the self-test, which uses note_said and log_lines.
+  --source-only) return 0 2>/dev/null || exit 0 ;;
+  run) [ "$#" = 3 ] || refuse "usage: $0 run <pkg> <version>"; run "$2" "$3"; say ""; say "every step passed" ;;
+  cleanup) cleanup ;;
+  *) refuse "usage: $0 run <pkg> <version> | cleanup" ;;
 esac

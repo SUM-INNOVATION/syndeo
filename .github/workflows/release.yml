@@ -2,9 +2,10 @@
 #
 #   git tag v0.1.0 && git push origin v0.1.0
 #
-# Produces one tarball per platform, the macOS installer package built from
-# the macOS tarball, a SHA256SUMS file covering those four, and a GitHub
-# release holding the five. install.sh reads exactly those names.
+# Produces one tarball per platform, the macOS installer package of
+# Syndeo.app, built from the same binaries as the macOS tarball, a SHA256SUMS
+# file covering those four, and a GitHub release holding the five. install.sh
+# reads exactly those names.
 #
 # A workflow_dispatch run is a dry run. It builds, signs if configured, checks
 # and installs everything a tag would, and rehearses the publication on a
@@ -16,10 +17,11 @@
 # secrets, which ci/check-signing-config.sh reads before anything is signed.
 # Signed, the macOS release goes through three jobs, in order, each given
 # only its own share of the secrets and checking that share first:
-# build-macos signs the binaries and makes the tarball; notarize-binaries
-# sends those binaries to Apple once and waits for the verdict; package
-# builds the installer package from that exact tarball, signs it, sends it
-# to Apple once, waits, and staples it. Apple's two waits are in separate
+# build-macos signs the binaries, makes the tarball, and assembles and signs
+# Syndeo.app from the same binaries; notarize-binaries sends those binaries
+# and that bundle to Apple once, together, and waits for the verdict; package
+# staples that exact bundle, builds the installer package from it, signs it,
+# sends it to Apple once, waits, and staples it. Apple's two waits are in separate
 # jobs, so neither shares a job's time limit with the other. The rest of
 # the release needs both. Only those four jobs declare release-macos; it is
 # a boundary for the signing configuration and nothing more: no required
@@ -153,9 +155,12 @@ jobs:
         run: ./ci/check-signing-config.sh --github-output
 
   # The macOS binaries: built, and Developer ID signed and checked if the
-  # configuration says so; the tarball made from them. Nothing is notarized
-  # here. The tarball goes on as an internal artifact, with its SHA-256 as
-  # this job's output, so the jobs after it can require the same bytes.
+  # configuration says so; the tarball made from them; and Syndeo.app,
+  # assembled from the same binaries, its helper the tarball's syndeo-proxy,
+  # and signed after them (ad hoc if the configuration says unsigned).
+  # Nothing is notarized here. The tarball and the bundle, as a ZIP, go on as
+  # internal artifacts, with their SHA-256s as this job's outputs, so the
+  # jobs after it can require the same bytes.
   build-macos:
     name: aarch64-apple-darwin, built and signed
     needs: [verify, signing-config]
@@ -163,10 +168,12 @@ jobs:
     environment: release-macos
     outputs:
       tarball-sha256: ${{ steps.tarball.outputs.sha256 }}
+      app-sha256: ${{ steps.tarball.outputs.app-sha256 }}
     env:
       VERSION: ${{ needs.verify.outputs.version }}
       SIGNED: ${{ needs.signing-config.outputs.signed }}
       TARBALL: syndeo-${{ needs.verify.outputs.version }}-aarch64-apple-darwin.tar.gz
+      APPZIP: Syndeo.app.zip
     steps:
       - uses: actions/checkout@v4
 
@@ -189,24 +196,31 @@ jobs:
       # syndeo-webkit embeds WKWebView, so it exists on macOS and nowhere
       # else. Built separately for the same reason it is packaged separately:
       # on Linux that crate is a stub that exists to explain itself.
+      # syndeo-app is Syndeo.app's executable, and in no tarball.
       - name: Build
         run: |
           cargo build --release --locked --target aarch64-apple-darwin \
             -p syndeo-shell -p syndeo-net -p syndeo-keystore \
-            -p syndeo-agent -p syndeo-proxy -p syndeo-ui
+            -p syndeo-agent -p syndeo-proxy -p syndeo-ui -p syndeo-app
           cargo build --release --locked --target aarch64-apple-darwin \
             -p syndeo-webkit
 
-      # ci/sign-macos.sh signs and verifies; without a notary key, which this
-      # job is never given, it notarizes nothing. notarize-binaries does that.
-      - name: Sign the binaries
+      # ci/sign-macos.sh signs and verifies the seven, then assembles
+      # Syndeo.app from them and signs the bundle; without a notary key,
+      # which this job is never given, it notarizes nothing.
+      # notarize-binaries does that.
+      - name: Sign the binaries, then Syndeo.app
         if: needs.signing-config.outputs.signed == 'yes'
         env:
           CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
           TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
-        run: ./ci/sign-macos.sh "target/aarch64-apple-darwin/release"
+        run: ./ci/sign-macos.sh "target/aarch64-apple-darwin/release" --app "$VERSION" "$RUNNER_TEMP/app"
+
+      - name: Syndeo.app, signed ad hoc, as the configuration decided
+        if: needs.signing-config.outputs.signed == 'no'
+        run: ./ci/sign-macos.sh "target/aarch64-apple-darwin/release" --app "$VERSION" "$RUNNER_TEMP/app"
 
       - name: The tarball
         shell: bash
@@ -223,13 +237,26 @@ jobs:
           MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
         run: bash ci/verify-pkg.sh signed-binaries "dist/$TARBALL" "$VERSION"
 
-      - name: The tarball's SHA-256
+      # Likewise the bundle: exactly Syndeo.app, it and its helper signed as
+      # the seven are, and the helper the tarball's syndeo-proxy, run.
+      - name: Check the signed Syndeo.app, and run its helper
+        if: needs.signing-config.outputs.signed == 'yes'
+        env:
+          SYNDEO_EXPECT_SIGNED: "yes"
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: bash ci/verify-pkg.sh signed-app "$RUNNER_TEMP/app/Syndeo.app" "$VERSION" --tarball "dist/$TARBALL"
+
+      - name: The tarball's and Syndeo.app's SHA-256
         id: tarball
         run: |
           set -euo pipefail
           sum="$(shasum -a 256 "dist/$TARBALL" | cut -d' ' -f1)"
           echo "sha256=$sum" >> "$GITHUB_OUTPUT"
           echo "$TARBALL: $sum" >> "$GITHUB_STEP_SUMMARY"
+          /usr/bin/ditto -c -k --keepParent "$RUNNER_TEMP/app/Syndeo.app" "dist/$APPZIP"
+          sum="$(shasum -a 256 "dist/$APPZIP" | cut -d' ' -f1)"
+          echo "app-sha256=$sum" >> "$GITHUB_OUTPUT"
+          echo "$APPZIP: $sum" >> "$GITHUB_STEP_SUMMARY"
 
       # ci/sign-macos.sh leaves its keychain in the search list, and its
       # certificate behind if it fails part-way.
@@ -246,8 +273,15 @@ jobs:
           path: dist/syndeo-${{ env.VERSION }}-aarch64-apple-darwin.tar.gz
           if-no-files-found: error
 
-  # The signed binaries, sent to Apple once, and waited for in a job of their
-  # own, so the wait does not share a job's time with the package's.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: internal-macos-app
+          path: dist/Syndeo.app.zip
+          if-no-files-found: error
+
+  # The signed binaries and Syndeo.app, sent to Apple once, together, and
+  # waited for in a job of their own, so the wait does not share a job's time
+  # with the package's.
   #
   # The time: a job on a hosted runner may run 360 minutes. 60 are kept for
   # setup and download (10), checks and the upload to Apple (10), what
@@ -267,11 +301,13 @@ jobs:
     timeout-minutes: 350
     outputs:
       tarball-sha256: ${{ steps.tarball.outputs.sha256 }}
+      app-sha256: ${{ steps.tarball.outputs.app-sha256 }}
       notarization: ${{ steps.verdict.outputs.notarization }}
     env:
       VERSION: ${{ needs.verify.outputs.version }}
       SIGNED: ${{ needs.signing-config.outputs.signed }}
       TARBALL: syndeo-${{ needs.verify.outputs.version }}-aarch64-apple-darwin.tar.gz
+      APPZIP: Syndeo.app.zip
       NOTARY_DEADLINE_MINUTES: "300"
     steps:
       - uses: actions/checkout@v4
@@ -290,14 +326,22 @@ jobs:
           name: internal-macos-tarball
           path: dist
 
-      - name: The tarball build-macos made, byte for byte
+      - uses: actions/download-artifact@v4
+        with:
+          name: internal-macos-app
+          path: dist
+
+      - name: The tarball and Syndeo.app build-macos made, byte for byte
         id: tarball
         env:
           WANT: ${{ needs.build-macos.outputs.tarball-sha256 }}
+          WANT_APP: ${{ needs.build-macos.outputs.app-sha256 }}
         run: |
           set -euo pipefail
           printf '%s  %s\n' "$WANT" "dist/$TARBALL" | shasum -a 256 -c -
+          printf '%s  %s\n' "$WANT_APP" "dist/$APPZIP" | shasum -a 256 -c -
           echo "sha256=$WANT" >> "$GITHUB_OUTPUT"
+          echo "app-sha256=$WANT_APP" >> "$GITHUB_OUTPUT"
 
       - name: Check and run the signed binaries again, before Apple sees them
         if: needs.signing-config.outputs.signed == 'yes'
@@ -306,9 +350,20 @@ jobs:
           MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
         run: bash ci/verify-pkg.sh signed-binaries "dist/$TARBALL" "$VERSION"
 
-      - name: The ZIP of exactly the seven executables
+      - name: Check the signed Syndeo.app again, before Apple sees it
         if: needs.signing-config.outputs.signed == 'yes'
-        run: python3 -I ci/notarize.py binaries-zip "dist/$TARBALL" "$VERSION" "$RUNNER_TEMP/notarize.zip"
+        env:
+          SYNDEO_EXPECT_SIGNED: "yes"
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/app"
+          /usr/bin/ditto -x -k "dist/$APPZIP" "$RUNNER_TEMP/app"
+          bash ci/verify-pkg.sh signed-app "$RUNNER_TEMP/app/Syndeo.app" "$VERSION" --tarball "dist/$TARBALL"
+
+      - name: The ZIP of exactly the seven executables and Syndeo.app
+        if: needs.signing-config.outputs.signed == 'yes'
+        run: python3 -I ci/notarize.py binaries-zip "dist/$TARBALL" "$VERSION" "$RUNNER_TEMP/app/Syndeo.app" "$RUNNER_TEMP/notarize.zip"
 
       - name: Submit the binaries to Apple, once
         if: needs.signing-config.outputs.signed == 'yes'
@@ -356,11 +411,13 @@ jobs:
           path: notarization/binaries/
           if-no-files-found: ignore
 
-  # The installer package, built from the tarball Apple accepted, only once
-  # it has: it needs notarize-binaries, and checks the tarball is the same
-  # bytes. Then, if signed: Developer ID Installer signing, one submission
-  # and its own wait, on the same terms as the binaries', and stapling and
-  # Gatekeeper only after Apple accepted exactly that file.
+  # The installer package, built from the Syndeo.app Apple accepted, only
+  # once it has: it needs notarize-binaries, and checks the tarball and the
+  # bundle are the same bytes. If signed, the bundle is stapled first, and
+  # has to be unchanged but for its ticket, and accepted by Gatekeeper. Then
+  # the package: Developer ID Installer signing, one submission and its own
+  # wait, on the same terms as the binaries', and stapling and Gatekeeper
+  # only after Apple accepted exactly that file.
   package:
     name: the installer package, signed and notarized
     needs: [verify, signing-config, build-macos, notarize-binaries]
@@ -371,6 +428,7 @@ jobs:
       VERSION: ${{ needs.verify.outputs.version }}
       SIGNED: ${{ needs.signing-config.outputs.signed }}
       TARBALL: syndeo-${{ needs.verify.outputs.version }}-aarch64-apple-darwin.tar.gz
+      APPZIP: Syndeo.app.zip
       PKG: syndeo-${{ needs.verify.outputs.version }}-aarch64-apple-darwin.pkg
       NOTARY_DEADLINE_MINUTES: "300"
     steps:
@@ -393,9 +451,15 @@ jobs:
           name: internal-macos-tarball
           path: dist
 
-      - name: The tarball Apple accepted, byte for byte
+      - uses: actions/download-artifact@v4
+        with:
+          name: internal-macos-app
+          path: dist
+
+      - name: The tarball and Syndeo.app Apple accepted, byte for byte
         env:
           WANT: ${{ needs.notarize-binaries.outputs.tarball-sha256 }}
+          WANT_APP: ${{ needs.notarize-binaries.outputs.app-sha256 }}
           NOTARIZATION: ${{ needs.notarize-binaries.outputs.notarization }}
         run: |
           set -euo pipefail
@@ -404,10 +468,25 @@ jobs:
             *) echo "::error::signed is '$SIGNED' but the binaries' notarization is '$NOTARIZATION'"; exit 1 ;;
           esac
           printf '%s  %s\n' "$WANT" "dist/$TARBALL" | shasum -a 256 -c -
+          printf '%s  %s\n' "$WANT_APP" "dist/$APPZIP" | shasum -a 256 -c -
 
-      - name: The package, from that tarball
+      - name: Staple Syndeo.app, which Apple accepted with the binaries, and ask Gatekeeper
+        if: needs.signing-config.outputs.signed == 'yes'
+        env:
+          SYNDEO_EXPECT_SIGNED: "yes"
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: ./ci/sign-macos-pkg.sh staple-app "dist/$APPZIP" "$RUNNER_TEMP/app" diagnostics/stapling
+
+      - name: Syndeo.app, signed ad hoc, as the configuration decided
+        if: needs.signing-config.outputs.signed == 'no'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/app"
+          /usr/bin/ditto -x -k "dist/$APPZIP" "$RUNNER_TEMP/app"
+
+      - name: The package, from that Syndeo.app
         shell: bash
-        run: ./ci/package-macos-pkg.sh "$VERSION" "dist/$TARBALL" "$RUNNER_TEMP/unsigned"
+        run: ./ci/package-macos-pkg.sh "$VERSION" "$RUNNER_TEMP/app/Syndeo.app" "$RUNNER_TEMP/unsigned"
 
       - name: Sign the package
         if: needs.signing-config.outputs.signed == 'yes'
@@ -450,7 +529,7 @@ jobs:
         env:
           SYNDEO_EXPECT_SIGNED: ${{ needs.signing-config.outputs.signed }}
           MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
-        run: bash ci/verify-pkg.sh inspect "dist/$PKG" "$VERSION" --tarball "dist/$TARBALL"
+        run: bash ci/verify-pkg.sh inspect "dist/$PKG" "$VERSION" --app "$RUNNER_TEMP/app/Syndeo.app"
 
       - name: The submission, in the summary, whatever happened
         if: always()
@@ -460,7 +539,7 @@ jobs:
               [ ! -f notarization/package/result.json ] || python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print("outcome:", r.get("outcome"), "-", r.get("message", ""))' notarization/package/result.json
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-          rm -rf "$RUNNER_TEMP/unsigned" "$RUNNER_TEMP/pkg-state"
+          rm -rf "$RUNNER_TEMP/unsigned" "$RUNNER_TEMP/pkg-state" "$RUNNER_TEMP/app"
 
       - name: Keep the notarization record
         if: always()
@@ -494,7 +573,8 @@ jobs:
 
   # The package as built, installed for real on a runner that has never seen
   # it, through the same guarded test every pull request runs, and the runner
-  # put back. Only its logs are kept.
+  # put back. Signed, Gatekeeper has to accept it, downloaded, and the bundle
+  # it installs; unsigned, to reject both. Only its logs are kept.
   pkg-install:
     name: the package, installed and removed on a fresh runner
     needs: [verify, build-macos, notarize-binaries, package]
@@ -503,7 +583,7 @@ jobs:
     env:
       VERSION: ${{ needs.verify.outputs.version }}
       SYNDEO_ALLOW_SYSTEM_INSTALL_TEST: "yes"
-      PRESERVE: SYNDEO_ALLOW_SYSTEM_INSTALL_TEST,GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_WORKSPACE
+      SYNDEO_EXPECT_SIGNED: ${{ needs.notarize-binaries.outputs.notarization == 'accepted' && 'yes' || 'no' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -513,28 +593,19 @@ jobs:
       - name: The package
         run: echo "PKG=$GITHUB_WORKSPACE/dist/syndeo-$VERSION-aarch64-apple-darwin.pkg" >> "$GITHUB_ENV"
 
-      - name: Install it, through refusals, upgrades in use, failed upgrades and their repair (root)
-        run: sudo --preserve-env="$PRESERVE" bash ci/test-pkg-install.sh --system-before "$PKG" "$VERSION"
-
-      - name: Use it from PATH (runner)
-        run: bash ci/test-pkg-install.sh --user "$VERSION"
-
-      - name: Reinstalls, refusals, a missing path, the uninstaller, and removal (root)
-        run: sudo --preserve-env="$PRESERVE" bash ci/test-pkg-install.sh --system-after "$PKG" "$VERSION"
+      - name: Install it, open it, upgrade, break, repair, move to the Trash and remove it, over the v0.1.x packages and install.sh's commands
+        run: bash ci/test-pkg-install.sh run "$PKG" "$VERSION"
 
       - name: Put the runner back, whatever happened
         if: always()
-        run: sudo --preserve-env="$PRESERVE" bash ci/test-pkg-install.sh --cleanup
+        run: bash ci/test-pkg-install.sh cleanup
 
       - name: Keep the logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: release-package-logs
-          path: |
-            ${{ runner.temp }}/syndeo-pkg-test/logs/
-            ${{ runner.temp }}/syndeo-pkg-user/*.log
-            ${{ runner.temp }}/syndeo-pkg-user/doctor
+          path: ${{ runner.temp }}/syndeo-pkg-test/logs/
           if-no-files-found: warn
 
   # Exactly the three tarballs and the package, named for this version, and
