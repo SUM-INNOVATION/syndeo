@@ -1281,6 +1281,30 @@ st_preinstall() {
     echo "$held" >>"$T/held"
     pre_case "a process that only reads Syndeo's executable: not running, upgraded" 0 "upgrading from 0.0.2 to 0.1.7" 0.1.7
     st_unhold
+    # The same, by a program that is itself called Syndeo, from elsewhere.
+    st_new; st_app_installed 0.0.2
+    mkdir -p "$C/elsewhere"
+    cp "$T/hold" "$C/elsewhere/Syndeo"
+    "$C/elsewhere/Syndeo" 120 <"$A/Contents/MacOS/Syndeo" &
+    held=$!
+    echo "$held" >>"$T/held"
+    pre_case "a process named Syndeo that only reads Syndeo's executable: not running, upgraded" 0 "upgrading from 0.0.2 to 0.1.7" 0.1.7
+    st_unhold
+    # And the executable mapped by a process that is not Syndeo, as a scan
+    # that maps the file may: its program text, under another name.
+    st_new; st_app_installed 0.0.2
+    cp "$T/hold" "$A/Contents/MacOS/Syndeo"
+    chmod 755 "$A/Contents/MacOS/Syndeo"
+    st_sign
+    ( exec -a mdworker_shared "$A/Contents/MacOS/Syndeo" 120 ) &
+    held=$!
+    echo "$held" >>"$T/held"
+    for _ in $(seq 1 50); do
+      [ -n "$(/usr/sbin/lsof -a -d txt -t -- "$A/Contents/MacOS/Syndeo" 2>/dev/null)" ] && break
+      sleep 0.1
+    done
+    pre_case "a process mapping Syndeo's executable under another name, as a scan may: not running, upgraded" 0 "upgrading from 0.0.2 to 0.1.7" 0.1.7
+    st_unhold
   else
     expect "preinstall: Syndeo running (needs cc, to build a program to hold)" false
   fi
