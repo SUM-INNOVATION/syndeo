@@ -188,7 +188,7 @@ inspect() {
       ;;
     *) echo "SYNDEO_EXPECT_SIGNED must be yes or no, not '$expect'" >&2; return 2 ;;
   esac
-  name="syndeo-$version-aarch64-apple-darwin"
+  name="Syndeo-$version"
   w="$inspect_work"
 
   note "the package, by name and shape"
@@ -493,7 +493,7 @@ signed_state() {
 # three tarballs, then the package.
 release_assets() {
   printf '%s\n' "syndeo-$1-aarch64-apple-darwin.tar.gz" "syndeo-$1-aarch64-unknown-linux-gnu.tar.gz" \
-    "syndeo-$1-x86_64-unknown-linux-gnu.tar.gz" "syndeo-$1-aarch64-apple-darwin.pkg"
+    "syndeo-$1-x86_64-unknown-linux-gnu.tar.gz" "Syndeo-$1.pkg"
 }
 
 # exactly DIR NAMES: DIR holds the regular, non-empty files NAMES (one per
@@ -1977,7 +1977,7 @@ st_inspect() {
   st_fake_app "$d" 0.0.1 || { expect "inspect: a stand-in Syndeo.app 0.0.1 assembled and signed ad hoc" false; return 0; }
   app="$d/app/Syndeo.app"
   SOURCE_DATE_EPOCH=1 "$builder" 0.0.1 "$app" "$d/out" >/dev/null 2>&1
-  pkg="$d/out/syndeo-0.0.1-aarch64-apple-darwin.pkg"
+  pkg="$d/out/Syndeo-0.0.1.pkg"
   out="$(bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --app "$app" 2>&1)"
   expect "inspect: a package built from the bundle passes" eval "printf '%s' \"\$out\" | grep -q '[1-9][0-9]* passed, 0 failed'"
   printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
@@ -1988,7 +1988,7 @@ st_inspect() {
 
   rm -rf "$d/unsigned" && mkdir -p "$d/unsigned"
   bash "$assembler" 0.0.1 "$d/bins" "$d/unsigned" >/dev/null
-  expect "the builder refuses an unsigned bundle" eval "! SOURCE_DATE_EPOCH=1 '$builder' 0.0.1 '$d/unsigned/Syndeo.app' '$d/refused' >/dev/null 2>&1 && ! [ -e '$d/refused/syndeo-0.0.1-aarch64-apple-darwin.pkg' ]"
+  expect "the builder refuses an unsigned bundle" eval "! SOURCE_DATE_EPOCH=1 '$builder' 0.0.1 '$d/unsigned/Syndeo.app' '$d/refused' >/dev/null 2>&1 && ! [ -e '$d/refused/Syndeo-0.0.1.pkg' ]"
   expect "the builder refuses a bundle of another version" eval "! SOURCE_DATE_EPOCH=1 '$builder' 0.0.2 '$app' '$d/refused' >/dev/null 2>&1"
   cp -R "$app" "$d/extra.app" && mkdir -p "$d/extra" && mv "$d/extra.app" "$d/extra/Syndeo.app"
   echo x >"$d/extra/Syndeo.app/Contents/Resources/extra"
@@ -2003,13 +2003,13 @@ st_inspect() {
   mkdir -p "$d/faulty"
   local w
   for w in entry mid-removal; do
-    rm -f "$d/faulty/syndeo-0.0.1-aarch64-apple-darwin.pkg"
-    bash "$here/pkg-test-fault.sh" "$pkg" "$d/faulty/syndeo-0.0.1-aarch64-apple-darwin.pkg" "$w" "$d/faulty/marker" >"$d/faulty/log" 2>&1
+    rm -f "$d/faulty/Syndeo-0.0.1.pkg"
+    bash "$here/pkg-test-fault.sh" "$pkg" "$d/faulty/Syndeo-0.0.1.pkg" "$w" "$d/faulty/marker" >"$d/faulty/log" 2>&1
     expect "pkg-test-fault.sh: a fault at $w, and nothing else changed" test "$?" = 0
-    out="$(bash "$here/verify-pkg.sh" inspect "$d/faulty/syndeo-0.0.1-aarch64-apple-darwin.pkg" 0.0.1 --app "$app" 2>&1)"
+    out="$(bash "$here/verify-pkg.sh" inspect "$d/faulty/Syndeo-0.0.1.pkg" 0.0.1 --app "$app" 2>&1)"
     expect "inspect: a package with a test fault at $w fails" eval "printf '%s' \"\$out\" | grep -q 'postinstall — differs from the template'"
   done
-  expect "pkg-test-fault.sh: refuses anything but a 0.0.x stand-in" eval "cp '$pkg' '$d/faulty/syndeo-0.1.7-aarch64-apple-darwin.pkg' && ! bash '$here/pkg-test-fault.sh' '$d/faulty/syndeo-0.1.7-aarch64-apple-darwin.pkg' '$d/faulty/y.pkg' entry '$d/faulty/m' >/dev/null 2>&1 && ! [ -e '$d/faulty/y.pkg' ]"
+  expect "pkg-test-fault.sh: refuses anything but a 0.0.x stand-in" eval "cp '$pkg' '$d/faulty/Syndeo-0.1.7.pkg' && ! bash '$here/pkg-test-fault.sh' '$d/faulty/Syndeo-0.1.7.pkg' '$d/faulty/y.pkg' entry '$d/faulty/m' >/dev/null 2>&1 && ! [ -e '$d/faulty/y.pkg' ]"
 
   # Edited packages: expanded, one thing changed, flattened again.
   edit_case() {
@@ -2018,8 +2018,8 @@ st_inspect() {
     pkgutil --expand "$pkg" "$d/edit"
     sed -i '' "s|$from|$to|" "$d/edit/$file"
     mkdir -p "$d/edited"
-    pkgutil --flatten "$d/edit" "$d/edited/syndeo-0.0.1-aarch64-apple-darwin.pkg"
-    out="$(bash "$here/verify-pkg.sh" inspect "$d/edited/syndeo-0.0.1-aarch64-apple-darwin.pkg" 0.0.1 --app "$app" 2>&1)"
+    pkgutil --flatten "$d/edit" "$d/edited/Syndeo-0.0.1.pkg"
+    out="$(bash "$here/verify-pkg.sh" inspect "$d/edited/Syndeo-0.0.1.pkg" 0.0.1 --app "$app" 2>&1)"
     expect "inspect: $label fails" eval "printf '%s' \"\$out\" | grep -q -- '$text'"
   }
   edit_case "overwrite-permissions true" Syndeo.pkg/PackageInfo 'overwrite-permissions="false"' 'overwrite-permissions="true"' "overwrite-permissions)"
@@ -2032,7 +2032,7 @@ st_inspect() {
 
   cp "$pkg" "$d/renamed.pkg"
   out="$(bash "$here/verify-pkg.sh" inspect "$d/renamed.pkg" 0.0.1 --app "$app" 2>&1)"
-  expect "inspect: a misnamed package fails" eval "printf '%s' \"\$out\" | grep -q 'renamed.pkg is not syndeo-0.0.1-aarch64-apple-darwin.pkg'"
+  expect "inspect: a misnamed package fails" eval "printf '%s' \"\$out\" | grep -q 'renamed.pkg is not Syndeo-0.0.1.pkg'"
   st_signed "$pkg" "$app"
 }
 
@@ -2318,10 +2318,13 @@ st_release() {
   fresh; echo old >"$d/dist/SHA256SUMS"
   rel sums "$d/dist" "$v"
   expect "sums: a SHA256SUMS already there: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected SHA256SUMS'"
-  fresh; : >"$d/dist/syndeo-$v-aarch64-apple-darwin.pkg"
+  fresh; mv "$d/dist/Syndeo-$v.pkg" "$d/dist/syndeo-$v-aarch64-apple-darwin.pkg"
+  rel sums "$d/dist" "$v"
+  expect "sums: the package under the old name the v0.1.x packages had: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected syndeo-$v-aarch64-apple-darwin.pkg' && printf '%s' \"\$out\" | grep -q 'missing Syndeo-$v.pkg'"
+  fresh; : >"$d/dist/Syndeo-$v.pkg"
   rel sums "$d/dist" "$v"
   expect "sums: an empty package: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'pkg is not a non-empty regular file'"
-  fresh; rm "$d/dist/syndeo-$v-aarch64-apple-darwin.pkg"; mkdir "$d/dist/syndeo-$v-aarch64-apple-darwin.pkg"
+  fresh; rm "$d/dist/Syndeo-$v.pkg"; mkdir "$d/dist/Syndeo-$v.pkg"
   rel sums "$d/dist" "$v"
   expect "sums: a directory for the package: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'pkg is not a non-empty regular file'"
   fresh
@@ -2342,12 +2345,12 @@ st_release() {
   draft; printf '\n\n' >>"$d/draft-notes.md"
   rel check "$d/draft" "$v" --against "$d/dist" --notes "$d/notes.md" "$d/draft-notes.md"
   expect "check: notes that differ only in trailing blank lines: pass" test "$status" = 0
-  draft; rm "$d/draft/syndeo-$v-aarch64-apple-darwin.pkg"
+  draft; rm "$d/draft/Syndeo-$v.pkg"
   rel check "$d/draft" "$v" --against "$d/dist"
-  expect "check: the package missing from the draft: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'missing syndeo-$v-aarch64-apple-darwin.pkg'"
-  draft; echo stale >"$d/draft/syndeo-0.9.0-aarch64-apple-darwin.pkg"
+  expect "check: the package missing from the draft: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'missing Syndeo-$v.pkg'"
+  draft; echo stale >"$d/draft/Syndeo-0.9.0.pkg"
   rel check "$d/draft" "$v" --against "$d/dist"
-  expect "check: a stale asset in the draft: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected syndeo-0.9.0-aarch64-apple-darwin.pkg'"
+  expect "check: a stale asset in the draft: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected Syndeo-0.9.0.pkg'"
   draft; printf 'syndeo-%s-aarch64-apple-darwin.tar.gx\n' "$v" >"$d/draft/syndeo-$v-aarch64-apple-darwin.tar.gz"
   rel check "$d/draft" "$v" --against "$d/dist"
   expect "check: an asset changed in one byte, same size: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'syndeo-$v-aarch64-apple-darwin.tar.gz — differs from what was built'"
@@ -2367,7 +2370,7 @@ st_release() {
 
   out="$(bash "$here/release-notes.sh" "$v" no)"
   expect "notes, unsigned: both routes, the package's exact name, Syndeo.app alone, its uninstaller, and the signing state as it is" eval "printf '%s' \"\$out\" | grep -qF 'install.sh | sh' &&
-    printf '%s' \"\$out\" | grep -qF 'sudo installer -pkg syndeo-$v-aarch64-apple-darwin.pkg -target /' &&
+    printf '%s' \"\$out\" | grep -qF 'sudo installer -pkg Syndeo-$v.pkg -target /' &&
     printf '%s' \"\$out\" | grep -qF 'shasum -a 256 -c SHA256SUMS --ignore-missing' &&
     printf '%s' \"\$out\" | grep -qF 'sudo /bin/sh /Applications/Syndeo.app/Contents/Resources/uninstall.sh' &&
     printf '%s' \"\$out\" | grep -qF 'and nothing else: the command-line tools come' &&

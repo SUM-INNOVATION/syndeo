@@ -180,7 +180,7 @@ jobs:
           {
             echo "VERSION=$version"
             echo "APP=$GITHUB_WORKSPACE/dist/app/Syndeo.app"
-            echo "PKG=$GITHUB_WORKSPACE/dist/syndeo-$version-aarch64-apple-darwin.pkg"
+            echo "PKG=$GITHUB_WORKSPACE/dist/Syndeo-$version.pkg"
           } >> "$GITHUB_ENV"
           mkdir -p dist/app
           bash ci/sign-macos.sh target/aarch64-apple-darwin/release --app "$version" dist/app

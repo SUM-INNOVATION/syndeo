@@ -107,7 +107,7 @@ out="$2"
 where="$3"
 marker="$4"
 check_where_and_marker "$where" "$marker"
-case "$(basename "$pkg")" in syndeo-0.0.*-aarch64-apple-darwin.pkg) ;; *) die "only a 0.0.x stand-in" ;; esac
+case "$(basename "$pkg")" in Syndeo-0.0.*.pkg) ;; *) die "only a 0.0.x stand-in" ;; esac
 [ -e "$out" ] && die "$out exists"
 
 work="$(mktemp -d)"

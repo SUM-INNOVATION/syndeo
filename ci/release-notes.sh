@@ -24,7 +24,7 @@ signed="$2"
 syndeo_version_valid "$version" || { echo "release-notes: '$version' is not a version" >&2; exit 2; }
 case "$signed" in yes | no) ;; *) echo "release-notes: signed must be yes or no, not '$signed'" >&2; exit 2 ;; esac
 repo="${GITHUB_REPOSITORY:-SUM-INNOVATION/syndeo}"
-pkg="syndeo-${version}-aarch64-apple-darwin.pkg"
+pkg="Syndeo-${version}.pkg"
 download="https://github.com/${repo}/releases/download/v${version}"
 
 cat <<EOF

@@ -429,7 +429,7 @@ jobs:
       SIGNED: ${{ needs.signing-config.outputs.signed }}
       TARBALL: syndeo-${{ needs.verify.outputs.version }}-aarch64-apple-darwin.tar.gz
       APPZIP: Syndeo.app.zip
-      PKG: syndeo-${{ needs.verify.outputs.version }}-aarch64-apple-darwin.pkg
+      PKG: Syndeo-${{ needs.verify.outputs.version }}.pkg
       NOTARY_DEADLINE_MINUTES: "300"
     steps:
       - uses: actions/checkout@v4
@@ -568,7 +568,7 @@ jobs:
           name: syndeo-aarch64-apple-darwin
           path: |
             dist/syndeo-${{ env.VERSION }}-aarch64-apple-darwin.tar.gz
-            dist/syndeo-${{ env.VERSION }}-aarch64-apple-darwin.pkg
+            dist/Syndeo-${{ env.VERSION }}.pkg
           if-no-files-found: error
 
   # The package as built, installed for real on a runner that has never seen
@@ -591,7 +591,7 @@ jobs:
           name: syndeo-aarch64-apple-darwin
           path: dist
       - name: The package
-        run: echo "PKG=$GITHUB_WORKSPACE/dist/syndeo-$VERSION-aarch64-apple-darwin.pkg" >> "$GITHUB_ENV"
+        run: echo "PKG=$GITHUB_WORKSPACE/dist/Syndeo-$VERSION.pkg" >> "$GITHUB_ENV"
 
       - name: Install it, open it, upgrade, break, repair, move to the Trash and remove it, over the v0.1.x packages and install.sh's commands
         run: bash ci/test-pkg-install.sh run "$PKG" "$VERSION"
@@ -661,7 +661,7 @@ jobs:
             "dist/syndeo-$VERSION-aarch64-apple-darwin.tar.gz" \
             "dist/syndeo-$VERSION-aarch64-unknown-linux-gnu.tar.gz" \
             "dist/syndeo-$VERSION-x86_64-unknown-linux-gnu.tar.gz" \
-            "dist/syndeo-$VERSION-aarch64-apple-darwin.pkg" \
+            "dist/Syndeo-$VERSION.pkg" \
             dist/SHA256SUMS \
             --draft --verify-tag --title "v$VERSION" --notes-file "$RUNNER_TEMP/notes.md"
       - name: The draft, downloaded and checked
@@ -704,7 +704,7 @@ jobs:
             "dist/syndeo-$VERSION-aarch64-apple-darwin.tar.gz" \
             "dist/syndeo-$VERSION-aarch64-unknown-linux-gnu.tar.gz" \
             "dist/syndeo-$VERSION-x86_64-unknown-linux-gnu.tar.gz" \
-            "dist/syndeo-$VERSION-aarch64-apple-darwin.pkg" \
+            "dist/Syndeo-$VERSION.pkg" \
             dist/SHA256SUMS \
             --draft --target "$GITHUB_SHA" --title "$TAG (dry run of v$VERSION, never published)" \
             --notes-file "$RUNNER_TEMP/notes.md"

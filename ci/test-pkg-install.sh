@@ -546,7 +546,7 @@ standin() {
     codesign --force --sign - --options runtime "$app" >/dev/null 2>&1 || return 1
   SOURCE_DATE_EPOCH="$(date +%s)" bash "$here/package-macos-pkg.sh" "$v" "$app" "$dir" >"$dir/build.log" 2>&1 ||
     { sed 's/^/      | /' "$dir/build.log" >&2; return 1; }
-  printf '%s' "$dir/syndeo-$v-aarch64-apple-darwin.pkg"
+  printf '%s' "$dir/Syndeo-$v.pkg"
 }
 
 # fault_pkg PKG entry|mid-removal: PKG, a stand-in, with a test fault in its

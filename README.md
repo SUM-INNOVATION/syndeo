@@ -92,10 +92,10 @@ now come only from the tarball and `install.sh`, above. With `<version>` the
 release's version:
 
 ```sh
-curl -fsSLO https://github.com/SUM-INNOVATION/syndeo/releases/download/v<version>/syndeo-<version>-aarch64-apple-darwin.pkg
+curl -fsSLO https://github.com/SUM-INNOVATION/syndeo/releases/download/v<version>/Syndeo-<version>.pkg
 curl -fsSLO https://github.com/SUM-INNOVATION/syndeo/releases/download/v<version>/SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
-sudo installer -pkg syndeo-<version>-aarch64-apple-darwin.pkg -target /
+sudo installer -pkg Syndeo-<version>.pkg -target /
 ```
 
 - **What it installs.** `/Applications/Syndeo.app`, root-owned:

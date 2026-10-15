@@ -6,6 +6,9 @@
 #       <version> <root> <uid> <gid> <pkgutil> <codesign> <out-file>
 #   ci/package-macos-pkg.sh --library <out-file>
 #
+# It writes <out-dir>/Syndeo-<version>.pkg, the release's installer for
+# customers; the command-line tarballs keep their own names.
+#
 # The package installs /Applications/Syndeo.app and nothing else: no command
 # in /usr/local, no link, no other file. Its component identifier is
 # com.sum.syndeo.app, which no earlier package used; the discontinued v0.1.x
@@ -152,11 +155,11 @@ build() {
         die "pkgbuild did not record what the component has to be; stopping, as the plan requires"
 
     sed "s|@VERSION@|$version|g" "$templates/Distribution.xml.in" >"$work/Distribution.xml"
-    local name="syndeo-$version-aarch64-apple-darwin"
+    local name="Syndeo-$version.pkg"
     /usr/bin/productbuild --quiet --distribution "$work/Distribution.xml" \
-        --package-path "$work/component" "$out/$name.pkg"
-    echo "built $out/$name.pkg"
-    shasum -a 256 "$out/$name.pkg"
+        --package-path "$work/component" "$out/$name"
+    echo "built $out/$name"
+    shasum -a 256 "$out/$name"
 }
 
 case "${1:-}" in
