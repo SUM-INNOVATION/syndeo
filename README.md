@@ -19,9 +19,11 @@ It downloads the release built for your machine, checks it against the published
 written outside your home directory. `SYNDEO_INSTALL_DIR` moves them;
 `SYNDEO_VERSION` pins a version. If that directory is not on your `PATH`, it
 says which file to add it to for your shell. On Linux it also checks that the
-keystore can start, and says what to install if it cannot (see below). From
-v0.1.6 there is also an installer package, for the whole Mac; see
-[below](#for-the-whole-mac-the-installer-package).
+keystore can start, and says what to install if it cannot (see below). On
+macOS there is also an installer package, for the whole Mac; see
+[below](#for-the-whole-mac-the-installer-package). From the release after
+v0.1.7 it installs Syndeo.app, the desktop application, and no longer the
+command-line tools.
 
 They all have to live in the same directory. The shell starts the network
 process and the keystore by looking beside itself, which is what keeps a build
@@ -83,8 +85,11 @@ shasum -a 256 -c SHA256SUMS --ignore-missing
 
 ### For the whole Mac: the installer package
 
-**v0.1.6 is the first release to include the installer package.** With
-`<version>` the release's version, v0.1.6 or later:
+The package installs **Syndeo.app**, the desktop application, in
+`/Applications`, and nothing else. The v0.1.6 and v0.1.7 packages were
+different: they installed the command-line tools under `/usr/local`. Those
+now come only from the tarball and `install.sh`, above. With `<version>` the
+release's version:
 
 ```sh
 curl -fsSLO https://github.com/SUM-INNOVATION/syndeo/releases/download/v<version>/syndeo-<version>-aarch64-apple-darwin.pkg
@@ -93,87 +98,107 @@ shasum -a 256 -c SHA256SUMS --ignore-missing
 sudo installer -pkg syndeo-<version>-aarch64-apple-darwin.pkg -target /
 ```
 
-- **What it installs.** Everything is root-owned, under `/usr/local`:
-  - the version, whole, in `/usr/local/libexec/syndeo/<version>/`, with its
-    uninstaller beside it;
-  - `/usr/local/libexec/syndeo/current`, pointing at that version;
-  - the seven commands in `/usr/local/bin`, as links through `current`.
+- **What it installs.** `/Applications/Syndeo.app`, root-owned:
+  - its helper, `syndeo-proxy`, inside it, in `Contents/Helpers`;
+  - its uninstaller, in `Contents/Resources/uninstall.sh`;
+  - the package's receipt, `com.sum.syndeo.app`.
 
-  It needs an administrator, Apple Silicon and macOS 13 or later, and installs
-  only on the startup disk.
+  Nothing goes in `/usr/local`: no command and no link. It needs an
+  administrator, Apple Silicon and macOS 13 or later, and installs only on
+  the startup disk, always in `/Applications`.
 - **Its two scripts.**
-  - The preinstall writes nothing. It checks that everything it would install
-    over is Syndeo's own, exactly as its package left it, and refuses
-    otherwise: a command in `/usr/local/bin` it did not put there, a Syndeo
-    directory with no package receipt, a second version, files that are not
-    as packaged, or a package older than the one installed.
-  - The postinstall checks that the new version is complete and the only one,
-    then switches `current` to it with one rename.
+  - The preinstall writes nothing. It refuses:
+    - while Syndeo or its helper runs from `/Applications`;
+    - a `Syndeo.app` there that no Syndeo package installed;
+    - one changed since it was signed, or not what its receipt says;
+    - a package older than the one installed.
+  - The postinstall checks that the bundle is exactly this version, its
+    signature intact. Then it removes the v0.1.x command-line package, if it
+    is there (below).
 
-  Installer itself says only that the installation failed. The preinstall
-  says why, one `syndeo preinstall: refusing: …` line per reason. Installer
+  Installer itself says only that the installation failed. The scripts say
+  why, one `syndeo preinstall: refusing: …` line per reason. Installer
   normally records those lines in `/var/log/install.log`, but they are not
   guaranteed to appear there.
-- **Where it will not install.**
-  - `/usr/local` and `/usr/local/libexec` have to be root's, and writable by
-    nobody else.
-  - `/usr/local/bin` may belong to a person, as it does on a Mac that once
-    ran Homebrew on Intel. It may be writable by the admin or wheel group, but
-    not by everyone, not through an access control list, not locked, and not
-    a symbolic link.
-  - A `/usr/local` owned by a user is refused by design.
-- **Upgrading.** One version is installed at a time, so quit Syndeo before
-  installing or upgrading.
-  - An upgrade removes the previous version before it places the new one, and
-    the commands do not start until `current` has switched. On a CI runner
-    that took about 0.3 s; that is a measurement, not a promise.
-  - A Syndeo left running from the replaced version stops at the next program
-    it needs, saying "this version was removed during an upgrade; quit and
-    restart Syndeo".
-  - If an upgrade fails, Installer undoes nothing. Install the same package
-    again to finish it. Until then every other package, older or newer, is
-    refused, and so is the uninstaller.
-- **Downgrading is refused.** Uninstall first, then install the older package.
-- **Removing it:**
+- **Over the v0.1.6 or v0.1.7 package.** Its receipt is `com.sum.syndeo.pkg`.
+  The package removes it only if it is exactly as its own package left it:
+  - its seven links in `/usr/local/bin`, then `/usr/local/libexec/syndeo`,
+    each path looked at again just before it goes;
+  - `/usr/local/libexec` itself, only if it is an empty directory exactly as
+    that package created it (root:wheel, 0755, no access control list, flags
+    or extended attributes) and no other package claims it. Otherwise it
+    stays, harmlessly;
+  - its receipt, last.
 
-  ```sh
-  sudo /bin/sh /usr/local/libexec/syndeo/<version>/uninstall.sh
-  ```
+  `/usr/local/bin` itself and everything else in it stay. Without that
+  receipt, nothing in `/usr/local` is looked at, so the commands `install.sh`
+  puts there, or anywhere, are never touched. In any other state the package
+  refuses, and touches none of it: a file changed or missing, an extra one, or
+  a command `install.sh` put over one of its links. Repair it by installing
+  its own package again, or remove it with
+  `sudo /bin/sh /usr/local/libexec/syndeo/<old version>/uninstall.sh`, then
+  install this one. If the removal is interrupted, installing the same
+  package again finishes it.
+- **Upgrading.** Quit Syndeo first: Installer would replace it while it runs,
+  so the package refuses to.
+  - If an upgrade fails, Installer undoes nothing: the new bundle stays, under
+    the old receipt. Install the same package again to finish it. Until then
+    every other package, older or newer, is refused, and so is the
+    uninstaller.
+- **Downgrading is refused.** Remove Syndeo.app first.
+- **Removing it**, either way:
+  - With the uninstaller, which removes the application and the package's
+    receipt:
 
-  `--help` says what it does. It changes nothing unless everything is exactly
-  as the package left it. Then it removes the seven commands, the version and
-  the receipt. It never touches homes, `~/.syndeo`, keychain items or proxy
-  trust settings.
+    ```sh
+    sudo /bin/sh /Applications/Syndeo.app/Contents/Resources/uninstall.sh
+    ```
 
-  If it removed everything but could not forget the receipt, it exits 2 and
-  prints the command that finishes the job:
+    It changes nothing unless all of it is exactly as the package installed
+    it, its signature included. `--help` says what it does. If it removed the
+    application but could not forget the receipt, it exits 2 and prints the
+    command that finishes the job:
 
-  ```sh
-  sudo /usr/sbin/pkgutil --forget com.sum.syndeo.pkg --volume /
-  ```
+    ```sh
+    sudo /usr/sbin/pkgutil --forget com.sum.syndeo.app --volume /
+    ```
+  - By moving Syndeo.app to the Trash. The receipt stays behind, harmlessly,
+    and installing the package again puts the application back in
+    `/Applications`.
+
+  Neither touches your settings or data: `~/Library/Application Support/Syndeo`,
+  preferences, cookies, caches and search settings are kept, and so are
+  keychain items and trust settings.
 - **Signing.**
-  - From v0.1.7 the package is signed with a Developer ID Installer identity,
-    notarized, and its ticket stapled, and Gatekeeper accepts it. The
-    binaries in it are signed with a Developer ID Application identity and
-    notarized, and carry no entitlements.
-  - The v0.1.6 package is unsigned, and the binaries in it are ad-hoc
-    signed, without Developer ID or notarization. Downloaded with `curl`, as
-    above, it is not quarantined and installs; opened from a browser
-    download, Gatekeeper is expected to reject it.
-- **What was tested.** Every pull request builds the package from the release
-  tarball, inspects it, and installs it for real on a disposable
-  GitHub-hosted macOS 15 runner. The test covers:
-  - refusals, and upgrades while the commands are being started;
-  - both kinds of failed upgrade, and their repair;
-  - a Syndeo running across an upgrade;
-  - reinstalls and the uninstaller;
+  - In a signed release, Syndeo.app and its helper are signed with a
+    Developer ID Application identity, with the hardened runtime and no
+    entitlements, and notarized with the command-line binaries, the ticket
+    stapled. The package is signed with a Developer ID Installer identity,
+    notarized, and its ticket stapled. Gatekeeper has to accept both.
+  - An unsigned build's application is signed ad hoc, and its package not at
+    all. Downloaded in a browser, Gatekeeper rejects both.
+- **What was tested.** Every pull request builds the binaries and Syndeo.app
+  as a release does, builds the package from the app, inspects it, and
+  installs it for real on a disposable GitHub-hosted macOS 15 runner. The
+  test covers:
+  - a download quarantined as Safari leaves one, and Gatekeeper's verdict on
+    it, then installed;
+  - the application opened through LaunchServices, its helper running from
+    inside the bundle, byte for byte the one the package carried;
+  - the published v0.1.6 and v0.1.7 packages removed, every kind of change to
+    them refused, and an interrupted removal finished;
+  - the commands `install.sh` put in `/usr/local/bin`, left alone;
+  - upgrades, a failed upgrade and its repair, a downgrade refused, a
+    reinstall and a refusal while the app runs;
+  - the Trash, the uninstaller, and a receipt that cannot be forgotten, with
+    the user's data kept throughout;
   - the runner put back afterwards.
 
-  The first run to pass all of it was
-  [38012208859](https://github.com/SUM-INNOVATION/syndeo/actions/runs/38012208859).
+  A signed release runs the same test on its signed package, where
+  Gatekeeper has to accept it.
 - **What was not tested:**
-  - installing from Finder;
-  - Gatekeeper on a browser download;
+  - installing by opening the package in Finder, which runs Installer's
+    window and asks for an administrator's password;
   - the refusal of Intel Macs and of macOS before 13, which rests on the
     package's metadata alone, with no such runners to try it on.
 
@@ -758,7 +783,8 @@ runs the installer against a release built on the spot; CI runs both, on Linux
 and macOS.
 
 `.github/workflows/release.yml` refuses a tag that disagrees with the workspace
-version, and builds the three targets and the macOS installer package.
+version, and builds the three targets, Syndeo.app and the macOS installer
+package.
 - **Only the signing jobs see the signing configuration.** The
   `release-macos` environment holds `SYNDEO_EXPECT_SIGNED` and any signing
   secrets. Four jobs declare it, and each is given only its own share:
@@ -777,18 +803,22 @@ version, and builds the three targets and the macOS installer package.
   - Signed, the macOS release goes through three jobs, in order:
     1. `build-macos` signs the binaries with `ci/sign-macos.sh` (Developer ID
        Application, the hardened runtime and a secure timestamp, and no
-       entitlements) and makes the tarball. It then checks the signatures and
-       runs every binary in it (`ci/verify-pkg.sh signed-binaries`): each
+       entitlements) and makes the tarball. It assembles Syndeo.app from the
+       same binaries, its helper the tarball's own `syndeo-proxy`, and signs
+       the bundle the same way. It then checks the signatures and runs every
+       binary (`ci/verify-pkg.sh signed-binaries` and `signed-app`): each
        `--version` has to exit 0 with exactly its name and version, and
        `syndeo-keystore status` has to report presence unenforced and the
        passphrase required. macOS kills a binary it refuses as it starts, and
        that fails here, before Apple is sent anything.
-    2. `notarize-binaries` checks and runs exactly those binaries again, then
-       sends them to Apple once, with `ci/notarize.py`, and waits for the
-       verdict.
-    3. `package` builds the installer package from that same tarball,
-       checked by its SHA-256. It signs it with `ci/sign-macos-pkg.sh`, sends
-       it to Apple once, waits, and only then staples it. Every stapler
+    2. `notarize-binaries` checks and runs exactly those binaries and that
+       bundle again, then sends them to Apple once, together, with
+       `ci/notarize.py`, and waits for the verdict.
+    3. `package` staples that same bundle, checked by its SHA-256, and
+       requires it unchanged but for its ticket, and accepted by Gatekeeper.
+       It builds the installer package from it, signs it with
+       `ci/sign-macos-pkg.sh`, sends it to Apple once, waits, and only then
+       staples it. Every stapler
        command is shown with its output and exit status. Validating the
        stapled ticket is retried, up to five times over about four minutes,
        and has to pass; if it never does, the job fails and keeps the package
@@ -802,9 +832,9 @@ version, and builds the three targets and the macOS installer package.
   - v0.1.6 was built with `SYNDEO_EXPECT_SIGNED=no` and no signing secrets,
     so its binaries have no Developer ID and its package is unsigned. v0.1.7
     is the first release built with `SYNDEO_EXPECT_SIGNED=yes`.
-- **The package** is built from the macOS tarball, inspected against what was
-  decided (`ci/verify-pkg.sh inspect`), and installed and removed on a fresh
-  runner.
+- **The package** is built from Syndeo.app, inspected against what was
+  decided and against that bundle (`ci/verify-pkg.sh inspect`), and installed
+  and removed on a fresh runner.
 - **Publishing.** Exactly the three tarballs and the package, with one
   `SHA256SUMS` over them, go into a draft release. The draft's assets are
   downloaded back and checked against what was built, and its notes against

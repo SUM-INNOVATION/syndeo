@@ -4,9 +4,11 @@
 #   ci/release-notes.sh <version> <signed: yes|no>
 #
 # Two ways to install, which the notes keep apart: the per-user install
-# script, from the tarball, into ~/.local/bin, with no sudo; and, on macOS,
-# the system package, root-owned under /usr/local, which needs an
-# administrator and runs a preinstall and a postinstall script. Then the
+# script, from the tarball, into ~/.local/bin, with no sudo, for the
+# command-line tools; and, on macOS, the installer package of Syndeo.app,
+# into /Applications, which needs an administrator, runs a preinstall and a
+# postinstall script, and removes the discontinued v0.1.x command-line
+# package if it is installed exactly as its package left it. Then the
 # signing state, stated exactly for what was built, and the CHANGELOG's
 # section for the version, when it has one. The release job writes these, and
 # checks the draft carries exactly them before publishing it.
@@ -39,7 +41,7 @@ tarball for your machine, checks it against \`SHA256SUMS\`, and puts the
 binaries in \`~/.local/bin\`. No \`sudo\`, and nothing written outside your home
 directory.
 
-### For the whole Mac: the installer package
+### Syndeo.app, for the whole Mac: the installer package
 
 \`\`\`sh
 curl -fsSLO ${download}/${pkg}
@@ -48,27 +50,32 @@ shasum -a 256 -c SHA256SUMS --ignore-missing
 sudo installer -pkg ${pkg} -target /
 \`\`\`
 
-macOS 13 or later, on Apple Silicon, and an administrator. The package is
-root-owned, under \`/usr/local\`: this version in
-\`/usr/local/libexec/syndeo/${version}/\`, and the seven commands linked from
-\`/usr/local/bin\`. It runs a preinstall script, which refuses to install over
-anything it cannot account for, and a postinstall script, which makes this
-version the current one. One version is installed at a time: quit Syndeo
-before installing or upgrading. To remove it:
-\`sudo /bin/sh /usr/local/libexec/syndeo/${version}/uninstall.sh\`.
+macOS 13 or later, on Apple Silicon, and an administrator. It installs
+Syndeo.app in \`/Applications\`, and nothing else: the command-line tools come
+from the tarball and the install script above, and no longer from this
+package. Quit Syndeo before installing or upgrading. If the v0.1.6 or v0.1.7
+command-line package is installed, exactly as its package left it, this
+package removes it: its commands in \`/usr/local/bin\`, its files under
+\`/usr/local/libexec\`, and its receipt. If it is installed in any other
+state, this package refuses, and touches none of it. To remove Syndeo.app,
+either run \`sudo /bin/sh /Applications/Syndeo.app/Contents/Resources/uninstall.sh\`,
+which also forgets the package's receipt, or move it to the Trash. Your
+settings and data are kept either way.
 
 ### Signing
 
 EOF
 if [ "$signed" = yes ]; then
   cat <<'EOF'
-The macOS binaries are signed with a Developer ID and notarized. The installer
-package is signed with a Developer ID Installer identity and notarized, with
-its notarization ticket stapled.
+The macOS binaries and Syndeo.app are
+signed with a Developer ID and notarized, Syndeo.app with its ticket stapled.
+The installer package is signed with a Developer ID Installer identity and
+notarized, with its notarization ticket stapled.
 EOF
 else
   cat <<'EOF'
-The macOS binaries are ad-hoc signed, with no Developer ID, and not notarized.
+The macOS binaries and Syndeo.app are
+ad-hoc signed, with no Developer ID, and not notarized.
 The installer package is unsigned: Gatekeeper rejects it when it is opened
 from a browser download, so install it with the commands above.
 EOF
