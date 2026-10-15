@@ -1,27 +1,28 @@
 #!/bin/sh
 # The shared helpers below are embedded whole; each script uses only some.
 # shellcheck disable=SC2034,SC2329
-# Syndeo's postinstall step: make the version just installed the current one.
+# Syndeo.app's postinstall step.
 #
-# Installer runs it as root once every file of the version is in place, and
-# after it has removed the version this one replaces: one version is
-# installed at a time. It checks that this version is complete, exactly as
-# packaged, and the only one there, then points
-# /usr/local/libexec/syndeo/current at it with a single rename. The commands
-# in /usr/local/bin all lead through `current`, so a command that starts runs
-# this version or, before the switch, none: from the removal of the previous
-# version until this switch, commands fail to start with "No such file or
-# directory" (or, at the switch itself, "Invalid argument"). Once this step
-# returns, `current` is this version and every command starts. A Syndeo still
-# running from the removed version stops at the next program it needs, and
-# has to be quit and started again; quit Syndeo before installing.
+# Installer runs it as root once the bundle is in /Applications, and writes
+# this package's receipt only if it succeeds. It checks the bundle is exactly
+# this version as packaged, its code signature intact, and then removes the
+# discontinued v0.1.x command-line package, if its receipt is there and it is
+# exactly as its package left it, or as this package's own removal of it
+# left it when it stopped.
 #
-# If anything is wrong it switches nothing, and exits non-zero. Installer
-# then writes no receipt, so the receipt still names the removed version and
-# running this same package again finishes the upgrade.
+# The removal looks at everything first, remembers each path, and changes
+# nothing unless all of it is right. Then, in a fixed order, each path looked
+# at again just before it goes: the seven command links in /usr/local/bin,
+# `current`, the version's files, its directories and the private directory,
+# directories with rmdir. Then /usr/local/libexec, only if it is exactly as
+# the v0.1.x package created it, empty, and no other package claims it;
+# otherwise it stays. Only then is the old receipt forgotten. /usr/local/bin
+# itself, /usr/local, and anything not named here are never removed.
 #
-# It touches nothing outside the private directory: no command link, no home,
-# no keychain, no trust setting.
+# If anything is wrong it stops, and exits non-zero: Installer then writes no
+# receipt for this version, and running this same package again carries on
+# from where it stopped. It touches no home, no keychain, no trust setting,
+# and nothing of Syndeo.app's user data.
 set -eu
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 LC_ALL=C
@@ -36,6 +37,7 @@ ROOT='@ROOT@'
 EXPECT_UID='@EXPECT_UID@'
 EXPECT_GID='@EXPECT_GID@'
 PKGUTIL='@PKGUTIL@'
+CODESIGN='@CODESIGN@'
 
 @COMMON@
 
@@ -47,45 +49,98 @@ if ! syndeo_version_valid "$INCOMING"; then
 fi
 refuse_if_found
 
-check_strict_dir "$SYNDEO_LOCAL"
-check_strict_dir "$SYNDEO_LIBEXEC"
-if is_present "$SYNDEO_DIR"; then
-    check_strict_dir "$SYNDEO_DIR"
-else
-    finding "$SYNDEO_DIR: is missing"
-fi
+# The bundle Installer has just put in place.
+check_app_bundle "$INCOMING"
 refuse_if_found
 
-check_tree "$INCOMING" exact
-for entry in "$SYNDEO_DIR"/* "$SYNDEO_DIR"/.[!.]* "$SYNDEO_DIR"/..?*; do
-    is_present "$entry" || continue
-    case "${entry##*/}" in
-        "$INCOMING" | current | .current.new) ;;
-        *) finding "$entry: is still there; Syndeo $INCOMING is installed alone" ;;
-    esac
-done
-for link in current .current.new; do
-    path="$SYNDEO_DIR/$link"
-    is_present "$path" || continue
-    if ! is_private "$path" 'Symbolic Link' -; then
-        finding "$path: is not a symlink owned by root:wheel"
-    elif ! syndeo_version_valid "$(/usr/bin/readlink "$path")"; then
-        finding "$path: does not point at a version"
+legacy_plan yes
+if [ "$nfindings" != 0 ]; then
+    legacy_refusal
+fi
+refuse_if_found
+if [ "$legacy" = none ]; then
+    say "Syndeo.app $INCOMING is installed in $APP_DIR"
+    exit 0
+fi
+
+# ------------------------------------------------------------------ v0.1.x
+
+steps=$(legacy_steps "$legacy_v")
+
+# Everything that will be removed, as it is now.
+snapshot=''
+i=0
+while IFS= read -r p; do
+    i=$((i + 1))
+    [ "$i" -ge "$legacy_from" ] || continue
+    snapshot="$snapshot
+$p	$(meta_line "$p")"
+done <<EOF
+$steps
+EOF
+
+removed=''
+
+stop() {
+    say "stopped: $1"
+    if [ -n "$removed" ]; then
+        say "already removed:$removed"
     fi
-done
-refuse_if_found
+    say "the receipt for $SYNDEO_ID was not forgotten. Run this package again to carry on"
+    exit 1
+}
 
-# A temporary link left by a switch that was interrupted.
-if is_present "$SYNDEO_DIR/.current.new"; then
-    /bin/rm -f -- "$SYNDEO_DIR/.current.new"
-fi
-/bin/ln -s "$INCOMING" "$SYNDEO_DIR/.current.new"
-# -h: rename over `current` itself, not into the directory it points at.
-/bin/mv -h -f "$SYNDEO_DIR/.current.new" "$SYNDEO_DIR/current"
+# remembered PATH: what PATH was when it was looked at, or nothing.
+remembered() {
+    _rm_found=''
+    while IFS= read -r _rm_line; do
+        case "$_rm_line" in
+            "$1	"*) _rm_found=${_rm_line#"$1	"} ;;
+        esac
+    done <<EOF
+$snapshot
+EOF
+    printf '%s' "$_rm_found"
+}
 
-if [ "$(/usr/bin/readlink "$SYNDEO_DIR/current")" != "$INCOMING" ]; then
-    say "refusing: $SYNDEO_DIR/current does not point at $INCOMING after the switch"
+# unchanged PATH: whether PATH is as it was when it was looked at. For a
+# directory that is its own inode, owner, mode and flags; what it holds is
+# checked file by file, and rmdir refuses anything left in it.
+unchanged() {
+    _uc_want=$(remembered "$1")
+    [ -n "$_uc_want" ] && [ "$(meta_line "$1")" = "$_uc_want" ]
+}
+
+i=0
+while IFS= read -r p; do
+    i=$((i + 1))
+    [ "$i" -ge "$legacy_from" ] || continue
+    unchanged "$p" || stop "$p changed after it was checked"
+    load_meta "$p"
+    if [ "$m_type" = Directory ]; then
+        /bin/rmdir -- "$p" || stop "$p could not be removed: something unexpected is in it"
+    else
+        /bin/rm -f -- "$p" || stop "$p could not be removed"
+    fi
+    removed="$removed $p"
+done <<EOF
+$steps
+EOF
+
+# Every path the old receipt owned is gone; only now its parent, and then
+# the receipt.
+while IFS= read -r p; do
+    if is_present "$p"; then
+        stop "$p is still there"
+    fi
+done <<EOF
+$steps
+EOF
+legacy_libexec
+if ! "$PKGUTIL" --forget "$SYNDEO_ID" --volume / >/dev/null 2>&1; then
+    say "every file of the v0.1.x $legacy_v package is removed, but its receipt could not be forgotten. Run this package again, or:"
+    say "    sudo /usr/sbin/pkgutil --forget $SYNDEO_ID --volume /"
     exit 1
 fi
-say "$INCOMING is current. Commands did not start while the previous version was replaced; a Syndeo still running from it has to be quit and started again"
+say "Syndeo.app $INCOMING is installed in $APP_DIR, and the v0.1.x command-line package $legacy_v is removed: its commands in $SYNDEO_BIN, $SYNDEO_DIR, and its receipt. The command-line tools are still available from the release tarball and install.sh"
 exit 0

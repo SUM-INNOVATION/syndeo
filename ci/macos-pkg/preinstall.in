@@ -1,7 +1,7 @@
 #!/bin/sh
 # The shared helpers below are embedded whole; each script uses only some.
 # shellcheck disable=SC2034,SC2329
-# Syndeo's preinstall check.
+# Syndeo.app's preinstall check.
 #
 # Installer runs it as root, after the person installing has authenticated
 # and before anything is copied. It reads, and writes nothing: it stops the
@@ -9,28 +9,31 @@
 # refusing: ..." line per reason. Installer normally records those lines in
 # /var/log/install.log, but does not guarantee they appear there.
 #
-# One version of Syndeo is installed at a time. When this package goes ahead,
-# Installer removes the version its receipt names, places this one, and runs
-# the postinstall, which switches `current` to it; only then does Installer
-# write the receipt. From the removal to the switch the commands do not start,
-# and a Syndeo still running from the removed version stops at the next
-# program it needs: quit Syndeo before installing. A postinstall that fails is
-# not undone, so a failed upgrade leaves the receipt naming a version that is
-# gone and this version's files in place.
-#
-# It installs over nothing it cannot account for. With V this package's
-# version and X the receipt's:
-# - no receipt and no Syndeo: install V;
-# - no receipt, and nothing but part or all of V from an installation that
-#   was interrupted: resume it;
-# - receipt X, exactly X installed and nothing else: upgrade to a newer V,
+# The package installs /Applications/Syndeo.app and nothing else. Installer
+# replaces a bundle that is running without stopping it, so this refuses
+# while Syndeo or its helper runs from there. A postinstall that fails is not
+# undone: the new bundle stays, under the receipt it replaced, and only the
+# same package may finish it. With V this package's version, and P the
+# bundle in /Applications:
+# - no receipt and no P: install V;
+# - no receipt, P exactly V: this package's own installation, interrupted;
+#   resume it;
+# - receipt X, P exactly X and listed exactly by it: upgrade to a newer V,
 #   reinstall the same one, or refuse an older one;
-# - receipt X = V, part of V and nothing else: repair V;
-# - receipt X, X gone, exactly one newer version W there, `current` at X or
-#   W: an upgrade to W failed. Only W's package may finish it; any other is
-#   refused until it has.
-# Anything else is refused, including more than one version, anything that is
-# not the package's, and a tree whose files are not exactly as packaged.
+# - receipt X, P gone (moved to the Trash): install V;
+# - receipt X, P exactly a newer W: an upgrade to W failed. Only W's package
+#   may finish it; any other is refused until it has.
+# Anything else at P is refused: a bundle that is not Syndeo's, not exactly
+# as packaged, changed since it was signed, or not what its receipt says.
+# Move it to the Trash, and install again.
+#
+# And the discontinued v0.1.x command-line package, com.sum.syndeo.pkg: with
+# no receipt for it, nothing in /usr/local is looked at, and nothing there is
+# touched, whatever is there, the commands install.sh installs included. With
+# its receipt, it has to be exactly as its package left it, for the
+# postinstall to remove it; or, when P is already exactly V, what this
+# package's own removal of it left when it stopped. Anything else is refused,
+# and nothing of it is touched.
 set -eu
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 LC_ALL=C
@@ -45,6 +48,7 @@ ROOT='@ROOT@'
 EXPECT_UID='@EXPECT_UID@'
 EXPECT_GID='@EXPECT_GID@'
 PKGUTIL='@PKGUTIL@'
+CODESIGN='@CODESIGN@'
 
 @COMMON@
 
@@ -60,115 +64,89 @@ if ! syndeo_version_valid "$INCOMING"; then
 fi
 refuse_if_found
 
-# The paths themselves, whatever owns them.
-check_strict_dir "$SYNDEO_LOCAL"
-check_strict_dir "$SYNDEO_LIBEXEC"
-check_bin_dir "$SYNDEO_BIN"
-refuse_if_found
-scan_bin
-scan_private
-read_receipt
+check_apps_dir
+check_not_running
 refuse_if_found
 
+# ------------------------------------------------------------------ the app
+
 decision=''
-if [ "$r_present" = no ]; then
-    if [ "$d_present" = no ]; then
-        if [ "$bin_present" = 0 ]; then
-            decision="installing $INCOMING"
-        else
-            for n in $SYNDEO_NAMES; do
-                if is_present "$SYNDEO_BIN/$n"; then
-                    finding "$SYNDEO_BIN/$n: exists, and no Syndeo package is installed"
-                fi
-            done
-        fi
+# yes when P is already exactly this version: the one case in which what is
+# left of a v0.1.x removal may be this package's own.
+is_incoming=no
+read_app_receipt
+if [ "$ar_present" = no ]; then
+    if ! is_present "$APP"; then
+        decision="installing $INCOMING"
+    elif is_app_bundle "$INCOMING"; then
+        decision="resuming an interrupted installation of $INCOMING"
+        is_incoming=yes
     else
-        # The one state without a receipt that may be resumed: this version,
-        # partly or wholly in place, nothing else, and only its own links.
-        resumable=yes
-        [ "$versions" = " $INCOMING" ] || resumable=no
-        case "$current_v" in '' | "$INCOMING") ;; *) resumable=no ;; esac
-        case "$pending_v" in '' | "$INCOMING") ;; *) resumable=no ;; esac
-        [ -z "$bin_foreign" ] || resumable=no
-        if [ "$resumable" = yes ] && [ "$current_v" = "$INCOMING" ]; then
-            check_tree "$INCOMING" exact
-        fi
-        if [ "$resumable" = yes ]; then
-            decision="resuming an interrupted installation of $INCOMING"
+        found=$(app_info CFBundleShortVersionString)
+        if syndeo_version_valid "$found" && is_app_bundle "$found"; then
+            finding "$APP: is Syndeo.app $found, with no receipt. If the Syndeo $found package was interrupted installing it, install that package again; otherwise move it to the Trash, then install this package"
         else
-            finding "$SYNDEO_DIR: exists, and no Syndeo package is installed; it holds${versions:- nothing}${current_v:+, current -> $current_v}${pending_v:+, .current.new -> $pending_v}"
-            for n in $bin_foreign; do
-                finding "$SYNDEO_BIN/$n: is not a link this package writes"
-            done
+            check_app_bundle "$INCOMING"
+            finding "$APP: is there, and no Syndeo.app package installed it. Move it to the Trash, then install this package"
         fi
     fi
 else
-    check_receipt_meta
+    check_app_receipt_meta
     refuse_if_found
-    for n in $bin_foreign; do
-        finding "$SYNDEO_BIN/$n: is not a link this package writes"
-    done
-    if [ "$d_present" = no ]; then
-        finding "$SYNDEO_DIR: is missing, but the receipt says $r_version is installed"
-    fi
-    refuse_if_found
-
-    if has_version "$r_version"; then
-        # The receipt's version is here: it has to be the only one, current,
-        # and, unless this is the same version, complete.
-        if [ "$(version_count)" != 1 ]; then
-            finding "$SYNDEO_DIR: holds${versions}; with $r_version installed, it may hold nothing else"
-        fi
-        if [ "$current_v" != "$r_version" ]; then
-            finding "$SYNDEO_DIR/current: points at '${current_v}', not the installed $r_version"
-        fi
-        case "$pending_v" in '' | "$r_version") ;; *) finding "$SYNDEO_DIR/.current.new: points at $pending_v, not $r_version" ;; esac
-        refuse_if_found
-        case "$(syndeo_version_cmp "$INCOMING" "$r_version")" in
-            lt)
-                finding "Syndeo $r_version is installed, and this package is the older $INCOMING. Uninstall $r_version first with $SYNDEO_DIR/$r_version/uninstall.sh"
-                ;;
-            eq)
-                # The same version: what an interruption left may be repaired.
-                # scan_private has refused anything that is not exactly the
-                # package's, so only missing files and links can be wrong.
-                if is_complete_tree "$INCOMING" && [ "$bin_present" = 7 ]; then
-                    decision="reinstalling $INCOMING"
-                else
-                    decision="repairing $INCOMING"
-                fi
-                ;;
-            gt)
-                check_receipt_installed "$r_version"
-                decision="upgrading from $r_version to $INCOMING"
-                ;;
-        esac
+    if ! is_present "$APP"; then
+        decision="installing $INCOMING; Syndeo.app $ar_version, which the receipt names, is no longer in $APP_DIR"
     else
-        # The receipt's version is gone. The one state that may follow: an
-        # upgrade to exactly one newer version, whose postinstall failed.
-        if [ "$(version_count)" != 1 ]; then
-            finding "$SYNDEO_DIR: the installed $r_version is gone, and it holds${versions:- nothing} rather than exactly one newer version: not a failed upgrade this package can finish"
-        else
-            failed=${versions# }
-            if [ "$(syndeo_version_cmp "$failed" "$r_version")" != gt ]; then
-                finding "$SYNDEO_DIR: the installed $r_version is gone, and $failed is not newer"
-            fi
-            case "$current_v" in
-                "$r_version" | "$failed") ;;
-                '') finding "$SYNDEO_DIR/current: is missing" ;;
-                *) finding "$SYNDEO_DIR/current: points at $current_v, neither $r_version nor $failed" ;;
-            esac
-            case "$pending_v" in '' | "$failed") ;; *) finding "$SYNDEO_DIR/.current.new: points at $pending_v, not $failed" ;; esac
-            refuse_if_found
-            if [ "$INCOMING" = "$failed" ]; then
-                decision="completing the failed upgrade from $r_version to $INCOMING"
+        found=$(app_info CFBundleShortVersionString)
+        if syndeo_version_valid "$found" && [ "$found" != "$ar_version" ] &&
+            [ "$(syndeo_version_cmp "$found" "$ar_version")" = gt ] && is_app_bundle "$found"; then
+            # The receipt's version is gone, and exactly one newer version is
+            # in its place: an upgrade to it whose postinstall failed.
+            if [ "$INCOMING" = "$found" ]; then
+                decision="completing the failed upgrade from $ar_version to $INCOMING"
+                is_incoming=yes
             else
-                finding "an upgrade from $r_version to $failed did not finish: install the Syndeo $failed package again to complete it, then this one"
+                finding "an upgrade from $ar_version to $found did not finish: install the Syndeo $found package again to complete it, then this one"
+            fi
+        else
+            check_app_bundle "$ar_version"
+            if [ "$nfindings" = 0 ] && [ "$app_ticket" != "$ar_ticket" ]; then
+                if [ "$app_ticket" = yes ]; then
+                    finding "$APP: holds a stapled ticket its receipt does not list"
+                else
+                    finding "$APP: lacks the stapled ticket its receipt lists"
+                fi
+            fi
+            if [ "$nfindings" != 0 ]; then
+                finding "$APP: is not Syndeo.app $ar_version as its package installed it. Move it to the Trash, then install this package"
+            else
+                case "$(syndeo_version_cmp "$INCOMING" "$ar_version")" in
+                    lt)
+                        finding "Syndeo.app $ar_version is installed, and this package is the older $INCOMING. Remove $ar_version first: run sudo /bin/sh $APP/Contents/Resources/uninstall.sh, or move Syndeo.app to the Trash"
+                        ;;
+                    eq)
+                        decision="reinstalling $INCOMING"
+                        is_incoming=yes
+                        ;;
+                    gt)
+                        decision="upgrading from $ar_version to $INCOMING"
+                        ;;
+                esac
             fi
         fi
     fi
 fi
 
+# ------------------------------------------------------------------ v0.1.x
+
+app_findings=$nfindings
+legacy_plan "$is_incoming"
+if [ "$nfindings" != "$app_findings" ]; then
+    legacy_refusal
+fi
 refuse_if_found
+case "$legacy" in
+    whole) decision="$decision, and removing the v0.1.x command-line package $legacy_v" ;;
+    partial) decision="$decision, and finishing the removal of the v0.1.x command-line package $legacy_v" ;;
+esac
 say "$decision"
 exit 0

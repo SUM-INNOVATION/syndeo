@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Handed to pkgbuild as its component property list, for the one bundle in
+  the payload, Syndeo.app.
+
+  BundleIsRelocatable false: installed at /Applications/Syndeo.app and
+  nowhere else, even when a copy of the same bundle is somewhere else, such
+  as the Trash. BundleIsVersionChecked false: Installer always lays down this
+  package's bundle. With pkgbuild's default, true, an older package left a
+  newer bundle in place and still wrote its own, older receipt (measured on a
+  runner); refusing an older package is the preinstall's job instead.
+  BundleHasStrictIdentifier true and BundleOverwriteAction upgrade are
+  pkgbuild's defaults: an upgrade replaces the bundle in place, and removes
+  what the new one no longer holds.
+-->
+<plist version="1.0">
+<array>
+	<dict>
+		<key>BundleHasStrictIdentifier</key>
+		<true/>
+		<key>BundleIsRelocatable</key>
+		<false/>
+		<key>BundleIsVersionChecked</key>
+		<false/>
+		<key>BundleOverwriteAction</key>
+		<string>upgrade</string>
+		<key>RootRelativeBundlePath</key>
+		<string>Syndeo.app</string>
+	</dict>
+</array>
+</plist>

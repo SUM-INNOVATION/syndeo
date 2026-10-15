@@ -1,24 +1,24 @@
 #!/bin/sh
 # The shared helpers below are embedded whole; each script uses only some.
 # shellcheck disable=SC2034,SC2329
-# Remove Syndeo, installed by its macOS package.
+# Remove Syndeo.app, installed by its macOS package.
 #
-#   sudo /bin/sh /usr/local/libexec/syndeo/<version>/uninstall.sh
+#   sudo /bin/sh /Applications/Syndeo.app/Contents/Resources/uninstall.sh
 #
-# One version is installed at a time, and only its own copy of this script,
-# the one the receipt's version carries, removes it. It looks at everything
-# first and changes nothing unless all of it is as the package left it: the
-# receipt, every path the receipt lists, exactly as packaged, `current`
-# pointing at it, and nothing else. After a failed upgrade it refuses, and
-# says to run that upgrade's package again first. Then it removes the seven
-# command links, `current`, the version's files, its directory and the
-# private directory (directories with rmdir, so anything unexpected keeps its
-# directory), and only then forgets the receipt. Each path is looked at again
-# just before it is removed; if one has changed since, it stops there and
-# says what is left.
+# Only the copy inside the installed version removes it. It looks at
+# everything first and changes nothing unless all of it is as the package
+# left it: Syndeo not running, the receipt this package writes, for this
+# version, listing exactly the bundle's paths, and the bundle exactly as
+# packaged, its code signature intact. After a failed upgrade it refuses, and
+# says to run that upgrade's package again first. Then it removes the
+# bundle's files and directories, directories with rmdir, each looked at
+# again just before; if one has changed since, it stops there and says what
+# is left. Only once the bundle is gone is the receipt forgotten. If that
+# fails, it says how, and exits 2.
 #
-# Never touched: homes, ~/.syndeo, keychain items, proxy trust settings, and
-# any path not named above.
+# Never touched: ~/Library/Application Support/Syndeo, preferences, cookies,
+# caches, search settings, any other user data, homes, keychain items, trust
+# settings, /Applications itself, and any path not named above.
 set -eu
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 LC_ALL=C
@@ -33,6 +33,7 @@ ROOT='@ROOT@'
 EXPECT_UID='@EXPECT_UID@'
 EXPECT_GID='@EXPECT_GID@'
 PKGUTIL='@PKGUTIL@'
+CODESIGN='@CODESIGN@'
 
 @COMMON@
 
@@ -40,26 +41,26 @@ case "$#:${1-}" in
     0:) ;;
     1:--help | 1:-h)
         cat <<EOF
-Syndeo $EMBEDDED, installed by its macOS package.
+Syndeo.app $EMBEDDED, installed by its macOS package in $APP_DIR.
 
-One version is installed, whole, in $SYNDEO_DIR/$EMBEDDED/, and the seven
-commands in $SYNDEO_BIN lead to it through $SYNDEO_DIR/current. Quit Syndeo
-before installing or upgrading. An upgrade removes this version and puts the
-new one in its place: while it does, the commands do not start, and a Syndeo
-left running from this version stops at the next program it needs, saying
-it was removed during an upgrade; quit it and start it again. If an upgrade
-fails, run the same package again to finish it.
+There are two ways to remove it:
 
-  sudo /bin/sh $SYNDEO_DIR/$EMBEDDED/uninstall.sh
-      Remove Syndeo: the seven commands, this version, and the receipt.
+  sudo /bin/sh $APP/Contents/Resources/uninstall.sh
+      Remove it completely: the application and the package's receipt.
 
-Nothing is changed unless everything is as the package left it. Homes,
-~/.syndeo, keychain items and proxy trust settings are never touched.
+  Move Syndeo.app to the Trash.
+      The application goes; the package's receipt stays behind, harmlessly.
+      Installing a Syndeo.app package later works the same either way.
+
+Quit Syndeo first. Nothing is changed unless everything is as the package
+left it. Your settings and data are kept, either way:
+~/Library/Application Support/Syndeo, preferences, cookies, caches and
+search settings are never touched, nor are keychain items or trust settings.
 EOF
         exit 0
         ;;
     *)
-        say "usage: sudo /bin/sh $SYNDEO_DIR/$EMBEDDED/uninstall.sh [--help]"
+        say "usage: sudo /bin/sh $APP/Contents/Resources/uninstall.sh [--help]"
         exit 1
         ;;
 esac
@@ -70,62 +71,63 @@ fi
 
 # ------------------------------------------------------------------ look
 
-read_receipt
-if [ "$r_present" = no ]; then
-    say "refusing: no Syndeo package is installed"
+check_apps_dir
+check_not_running
+refuse_if_found
+read_app_receipt
+if [ "$ar_present" = no ]; then
+    say "refusing: no Syndeo.app package is installed. If Syndeo.app is in $APP_DIR without one, move it to the Trash"
     exit 1
 fi
-check_receipt_meta
+check_app_receipt_meta
 refuse_if_found
-if [ "$r_version" != "$EMBEDDED" ]; then
-    if [ -d "$SYNDEO_DIR/$EMBEDDED" ] && [ ! -e "$SYNDEO_DIR/$r_version" ] && [ ! -L "$SYNDEO_DIR/$r_version" ]; then
-        say "refusing: the upgrade from $r_version to $EMBEDDED did not finish. Install the Syndeo $EMBEDDED package again to complete it, then run this again"
+if [ "$ar_version" != "$EMBEDDED" ]; then
+    if [ "$(app_info CFBundleShortVersionString)" = "$EMBEDDED" ] &&
+        [ "$(syndeo_version_cmp "$EMBEDDED" "$ar_version")" = gt ] && is_app_bundle "$EMBEDDED"; then
+        say "refusing: the upgrade from $ar_version to $EMBEDDED did not finish. Install the Syndeo $EMBEDDED package again to complete it, then run this again"
     else
-        say "refusing: this is $EMBEDDED's uninstaller, and the installed package is $r_version. Run $SYNDEO_DIR/$r_version/uninstall.sh"
+        say "refusing: this is the uninstaller of Syndeo.app $EMBEDDED, and the installed package is $ar_version. Run $APP/Contents/Resources/uninstall.sh"
     fi
     exit 1
 fi
-
-check_strict_dir "$SYNDEO_LOCAL"
-check_strict_dir "$SYNDEO_LIBEXEC"
-check_bin_dir "$SYNDEO_BIN"
-if ! is_present "$SYNDEO_DIR"; then
-    finding "$SYNDEO_DIR: is missing"
+if ! is_present "$APP"; then
+    say "refusing: $APP is not there; it may be in the Trash. Its receipt stays behind, harmlessly; to forget it too, run:"
+    say "    sudo /usr/sbin/pkgutil --forget $APP_RECEIPT --volume /"
+    exit 1
 fi
+check_app_bundle "$EMBEDDED"
 refuse_if_found
-scan_private
-scan_bin
-refuse_if_found
-# Exactly the receipt's version, every path it lists as packaged, and nothing
-# else.
-check_receipt_installed "$EMBEDDED"
-if [ "$versions" != " $EMBEDDED" ]; then
-    finding "$SYNDEO_DIR: holds${versions:- no version}; only $EMBEDDED may be there"
+if [ "$app_ticket" != "$ar_ticket" ]; then
+    finding "$APP: its stapled ticket and its receipt disagree"
 fi
-if [ "$current_v" != "$EMBEDDED" ]; then
-    finding "$SYNDEO_DIR/current: points at '${current_v}', not $EMBEDDED"
-fi
-case "$pending_v" in '' | "$EMBEDDED") ;; *) finding "$SYNDEO_DIR/.current.new: points at $pending_v, not $EMBEDDED" ;; esac
 refuse_if_found
 
-# Everything that will be removed, as it is now.
+# Everything that will be removed, as it is now: the files, the ticket if
+# stapled, uninstall.sh last; then the directories, deepest first.
+paths=$(
+    app_manifest | while read -r p t m; do
+        if [ "$t" = f ] && [ "$p" != Contents/Resources/uninstall.sh ]; then
+            echo "$APP/$p"
+        fi
+    done
+    if [ "$app_ticket" = yes ]; then
+        echo "$APP/$APP_TICKET"
+    fi
+    echo "$APP/Contents/Resources/uninstall.sh"
+    app_manifest | while read -r p t m; do
+        if [ "$t" = d ]; then
+            echo "$APP/$p"
+        fi
+    done | LC_ALL=C /usr/bin/sort -r
+    echo "$APP"
+)
 snapshot=''
-remember() {
+while IFS= read -r p; do
     snapshot="$snapshot
-$1	$(meta_line "$1")"
-}
-for n in $SYNDEO_EXECUTABLES $SYNDEO_DOCUMENTS tools/wordcount.wat tools; do
-    remember "$SYNDEO_DIR/$EMBEDDED/$n"
-done
-remember "$SYNDEO_DIR/$EMBEDDED"
-for n in $SYNDEO_NAMES; do
-    remember "$SYNDEO_BIN/$n"
-done
-remember "$SYNDEO_DIR/current"
-if [ -n "$pending_v" ]; then
-    remember "$SYNDEO_DIR/.current.new"
-fi
-remember "$SYNDEO_DIR"
+$p	$(meta_line "$p")"
+done <<EOF
+$paths
+EOF
 
 # ------------------------------------------------------------------ remove
 
@@ -161,47 +163,27 @@ unchanged() {
     [ -n "$_uc_want" ] && [ "$(meta_line "$1")" = "$_uc_want" ]
 }
 
-remove_file() {
-    unchanged "$1" || stop "$1 changed after it was checked"
-    /bin/rm -f -- "$1" || stop "$1 could not be removed"
-    removed="$removed $1"
-}
-
-remove_dir() {
-    unchanged "$1" || stop "$1 changed after it was checked"
-    /bin/rmdir -- "$1" || stop "$1 could not be removed: something unexpected is in it"
-    removed="$removed $1"
-}
-
-for n in $SYNDEO_NAMES; do
-    remove_file "$SYNDEO_BIN/$n"
-done
-remove_file "$SYNDEO_DIR/current"
-if [ -n "$pending_v" ]; then
-    remove_file "$SYNDEO_DIR/.current.new"
-fi
-# The version's files, uninstall.sh last, then its directories.
-for n in $SYNDEO_NAMES $SYNDEO_DOCUMENTS tools/wordcount.wat; do
-    remove_file "$SYNDEO_DIR/$EMBEDDED/$n"
-done
-remove_dir "$SYNDEO_DIR/$EMBEDDED/tools"
-remove_file "$SYNDEO_DIR/$EMBEDDED/uninstall.sh"
-remove_dir "$SYNDEO_DIR/$EMBEDDED"
-remove_dir "$SYNDEO_DIR"
-
-# Every path the receipt owns is gone; only now is it forgotten.
-for n in $SYNDEO_NAMES; do
-    if is_present "$SYNDEO_BIN/$n"; then
-        stop "$SYNDEO_BIN/$n is still there"
+while IFS= read -r p; do
+    unchanged "$p" || stop "$p changed after it was checked"
+    load_meta "$p"
+    if [ "$m_type" = Directory ]; then
+        /bin/rmdir -- "$p" || stop "$p could not be removed: something unexpected is in it"
+    else
+        /bin/rm -f -- "$p" || stop "$p could not be removed"
     fi
-done
-if is_present "$SYNDEO_DIR"; then
-    stop "$SYNDEO_DIR is still there"
+    removed="$removed $p"
+done <<EOF
+$paths
+EOF
+
+# The bundle is gone; only now is the receipt forgotten.
+if is_present "$APP"; then
+    stop "$APP is still there"
 fi
-if ! "$PKGUTIL" --forget "$SYNDEO_ID" --volume / >/dev/null 2>&1; then
-    say "every file is removed, but the receipt could not be forgotten. Run:"
-    say "    sudo /usr/sbin/pkgutil --forget $SYNDEO_ID --volume /"
+if ! "$PKGUTIL" --forget "$APP_RECEIPT" --volume / >/dev/null 2>&1; then
+    say "Syndeo.app is removed, but the package's receipt could not be forgotten. Run:"
+    say "    sudo /usr/sbin/pkgutil --forget $APP_RECEIPT --volume /"
     exit 2
 fi
-say "removed Syndeo $EMBEDDED"
+say "removed Syndeo.app $EMBEDDED. Your settings and data in ~/Library are kept"
 exit 0

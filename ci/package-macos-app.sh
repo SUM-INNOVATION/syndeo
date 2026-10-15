@@ -2,16 +2,24 @@
 # Assemble Syndeo.app, the macOS desktop application, from built binaries.
 #
 #   ci/package-macos-app.sh <version> <binaries-dir> <out-dir>
-#   ci/package-macos-app.sh --check <Syndeo.app> <version>
+#   ci/package-macos-app.sh --check <Syndeo.app> <version> [unsigned|signed|stapled]
+#   ci/package-macos-app.sh --manifest [unsigned|signed|stapled]
 #   ci/package-macos-app.sh --self-test
 #
-# The bundle holds exactly these, and nothing else:
+# The bundle holds exactly these, and nothing else (ci/macos-app/bundle.manifest
+# lists them, with their modes, for this script and for the package's root
+# scripts alike):
 #
-#   Syndeo.app/Contents/Info.plist              ci/macos-app/Info.plist.in, for <version>
-#   Syndeo.app/Contents/PkgInfo                 APPL????
-#   Syndeo.app/Contents/MacOS/Syndeo            <binaries-dir>/syndeo-app
-#   Syndeo.app/Contents/Helpers/syndeo-proxy    <binaries-dir>/syndeo-proxy
-#   Syndeo.app/Contents/Resources/Syndeo.icns   ci/macos-app/Syndeo.icns
+#   Syndeo.app/Contents/Info.plist                ci/macos-app/Info.plist.in, for <version>
+#   Syndeo.app/Contents/PkgInfo                   APPL????
+#   Syndeo.app/Contents/MacOS/Syndeo              <binaries-dir>/syndeo-app
+#   Syndeo.app/Contents/Helpers/syndeo-proxy      <binaries-dir>/syndeo-proxy
+#   Syndeo.app/Contents/Resources/Syndeo.icns     ci/macos-app/Syndeo.icns
+#   Syndeo.app/Contents/Resources/uninstall.sh    ci/macos-pkg/uninstall.sh.in, for <version>
+#
+# uninstall.sh removes the bundle the installer package installed, and that
+# package's receipt (see ci/package-macos-pkg.sh). It is inside the bundle so
+# that it is signed and sealed with it, and goes wherever the bundle goes.
 #
 # The application's one helper is the proxy, which runs the network layer
 # in-process. The app finds it in Contents/Helpers and nowhere else (see
@@ -20,11 +28,18 @@
 #
 # Directories are 0755, the executables 0755 and everything else 0644, with
 # no extended attributes and no links. The bundle is unsigned; signing it is
-# a separate step, the helper first and then the bundle.
+# a separate step (ci/sign-macos.sh --app), the helper first and then the
+# bundle.
 #
 # --check requires a bundle to be exactly that: the paths and their modes,
 # the Info.plist's identifier, executable, versions and minimum system, its
-# App Transport Security exactly as below, the PkgInfo, and an icon.
+# App Transport Security exactly as below, the PkgInfo, an icon, and the
+# uninstaller exactly as rendered for <version>. signed also requires the
+# code signature's two paths, Contents/_CodeSignature/ and its CodeResources;
+# stapled, those and the notarization ticket stapler adds,
+# Contents/CodeResources. It looks at the paths, not at whether the signature
+# verifies: codesign does that. --manifest prints what --check requires, one
+# path per line with its type (d or f) and mode.
 #
 # App Transport Security: web pages may load over plain http, as they do in
 # any browser, and nothing else is relaxed. NSAllowsArbitraryLoadsInWebContent
@@ -41,19 +56,17 @@ die() {
   exit 1
 }
 
-# The bundle's paths, relative to Syndeo.app, with each one's type and mode.
+# manifest [STATE]: the bundle's paths, relative to Syndeo.app, with each
+# one's type and mode, sorted, for an unsigned (the default), signed or
+# stapled bundle.
 manifest() {
-  cat <<'EOF'
-Contents d 755
-Contents/Helpers d 755
-Contents/Helpers/syndeo-proxy f 755
-Contents/Info.plist f 644
-Contents/MacOS d 755
-Contents/MacOS/Syndeo f 755
-Contents/PkgInfo f 644
-Contents/Resources d 755
-Contents/Resources/Syndeo.icns f 644
-EOF
+  {
+    cat "$here/macos-app/bundle.manifest"
+    case "${1:-unsigned}" in
+      signed | stapled) printf '%s\n' 'Contents/_CodeSignature d 755' 'Contents/_CodeSignature/CodeResources f 644' ;;
+    esac
+    if [ "${1:-unsigned}" = stapled ]; then printf '%s\n' 'Contents/CodeResources f 644'; fi
+  } | LC_ALL=C sort
 }
 
 # What APP actually holds, in manifest's form.
@@ -95,9 +108,12 @@ assemble() {
   cp "$bins/syndeo-app" "$staging/Contents/MacOS/Syndeo"
   cp "$bins/syndeo-proxy" "$staging/Contents/Helpers/syndeo-proxy"
   cp "$here/macos-app/Syndeo.icns" "$staging/Contents/Resources/Syndeo.icns"
+  bash "$here/package-macos-pkg.sh" --render uninstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign \
+    "$staging/Contents/Resources/uninstall.sh"
   find "$staging" -type d -exec chmod 755 {} +
   find "$staging" -type f -exec chmod 644 {} +
-  chmod 755 "$staging/Contents/MacOS/Syndeo" "$staging/Contents/Helpers/syndeo-proxy"
+  chmod 755 "$staging/Contents/MacOS/Syndeo" "$staging/Contents/Helpers/syndeo-proxy" \
+    "$staging/Contents/Resources/uninstall.sh"
   xattr -cr "$staging" 2>/dev/null || true
   check "$staging" "$version" >/dev/null
   mv "$staging" "$app"
@@ -105,19 +121,28 @@ assemble() {
   say "assembled $app ($version)"
 }
 
-# check APP VERSION: APP is exactly the bundle for VERSION. Prints each
-# failure; returns non-zero if there was any.
+# check APP VERSION [STATE]: APP is exactly the bundle for VERSION, unsigned
+# (the default), signed or stapled. Prints each failure; returns non-zero if
+# there was any.
 check() {
-  local app="$1" version="$2" plist bad=0 key want have
+  local app="$1" version="$2" state="${3:-unsigned}" plist bad=0 key want have rendered
   plist="$app/Contents/Info.plist"
+  case "$state" in unsigned | signed | stapled) ;; *) die "no state called $state" ;; esac
   if [ ! -d "$app/Contents" ] || [ -L "$app" ]; then
     printf '  FAIL  bundle — %s is not a bundle\n' "$app"
     return 1
   fi
-  if [ "$(holds "$app")" != "$(manifest)" ]; then
-    printf '  FAIL  manifest — %s\n' "$(diff <(manifest) <(holds "$app") | grep '^[<>]' | tr '\n' ';')"
+  if [ "$(holds "$app")" != "$(manifest "$state")" ]; then
+    printf '  FAIL  manifest (%s) — %s\n' "$state" "$(diff <(manifest "$state") <(holds "$app") | grep '^[<>]' | tr '\n' ';')"
     bad=1
   fi
+  rendered="$(mktemp)"
+  if ! bash "$here/package-macos-pkg.sh" --render uninstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign "$rendered" 2>/dev/null ||
+    ! cmp -s "$rendered" "$app/Contents/Resources/uninstall.sh"; then
+    printf '  FAIL  uninstall.sh — not exactly the uninstaller rendered for %s\n' "$version"
+    bad=1
+  fi
+  rm -f "$rendered"
   if ! plutil -lint -s "$plist" >/dev/null 2>&1; then
     printf '  FAIL  Info.plist — not a valid property list\n'
     return 1
@@ -154,7 +179,7 @@ EOF
     bad=1
   fi
   if [ "$bad" = 0 ]; then
-    say "$app is exactly Syndeo.app $version"
+    say "$app is exactly Syndeo.app $version, $state"
   fi
   return "$bad"
 }
@@ -190,7 +215,7 @@ self_test() {
 
   printf '\n  package-macos-app.sh: the bundle, exactly\n'
   fresh
-  expect "0:assembled from the two binaries: exactly the bundle for 0.2.0" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  expect "0:assembled from the two binaries: exactly the bundle for 0.2.0, its uninstaller included" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
   expect "1:another version is not this bundle" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.1
   expect "1:assembling over an existing bundle: refused" bash "$0" 0.2.0 "$T/bins" "$T/out-dir"
   expect "1:a version that is not one: refused" bash "$0" v0.2 "$T/bins" "$T/out-dir/x"
@@ -231,6 +256,25 @@ self_test() {
   ln -s Syndeo "$T/out-dir/Syndeo.app/Contents/MacOS/link"
   expect "1:a link inside the bundle: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
   fresh
+  printf '# changed\n' >>"$T/out-dir/Syndeo.app/Contents/Resources/uninstall.sh"
+  expect "1:an uninstaller other than the one rendered for 0.2.0: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  fresh
+  rm "$T/out-dir/Syndeo.app/Contents/Resources/uninstall.sh"
+  expect "1:no uninstaller: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  fresh
+  expect "1:an unsigned bundle is not a signed one" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0 signed
+  mkdir -m 755 "$T/out-dir/Syndeo.app/Contents/_CodeSignature"
+  printf 'seal' >"$T/out-dir/Syndeo.app/Contents/_CodeSignature/CodeResources"
+  chmod 644 "$T/out-dir/Syndeo.app/Contents/_CodeSignature/CodeResources"
+  expect "0:signed: the signature's two paths as well" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0 signed
+  expect "1:a signed bundle is not the unsigned one" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  expect "1:a signed bundle without a ticket is not a stapled one" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0 stapled
+  printf 'ticket' >"$T/out-dir/Syndeo.app/Contents/CodeResources"
+  chmod 644 "$T/out-dir/Syndeo.app/Contents/CodeResources"
+  expect "0:stapled: the ticket as well" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0 stapled
+  expect "1:a stapled bundle is not merely a signed one" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0 signed
+  expect "1:a state that is not one: refused" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0 notarized
+  fresh
   printf 'garbage' >"$T/out-dir/Syndeo.app/Contents/Info.plist"
   expect "1:an Info.plist that is not one: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
   rm -rf "$T/out-dir/Syndeo.app"
@@ -245,12 +289,17 @@ case "${1:-}" in
     [ "$(uname -s)" = Darwin ] || { printf '\n  on %s: plutil and stat -f are macOS tools; not run\n\n' "$(uname -s)"; exit 0; }
     self_test
     ;;
+  --manifest)
+    [ "$#" -le 2 ] || die "usage: $0 --manifest [unsigned|signed|stapled]"
+    case "${2:-unsigned}" in unsigned | signed | stapled) ;; *) die "no state called $2" ;; esac
+    manifest "${2:-unsigned}"
+    ;;
   --check)
-    [ "$#" = 3 ] || die "usage: $0 --check <Syndeo.app> <version>"
-    check "$2" "$3"
+    [ "$#" = 3 ] || [ "$#" = 4 ] || die "usage: $0 --check <Syndeo.app> <version> [unsigned|signed|stapled]"
+    check "$2" "$3" "${4:-unsigned}"
     ;;
   *)
-    [ "$#" = 3 ] || die "usage: $0 <version> <binaries-dir> <out-dir> | --check <Syndeo.app> <version> | --self-test"
+    [ "$#" = 3 ] || die "usage: $0 <version> <binaries-dir> <out-dir> | --check <Syndeo.app> <version> [unsigned|signed|stapled] | --self-test"
     assemble "$1" "$2" "$3"
     ;;
 esac

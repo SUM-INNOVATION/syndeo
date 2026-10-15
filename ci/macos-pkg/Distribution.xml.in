@@ -2,7 +2,7 @@
 <!--
   The product's own limits, held here whatever the scripts do: Apple Silicon,
   macOS 13 or later, the startup disk and nowhere else, and nothing to
-  customize. No JavaScript.
+  customize. No JavaScript. One component, Syndeo.app.
 -->
 <installer-gui-script minSpecVersion="2">
     <title>Syndeo @VERSION@</title>
@@ -14,11 +14,11 @@
         </allowed-os-versions>
     </volume-check>
     <choices-outline>
-        <line choice="com.sum.syndeo.pkg"/>
+        <line choice="com.sum.syndeo.app"/>
     </choices-outline>
-    <choice id="com.sum.syndeo.pkg" visible="false" title="Syndeo">
-        <pkg-ref id="com.sum.syndeo.pkg"/>
+    <choice id="com.sum.syndeo.app" visible="false" title="Syndeo">
+        <pkg-ref id="com.sum.syndeo.app"/>
     </choice>
-    <pkg-ref id="com.sum.syndeo.pkg" version="@VERSION@" onConclusion="none">syndeo.pkg</pkg-ref>
+    <pkg-ref id="com.sum.syndeo.app" version="@VERSION@" onConclusion="none">Syndeo.pkg</pkg-ref>
     <product id="com.sum.syndeo" version="@VERSION@"/>
 </installer-gui-script>
