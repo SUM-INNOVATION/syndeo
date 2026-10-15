@@ -349,6 +349,48 @@ jobs:
           path: ${{ runner.temp }}/syndeo-app-test/
           if-no-files-found: warn
 
+  macos-app-pkg-measure:
+    name: Syndeo.app's package, measured (not a gate)
+    # Phase 4's first step, measured and not gated: what Installer,
+    # LaunchServices and Gatekeeper do with an application package (probe
+    # packages of Syndeo.app, signed ad hoc), and exactly what the published
+    # v0.1.6 and v0.1.7 packages leave. See ci/measure-app-pkg.sh. No secret,
+    # no environment: a pull request never signs. It fails only if it cannot
+    # put the runner back exactly as it found it.
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      SYNDEO_ALLOW_SYSTEM_INSTALL_TEST: "yes"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-app
+
+      - name: Build the app and its helper
+        run: cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app -p syndeo-proxy
+
+      - name: Probe packages of Syndeo.app, 0.0.1 to 0.0.4
+        run: bash ci/measure-app-pkg.sh build target/aarch64-apple-darwin/release "$RUNNER_TEMP/probe-pkgs"
+
+      - name: The v0.1.x packages, then the probes installed, opened, upgraded, failed and moved to the Trash (measured)
+        run: bash ci/measure-app-pkg.sh run "$RUNNER_TEMP/probe-pkgs"
+
+      - name: Put the runner back exactly as found (the only gate)
+        if: always()
+        run: bash ci/measure-app-pkg.sh cleanup
+
+      - name: Keep the measurements and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app-pkg-measure
+          path: ${{ runner.temp }}/syndeo-app-pkg-measure/
+          if-no-files-found: warn
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-22.04
