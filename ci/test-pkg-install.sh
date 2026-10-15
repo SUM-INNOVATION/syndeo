@@ -21,10 +21,10 @@
 #    v0.1.7 tarball, into /usr/local/bin. Then <pkg>, copied to ~/Downloads and
 #    quarantined as a browser leaves a download: Gatekeeper's verdict on it,
 #    installed, Gatekeeper's verdict on the installed bundle, and install.sh's
-#    commands untouched. Opened by its bundle identifier, as Finder or
-#    Launchpad opens it: the application and its helper run from the
-#    bundle, the helper byte for byte the one the package carried, and nothing
-#    from /usr/local. The package installed again while it runs is refused, as
+#    commands untouched. Opened by its path, as Finder opens it: its bundle
+#    identifier, its executable in the bundle, and its helper running from
+#    the bundle, byte for byte the one the package carried, and nothing from
+#    /usr/local. The package installed again while it runs is refused, as
 #    is its uninstaller; quit, nothing of it left running. Reinstalled.
 #    Installed on another volume: refused. Removed with its uninstaller,
 #    Syndeo's user data kept.
@@ -44,7 +44,9 @@
 # 4. Moved to the Trash as Finder moves it: the receipt stays, the trashed
 #    copy's uninstaller refuses, saying how to forget it; an older package is
 #    refused; <pkg> installs into /Applications again, the trashed copy
-#    untouched, and opening it opens the one in /Applications. Moved to the
+#    untouched. With both copies registered with the runner's LaunchServices
+#    by the test, opening by the bundle identifier opens the one in
+#    /Applications. Moved to the
 #    Trash again, the receipt forgotten as the refusal says, an older package
 #    installs, and <pkg> upgrades it.
 # 5. Removal: a receipt that cannot be forgotten (exit 2, and the command to
@@ -58,7 +60,9 @@
 # there before, and then requires the runner to be exactly as run found it:
 # receipts, /Applications, /usr/local, the user's Syndeo paths,
 # LaunchServices' records for the bundle, keychains, trust settings and
-# Syndeo's defaults. It fails if anything differs.
+# Syndeo's defaults. It fails if anything differs. The runner's
+# LaunchServices records of /Applications/Syndeo.app and of the trashed copy
+# are removed whether or not a bundle is still there, and each checked gone.
 #
 # The checks on the environment below prevent accidents; they are not
 # security.
@@ -231,6 +235,14 @@ for block in re.split(r"\n-{40,}\n", text):
         print("-" * 40)
 '
 }
+
+# ls_paths: the paths of those records, one per line.
+ls_paths() { ls_records | sed -n 's/^path: *//p' | sed 's/ (0x[0-9a-f]*)$//'; }
+# ls_has PATH: the runner's LaunchServices has a record of PATH.
+ls_has() { ls_paths | grep -qxF -- "$1"; }
+# ls_unregister PATH: remove the runner's record of PATH. lsregister is the
+# test's alone: the package's scripts never touch LaunchServices.
+ls_unregister() { "$LSREGISTER" -u "$1" >/dev/null 2>&1 || true; }
 
 # snapshot DIR: what cleanup has to restore, as comparable text.
 snapshot() {
@@ -649,16 +661,70 @@ descendants() {
   return 0
 }
 
-# opened LABEL: open the application through LaunchServices by its bundle
-# identifier, as Finder or Launchpad would; it, and every process under it,
-# runs from /Applications/Syndeo.app, its helper among them, and nothing from
-# /usr/local; a window shows. Sets RUNNING_PID.
-opened() {
+# Syndeo.app is opened two ways, kept apart. launched opens it by its path,
+# as Finder does: how a person opens it, and how this test does. opened_by_id
+# opens it by its bundle identifier, which needs the runner's own
+# LaunchServices to have a record of the bundle; it is used where that is
+# the point, which copy the identifier opens. Installer's log says it
+# registered the bundle "for uid 0", and the first run of this test found no
+# record of it in the runner's LaunchServices 2 seconds after the install,
+# so open -b failed (CI 38817241706), though in the measurement it had
+# found it.
+# When another user's LaunchServices learns of a new bundle is not assumed
+# here: opened_by_id registers it itself, as the runner's user, and
+# ls_diagnostics keeps what Installer and LaunchServices said each time.
+
+# ls_diagnostics LABEL: kept in the logs, and said, never required: the last
+# line in which Installer's log says it registered the bundle, and the
+# runner's LaunchServices records of the bundle identifier.
+ls_diagnostics() {
+  local f registered
+  f="$(ST)/logs/launchservices-$1"
+  registered="$(grep -h 'Registered bundle file:///Applications/Syndeo.app/' "$INSTALL_LOG" 2>/dev/null | tail -n 1 | sed 's/.*PackageKit: //')"
+  {
+    printf 'Installer, last: %s\n' "${registered:-(no such line)}"
+    printf 'the records of %s in the LaunchServices of %s:\n' "$BUNDLE_ID" "$(id -un)"
+    ls_records
+  } >"$f"
+  say "        recorded ($1): Installer's log, last: ${registered:-no such line}; the runner's LaunchServices: $(if ls_has "$APP"; then echo "a record of $APP"; else echo "no record of $APP"; fi)"
+}
+
+# launched LABEL: open Syndeo.app by its path, as Finder does, then
+# came_up. Sets RUNNING_PID.
+launched() {
+  local label="$1" log
+  log="$(ST)/logs/open-$label.log"
+  ls_diagnostics "before-$label"
+  open "$APP" >"$log" 2>&1 || fail "$label: open $APP: $(cat "$log")"
+  came_up "$label"
+  ls_diagnostics "after-$label"
+}
+
+# opened_by_id LABEL: register /Applications/Syndeo.app with the runner's
+# LaunchServices, as the runner's user, wait for its record, open Syndeo.app
+# by its bundle identifier, then came_up. Sets RUNNING_PID.
+opened_by_id() {
+  local label="$1" log
+  log="$(ST)/logs/open-$label.log"
+  "$LSREGISTER" -f "$APP" >"$(ST)/logs/lsregister-$label.log" 2>&1 ||
+    fail "$label: lsregister -f $APP: $(cat "$(ST)/logs/lsregister-$label.log")"
+  must "$label: $APP, registered by the test as the runner's user, has a record in its LaunchServices" wait_for 30 ls_has "$APP"
+  ls_diagnostics "$label"
+  open -b "$BUNDLE_ID" >"$log" 2>&1 || fail "$label: open -b $BUNDLE_ID: $(cat "$log")"
+  came_up "$label"
+}
+
+# came_up LABEL: what open started, polled for: within 30 seconds a process
+# with the bundle identifier com.sum.syndeo, running the bundle's
+# executable, with a window; its helper, and every process under it, runs
+# from /Applications/Syndeo.app, and nothing from /usr/local. Sets
+# RUNNING_PID.
+came_up() {
   local label="$1" pid helper p img
-  open -b "$BUNDLE_ID" >"$(ST)/logs/open-$label.log" 2>&1 || fail "$label: open -b $BUNDLE_ID: $(cat "$(ST)/logs/open-$label.log")"
   wait_for 30 running || fail "$label: nothing running 30 seconds after open"
   pid="$(appctl pids "$BUNDLE_ID" | head -n 1)"
-  must "$label: Syndeo runs $APP/Contents/MacOS/Syndeo" test "$(image_of "$pid")" = "$APP/Contents/MacOS/Syndeo"
+  must "$label: Syndeo runs, with the bundle identifier $BUNDLE_ID" test "$(appctl bundle "$pid")" = "$BUNDLE_ID"
+  must "  ... its executable $APP/Contents/MacOS/Syndeo" test "$(image_of "$pid")" = "$APP/Contents/MacOS/Syndeo"
   must "  ... a window shows" wait_for 30 appctl windows "$pid"
   wait_for 30 sh -c "pgrep -P $pid >/dev/null" || fail "$label: no helper 30 seconds after open"
   helper=''
@@ -780,7 +846,7 @@ run() {
   if [ "${SYNDEO_EXPECT_SIGNED:-no}" = yes ]; then
     must "  ... its notarization ticket is stapled, and validates" xcrun stapler validate "$APP"
   fi
-  opened first
+  launched first
   before="$(package_state)"
   refused while-it-runs "$pkg" "Syndeo is running from $APP (process $RUNNING_PID): quit it first"
   must "  ... Syndeo still runs, the same process" test "$(image_of "$RUNNING_PID")" = "$APP/Contents/MacOS/Syndeo"
@@ -893,10 +959,15 @@ run() {
   refused after-the-trash-older "$s3" "Syndeo.app $version is no longer in /Applications, but its package's receipt remains, and this package is the older 0.0.3"
   installed after-the-trash "$pkg" "installing $version; Syndeo.app $version, which the receipt names, is no longer in /Applications" "$version"
   must "  ... the trashed copy untouched" eval "[ \"\$(as_root find '$trashed' -exec stat -f '%N|%HT|%u|%g|%Lp|%i|%z' {} + | LC_ALL=C sort)\" = \"\$(cat '$st/trashed.before')\" ]"
-  opened after-the-trash
+  "$LSREGISTER" -f "$trashed" >"$st/logs/lsregister-trashed.log" 2>&1 ||
+    fail "lsregister -f $trashed: $(cat "$st/logs/lsregister-trashed.log")"
+  must "the trashed copy, registered by the test as the runner's user, has a record in its LaunchServices" wait_for 30 ls_has "$trashed"
+  opened_by_id after-the-trash
+  must "  ... with both copies registered, the bundle identifier opened the one in /Applications, not the trashed one" eval \
+    "[ \"\$(image_of $RUNNING_PID)\" = '$APP/Contents/MacOS/Syndeo' ] && ! pgrep -f '$trashed/Contents/' >/dev/null"
   quit_app
   must "quit again: nothing left running" none_running
-  "$LSREGISTER" -u "$trashed" >/dev/null 2>&1 || true
+  ls_unregister "$trashed"
   as_root rm -rf "$trashed"
   must "the trashed copy, the test's own, emptied from the Trash" test ! -e "$trashed"
 
@@ -907,7 +978,7 @@ run() {
   must "the receipt forgotten, as the refusal says to" no_receipt "$APP_ID"
   installed downgrade-after-forgetting "$s3" "installing 0.0.3" 0.0.3
   installed upgrade-after-downgrade "$pkg" "upgrading from 0.0.3 to $version" "$version"
-  "$LSREGISTER" -u "$trashed" >/dev/null 2>&1 || true
+  ls_unregister "$trashed"
   as_root rm -rf "$trashed"
   must "the trashed copy emptied from the Trash" test ! -e "$trashed"
 
@@ -953,6 +1024,8 @@ uninstalled() {
   log="$(ST)/logs/uninstall-$(date +%s)"
   data="$(settled_user_data)"
   [ -n "$data" ] || fail "no user data of Syndeo's to keep: it has not been opened"
+  # The runner's record of the bundle, while it is still there to name.
+  ls_unregister "$APP"
   sudo -n /bin/sh "$APP/Contents/Resources/uninstall.sh" >"$log" 2>&1 ||
     { sed 's/^/      | /' "$log"; fail "the uninstaller failed"; }
   must "the uninstaller removed Syndeo.app $v, and its receipt" eval "! present '$APP' && no_receipt $APP_ID && grep -q 'removed Syndeo.app $v' '$log'"
@@ -978,6 +1051,7 @@ EOF
   as_root chown -R root:wheel "$fake" && as_root chmod 755 "$fake" "$fake/pkgutil" || fail "making the stand-in pkgutil"
   bash "$here/package-macos-pkg.sh" --render uninstall "$v" '' 0 0 "$fake/pkgutil" /usr/bin/codesign "$(ST)/uninstall-forget-fails" ||
     fail "rendering the uninstaller with the stand-in"
+  ls_unregister "$APP"
   out="$(sudo -n /bin/sh "$(ST)/uninstall-forget-fails" 2>&1)" && status=0 || status=$?
   printf '%s\n' "$out" >"$(ST)/logs/uninstall-forget-fails"
   must "the receipt cannot be forgotten: the uninstaller exits 2" test "$status" = 2
@@ -1032,10 +1106,12 @@ cleanup() {
       fi
     done
   fi
-  # The bundles, in /Applications and in the Trash, and their receipt.
+  # The bundles, in /Applications and in the Trash, and their receipt; the
+  # runner's LaunchServices records of both paths, whether or not a bundle
+  # is still there.
   for p in "$APP" "$HOME/.Trash/Syndeo.app"; do
+    if is_syndeo_bundle "$p" || ls_has "$p"; then ls_unregister "$p"; fi
     if is_syndeo_bundle "$p"; then
-      "$LSREGISTER" -u "$p" >/dev/null 2>&1 || true
       as_root rm -rf "$p"
       say "cleanup: removed $p"
     fi
@@ -1090,6 +1166,15 @@ cleanup() {
     else
       diff "$st/before/$f.txt" "$st/after/$f.txt" | sed 's/^/      | /'
       problems="$problems; $f differs"
+    fi
+  done
+  # The records, each by name, unless the runner had it before.
+  for p in "$APP" "$HOME/.Trash/Syndeo.app"; do
+    sed 's/ (0x[0-9a-f]*)$//' "$st/before/lsregister.txt" | grep -qxF -- "$p" && continue
+    if ls_has "$p"; then
+      problems="$problems; LaunchServices still has a record of $p"
+    else
+      pass "LaunchServices: no record of $p"
     fi
   done
   pristine || problems="$problems; Syndeo is still installed"

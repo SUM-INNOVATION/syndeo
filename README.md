@@ -194,16 +194,19 @@ sudo installer -pkg Syndeo-<version>.pkg -target /
   test covers:
   - a download quarantined as Safari leaves one, and Gatekeeper's verdict on
     it, then installed;
-  - the application opened through LaunchServices, its helper running from
-    inside the bundle, byte for byte the one the package carried;
+  - the application opened by its path, as Finder opens it: its bundle
+    identifier, its executable, and its helper running from inside the
+    bundle, byte for byte the one the package carried;
   - the published v0.1.6 and v0.1.7 packages removed, every kind of change to
     them refused, and an interrupted removal finished;
   - the commands `install.sh` put in `/usr/local/bin`, left alone;
   - upgrades, a failed upgrade and its repair, a downgrade refused, a
     reinstall, and refusals while the app runs and while a v0.1.x program
     runs;
-  - the Trash: an older package refused, the same one reinstalled, and a
-    deliberate downgrade once the receipt is forgotten;
+  - the Trash: an older package refused, the same one reinstalled, opening
+    by the bundle identifier choosing the copy in `/Applications` over the
+    trashed one (both registered with LaunchServices by the test itself),
+    and a deliberate downgrade once the receipt is forgotten;
   - the uninstaller, and a receipt that cannot be forgotten, with the user's
     data kept throughout;
   - the runner put back afterwards.
