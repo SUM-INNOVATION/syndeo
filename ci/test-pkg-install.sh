@@ -224,9 +224,10 @@ snap_path() {
   fi
 }
 
-# The LaunchServices records that mention com.sum.syndeo, whole.
-ls_records() {
-  "$LSREGISTER" -dump 2>/dev/null | python3 -I -c '
+# ls_filter: of lsregister -dump on stdin, the records that mention
+# com.sum.syndeo, whole.
+ls_filter() {
+  python3 -I -c '
 import re, sys
 text = sys.stdin.read()
 for block in re.split(r"\n-{40,}\n", text):
@@ -236,8 +237,13 @@ for block in re.split(r"\n-{40,}\n", text):
 '
 }
 
+# The LaunchServices records that mention com.sum.syndeo, whole.
+ls_records() { "$LSREGISTER" -dump 2>/dev/null | ls_filter; }
+
+# ls_paths_of: the paths of the records on stdin, one per line.
+ls_paths_of() { sed -n 's/^path: *//p' | sed 's/ (0x[0-9a-f]*)$//'; }
 # ls_paths: the paths of those records, one per line.
-ls_paths() { ls_records | sed -n 's/^path: *//p' | sed 's/ (0x[0-9a-f]*)$//'; }
+ls_paths() { ls_records | ls_paths_of; }
 # ls_has PATH: the runner's LaunchServices has a record of PATH.
 ls_has() { ls_paths | grep -qxF -- "$1"; }
 # ls_unregister PATH: remove the runner's record of PATH. lsregister is the
@@ -672,21 +678,41 @@ descendants() {
 # found it.
 # When another user's LaunchServices learns of a new bundle is not assumed
 # here: opened_by_id registers it itself, as the runner's user, and
-# ls_diagnostics keeps what Installer and LaunchServices said each time.
+# ls_diagnostics keeps what Installer and LaunchServices said each time. (In
+# CI 38829502689 the runner's record appeared on its own, some 3 to 12
+# seconds after Installer's line: evidence, not relied on.)
 
 # ls_diagnostics LABEL: kept in the logs, and said, never required: the last
 # line in which Installer's log says it registered the bundle, and the
-# runner's LaunchServices records of the bundle identifier.
+# runner's LaunchServices records of the bundle identifier. LaunchServices is
+# asked once, and what is said is read from the answer that is kept, never
+# from a second query: two can answer differently, as in CI 38829502689. A
+# query that fails is kept and said as failed, and nothing it printed is
+# taken for its answer. A file already there is not written over.
 ls_diagnostics() {
-  local f registered
+  local f registered records status paths summary
   f="$(ST)/logs/launchservices-$1"
+  [ -e "$f" ] && fail "$f exists; not writing over it"
   registered="$(grep -h 'Registered bundle file:///Applications/Syndeo.app/' "$INSTALL_LOG" 2>/dev/null | tail -n 1 | sed 's/.*PackageKit: //')"
+  records="$("$LSREGISTER" -dump 2>"$f.query" | ls_filter)" && status=0 || status=$?
   {
     printf 'Installer, last: %s\n' "${registered:-(no such line)}"
-    printf 'the records of %s in the LaunchServices of %s:\n' "$BUNDLE_ID" "$(id -un)"
-    ls_records
+    if [ "$status" = 0 ]; then
+      printf 'the records of %s in the LaunchServices of %s:\n' "$BUNDLE_ID" "$(id -un)"
+      printf '%s\n' "${records:-(none)}"
+    else
+      printf 'the LaunchServices of %s: the query failed (lsregister -dump, filtered: status %s), and its answer is not kept; lsregister'"'"'s errors:\n' "$(id -un)" "$status"
+      cat "$f.query"
+    fi
   } >"$f"
-  say "        recorded ($1): Installer's log, last: ${registered:-no such line}; the runner's LaunchServices: $(if ls_has "$APP"; then echo "a record of $APP"; else echo "no record of $APP"; fi)"
+  rm -f "$f.query"
+  if [ "$status" != 0 ]; then
+    summary="not known: the query failed (status $status)"
+  else
+    paths="$(printf '%s\n' "$records" | ls_paths_of)"
+    if grep -qxF -- "$APP" <<<"$paths"; then summary="a record of $APP"; else summary="no record of $APP"; fi
+  fi
+  say "        recorded ($1): Installer's log, last: ${registered:-no such line}; the runner's LaunchServices: $summary"
 }
 
 # launched LABEL: open Syndeo.app by its path, as Finder does, then

@@ -908,6 +908,101 @@ installer: The upgrade was successful.
   expect "log_lines keeps all install.log gained, whole, and filters only a copy" test "$ok" = yes
 }
 
+# st_ls_run DIR ANSWER...: ls_diagnostics() from ci/test-pkg-install.sh,
+# for the label "probe", in DIR, against a stand-in lsregister that counts
+# its calls and gives the answers named, one per call, in turn: record, a
+# record of /Applications/Syndeo.app among another bundle's; none, the other
+# bundle's only; fail, the record, then an error and status 1. Leaves
+# DIR/status, DIR/calls, what it said in DIR/said, and the file it kept,
+# DIR/kept.
+st_ls_run() {
+  local d="$1"; shift
+  mkdir -p "$d/syndeo-pkg-test/logs"
+  printf '%s\n' "$@" >"$d/answers"
+  printf '%s\n' \
+    '2026-10-16 00:33:20+00 runner installer[1]: PackageKit: Registered bundle file:///Applications/Syndeo.app/ for uid 0' \
+    '2026-10-16 00:33:37+00 runner installer[2]: PackageKit: Registered bundle file:///Applications/Syndeo.app/ for uid 501' >"$d/install.log"
+  cat >"$d/lsregister" <<'EOF'
+#!/bin/sh
+d="$(dirname "$0")"
+n=$(($(cat "$d/calls" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$d/calls"
+[ "$*" = -dump ] || { echo "lsregister stand-in: asked for $*" >&2; exit 64; }
+sep=--------------------------------------------------------------------------------
+other() { printf '%s\n' 'bundle id:                  Other (0x10)' 'path:                       /Applications/Other.app (0x20)' 'identifier:                 com.example.other' "$sep"; }
+ours() { printf '%s\n' 'bundle id:                  Syndeo (0x269c)' 'path:                       /Applications/Syndeo.app (0x3edc)' 'identifier:                 com.sum.syndeo' "$sep"; }
+printf '%s\n' 'Checking data integrity......done.' "$sep"
+case "$(sed -n "${n}p" "$d/answers")" in
+  record) other; ours ;;
+  none) other ;;
+  fail) ours; echo 'lsregister: the database could not be read' >&2; exit 1 ;;
+  *) exit 70 ;;
+esac
+EOF
+  chmod +x "$d/lsregister"
+  bash -c '
+    . "$1" --source-only
+    LSREGISTER="$2/lsregister"
+    RUNNER_TEMP="$2"
+    INSTALL_LOG="$2/install.log"
+    ls_diagnostics probe
+  ' _ "$here/test-pkg-install.sh" "$d" >"$d/said" 2>&1
+  echo "$?" >"$d/status"
+  [ -e "$d/calls" ] || echo 0 >"$d/calls"
+  cp "$d/syndeo-pkg-test/logs/launchservices-probe" "$d/kept" 2>/dev/null || : >"$d/kept"
+}
+
+# The real-runner test's LaunchServices diagnostics, which no assertion
+# depends on and which only a real runner otherwise exercises: one query per
+# snapshot, the file kept from it and what is said read from that same
+# answer, so the two cannot disagree, as two queries did in CI 38829502689;
+# a failed query kept and said as failed; a file already there not written
+# over.
+st_launchservices() {
+  printf '\n  the install test: what LaunchServices answered, kept and said once\n'
+  local d ok record='path:                       /Applications/Syndeo.app (0x3edc)'
+
+  d="$T/ls-record-then-none"
+  st_ls_run "$d" record none
+  ok=no
+  if [ "$(cat "$d/status")" = 0 ] && [ "$(cat "$d/calls")" = 1 ] &&
+    grep -qF "the runner's LaunchServices: a record of /Applications/Syndeo.app" "$d/said" &&
+    grep -qxF -- "$record" "$d/kept" && ! grep -qF com.example.other "$d/kept"; then ok=yes; fi
+  expect "LaunchServices diagnostics: asked once, a record kept and said, where a second query would find none" test "$ok" = yes
+  ok=no
+  if grep -qF "recorded (probe): Installer's log, last: Registered bundle file:///Applications/Syndeo.app/ for uid 501;" "$d/said" &&
+    [ "$(head -n 1 "$d/kept")" = 'Installer, last: Registered bundle file:///Applications/Syndeo.app/ for uid 501' ]; then ok=yes; fi
+  expect "LaunchServices diagnostics: Installer's last registration line kept and said" test "$ok" = yes
+
+  d="$T/ls-none-then-record"
+  st_ls_run "$d" none record
+  ok=no
+  if [ "$(cat "$d/status")" = 0 ] && [ "$(cat "$d/calls")" = 1 ] &&
+    grep -qF "the runner's LaunchServices: no record of /Applications/Syndeo.app" "$d/said" &&
+    grep -qxF '(none)' "$d/kept" && ! grep -q '^path:' "$d/kept"; then ok=yes; fi
+  expect "LaunchServices diagnostics: asked once, no record kept and said, where a second query would find one" test "$ok" = yes
+
+  d="$T/ls-fail-then-record"
+  st_ls_run "$d" fail record
+  ok=no
+  if [ "$(cat "$d/status")" = 0 ] && [ "$(cat "$d/calls")" = 1 ] &&
+    grep -qF "the runner's LaunchServices: not known: the query failed (status 1)" "$d/said" &&
+    ! grep -qE 'a record of|no record of' "$d/said" &&
+    grep -qF 'the query failed (lsregister -dump, filtered: status 1)' "$d/kept" &&
+    grep -qxF 'lsregister: the database could not be read' "$d/kept" && ! grep -q '^path:' "$d/kept" &&
+    [ ! -e "$d/syndeo-pkg-test/logs/launchservices-probe.query" ]; then ok=yes; fi
+  expect "LaunchServices diagnostics: a failed query kept and said as failed, nothing of its answer taken" test "$ok" = yes
+
+  d="$T/ls-already-there"
+  mkdir -p "$d/syndeo-pkg-test/logs"
+  echo stale >"$d/syndeo-pkg-test/logs/launchservices-probe"
+  st_ls_run "$d" record
+  ok=no
+  if [ "$(cat "$d/status")" != 0 ] && [ "$(cat "$d/calls")" = 0 ] && [ "$(cat "$d/kept")" = stale ] &&
+    ! grep -qF 'recorded (probe)' "$d/said"; then ok=yes; fi
+  expect "LaunchServices diagnostics: a file already there is not written over, and nothing asked" test "$ok" = yes
+}
+
 # --- macOS: the root scripts, under a temporary root ------------------------
 
 # st_new: a fresh case. C is its directory; R the root, with a space in it,
@@ -2274,6 +2369,7 @@ self_test() {
   mkdir -p "$T/render"
   st_render "$T/render"
   st_harness
+  st_launchservices
   st_release
   if [ "$(uname -s)" = Darwin ]; then
     st_tools
