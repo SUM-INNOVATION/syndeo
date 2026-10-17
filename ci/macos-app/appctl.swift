@@ -27,6 +27,8 @@
 //                                in pid's front window; exits 1 if there is none
 //   appctl value <pid> <id>      that element's value
 //   appctl enabled <pid> <id>    "enabled" or "disabled", for that element
+//   appctl describe <pid> <id>   that element's description and help (its
+//                                tooltip), "description<TAB>help"
 //   appctl menu <pid> <menu> <item>   press a menu item, as a click on it would;
 //                                exits 1 if there is no such item
 //   appctl menu-items <pid> <menu>    the title of each item in that menu, one a line
@@ -278,6 +280,9 @@ case "value" where args.count == 4:
 case "enabled" where args.count == 4:
     guard let pid = Int32(args[2]), let element = identified(pid, args[3]) else { exit(1) }
     print((attribute(element, kAXEnabledAttribute) as? Bool) == true ? "enabled" : "disabled")
+case "describe" where args.count == 4:
+    guard let pid = Int32(args[2]), let element = identified(pid, args[3]) else { exit(1) }
+    print("\(oneLine(attribute(element, kAXDescriptionAttribute)))\t\(oneLine(attribute(element, kAXHelpAttribute)))")
 case "menu" where args.count == 5:
     guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
     exit(AXUIElementPerformAction(item, kAXPressAction as CFString) == .success ? 0 : 1)

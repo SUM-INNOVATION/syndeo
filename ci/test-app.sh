@@ -5,6 +5,7 @@
 #   ci/test-app.sh refuse <Syndeo.app whose proxy cannot start>
 #   ci/test-app.sh mutant <name> <Syndeo.app with that safeguard taken out>
 #   ci/test-app.sh routes <Syndeo.app>
+#   ci/test-app.sh customer <installed Syndeo.app> [again]
 #   ci/test-app.sh measure
 #
 # launch, which gates: open the app with `open`, never by running its
@@ -62,6 +63,23 @@
 #     item for one;
 #   - the user's trust settings are as they were, and the search engine it
 #     chose is removed again.
+#
+# customer, which gates: the part of ci/test-journey.sh's customer journey
+# that happens in the app, on the Syndeo.app the package installed, and
+# nothing of launch's breadth. Opened by its path, as Finder opens it: running
+# as com.sum.syndeo from that bundle, with an on-screen window, its proxy the
+# one helper, from the bundle, and no keystore process; the window holds a web
+# view and shows the start page; https://example.com, typed with this
+# instance's own query, shows its own text and the proxy's count rises (the
+# journey requires the trust settings and keychains unchanged around it);
+# asked to quit, it exits with its proxy. Then opened again, and all of that
+# again. With `again`, after a reinstall: one opening, the same checks. It
+# made no keystore changes.
+# Measured, not gated, in the first opening: what a reload over https does.
+# The proxy's counters (requests, hits, stale, misses, revalidations, 304s
+# and entries) around a fresh https page opened alone, and around another
+# opened and then reloaded with the bar's Reload, as a person would; whether
+# the bar showed Stop; and the page after it.
 #
 # refuse, which gates: a bundle whose proxy cannot start opens all the same,
 # its window says it cannot browse and holds no web view, and no helper runs.
@@ -748,6 +766,104 @@ launch() {
   [ "$fails" = 0 ]
 }
 
+# stats_now WHEN: the proxy's own page, opened as counted opens it, and its
+# counters on one line, "requests N hits N stale N misses N revalidations N
+# 304 N entries N", a ? for any not found. Sets STATS (and, through
+# counted, COUNTED and ENTRIES).
+STATS=''
+stats_now() {
+  local tree k v
+  counted "$1"
+  tree="$(front)"
+  STATS=''
+  for k in requests hits stale misses revalidations '304:' entries; do
+    v="$(printf '%s\n' "$tree" | grep -oE "$k [0-9]+" | head -n 1 | awk '{print $NF}')"
+    STATS="$STATS${STATS:+ }${k%:} ${v:-?}"
+  done
+}
+
+# change BEFORE AFTER: each counter's change between two STATS lines.
+change() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    n = split(a, x, " "); split(b, y, " "); s = ""
+    for (i = 1; i < n; i += 2) {
+      d = (x[i + 1] ~ /^[0-9]+$/ && y[i + 1] ~ /^[0-9]+$/) ? sprintf("%+d", y[i + 1] - x[i + 1]) : "?"
+      s = s (s == "" ? "" : " ") x[i] " " d
+    }
+    print s
+  }'
+}
+
+# reload_measured: what a reload over https does, measured and recorded,
+# never judged. A fresh https page opened alone, between two readings of the
+# proxy's counters; then another fresh one, opened and reloaded with the
+# bar's Reload, between two more. Reading the counters opens the proxy's own
+# page, which the proxy does not count, so each pair brackets exactly what
+# was opened between them. Kept in reload.txt too.
+reload_measured() {
+  local a b c pressed=no stop_seen=no reloaded=no out="$LOGS/reload.txt" said
+  stats_now "before a fresh https page, opened alone"
+  a="$STATS"
+  FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  visit "https://example.com/?$FRESH" "https://example.com/?$FRESH" "$EXAMPLE_BODY" "another fresh https page opens"
+  stats_now "after it"
+  b="$STATS"
+  FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  visit "https://example.com/?$FRESH" "https://example.com/?$FRESH" "$EXAMPLE_BODY" "and one more, to reload"
+  if "$APPCTL" press "$PID" syndeo.reload; then
+    pressed=yes
+    if wait_for 5 sh -c '"$1" describe "$2" syndeo.reload | grep -q "Stop"' _ "$APPCTL" "$PID"; then stop_seen=yes; fi
+    if wait_for 30 sh -c '"$1" describe "$2" syndeo.reload | grep -q "Reload"' _ "$APPCTL" "$PID"; then reloaded=yes; fi
+  fi
+  said="address field '$(address)', page: $(page_text | head -c 120)"
+  stats_now "after it was reloaded"
+  c="$STATS"
+  {
+    printf 'a fresh https page, opened alone\n  before: %s\n  after:  %s\n  change: %s\n' "$a" "$b" "$(change "$a" "$b")"
+    printf 'another, opened and then reloaded with the bar'"'"'s Reload\n  before: %s\n  after:  %s\n  change: %s\n' "$b" "$c" "$(change "$b" "$c")"
+    printf 'Reload pressed: %s; the bar showed Stop then: %s; it read Reload again within 30 s: %s; the button now: %s\n' \
+      "$pressed" "$stop_seen" "$reloaded" "$("$APPCTL" describe "$PID" syndeo.reload | tr '\t' '|')"
+    printf 'after the reload: %s\n' "$said"
+  } >"$out"
+  sed 's/^/  MEASURE  /' "$out"
+}
+
+# customer_round APP ROUND [reload]: one opening, as customer describes it.
+customer_round() {
+  local app="$1" round="$2"
+  started "$app" "$round" || return
+  helper_of "$app" "$round"
+  browses "$round"
+  arrive "" 'Welcome to Syndeo' "the window shows the start page, with an empty address field ($round)"
+  pinned
+  if [ "${3:-}" = reload ]; then reload_measured; fi
+  stopped "$round"
+}
+
+# customer APP [again]: see the top of this script.
+customer() {
+  local app keystore_before home
+  [ -d "${1:-}" ] || { say "usage: $0 customer <Syndeo.app> [again]"; exit 2; }
+  app="$(cd "$1" && pwd -P)"
+  home="$HOME/Library/Application Support/Syndeo"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  keystore_before="$(keystore_item)"
+  if [ "${2:-}" = again ]; then
+    printf '\nSyndeo.app, installed again, opened once more: %s\n' "$app"
+    customer_round "$app" customer-again
+  else
+    printf '\nSyndeo.app, opened as a customer opens it: %s\n' "$app"
+    customer_round "$app" customer-first reload
+    printf '\nquit, and opened again\n'
+    customer_round "$app" customer-reopened
+  fi
+  printf '\nwhat it left\n'
+  must "$([ ! -e "$home/.keystore" ] && echo yes)" "no keystore in its home ($home)" "$(ls -la "$home/.keystore" 2>&1 | head -3)"
+  must "$([ "$keystore_before" = absent ] && [ "$(keystore_item)" = absent ] && echo yes)" "no keychain item for a keystore, before or after" "before: $keystore_before, after: $(keystore_item)"
+  printf '\n%d failed\n' "$fails"
+  [ "$fails" = 0 ]
+}
+
 # refuse APP: APP's helper cannot start. The app has to open all the same,
 # and its window has to say it cannot browse, hold no web view, and leave no
 # helper running.
@@ -1427,6 +1543,7 @@ case "${1:-}" in
   refuse) shift; refuse "$@" ;;
   mutant) shift; mutant "$@" ;;
   routes) shift; routes "$@" ;;
+  customer) shift; customer "$@" ;;
   measure) measure ;;
-  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | measure"; exit 2 ;;
+  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | measure"; exit 2 ;;
 esac
