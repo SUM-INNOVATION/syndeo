@@ -149,9 +149,16 @@ jobs:
     # handles, the published v0.1.x packages and install.sh's commands
     # included; and the runner put back, whatever happened. Unsigned, with no
     # secrets: a pull request never signs, and Gatekeeper has to reject what
-    # it builds. Only the logs are kept, never the package.
+    # it builds. Besides the logs, the package is kept for one day as
+    # pr-package-adhoc-unsigned-<the commit built>, with its SHA-256 as this
+    # job's output, for macos-journey alone: it is unsigned, Gatekeeper
+    # rejects it, and no release job can read it (a release run reads only
+    # its own run's artifacts, and ci/check-workflows.py keeps release.yml
+    # from naming it or reaching into another run).
     runs-on: macos-15
     timeout-minutes: 90
+    outputs:
+      pkg-sha256: ${{ steps.pkg.outputs.sha256 }}
     env:
       SYNDEO_ALLOW_SYSTEM_INSTALL_TEST: "yes"
       SYNDEO_EXPECT_SIGNED: "no"
@@ -198,6 +205,28 @@ jobs:
       - name: Inspect the package without installing it
         run: bash ci/verify-pkg.sh inspect "$PKG" "$VERSION" --app "$APP"
 
+      - name: The package's SHA-256, and the package, unsigned, kept one day for macos-journey
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          sum="$(shasum -a 256 "$PKG" | cut -d' ' -f1)"
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+          {
+            echo "### pr-package-adhoc-unsigned-$GITHUB_SHA"
+            echo ""
+            echo "Syndeo-$VERSION.pkg, SHA-256 \`$sum\`, built from $GITHUB_SHA (for a pull request, GitHub's merge of it into its base)."
+            echo ""
+            echo "**Unsigned:** signed ad hoc, with no Developer ID and no notarization, so **Gatekeeper rejects it**."
+            echo "Kept one day, for this run's macos-journey job alone. It is not a release, no release job can read it, and it is not for installing."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-package-adhoc-unsigned-${{ github.sha }}
+          path: ${{ env.PKG }}
+          retention-days: 1
+          if-no-files-found: error
+
       - name: Install it, open it, upgrade, break, repair, move to the Trash and remove it, over the v0.1.x packages and install.sh's commands
         run: bash ci/test-pkg-install.sh run "$PKG" "$VERSION"
 
@@ -211,6 +240,69 @@ jobs:
         with:
           name: macos-package-logs
           path: ${{ runner.temp }}/syndeo-pkg-test/logs/
+          if-no-files-found: warn
+
+  macos-journey:
+    name: Syndeo.app, a customer's journey on a pristine runner
+    # One new customer, end to end (ci/test-journey.sh), with the exact
+    # package macos-package made, required by its SHA-256, on a runner that
+    # has built nothing: downloaded and quarantined; Gatekeeper's verdict,
+    # which for this ad hoc package has to be a rejection; installed; opened
+    # by its path, browsing https pinned with Syndeo's authority in no trust
+    # settings, quit and opened again; installed again; removed; the trust
+    # settings and keychains exactly as they were; and the runner put back,
+    # whatever happened. What a reload over https does is measured, not
+    # judged. Nothing of Phase 4's states is repeated here. Only the logs are
+    # kept.
+    needs: macos-package
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      SYNDEO_ALLOW_SYSTEM_INSTALL_TEST: "yes"
+      SYNDEO_ALLOW_APP_TEST: "yes"
+      SYNDEO_EXPECT_SIGNED: "no"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-package-adhoc-unsigned-${{ github.sha }}
+          path: ${{ runner.temp }}/package
+
+      - name: The package, byte for byte the one macos-package made
+        shell: bash
+        env:
+          WANT: ${{ needs.macos-package.outputs.pkg-sha256 }}
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          {
+            echo "VERSION=$version"
+            echo "PKG=$RUNNER_TEMP/package/Syndeo-$version.pkg"
+          } >> "$GITHUB_ENV"
+          printf '%s  %s\n' "$WANT" "$RUNNER_TEMP/package/Syndeo-$version.pkg" | shasum -a 256 -c -
+          {
+            echo "The journey's package: pr-package-adhoc-unsigned-$GITHUB_SHA, Syndeo-$version.pkg, SHA-256 \`$WANT\`."
+            echo ""
+            echo "**Unsigned** (ad hoc): **Gatekeeper rejects it**, and this journey requires that it does."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download it, install it, use it, quit and open it again, install it again, and remove it
+        env:
+          WANT: ${{ needs.macos-package.outputs.pkg-sha256 }}
+        run: bash ci/test-journey.sh run "$PKG" "$VERSION" "$WANT"
+
+      - name: Put the runner back, whatever happened
+        if: always()
+        run: bash ci/test-journey.sh cleanup
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-journey-logs
+          path: |
+            ${{ runner.temp }}/syndeo-journey/logs/
+            ${{ runner.temp }}/syndeo-app-test/
           if-no-files-found: warn
 
   macos-app:

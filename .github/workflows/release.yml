@@ -26,6 +26,20 @@
 # the release needs both. Only those four jobs declare release-macos; it is
 # a boundary for the signing configuration and nothing more: no required
 # reviewers and no wait timer, so no run waits for anyone there.
+#
+# The installer package's bytes, from package to publication, by one
+# SHA-256: package gives the SHA-256 of the package it made as its output,
+# pkg-sha256. pkg-install (every state the package handles), acceptance (one
+# customer's journey) and checksums each require the package they download
+# to have exactly that SHA-256 before they use it. acceptance gives the
+# SHA-256 it accepted as its output, and only once the journey has passed.
+# publish and rehearse, before any draft, require acceptance's SHA-256 to be
+# package's, the package they are about to upload to have it, and SHA256SUMS
+# to list it so; their check of the draft then requires the draft's assets
+# to be those bytes. The package published is the package accepted, signed,
+# notarized and stapled, with Gatekeeper accepting it; a dry run rehearses
+# the same with the package it would publish. No release job reads another
+# run's artifacts, and none names a pull request's unsigned package.
 # ci/check-workflows.py, run on every pull request, keeps all of this so.
 name: Release
 
@@ -424,6 +438,8 @@ jobs:
     runs-on: macos-15
     environment: release-macos
     timeout-minutes: 350
+    outputs:
+      pkg-sha256: ${{ steps.pkg.outputs.sha256 }}
     env:
       VERSION: ${{ needs.verify.outputs.version }}
       SIGNED: ${{ needs.signing-config.outputs.signed }}
@@ -531,6 +547,15 @@ jobs:
           MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
         run: bash ci/verify-pkg.sh inspect "dist/$PKG" "$VERSION" --app "$RUNNER_TEMP/app/Syndeo.app"
 
+      # The SHA-256 every later job requires of the package it downloads.
+      - name: The package's SHA-256, which every later job requires
+        id: pkg
+        run: |
+          set -euo pipefail
+          sum="$(shasum -a 256 "dist/$PKG" | cut -d' ' -f1)"
+          echo "sha256=$sum" >> "$GITHUB_OUTPUT"
+          echo "$PKG: $sum" >> "$GITHUB_STEP_SUMMARY"
+
       - name: The submission, in the summary, whatever happened
         if: always()
         run: |
@@ -592,6 +617,10 @@ jobs:
           path: dist
       - name: The package
         run: echo "PKG=$GITHUB_WORKSPACE/dist/Syndeo-$VERSION.pkg" >> "$GITHUB_ENV"
+      - name: The package, byte for byte the one package made
+        env:
+          WANT: ${{ needs.package.outputs.pkg-sha256 }}
+        run: printf '%s  %s\n' "$WANT" "dist/Syndeo-$VERSION.pkg" | shasum -a 256 -c -
 
       - name: Install it, open it, upgrade, break, repair, move to the Trash and remove it, over the v0.1.x packages and install.sh's commands
         run: bash ci/test-pkg-install.sh run "$PKG" "$VERSION"
@@ -606,6 +635,66 @@ jobs:
         with:
           name: release-package-logs
           path: ${{ runner.temp }}/syndeo-pkg-test/logs/
+          if-no-files-found: warn
+
+  # One customer's journey (ci/test-journey.sh), as every pull request runs
+  # it, with the exact package this run would publish, on a fresh runner:
+  # downloaded and quarantined; Gatekeeper's verdict, which, signed, has to
+  # accept the package and the Syndeo.app it installs, and, unsigned, to
+  # reject both; installed, used, quit and opened again, installed again,
+  # removed; and the runner put back. Its output is the SHA-256 it accepted,
+  # set only once the journey has passed; publish and rehearse upload
+  # nothing else. No secrets and no environment; only its logs are kept.
+  acceptance:
+    name: the package, a customer's journey on a fresh runner
+    needs: [verify, build-macos, notarize-binaries, package]
+    runs-on: macos-15
+    timeout-minutes: 60
+    outputs:
+      accepted-sha256: ${{ steps.accepted.outputs.sha256 }}
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      SYNDEO_ALLOW_SYSTEM_INSTALL_TEST: "yes"
+      SYNDEO_ALLOW_APP_TEST: "yes"
+      SYNDEO_EXPECT_SIGNED: ${{ needs.notarize-binaries.outputs.notarization == 'accepted' && 'yes' || 'no' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: syndeo-aarch64-apple-darwin
+          path: dist
+      - name: The package, byte for byte the one package made
+        env:
+          WANT: ${{ needs.package.outputs.pkg-sha256 }}
+        run: printf '%s  %s\n' "$WANT" "dist/Syndeo-$VERSION.pkg" | shasum -a 256 -c -
+
+      - name: Download it, install it, use it, quit and open it again, install it again, and remove it
+        env:
+          WANT: ${{ needs.package.outputs.pkg-sha256 }}
+        run: bash ci/test-journey.sh run "$GITHUB_WORKSPACE/dist/Syndeo-$VERSION.pkg" "$VERSION" "$WANT"
+
+      - name: Accepted, and only now its SHA-256 handed on
+        id: accepted
+        env:
+          WANT: ${{ needs.package.outputs.pkg-sha256 }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$WANT" "dist/Syndeo-$VERSION.pkg" | shasum -a 256 -c -
+          echo "sha256=$WANT" >> "$GITHUB_OUTPUT"
+          echo "accepted: Syndeo-$VERSION.pkg, SHA-256 $WANT" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Put the runner back, whatever happened
+        if: always()
+        run: bash ci/test-journey.sh cleanup
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-journey-logs
+          path: |
+            ${{ runner.temp }}/syndeo-journey/logs/
+            ${{ runner.temp }}/syndeo-app-test/
           if-no-files-found: warn
 
   # Exactly the three tarballs and the package, named for this version, and
@@ -624,6 +713,10 @@ jobs:
           pattern: syndeo-*
           path: dist
           merge-multiple: true
+      - name: The package, byte for byte the one package made
+        env:
+          WANT: ${{ needs.package.outputs.pkg-sha256 }}
+        run: printf '%s  %s\n' "$WANT" "dist/Syndeo-$VERSION.pkg" | shasum -a 256 -c -
       - name: Exactly the four assets, and SHA256SUMS over them
         run: bash ci/verify-pkg.sh release sums dist "$VERSION"
       - uses: actions/upload-artifact@v4
@@ -638,7 +731,7 @@ jobs:
   # draft and nothing is public.
   publish:
     name: publish
-    needs: [verify, signing-config, build-macos, notarize-binaries, package, pkg-install, checksums]
+    needs: [verify, signing-config, build-macos, notarize-binaries, package, pkg-install, acceptance, checksums]
     if: needs.verify.outputs.publish == 'true'
     runs-on: ubuntu-22.04
     permissions:
@@ -653,6 +746,21 @@ jobs:
         with:
           name: release-assets
           path: dist
+      - name: The package acceptance accepted, and nothing else, byte for byte
+        env:
+          WANT: ${{ needs.package.outputs.pkg-sha256 }}
+          ACCEPTED: ${{ needs.acceptance.outputs.accepted-sha256 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ACCEPTED" ] || [ "$ACCEPTED" != "$WANT" ]; then
+            echo "::error::acceptance accepted '$ACCEPTED'; package made '$WANT'"
+            exit 1
+          fi
+          printf '%s  %s\n' "$ACCEPTED" "dist/Syndeo-$VERSION.pkg" | shasum -a 256 -c -
+          if ! grep -qxF "$ACCEPTED  Syndeo-$VERSION.pkg" dist/SHA256SUMS; then
+            echo "::error::SHA256SUMS does not list Syndeo-$VERSION.pkg as $ACCEPTED"
+            exit 1
+          fi
       - name: A draft first
         run: |
           set -euo pipefail
@@ -680,7 +788,7 @@ jobs:
   # so its tag is never created; the last step fails if either remains.
   rehearse:
     name: rehearse the draft (dry run, never published)
-    needs: [verify, signing-config, build-macos, notarize-binaries, package, pkg-install, checksums]
+    needs: [verify, signing-config, build-macos, notarize-binaries, package, pkg-install, acceptance, checksums]
     if: needs.verify.outputs.publish != 'true'
     runs-on: ubuntu-22.04
     permissions:
@@ -696,6 +804,21 @@ jobs:
         with:
           name: release-assets
           path: dist
+      - name: The package acceptance accepted, and nothing else, byte for byte
+        env:
+          WANT: ${{ needs.package.outputs.pkg-sha256 }}
+          ACCEPTED: ${{ needs.acceptance.outputs.accepted-sha256 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ACCEPTED" ] || [ "$ACCEPTED" != "$WANT" ]; then
+            echo "::error::acceptance accepted '$ACCEPTED'; package made '$WANT'"
+            exit 1
+          fi
+          printf '%s  %s\n' "$ACCEPTED" "dist/Syndeo-$VERSION.pkg" | shasum -a 256 -c -
+          if ! grep -qxF "$ACCEPTED  Syndeo-$VERSION.pkg" dist/SHA256SUMS; then
+            echo "::error::SHA256SUMS does not list Syndeo-$VERSION.pkg as $ACCEPTED"
+            exit 1
+          fi
       - name: A draft that is never published
         run: |
           set -euo pipefail

@@ -5,7 +5,16 @@
 
 ci.yml runs on every pull request, so it may reference no `secrets.` and no
 `environment:` at all, and may not run on pull_request_target, which would
-hand a fork's code the repository's secrets.
+hand a fork's code the repository's secrets. Its unsigned package, too:
+- macos-package gives its package's SHA-256 as its output pkg-sha256, says
+  in its summary that the package is unsigned and that Gatekeeper rejects
+  it, and keeps exactly that package, as
+  pr-package-adhoc-unsigned-${{ github.sha }}, for one day;
+- macos-journey, which needs exactly macos-package, is the only other job
+  that names it: it downloads it, requires it to have that SHA-256 before
+  the journey, says the same in its summary, runs the journey with that
+  SHA-256 and SYNDEO_EXPECT_SIGNED "no", and puts the runner back whatever
+  happened.
 
 release.yml holds the signing and notarization secrets. Four jobs may see
 them, each only its own share, and each declares the release-macos
@@ -27,8 +36,22 @@ is not an approval gate. Checked:
 - in each, ci/check-signing-config.sh runs first, for its own stage, before
   anything signs or notarizes; signing-config signs nothing;
 - the macOS release runs in order: build-macos, then notarize-binaries, then
-  package, then pkg-install and checksums, with exactly the needs that make
-  it so, and no job-level `if:` but publish's and rehearse's;
+  package, then pkg-install, acceptance and checksums, with exactly the
+  needs that make it so, and no job-level `if:` but publish's and
+  rehearse's;
+- the installer package's bytes, by one SHA-256, from package to
+  publication: package gives the SHA-256 of dist/$PKG as its output
+  pkg-sha256, after inspecting it and before handing it on; pkg-install,
+  acceptance and checksums each require the package they download to have
+  it before they use it; acceptance runs the journey on it, expecting
+  Gatekeeper to accept exactly when the binaries' notarization was
+  accepted, gives the SHA-256 it accepted as its output accepted-sha256 only
+  after the journey and from bytes it checked again, and puts the runner
+  back whatever happened; publish and rehearse, before any draft, fail
+  unless acceptance's SHA-256 is package's, the package they upload has
+  it, and SHA256SUMS lists it so;
+- no release job names a pull request's unsigned package, or downloads an
+  artifact from another run;
 - the tarball's and Syndeo.app's provenance: build-macos uploads each, the
   bundle as a ZIP, and gives their SHA-256s; notarize-binaries requires those
   bytes, and puts that bundle in its one submission with the seven
@@ -47,8 +70,9 @@ is not an approval gate. Checked:
   diagnostics and cleanup), and at least 30 minutes between them;
 - only publish and rehearse raise the token to `contents: write`, and
   nothing asks for write-all;
-- publish and rehearse each need exactly verify, build-macos, pkg-install
-  and checksums;
+- publish and rehearse each need exactly verify, signing-config,
+  build-macos, notarize-binaries, package, pkg-install, acceptance and
+  checksums;
 - every `gh release create` makes a draft (`--draft`), and publish's names
   its tag with `--verify-tag`;
 - only publish makes a release public (`--draft=false`), only for a tag,
@@ -81,13 +105,14 @@ SIGNING_JOBS = {
     "notarize-binaries": (NOTARY | TEAM, "binary-notarize"),
     "package": (INSTALLER | NOTARY | TEAM, "package"),
 }
-ORDER = ["verify", "signing-config", "build-macos", "notarize-binaries", "package", "pkg-install", "checksums"]
+ORDER = ["verify", "signing-config", "build-macos", "notarize-binaries", "package", "pkg-install", "acceptance", "checksums"]
 GRAPH = {
     "signing-config": ["verify"],
     "build-macos": ["signing-config", "verify"],
     "notarize-binaries": ["build-macos", "signing-config", "verify"],
     "package": ["build-macos", "notarize-binaries", "signing-config", "verify"],
     "pkg-install": ["build-macos", "notarize-binaries", "package", "verify"],
+    "acceptance": ["build-macos", "notarize-binaries", "package", "verify"],
     "checksums": ["build-linux", "build-macos", "notarize-binaries", "package", "verify"],
 }
 JOB_IFS = {"publish": "if: needs.verify.outputs.publish == 'true'", "rehearse": "if: needs.verify.outputs.publish != 'true'"}
@@ -109,6 +134,77 @@ def check_ci(text):
             found.append("ci.yml:%d declares an environment" % n)
         if "pull_request_target" in c:
             found.append("ci.yml:%d runs on pull_request_target" % n)
+    return found + check_ci_package(text)
+
+
+PR_PACKAGE = "name: pr-package-adhoc-unsigned-${{ github.sha }}"
+PR_WANT = "WANT: ${{ needs.macos-package.outputs.pkg-sha256 }}"
+
+
+def has(st, line):
+    """Whether step ST has a line that is exactly LINE, stripped."""
+    return any(c.strip() == line for _, c in st)
+
+
+def holds(st, needle):
+    """Whether step ST has a line holding NEEDLE."""
+    return any(needle in c for _, c in st)
+
+
+def conditional(st):
+    return any(c.strip().startswith("if:") for _, c in st)
+
+
+def says_unsigned(st, unsigned):
+    return holds(st, unsigned) and holds(st, "**Gatekeeper rejects it**")
+
+
+def check_ci_package(text):
+    """The pull request's unsigned package: kept a day, for macos-journey alone."""
+    found = []
+    _, jobs, _ = blocks(text)
+    mp, mj = jobs.get("macos-package"), jobs.get("macos-journey")
+    if mp is None or mj is None:
+        return ["ci.yml: no macos-package job, or no macos-journey job"]
+    if not any(c.strip() == "pkg-sha256: ${{ steps.pkg.outputs.sha256 }}" for _, c in mp):
+        found.append("ci.yml: macos-package does not give its package's SHA-256 as its output pkg-sha256")
+    st = [s for s in steps(mp) if has(s, "id: pkg")]
+    if len(st) != 1 or not holds(st[0], 'shasum -a 256 "$PKG"') or not holds(st[0], 'echo "sha256=$sum" >> "$GITHUB_OUTPUT"'):
+        found.append("ci.yml: macos-package's step pkg does not take the SHA-256 of $PKG for its output")
+    elif not says_unsigned(st[0], "**Unsigned:**"):
+        found.append("ci.yml: macos-package's summary does not say its package is unsigned and that Gatekeeper rejects it")
+    up = [s for s in steps(mp) if has(s, PR_PACKAGE)]
+    if len(up) != 1 or not holds(up[0], "actions/upload-artifact") or \
+            [c.strip() for _, c in up[0] if c.strip().startswith("retention-days:")] != ["retention-days: 1"] or \
+            [c.strip() for _, c in up[0] if c.strip().startswith("path:")] != ["path: ${{ env.PKG }}"]:
+        found.append("ci.yml: macos-package does not keep exactly its package, as pr-package-adhoc-unsigned-${{ github.sha }}, "
+                     "for one day")
+    for name, lines in jobs.items():
+        for n, c in lines:
+            if "pr-package" not in c:
+                continue
+            if name not in ("macos-package", "macos-journey"):
+                found.append("ci.yml:%d %s names the unsigned package; only macos-package and macos-journey may" % (n, name))
+            elif c.strip().startswith("name:") and c.strip() != PR_PACKAGE:
+                found.append("ci.yml:%d %s names an artifact for the unsigned package otherwise than %s" % (n, name, PR_PACKAGE))
+    if needs_of(mj) != ["macos-package"]:
+        found.append("ci.yml: macos-journey needs %s, not exactly macos-package" % needs_of(mj))
+    if not [s for s in steps(mj) if holds(s, "actions/download-artifact") and has(s, PR_PACKAGE)]:
+        found.append("ci.yml: macos-journey does not download pr-package-adhoc-unsigned-${{ github.sha }}")
+    chk = [s for s in steps(mj) if has(s, PR_WANT)
+           and holds(s, '"$WANT" "$RUNNER_TEMP/package/Syndeo-$version.pkg" | shasum -a 256 -c -') and not conditional(s)]
+    run = first_line(mj, "ci/test-journey.sh run")
+    if not chk or run is None or chk[0][0][0] > run:
+        found.append("ci.yml: macos-journey does not require the package's SHA-256 to be macos-package's before the journey")
+    elif not says_unsigned(chk[0], "**Unsigned**"):
+        found.append("ci.yml: macos-journey's summary does not say its package is unsigned and that Gatekeeper rejects it")
+    journey = [s for s in steps(mj) if holds(s, "ci/test-journey.sh run")]
+    if len(journey) != 1 or not has(journey[0], PR_WANT) or not holds(journey[0], 'ci/test-journey.sh run "$PKG" "$VERSION" "$WANT"'):
+        found.append("ci.yml: macos-journey does not hand the journey macos-package's SHA-256")
+    if [c.strip() for _, c in mj if "SYNDEO_EXPECT_SIGNED" in c] != ['SYNDEO_EXPECT_SIGNED: "no"']:
+        found.append('ci.yml: macos-journey does not require Gatekeeper to reject the unsigned package (SYNDEO_EXPECT_SIGNED: "no")')
+    if not [s for s in steps(mj) if has(s, "if: always()") and holds(s, "ci/test-journey.sh cleanup")]:
+        found.append("ci.yml: macos-journey does not put the runner back whatever happened (ci/test-journey.sh cleanup, if: always())")
     return found
 
 
@@ -322,7 +418,88 @@ def check_release(text):
         if name not in jobs:
             found.append("release.yml: no %s job" % name)
     found += check_order(jobs)
+    found += check_chain(text, jobs)
     found += check_publication(jobs)
+    return found
+
+
+WANT_PKG = "WANT: ${{ needs.package.outputs.pkg-sha256 }}"
+PKG_CHECK = '"$WANT" "dist/Syndeo-$VERSION.pkg" | shasum -a 256 -c -'
+ACCEPTED = "ACCEPTED: ${{ needs.acceptance.outputs.accepted-sha256 }}"
+EXPECT_SIGNED = "SYNDEO_EXPECT_SIGNED: ${{ needs.notarize-binaries.outputs.notarization == 'accepted' && 'yes' || 'no' }}"
+
+
+def fails_when(cmds, cond):
+    """CMDS holds an `if` with COND whose body exits 1 before its `fi`."""
+    for i, c in enumerate(cmds):
+        if c.startswith("if ") and cond in c:
+            for d in cmds[i + 1:]:
+                if d == "fi":
+                    break
+                if d == "exit 1":
+                    return True
+    return False
+
+
+def check_chain(text, jobs):
+    """The installer package's bytes, by one SHA-256, from package to publication."""
+    found = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if "pr-package" in code(line):
+            found.append("release.yml:%d names a pull request's unsigned package" % n)
+    for name, lines in jobs.items():
+        for st in steps(lines):
+            if holds(st, "actions/download-artifact"):
+                for n, c in st:
+                    if re.match(r"^\s+(run-id|github-token|repository):", c):
+                        found.append("release.yml:%d %s downloads from another run (%s)" % (n, name, c.strip()))
+    if not all(j in jobs for j in ("package", "pkg-install", "acceptance", "checksums", "publish", "rehearse")):
+        return found
+    pk, ac = jobs["package"], jobs["acceptance"]
+    if not any(c.strip() == "pkg-sha256: ${{ steps.pkg.outputs.sha256 }}" for _, c in pk):
+        found.append("release.yml: package does not give its package's SHA-256 as its output pkg-sha256")
+    st = [s for s in steps(pk) if has(s, "id: pkg")]
+    if len(st) != 1 or not holds(st[0], 'shasum -a 256 "dist/$PKG"') or \
+            not holds(st[0], 'echo "sha256=$sum" >> "$GITHUB_OUTPUT"') or conditional(st[0]):
+        found.append("release.yml: package's step pkg does not take the SHA-256 of dist/$PKG for its output")
+    else:
+        inspect = first_line(pk, "ci/verify-pkg.sh inspect")
+        upload = [s[0][0] for s in steps(pk) if has(s, "name: syndeo-aarch64-apple-darwin")]
+        if inspect is None or st[0][0][0] < inspect or not upload or st[0][0][0] > min(upload):
+            found.append("release.yml: package takes its package's SHA-256 before inspecting it, or after handing it on")
+    for name, use in (("pkg-install", "ci/test-pkg-install.sh run"), ("acceptance", "ci/test-journey.sh run"),
+                      ("checksums", "ci/verify-pkg.sh release sums")):
+        lines = jobs[name]
+        checked = [s for s in steps(lines) if has(s, WANT_PKG) and holds(s, PKG_CHECK) and not conditional(s)]
+        used = first_line(lines, use)
+        if not checked or used is None or checked[0][0][0] > used:
+            found.append("release.yml: %s does not require the package's SHA-256 to be package's before %s" % (name, use))
+    if not any(c.strip() == "accepted-sha256: ${{ steps.accepted.outputs.sha256 }}" for _, c in ac):
+        found.append("release.yml: acceptance does not give the SHA-256 it accepted as its output accepted-sha256")
+    if [c.strip() for _, c in ac if "SYNDEO_EXPECT_SIGNED" in c] != [EXPECT_SIGNED]:
+        found.append("release.yml: acceptance does not expect Gatekeeper to accept exactly when the binaries' notarization was accepted")
+    journey = [s for s in steps(ac) if holds(s, "ci/test-journey.sh run")]
+    if len(journey) != 1 or not has(journey[0], WANT_PKG) or \
+            not holds(journey[0], 'ci/test-journey.sh run "$GITHUB_WORKSPACE/dist/Syndeo-$VERSION.pkg" "$VERSION" "$WANT"'):
+        found.append("release.yml: acceptance does not run the journey on dist/Syndeo-$VERSION.pkg with package's SHA-256")
+    acc = [s for s in steps(ac) if has(s, "id: accepted")]
+    if len(acc) != 1 or not has(acc[0], WANT_PKG) or not holds(acc[0], PKG_CHECK) or \
+            not holds(acc[0], 'echo "sha256=$WANT" >> "$GITHUB_OUTPUT"') or conditional(acc[0]) or \
+            len(journey) != 1 or acc[0][0][0] < journey[0][0][0]:
+        found.append("release.yml: acceptance hands on a SHA-256 it did not check again, or before the journey has passed")
+    if not [s for s in steps(ac) if has(s, "if: always()") and holds(s, "ci/test-journey.sh cleanup")]:
+        found.append("release.yml: acceptance does not put the runner back whatever happened (ci/test-journey.sh cleanup, if: always())")
+    for name in ("publish", "rehearse"):
+        lines = jobs[name]
+        gate = [s for s in steps(lines) if has(s, WANT_PKG) and has(s, ACCEPTED)]
+        create = first_line(lines, "gh release create")
+        cmds = [c for _, c in joined(gate[0])] if gate else []
+        if not gate or create is None or gate[0][0][0] > create or conditional(gate[0]) or \
+                not fails_when(cmds, 'if [ -z "$ACCEPTED" ] || [ "$ACCEPTED" != "$WANT" ]; then') or \
+                not any('"$ACCEPTED" "dist/Syndeo-$VERSION.pkg" | shasum -a 256 -c -' in c for c in cmds) or \
+                not fails_when(cmds, 'if ! grep -qxF "$ACCEPTED  Syndeo-$VERSION.pkg" dist/SHA256SUMS; then'):
+            found.append("release.yml: %s does not require, before any draft, the package it uploads and SHA256SUMS's line for it "
+                         "to be the SHA-256 acceptance accepted, and that to be package's" % name)
     return found
 
 
@@ -763,8 +940,169 @@ def self_test(directory):
          in_job(rel, "package", ' --deadline-minutes "$NOTARY_DEADLINE_MINUTES"', ' --deadline-minutes 900'),
          "package waits without its NOTARY_DEADLINE_MINUTES")
 
+    print("\n  release.yml: the package's bytes, from package to publication, changed")
+    check_line = "        run: printf '%s  %s\\n' \"$WANT\" \"dist/Syndeo-$VERSION.pkg\" | shasum -a 256 -c -\n"
+    want_pkg = "          WANT: ${{ needs.package.outputs.pkg-sha256 }}"
+    case("package not giving its package's SHA-256", ci,
+         in_job(rel, "package", "    outputs:\n      pkg-sha256: ${{ steps.pkg.outputs.sha256 }}\n", ""),
+         "package does not give its package's SHA-256")
+    case("package taking the SHA-256 of another file", ci,
+         in_job(rel, "package", 'sum="$(shasum -a 256 "dist/$PKG" | cut -d\' \' -f1)"', 'sum="$(shasum -a 256 "dist/$TARBALL" | cut -d\' \' -f1)"'),
+         "package's step pkg does not take the SHA-256 of dist/$PKG")
+    case("package taking the SHA-256 even after a failure", ci,
+         in_job(rel, "package", "        id: pkg\n", "        id: pkg\n        if: always()\n"),
+         "package's step pkg does not take the SHA-256 of dist/$PKG")
+    a, b = job(rel, "package")
+    text = rel[a:b]
+    inspect_at = text.index("      - name: Inspect the package without installing it\n")
+    sha_at = text.index("      # The SHA-256 every later job requires of the package it downloads.\n")
+    summary_at = text.index("      - name: The submission, in the summary, whatever happened\n")
+    early = text[:inspect_at] + text[sha_at:summary_at] + text[inspect_at:sha_at] + text[summary_at:]
+    case("package taking the SHA-256 before inspecting the package", ci, rel[:a] + early + rel[b:],
+         "package takes its package's SHA-256 before inspecting it")
+    for name in ("pkg-install", "acceptance", "checksums"):
+        case("%s not requiring the package's SHA-256" % name, ci, in_job(rel, name, check_line, "        run: true\n"),
+             "%s does not require the package's SHA-256" % name)
+        case("%s requiring another SHA-256" % name, ci,
+             in_job(rel, name, want_pkg, "          WANT: ${{ needs.build-macos.outputs.tarball-sha256 }}"),
+             "%s does not require the package's SHA-256" % name)
+    for name, use in (("pkg-install", "      - name: Install it, open it, upgrade, break, repair, move to the Trash and remove it"),
+                      ("acceptance", "      - name: Download it, install it, use it, quit and open it again, install it again, and remove it\n")):
+        a, b = job(rel, name)
+        text = rel[a:b]
+        check_at = text.index("      - name: The package, byte for byte the one package made\n")
+        use_at = text.index(use)
+        after_at = text.index("\n      - ", use_at + 1) + 1
+        late = text[:check_at] + text[use_at:after_at] + text[check_at:use_at] + text[after_at:]
+        case("%s checking the package only after using it" % name, ci, rel[:a] + late + rel[b:],
+             "%s does not require the package's SHA-256" % name)
+    case("the journey given another SHA-256", ci,
+         in_job(rel, "acceptance", '"$GITHUB_WORKSPACE/dist/Syndeo-$VERSION.pkg" "$VERSION" "$WANT"',
+                '"$GITHUB_WORKSPACE/dist/Syndeo-$VERSION.pkg" "$VERSION" "$(shasum -a 256 "dist/Syndeo-$VERSION.pkg" | cut -c1-64)"'),
+         "acceptance does not run the journey on dist/Syndeo-$VERSION.pkg with package's SHA-256")
+    case("acceptance not giving the SHA-256 it accepted", ci,
+         in_job(rel, "acceptance", "    outputs:\n      accepted-sha256: ${{ steps.accepted.outputs.sha256 }}\n", ""),
+         "acceptance does not give the SHA-256 it accepted")
+    case("acceptance handing on its SHA-256 even when the journey failed", ci,
+         in_job(rel, "acceptance", "        id: accepted\n", "        id: accepted\n        if: always()\n"),
+         "acceptance hands on a SHA-256")
+    case("acceptance handing on a SHA-256 it did not check again", ci,
+         in_job(rel, "acceptance", "          printf '%s  %s\\n' \"$WANT\" \"dist/Syndeo-$VERSION.pkg\" | shasum -a 256 -c -\n", ""),
+         "acceptance hands on a SHA-256")
+    a, b = job(rel, "acceptance")
+    text = rel[a:b]
+    run_at = text.index("      - name: Download it, install it, use it, quit and open it again, install it again, and remove it\n")
+    acc_at = text.index("      - name: Accepted, and only now its SHA-256 handed on\n")
+    put_at = text.index("      - name: Put the runner back, whatever happened\n")
+    early = text[:run_at] + text[acc_at:put_at] + text[run_at:acc_at] + text[put_at:]
+    case("acceptance handing on its SHA-256 before the journey", ci, rel[:a] + early + rel[b:], "acceptance hands on a SHA-256")
+    case("acceptance never expecting Gatekeeper to accept", ci,
+         in_job(rel, "acceptance", "      " + EXPECT_SIGNED, '      SYNDEO_EXPECT_SIGNED: "no"'),
+         "acceptance does not expect Gatekeeper to accept exactly when")
+    case("acceptance not putting the runner back after a failure", ci,
+         in_job(rel, "acceptance", "        if: always()\n        run: bash ci/test-journey.sh cleanup\n", "        run: bash ci/test-journey.sh cleanup\n"),
+         "acceptance does not put the runner back")
+    case("acceptance given the release environment", ci, add_to_job(rel, "acceptance", "    environment: release-macos"),
+         "acceptance declares")
+    case("acceptance given a secret", ci, add_to_job(rel, "acceptance", "    env:\n      X: ${{ secrets.MACOS_TEAM_ID }}"),
+         "acceptance reads secrets.MACOS_TEAM_ID")
+    case("acceptance running whatever happened", ci, add_to_job(rel, "acceptance", "    if: ${{ !cancelled() }}"),
+         "acceptance has a job-level")
+    case("acceptance without package among its needs", ci,
+         in_job(rel, "acceptance", "    needs: [verify, build-macos, notarize-binaries, package]", "    needs: [verify, build-macos, notarize-binaries]"),
+         "acceptance needs")
+    a, b = job(rel, "publish")
+    gate = rel[a:b][rel[a:b].index("      - name: The package acceptance accepted, and nothing else, byte for byte\n"):
+                    rel[a:b].index("      - name: A draft first\n")]
+    for name in ("publish", "rehearse"):
+        want = "%s does not require, before any draft" % name
+        case("%s without its check of the accepted package" % name, ci, in_job(rel, name, gate, ""), want)
+        case("%s not failing when acceptance's SHA-256 differs" % name, ci,
+             in_job(rel, name, "            echo \"::error::acceptance accepted '$ACCEPTED'; package made '$WANT'\"\n            exit 1\n",
+                    "            echo \"::error::acceptance accepted '$ACCEPTED'; package made '$WANT'\"\n"), want)
+        case("%s comparing package's SHA-256 with itself" % name, ci,
+             in_job(rel, name, "          ACCEPTED: ${{ needs.acceptance.outputs.accepted-sha256 }}", "          ACCEPTED: ${{ needs.package.outputs.pkg-sha256 }}"),
+             want)
+        case("%s not checking the package it uploads" % name, ci,
+             in_job(rel, name, "          printf '%s  %s\\n' \"$ACCEPTED\" \"dist/Syndeo-$VERSION.pkg\" | shasum -a 256 -c -\n", ""), want)
+        case("%s not checking SHA256SUMS's line" % name, ci,
+             in_job(rel, name, 'if ! grep -qxF "$ACCEPTED  Syndeo-$VERSION.pkg" dist/SHA256SUMS; then',
+                    'if ! grep -qF "Syndeo-$VERSION.pkg" dist/SHA256SUMS; then'), want)
+        case("%s checking only if asked" % name, ci,
+             in_job(rel, name, "      - name: The package acceptance accepted, and nothing else, byte for byte\n",
+                    "      - name: The package acceptance accepted, and nothing else, byte for byte\n        if: failure()\n"), want)
+    case("publish not failing when SHA256SUMS lists the package otherwise", ci,
+         in_job(rel, "publish", "            echo \"::error::SHA256SUMS does not list Syndeo-$VERSION.pkg as $ACCEPTED\"\n            exit 1\n",
+                "            echo \"::error::SHA256SUMS does not list Syndeo-$VERSION.pkg as $ACCEPTED\"\n"),
+         "publish does not require, before any draft")
+    a, b = job(rel, "checksums")
+    text = rel[a:b]
+    check_at = text.index("      - name: The package, byte for byte the one package made\n")
+    sums_at = text.index("      - name: Exactly the four assets, and SHA256SUMS over them\n")
+    up_at = text.index("      - uses: actions/upload-artifact@v4\n")
+    late = text[:check_at] + text[sums_at:up_at] + text[check_at:sums_at] + text[up_at:]
+    case("checksums checking the package only after writing SHA256SUMS", ci, rel[:a] + late + rel[b:],
+         "checksums does not require the package's SHA-256")
+    a, b = job(rel, "publish")
+    text = rel[a:b]
+    gate_at = text.index("      - name: The package acceptance accepted, and nothing else, byte for byte\n")
+    draft_at = text.index("      - name: A draft first\n")
+    check_at = text.index("      - name: The draft, downloaded and checked\n")
+    late = text[:gate_at] + text[draft_at:check_at] + text[gate_at:draft_at] + text[check_at:]
+    case("publish checking the accepted package only after its draft", ci, rel[:a] + late + rel[b:], "publish does not require, before any draft")
+    case("a release job downloading a pull request's unsigned package", ci,
+         in_job(rel, "checksums", "          pattern: syndeo-*\n", "          pattern: pr-package-*\n"),
+         "names a pull request's unsigned package")
+    case("a release job downloading from another run", ci,
+         in_job(rel, "pkg-install", "          name: syndeo-aarch64-apple-darwin\n          path: dist\n",
+                "          name: syndeo-aarch64-apple-darwin\n          path: dist\n          run-id: 1\n          github-token: ${{ github.token }}\n"),
+         "pkg-install downloads from another run")
+
+    print("\n  ci.yml: the unsigned package, changed")
+    case("macos-package not giving its package's SHA-256", in_job(ci, "macos-package", "    outputs:\n      pkg-sha256: ${{ steps.pkg.outputs.sha256 }}\n", ""), rel,
+         "macos-package does not give its package's SHA-256")
+    case("macos-package taking the SHA-256 of another file",
+         in_job(ci, "macos-package", 'sum="$(shasum -a 256 "$PKG" | cut -d\' \' -f1)"', 'sum="$(shasum -a 256 "$APP/Contents/Info.plist" | cut -d\' \' -f1)"'),
+         rel, "macos-package's step pkg does not take the SHA-256 of $PKG")
+    case("macos-package's summary not saying Gatekeeper rejects the package",
+         in_job(ci, "macos-package", "so **Gatekeeper rejects it**.", "so Gatekeeper may reject it."), rel,
+         "macos-package's summary does not say its package is unsigned")
+    case("macos-package's summary not saying the package is unsigned",
+         in_job(ci, "macos-package", 'echo "**Unsigned:** signed ad hoc', 'echo "Signed ad hoc'), rel,
+         "macos-package's summary does not say its package is unsigned")
+    case("the unsigned package kept for a week", in_job(ci, "macos-package", "          retention-days: 1\n", "          retention-days: 7\n"), rel,
+         "macos-package does not keep exactly its package")
+    case("the unsigned package kept under a name that does not say so",
+         in_job(ci, "macos-package", "          name: pr-package-adhoc-unsigned-${{ github.sha }}\n", "          name: pr-package-${{ github.sha }}\n"),
+         rel, "macos-package names an artifact for the unsigned package otherwise")
+    case("more than the package kept", in_job(ci, "macos-package", "          path: ${{ env.PKG }}\n", "          path: dist/\n"), rel,
+         "macos-package does not keep exactly its package")
+    case("macos-journey not requiring the package's SHA-256",
+         in_job(ci, "macos-journey", "          printf '%s  %s\\n' \"$WANT\" \"$RUNNER_TEMP/package/Syndeo-$version.pkg\" | shasum -a 256 -c -\n", ""),
+         rel, "macos-journey does not require the package's SHA-256")
+    case("macos-journey's summary not saying the package is unsigned",
+         in_job(ci, "macos-journey", "**Unsigned** (ad hoc): **Gatekeeper rejects it**, and this journey requires that it does.",
+                "Ad hoc; this journey records Gatekeeper's verdict."), rel,
+         "macos-journey's summary does not say its package is unsigned")
+    case("the journey given another SHA-256",
+         in_job(ci, "macos-journey", 'ci/test-journey.sh run "$PKG" "$VERSION" "$WANT"', 'ci/test-journey.sh run "$PKG" "$VERSION" "$(shasum -a 256 "$PKG" | cut -c1-64)"'),
+         rel, "macos-journey does not hand the journey macos-package's SHA-256")
+    case("macos-journey expecting Gatekeeper to accept the unsigned package",
+         in_job(ci, "macos-journey", '      SYNDEO_EXPECT_SIGNED: "no"', '      SYNDEO_EXPECT_SIGNED: "yes"'), rel,
+         "macos-journey does not require Gatekeeper to reject")
+    case("macos-journey needing nothing", in_job(ci, "macos-journey", "    needs: macos-package\n", ""), rel,
+         "macos-journey needs")
+    case("macos-journey not putting the runner back after a failure",
+         in_job(ci, "macos-journey", "        if: always()\n        run: bash ci/test-journey.sh cleanup\n", "        run: bash ci/test-journey.sh cleanup\n"),
+         rel, "macos-journey does not put the runner back")
+    case("another job downloading the unsigned package",
+         in_job(ci, "macos-app", "      - name: Build the app and its helper\n",
+                "      - uses: actions/download-artifact@v4\n        with:\n          name: pr-package-adhoc-unsigned-${{ github.sha }}\n"
+                "      - name: Build the app and its helper\n"),
+         rel, "macos-app names the unsigned package")
+
     print("\n  release.yml's publication, changed")
-    deps = ["verify", "signing-config", "build-macos", "notarize-binaries", "package", "pkg-install", "checksums"]
+    deps = ["verify", "signing-config", "build-macos", "notarize-binaries", "package", "pkg-install", "acceptance", "checksums"]
     needs = "    needs: [%s]" % ", ".join(deps)
     for name in ("publish", "rehearse"):
         for dep in deps:
@@ -836,12 +1174,15 @@ def main():
         print("check-workflows: %s" % f)
     if found:
         return 1
-    print("check-workflows: ci.yml reads no secret and no environment; in release.yml only signing-config, build-macos, "
+    print("check-workflows: ci.yml reads no secret and no environment, and keeps its unsigned package one day for "
+          "macos-journey alone, by its SHA-256; in release.yml only signing-config, build-macos, "
           "notarize-binaries and package, behind release-macos, read secrets, each only its own share, each gating first; "
           "the macOS release runs build, notarize the binaries and Syndeo.app, package, in order, on one tarball and one "
           "Syndeo.app by their SHA-256s, runs every signed binary and checks the signed bundle before Apple sees any of them, "
           "staples the bundle before the package is built from it, with one "
-          "submission per file inside each job's time; every release is created a draft, publish checks it before making "
+          "submission per file inside each job's time; pkg-install, acceptance, checksums, publish and rehearse agree on the "
+          "package's one SHA-256, and only the package acceptance accepted is uploaded; every release is created a draft, "
+          "publish checks it before making "
           "it public, and rehearse only deletes its own")
     return 0
 
