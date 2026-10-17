@@ -75,11 +75,14 @@
 # asked to quit, it exits with its proxy. Then opened again, and all of that
 # again. With `again`, after a reinstall: one opening, the same checks. It
 # made no keystore changes.
-# Measured, not gated, in the first opening: what a reload over https does.
-# The proxy's counters (requests, hits, stale, misses, revalidations, 304s
-# and entries) around a fresh https page opened alone, and around another
-# opened and then reloaded with the bar's Reload, as a person would; whether
-# the bar showed Stop; and the page after it.
+# In the first opening, Reload: a fresh https page, then the bar's Reload,
+# pressed as a person presses it, has to consult the origin through Syndeo's
+# proxy — the proxy's revalidations or misses rise, whether the origin then
+# answers 304 or a new page — and a reload the proxy answered from its own
+# cache alone fails; the address and the page stay the page's. The proxy's
+# counters are read in a tab of their own, then closed, so they bracket the
+# reload and nothing else; no exact count is required, since what a page
+# loads and how its server marks it can vary. Kept in reload.txt too.
 #
 # refuse, which gates: a bundle whose proxy cannot start opens all the same,
 # its window says it cannot browse and holds no web view, and no helper runs.
@@ -94,9 +97,9 @@
 # no-pinning-delegate (while http, rendered and counted, still works), a
 # page's links in the window for no-navigation-policy, in a new tab for
 # any-scheme-in-a-new-tab, typing kept through a page's arrival for
-# no-editing-guard, the bar for a name for direct-for-every-name, and a link
-# to an IPv6 address with a zone for zoned-links-followed. Any other failure
-# is a failure.
+# no-editing-guard, the bar for a name for direct-for-every-name, a link to
+# an IPv6 address with a zone for zoned-links-followed, and Reload consulting
+# the origin for reload-from-cache. Any other failure is a failure.
 #
 # routes, which gates: the bar's route against what WebKit actually does,
 # the proxy caching nothing from this Mac, and Clear Browsing Data. From a
@@ -782,6 +785,16 @@ stats_now() {
   done
 }
 
+# stat_of NAME STATS: one counter's value in a STATS line, or ?.
+stat_of() { printf '%s\n' "$2" | awk -v k="$1" '{ for (i = 1; i < NF; i += 2) if ($i == k) { print $(i + 1); exit } } END { if (NR == 0) print "?" }'; }
+
+# rose NAME BEFORE AFTER: counter NAME is higher in AFTER than in BEFORE.
+rose() {
+  local was is
+  was="$(stat_of "$1" "$2")" is="$(stat_of "$1" "$3")"
+  [ -n "$was" ] && [ -n "$is" ] && [ "$was" != '?' ] && [ "$is" != '?' ] && [ "$is" -gt "$was" ]
+}
+
 # change BEFORE AFTER: each counter's change between two STATS lines.
 change() {
   awk -v a="$1" -v b="$2" 'BEGIN {
@@ -794,38 +807,43 @@ change() {
   }'
 }
 
-# reload_measured: what a reload over https does, measured and recorded,
-# never judged. A fresh https page opened alone, between two readings of the
-# proxy's counters; then another fresh one, opened and reloaded with the
-# bar's Reload, between two more. Reading the counters opens the proxy's own
-# page, which the proxy does not count, so each pair brackets exactly what
-# was opened between them. Kept in reload.txt too.
-reload_measured() {
-  local a b c pressed=no stop_seen=no reloaded=no out="$LOGS/reload.txt" said
-  stats_now "before a fresh https page, opened alone"
+# stats_aside ADDRESS PAGE WHEN: the proxy's counters, read in a tab of their
+# own, which is then closed, leaving the front tab's page, at ADDRESS and
+# saying PAGE, as it was. Sets STATS.
+stats_aside() {
+  choose File "New Tab"
+  arrive "" 'Welcome to Syndeo' "a tab of its own for the proxy's counters ($3)"
+  stats_now "$3"
+  close_tab "$3"
+  arrive "$1" "$2" "the page's tab in front again, as it was ($3)"
+}
+
+# reload_gate: see the top of this script.
+reload_gate() {
+  local a b at pressed=no stop_seen=no reloaded=no consulted=no out="$LOGS/reload.txt"
+  FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  at="https://example.com/?$FRESH"
+  visit "$at" "$at" "$EXAMPLE_BODY" "a fresh https page opens, to reload"
+  stats_aside "$at" "$EXAMPLE_BODY" "before Reload"
   a="$STATS"
-  FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-  visit "https://example.com/?$FRESH" "https://example.com/?$FRESH" "$EXAMPLE_BODY" "another fresh https page opens"
-  stats_now "after it"
-  b="$STATS"
-  FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-  visit "https://example.com/?$FRESH" "https://example.com/?$FRESH" "$EXAMPLE_BODY" "and one more, to reload"
   if "$APPCTL" press "$PID" syndeo.reload; then
     pressed=yes
     if wait_for 5 sh -c '"$1" describe "$2" syndeo.reload | grep -q "Stop"' _ "$APPCTL" "$PID"; then stop_seen=yes; fi
     if wait_for 30 sh -c '"$1" describe "$2" syndeo.reload | grep -q "Reload"' _ "$APPCTL" "$PID"; then reloaded=yes; fi
   fi
-  said="address field '$(address)', page: $(page_text | head -c 120)"
-  stats_now "after it was reloaded"
-  c="$STATS"
+  must "$pressed" "the bar's Reload is pressed" "no Reload button to press in the front window"
+  arrive "$at" "$EXAMPLE_BODY" "after Reload, the address is still the page's, and the page shows its own text"
+  stats_aside "$at" "$EXAMPLE_BODY" "after Reload"
+  b="$STATS"
+  if rose revalidations "$a" "$b" || rose misses "$a" "$b"; then consulted=yes; fi
   {
-    printf 'a fresh https page, opened alone\n  before: %s\n  after:  %s\n  change: %s\n' "$a" "$b" "$(change "$a" "$b")"
-    printf 'another, opened and then reloaded with the bar'"'"'s Reload\n  before: %s\n  after:  %s\n  change: %s\n' "$b" "$c" "$(change "$b" "$c")"
-    printf 'Reload pressed: %s; the bar showed Stop then: %s; it read Reload again within 30 s: %s; the button now: %s\n' \
-      "$pressed" "$stop_seen" "$reloaded" "$("$APPCTL" describe "$PID" syndeo.reload | tr '\t' '|')"
-    printf 'after the reload: %s\n' "$said"
+    printf 'a fresh https page, then the bar'"'"'s Reload\n  before: %s\n  after:  %s\n  change: %s\n' "$a" "$b" "$(change "$a" "$b")"
+    printf 'Reload pressed: %s; the bar showed Stop then: %s; it read Reload again within 30 s: %s\n' "$pressed" "$stop_seen" "$reloaded"
+    printf 'the origin consulted through the proxy (revalidations or misses rose): %s\n' "$consulted"
   } >"$out"
-  sed 's/^/  MEASURE  /' "$out"
+  sed 's/^/  RELOAD  /' "$out"
+  must "$consulted" "the reload consulted the origin through Syndeo's proxy: its revalidations or misses rose ($(change "$a" "$b"))" \
+    "a reload the proxy answered from its own cache alone"
 }
 
 # customer_round APP ROUND [reload]: one opening, as customer describes it.
@@ -836,7 +854,7 @@ customer_round() {
   browses "$round"
   arrive "" 'Welcome to Syndeo' "the window shows the start page, with an empty address field ($round)"
   pinned
-  if [ "${3:-}" = reload ]; then reload_measured; fi
+  if [ "${3:-}" = reload ]; then reload_gate; fi
   stopped "$round"
 }
 
@@ -907,6 +925,7 @@ mutant() {
     no-editing-guard) intended="^typing in the address field while a page loads" ;;
     direct-for-every-name) intended='^the bar for a name' ;;
     zoned-links-followed) intended='^a link to an IPv6 address with a zone' ;;
+    reload-from-cache) intended="^the reload consulted the origin through Syndeo's proxy" ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
   if started "$app" "mutant-$name"; then
@@ -917,6 +936,7 @@ mutant() {
       no-pinning-delegate) plain_http; pinned; unlogged "$log" ;;
       no-editing-guard) editing ;;
       direct-for-every-name | zoned-links-followed) routes_lite ;;
+      reload-from-cache) reload_gate ;;
       *) policy "$log" ;;
     esac
   fi

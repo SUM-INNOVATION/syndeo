@@ -32,6 +32,10 @@ back.
 - zoned-links-followed: a page's link to an IPv6 address with a zone is not
   refused, and a failure to open one is not described as a refusal. The
   link must then be seen not refused with the words typing it gets.
+- reload-from-cache: Reload reloads as WebKit's plain `reload` does, which
+  let Syndeo's proxy answer from its own fresh copy without asking the
+  origin. The reload must then be seen not consulting the origin: neither
+  the proxy's revalidations nor its misses rise.
 """
 import os
 import sys
@@ -113,6 +117,13 @@ MUTANTS = {
             BROWSER,
             "        let why = if address::has_zone(&address) {\n",
             "        let why = if false {\n",
+        ),
+    ],
+    "reload-from-cache": [
+        (
+            BROWSER,
+            "                    unsafe { web.view.reloadFromOrigin() };\n",
+            "                    unsafe { web.view.reload() };\n",
         ),
     ],
 }

@@ -450,13 +450,19 @@ impl BrowserController {
 
     /// Reload the page. The failure page stands in for a page that never
     /// opened, so reloading it means trying that page again.
+    ///
+    /// From the origin: someone pressing Reload wants the page as the site has
+    /// it now, so the reload asks past every cache, Syndeo's proxy included,
+    /// which then has to consult the origin (a 304 for what it holds, or a new
+    /// answer) rather than serve its own fresh copy. A plain `reload` let the
+    /// proxy answer from its cache without asking (PR #36's journey).
     fn reload(&self) {
         let failed = self.ivars().failed.borrow().clone();
         match failed {
             Some(address) => self.go(&address),
             None => {
                 if let Some(web) = &*self.ivars().web.borrow() {
-                    unsafe { web.view.reload() };
+                    unsafe { web.view.reloadFromOrigin() };
                 }
             }
         }
