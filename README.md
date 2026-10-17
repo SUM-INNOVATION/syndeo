@@ -222,6 +222,9 @@ sudo installer -pkg Syndeo-<version>.pkg -target /
   - opened by its path, its start page shown, and an https page opened
     through Syndeo's proxy, pinned to Syndeo's own authority, with that
     authority in no trust settings and in no keychain;
+  - Reload, pressed as a person presses it, asking the site again through
+    Syndeo's proxy (a 304 for what the proxy holds, or a new page), never
+    answered from the proxy's cache alone, the page still its own;
   - quit, with nothing left running, then opened and used again;
   - installed again over itself with the user's data kept, and opened once
     more;
@@ -521,6 +524,12 @@ use at `<SYNDEO_HOME>/cache`. So its hit rates and statistics are the proxy's,
 not the command line's, and the two can run at once. Upgrading to 0.1.3 starts
 the proxy's cache empty. Proxy traffic is not partitioned by site: see *What it
 does not tell anyone*.
+
+When the program that started the proxy quits normally, it closes the pipe
+the proxy reads, and the proxy writes its statistics and its entries' use
+stamps to disk before it exits; it is given two seconds for that, then
+terminated, then killed. The proxy also writes them every 32 requests. A
+crash or a forced kill loses what it counted since it last wrote them.
 
 The proxy caches only what came from the public internet. A response whose
 connection was to a loopback, private, link-local, shared (carrier-grade NAT)
