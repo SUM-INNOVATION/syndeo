@@ -1440,6 +1440,12 @@ impl Cache {
         Ok(entries)
     }
 
+    /// Carry what the index holds only in memory to disk: see
+    /// [`Index::persist`].
+    pub fn persist(&self) -> Result<()> {
+        self.index.persist()
+    }
+
     pub fn stats(&self) -> Result<Stats> {
         let (blobs, unique_bytes, on_disk_bytes, logical_bytes) = self.index.blob_totals()?;
         let mut stats = Stats {

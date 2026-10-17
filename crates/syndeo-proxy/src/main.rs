@@ -374,6 +374,12 @@ async fn run(args: RunArgs) -> Result<()> {
                 if let Err(err) = ended {
                     tracing::warn!(%err, "the command pipe failed");
                 }
+                // The pipe closed: the owner quit, or is gone. What the cache
+                // holds only in memory goes to disk first, because exit runs
+                // no destructors.
+                if let Err(err) = proxy.net.cache().persist() {
+                    tracing::warn!(%err, "could not write the cache's statistics to disk");
+                }
                 tracing::info!("the process that started this one is gone; exiting");
                 std::process::exit(0);
             })

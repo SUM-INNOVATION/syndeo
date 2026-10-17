@@ -263,9 +263,7 @@ impl Drop for Index {
         if self.since_flush.load(Ordering::Relaxed) == 0 {
             return;
         }
-        if let Ok(tx) = self.db.begin_write() {
-            let _ = tx.commit();
-        }
+        let _ = self.persist();
     }
 }
 
@@ -281,6 +279,19 @@ impl Index {
     /// The refusal is the point. Reading a foreign record with `bincode` does not
     /// fail cleanly; it produces a struct full of plausible nonsense. So the
     /// version is settled before the first record is touched.
+    /// Carry every relaxed commit to disk now, with one durable commit: the
+    /// statistics and the entries' use stamps recorded since the last one.
+    ///
+    /// What a process that is about to end on purpose calls. `Drop` does the
+    /// same, but `std::process::exit` — how the proxy leaves once its owner
+    /// closes the pipe it takes commands on — runs no destructors, and
+    /// neither does a kill. What a crash or a forced kill costs stays bounded
+    /// by the periodic flush in `record_access`, and nothing more.
+    pub fn persist(&self) -> Result<()> {
+        self.db.begin_write()?.commit()?;
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         // A path that does not exist yet, or exists and is empty, is ours to

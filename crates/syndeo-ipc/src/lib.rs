@@ -22,6 +22,7 @@
 pub mod confirm;
 pub mod frame;
 pub mod protocol;
+pub mod quit;
 pub mod secret;
 pub mod startup;
 pub mod transport;
@@ -32,6 +33,7 @@ pub use protocol::{
     AgentEvent, KeystoreRequest, KeystoreResponse, NetRequest, NetResponse, ShellRequest,
     ShellResponse, SignaturePurpose,
 };
+pub use quit::{quit_child, Quit, QUIT_AFTER_TERM, QUIT_GRACE};
 pub use secret::SecretString;
 pub use transport::{runtime_dir_for, Channel, Endpoint, Server, TransportError};
 

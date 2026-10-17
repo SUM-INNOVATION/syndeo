@@ -21,18 +21,30 @@ pub fn default_home() -> PathBuf {
 
 /// The proxy this browser started: that process and no other.
 ///
-/// Dropping it kills and reaps the child, which covers returning from `run`,
-/// an error on the way out, and unwinding. Until it is reaped the child's pid
-/// cannot be given to anyone else, so the kill can only ever reach our own
-/// proxy. What a destructor cannot cover — a force-quit, a crash, `kill -9` —
-/// the child covers itself: it holds the other end of its stdin pipe and exits
-/// when the kernel closes ours.
+/// Dropping it stops the child as a normal quit does, and reaps it, which
+/// covers quitting, returning from `run`, an error on the way out, and
+/// unwinding: see [`syndeo_ipc::quit_child`]. By then the pipe the child
+/// reads is closed ([`OwnedProxy`] closes it), and the proxy answers that by
+/// carrying what its cache holds only in memory to disk and exiting, which
+/// it is given a bounded time to do; then it is sent SIGTERM, and only then
+/// killed. Until it is reaped the child's pid cannot be given to anyone else,
+/// so neither signal can reach anything but our own proxy. What a destructor
+/// cannot cover — a force-quit, a crash, `kill -9` — the child covers itself:
+/// it holds the other end of its stdin pipe and exits when the kernel closes
+/// ours, and what its cache had not yet written is then not guaranteed.
 pub struct ProxyChild(std::process::Child);
 
 impl Drop for ProxyChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        match syndeo_ipc::quit_child(&mut self.0) {
+            syndeo_ipc::Quit::Exited(_) => {}
+            syndeo_ipc::Quit::Terminated(_) => {
+                tracing::warn!("the proxy did not exit when its pipe closed; it was terminated");
+            }
+            syndeo_ipc::Quit::Killed(_) => {
+                tracing::warn!("the proxy did not exit when its pipe closed, nor when terminated; it was killed");
+            }
+        }
     }
 }
 
@@ -45,6 +57,15 @@ pub struct OwnedProxy {
     child: ProxyChild,
     pub endpoint: std::net::SocketAddr,
     control: ProxyControl,
+}
+
+impl Drop for OwnedProxy {
+    /// Close the pipe the proxy takes its commands on, whoever else still
+    /// holds a [`ProxyControl`]: that is what tells it to write down what it
+    /// holds and exit. Then `child` is dropped, which waits for that.
+    fn drop(&mut self) {
+        self.control.close();
+    }
 }
 
 impl OwnedProxy {
@@ -67,7 +88,8 @@ impl OwnedProxy {
 pub struct ProxyControl(std::sync::Arc<std::sync::Mutex<Control>>);
 
 struct Control {
-    stdin: std::process::ChildStdin,
+    /// None once closed, by the owner's quitting.
+    stdin: Option<std::process::ChildStdin>,
     /// The proxy's lines after its announcement.
     answers: std::sync::mpsc::Receiver<String>,
     /// An earlier question went unanswered in time, so whatever comes next
@@ -94,10 +116,12 @@ impl ProxyControl {
         }
         // Nothing the proxy said before this question answers it.
         while control.answers.try_recv().is_ok() {}
-        let asked = control
-            .stdin
+        let Some(stdin) = control.stdin.as_mut() else {
+            anyhow::bail!("the proxy has stopped");
+        };
+        let asked = stdin
             .write_all(b"clear-cache\n")
-            .and_then(|()| control.stdin.flush());
+            .and_then(|()| stdin.flush());
         asked.context("asking the proxy to clear its cache")?;
         match control.answers.recv_timeout(within) {
             Ok(answer) => cleared(&answer),
@@ -112,6 +136,15 @@ impl ProxyControl {
                 anyhow::bail!("the proxy has stopped")
             }
         }
+    }
+}
+
+impl ProxyControl {
+    /// Close the pipe, for every clone: the proxy reads its end closing as
+    /// its owner quitting.
+    fn close(&self) {
+        let mut control = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        drop(control.stdin.take());
     }
 }
 
@@ -263,7 +296,7 @@ pub fn start_owned(
         .spawn(move || read_announcement(stdout, found, answered))
         .context("reading the proxy's output")?;
     let control = ProxyControl(std::sync::Arc::new(std::sync::Mutex::new(Control {
-        stdin,
+        stdin: Some(stdin),
         answers,
         out_of_step: false,
     })));
@@ -447,6 +480,49 @@ mod tests {
         assert!(alive(pid));
         drop(owned);
         assert!(!alive(pid));
+    }
+
+    /// A normal quit: the pipe closes, for the owner and for every clone of
+    /// its control (the app's Settings keeps one), and the proxy is left to
+    /// write down what it holds and exit by itself. The stand-in does what
+    /// the proxy does: it reads the pipe until it closes, then writes a mark,
+    /// as the proxy writes its cache's statistics, and exits. A kill, or a
+    /// pipe some clone kept open, leaves no mark.
+    #[test]
+    fn quitting_closes_the_pipe_and_lets_the_proxy_exit_by_itself() {
+        let mark = std::env::temp_dir().join(format!(
+            "syndeo-quit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&mark);
+        let owned = start_owned(
+            sh(&format!(
+                "echo 'SYNDEO-PROXY-READY 1 127.0.0.1:4567'; cat >/dev/null; echo written >'{}'",
+                mark.display()
+            )),
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+        let kept = owned.control();
+        let pid = owned.pid();
+        let started = Instant::now();
+        drop(owned);
+        let took = started.elapsed();
+        assert!(!alive(pid));
+        let written = std::fs::read_to_string(&mark);
+        let _ = std::fs::remove_file(&mark);
+        assert_eq!(
+            written.ok().as_deref(),
+            Some("written\n"),
+            "the proxy was not left to exit by itself"
+        );
+        assert!(took < syndeo_ipc::QUIT_GRACE, "{took:?}");
+        assert!(kept.clear_cache(Duration::from_secs(1)).is_err());
     }
 
     #[test]
