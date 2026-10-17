@@ -649,7 +649,7 @@ jobs:
     name: the package, a customer's journey on a fresh runner
     needs: [verify, build-macos, notarize-binaries, package]
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 15
     outputs:
       accepted-sha256: ${{ steps.accepted.outputs.sha256 }}
     env:

@@ -251,12 +251,14 @@ jobs:
     # by its path, browsing https pinned with Syndeo's authority in no trust
     # settings, quit and opened again; installed again; removed; the trust
     # settings and keychains exactly as they were; and the runner put back,
-    # whatever happened. What a reload over https does is measured, not
-    # judged. Nothing of Phase 4's states is repeated here. Only the logs are
-    # kept.
+    # whatever happened. Reload, pressed as a person presses it, has to
+    # consult the origin through Syndeo's proxy, not be answered from the
+    # proxy's cache alone. Nothing of Phase 4's states is repeated here. Only
+    # the logs are kept. Fifteen minutes: the journey took 2.7 in PR #36's
+    # run, and every wait inside it is bounded.
     needs: macos-package
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 15
     env:
       SYNDEO_ALLOW_SYSTEM_INSTALL_TEST: "yes"
       SYNDEO_ALLOW_APP_TEST: "yes"
@@ -315,7 +317,7 @@ jobs:
     # tab opened and closed, no private URL in any log, https pinned through
     # the proxy, a page's own links to other schemes refused; its last window
     # closed and brought back by opening it again, quit as the Quit menu item
-    # would, and opened again; six mutants, each of which the test has to
+    # would, and opened again; seven mutants, each of which the test has to
     # catch; a copy whose proxy cannot start, which has to refuse to browse;
     # and the route bar against what WebKit does, the proxy's cache keeping
     # nothing from this Mac, and Clear Browsing Data. Unsigned with a
