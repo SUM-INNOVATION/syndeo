@@ -100,6 +100,18 @@ ignore = [
     # reaches it on macOS at all. Cleared when winit's decoration stack moves.
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser, under winit's Wayland titlebar decorations" },
     { id = "RUSTSEC-2024-0436", reason = "paste, transitively under libp2p 0.44" },
+
+    # zvariant, zvariant_derive and zbus_names, all three on one Linux-only
+    # path: eframe -> accesskit_unix -> atspi -> zbus 5, the screen reader
+    # support of the egui UI. syndeo-ui still ships on Linux with this path in
+    # it; nothing reaches it on macOS. The three were folded into zbus 6.0.0,
+    # and no accesskit_unix release has moved to zbus 6 (0.24.0 still asks for
+    # zbus 5.19), so there is nothing compatible to migrate to. These are
+    # temporary, accepted maintenance risks, not remediated findings: remove
+    # all three when AccessKit migrates.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant, under eframe's Linux accessibility via zbus 5; temporary, until AccessKit moves to zbus 6" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names, under eframe's Linux accessibility via zbus 5; temporary, until AccessKit moves to zbus 6" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive, under eframe's Linux accessibility via zbus 5; temporary, until AccessKit moves to zbus 6" },
 ]
 
 [sources]
