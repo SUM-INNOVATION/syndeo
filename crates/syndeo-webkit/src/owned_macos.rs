@@ -443,8 +443,49 @@ fn listing_includes(listing: &str, der: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    /// Set for a test [`alone`] runs, and only for it.
+    const ALONE: &str = "SYNDEO_TEST_ALONE";
+
+    /// Run the `#[ignore]`d test `name`, of this module, in a test process of
+    /// its own with only that test in it, and require that it ran and passed.
+    ///
+    /// For a test of what a child does once its pipe closes. On macOS the
+    /// standard library makes a pipe and only then marks both ends
+    /// close-on-exec, and spawns without asking for everything else to be
+    /// closed, so a child another test spawns at that moment inherits both
+    /// ends and keeps the pipe open for as long as it lives. The child under
+    /// test then waits for an end of file that does not come. In a process
+    /// running one test, nothing else spawns.
+    fn alone(name: &str) {
+        let module = module_path!();
+        let test = format!(
+            "{}::{name}",
+            module.split_once("::").map_or(module, |(_, m)| m)
+        );
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                test.as_str(),
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(ALONE, "1")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success()
+                && said.contains("test result: ok. 1 passed")
+                && said.contains(&format!("alone: {name} ran")),
+            "{test}, alone:\n{said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 
     fn alive(pid: u32) -> bool {
         Command::new("/bin/kill")
@@ -490,6 +531,16 @@ mod tests {
     /// pipe some clone kept open, leaves no mark.
     #[test]
     fn quitting_closes_the_pipe_and_lets_the_proxy_exit_by_itself() {
+        alone("quitting_closes_the_pipe_and_lets_the_proxy_exit_by_itself_alone");
+    }
+
+    /// The test above, as [`alone`] runs it.
+    #[test]
+    #[ignore = "run alone, by quitting_closes_the_pipe_and_lets_the_proxy_exit_by_itself"]
+    fn quitting_closes_the_pipe_and_lets_the_proxy_exit_by_itself_alone() {
+        if std::env::var_os(ALONE).is_none() {
+            return;
+        }
         let mark = std::env::temp_dir().join(format!(
             "syndeo-quit-{}-{}",
             std::process::id(),
@@ -523,6 +574,7 @@ mod tests {
         );
         assert!(took < syndeo_ipc::QUIT_GRACE, "{took:?}");
         assert!(kept.clear_cache(Duration::from_secs(1)).is_err());
+        println!("alone: quitting_closes_the_pipe_and_lets_the_proxy_exit_by_itself_alone ran");
     }
 
     #[test]
