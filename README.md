@@ -213,6 +213,28 @@ sudo installer -pkg Syndeo-<version>.pkg -target /
 
   A signed release runs the same test on its signed package, where
   Gatekeeper has to accept it.
+- **One customer's journey** (`ci/test-journey.sh`), on another runner, one
+  that has built nothing and holds nothing of Syndeo, with the exact package
+  that was built, required by its SHA-256:
+  - downloaded, quarantined as a browser leaves it, and Gatekeeper's verdict
+    on it;
+  - installed, and Gatekeeper's verdict on the installed application;
+  - opened by its path, its start page shown, and an https page opened
+    through Syndeo's proxy, pinned to Syndeo's own authority, with that
+    authority in no trust settings and in no keychain;
+  - quit, with nothing left running, then opened and used again;
+  - installed again over itself with the user's data kept, and opened once
+    more;
+  - removed with its uninstaller, the user's data kept;
+  - the trust settings, keychains and certificates exactly as before, and the
+    runner put back.
+
+  A pull request's package is signed ad hoc, so there Gatekeeper has to
+  reject it, and installing and using it are still tested; it is kept for one
+  day as `pr-package-adhoc-unsigned-<commit>`, for that journey alone. A
+  release runs the same journey on the exact signed, notarized and stapled
+  package it would publish, where Gatekeeper has to accept it. It repeats
+  none of the test above.
 - **Checked by hand, for every signed release:** installing by opening the
   package in Finder, which runs Installer's window and asks for an
   administrator's password, then opening Syndeo.app from `/Applications`. CI
@@ -853,8 +875,18 @@ package.
     so its binaries have no Developer ID and its package is unsigned. v0.1.7
     is the first release built with `SYNDEO_EXPECT_SIGNED=yes`.
 - **The package** is built from Syndeo.app, inspected against what was
-  decided and against that bundle (`ci/verify-pkg.sh inspect`), and installed
-  and removed on a fresh runner.
+  decided and against that bundle (`ci/verify-pkg.sh inspect`), installed
+  and removed on a fresh runner through every state it handles
+  (`pkg-install`), and taken through one customer's journey on another
+  (`acceptance`).
+- **One package, by its SHA-256, from build to publication.** `package`
+  gives the SHA-256 of the package it made. `pkg-install`, `acceptance` and
+  `checksums` each require the package they download to have it before using
+  it. `acceptance` gives the SHA-256 it accepted, and only once the journey
+  has passed. Before any draft, `publish` and `rehearse` require that to be
+  `package`'s, the package they upload to have it, and `SHA256SUMS` to list
+  it so. The package published is the package accepted. No release job reads
+  another run's artifacts or a pull request's unsigned package.
 - **Publishing.** Exactly the three tarballs and the package, with one
   `SHA256SUMS` over them, go into a draft release. The draft's assets are
   downloaded back and checked against what was built, and its notes against
@@ -873,7 +905,10 @@ package.
   and its result is recorded with the release's evidence.
 - **Checks on every pull request.** `ci/check-workflows.py` checks that no
   pull request can see a secret, and that release.yml keeps them to that one
-  job.
+  job. It also checks every link of the package's SHA-256 from `package` to
+  publication, and that a pull request's unsigned package is kept one day,
+  says it is unsigned and rejected by Gatekeeper, and reaches only the
+  journey.
 
 `ci/verify-release.sh` checks the signing state of the installed binaries
 against `SYNDEO_EXPECT_SIGNED`, `no` by default, and fails a release that is
