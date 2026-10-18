@@ -653,7 +653,16 @@ wait_for() {
   done
 }
 
-running() { [ -n "$(appctl pids "$BUNDLE_ID")" ]; }
+# one_app: one answer of LaunchServices for $BUNDLE_ID, kept in APP_PIDS;
+# true when that answer names exactly one application, with a pid. The
+# count and the pid come from the one answer, never from two: an
+# application in one answer and missing from the next would otherwise pass
+# as running, with no pid.
+APP_PIDS=''
+one_app() {
+  APP_PIDS="$(appctl pids "$BUNDLE_ID")"
+  [ -n "$APP_PIDS" ] && [ "$(printf '%s\n' "$APP_PIDS" | wc -l | tr -d ' ')" = 1 ]
+}
 none_running() {
   [ -z "$(appctl pids "$BUNDLE_ID")" ] && ! pgrep -f '/Syndeo.app/Contents/MacOS/Syndeo' >/dev/null &&
     ! pgrep -f '/Syndeo.app/Contents/Helpers/syndeo-proxy' >/dev/null
@@ -740,15 +749,16 @@ opened_by_id() {
   came_up "$label"
 }
 
-# came_up LABEL: what open started, polled for: within 30 seconds a process
-# with the bundle identifier com.sum.syndeo, running the bundle's
-# executable, with a window; its helper, and every process under it, runs
-# from /Applications/Syndeo.app, and nothing from /usr/local. Sets
-# RUNNING_PID.
+# came_up LABEL: what open started, polled for: within 30 seconds exactly
+# one process with the bundle identifier com.sum.syndeo, its pid from the
+# same answer (one_app), running the bundle's executable, with a window; its
+# helper, and every process under it, runs from /Applications/Syndeo.app,
+# and nothing from /usr/local. Sets RUNNING_PID.
 came_up() {
   local label="$1" pid helper p img
-  wait_for 30 running || fail "$label: nothing running 30 seconds after open"
-  pid="$(appctl pids "$BUNDLE_ID" | head -n 1)"
+  wait_for 30 one_app ||
+    fail "$label: not exactly one application is $BUNDLE_ID 30 seconds after open; LaunchServices' last answer: [$(printf '%s' "$APP_PIDS" | tr '\n' ' ')]"
+  pid="$APP_PIDS"
   must "$label: Syndeo runs, with the bundle identifier $BUNDLE_ID" test "$(appctl bundle "$pid")" = "$BUNDLE_ID"
   must "  ... its executable $APP/Contents/MacOS/Syndeo" test "$(image_of "$pid")" = "$APP/Contents/MacOS/Syndeo"
   must "  ... a window shows" wait_for 30 appctl windows "$pid"

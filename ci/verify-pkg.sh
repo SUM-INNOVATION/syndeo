@@ -1003,6 +1003,97 @@ st_launchservices() {
   expect "LaunchServices diagnostics: a file already there is not written over, and nothing asked" test "$ok" = yes
 }
 
+# st_up_run DIR ANSWER...: came_up, from the install test, against a
+# stand-in appctl whose answers to `pids`, one per call, are ANSWER... (the
+# last repeated): "-" none, "11,12" two applications, else one pid. Only
+# 8275 is Syndeo, with a window, and its helper 8276 under it; sleep moves
+# the clock on five seconds, so a 30-second wait ends after seven answers.
+# Leaves DIR/status, DIR/calls (how many answers it asked for) and what it
+# said in DIR/said.
+st_up_run() {
+  local d="$1"; shift
+  mkdir -p "$d/syndeo-pkg-test/logs" "$d/bin" "$d/Syndeo.app/Contents/Helpers" \
+    "$d/syndeo-pkg-test/real-payload/Syndeo.pkg/Payload/Syndeo.app/Contents/Helpers"
+  printf '%s\n' "$@" >"$d/answers"
+  echo helper >"$d/Syndeo.app/Contents/Helpers/syndeo-proxy"
+  echo helper >"$d/syndeo-pkg-test/real-payload/Syndeo.pkg/Payload/Syndeo.app/Contents/Helpers/syndeo-proxy"
+  cat >"$d/syndeo-pkg-test/appctl" <<'EOF'
+#!/bin/sh
+d="$(dirname "$0")/.."
+case "$1" in
+  pids)
+    n=$(($(cat "$d/calls" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$d/calls"
+    a="$(sed -n "${n}p" "$d/answers")"
+    [ -n "$a" ] || a="$(tail -n 1 "$d/answers")"
+    [ "$a" = - ] || printf '%s\n' "$a" | tr ',' '\n' ;;
+  bundle) [ "$2" = 8275 ] && echo com.sum.syndeo ;;
+  windows) [ "$2" = 8275 ] && echo '1024 681' ;;
+  *) exit 64 ;;
+esac
+EOF
+  printf '#!/bin/sh\n[ "$*" = "-P 8275" ]\n' >"$d/bin/pgrep"
+  chmod +x "$d/syndeo-pkg-test/appctl" "$d/bin/pgrep"
+  bash -c '
+    . "$1" --source-only
+    RUNNER_TEMP="$2"
+    APP="$2/Syndeo.app"
+    PATH="$2/bin:$PATH"
+    image_of() { case "$1" in 8275) echo "$APP/Contents/MacOS/Syndeo" ;; 8276) echo "$APP/Contents/Helpers/syndeo-proxy" ;; *) echo "(gone)" ;; esac; }
+    descendants() { echo "$1"; [ "$1" != 8275 ] || echo 8276; }
+    sleep() { SECONDS=$((SECONDS + 5)); }
+    came_up probe
+    echo "RUNNING_PID=[$RUNNING_PID]"
+  ' _ "$here/test-pkg-install.sh" "$d" >"$d/said" 2>&1
+  echo "$?" >"$d/status"
+  [ -e "$d/calls" ] || echo 0 >"$d/calls"
+}
+
+# The real-runner test's came_up, which only a real runner otherwise
+# exercises: what open started, from one answer of LaunchServices per poll,
+# the count and the pid both from that answer, so an application seen and
+# then missed cannot pass with no pid, as two queries let test-app.sh's
+# started() do in CI 39097165867; exactly one application; and when there
+# never is, the last answer said and nothing checked after.
+st_came_up() {
+  printf '\n  the install test: what open started, from one answer of LaunchServices\n'
+  local d ok
+
+  d="$T/up-seen-missed-seen"
+  st_up_run "$d" 8275 - 8275
+  ok=no
+  if [ "$(cat "$d/status")" = 0 ] && [ "$(cat "$d/calls")" = 1 ] && grep -qxF 'RUNNING_PID=[8275]' "$d/said"; then ok=yes; fi
+  expect "came_up: seen, then missed, then seen: the pid from the one answer that saw it" test "$ok" = yes
+
+  d="$T/up-none-then-one"
+  st_up_run "$d" - - 8275
+  ok=no
+  if [ "$(cat "$d/status")" = 0 ] && [ "$(cat "$d/calls")" = 3 ] && grep -qxF 'RUNNING_PID=[8275]' "$d/said"; then ok=yes; fi
+  expect "came_up: none twice, then one: waited for, and its pid taken" test "$ok" = yes
+
+  d="$T/up-two-then-one"
+  st_up_run "$d" 11,12 8275
+  ok=no
+  if [ "$(cat "$d/status")" = 0 ] && [ "$(cat "$d/calls")" = 2 ] && grep -qxF 'RUNNING_PID=[8275]' "$d/said"; then ok=yes; fi
+  expect "came_up: two, then one: two not taken for one" test "$ok" = yes
+
+  d="$T/up-never"
+  st_up_run "$d" -
+  ok=no
+  if [ "$(cat "$d/status")" != 0 ] &&
+    grep -qF "probe: not exactly one application is com.sum.syndeo 30 seconds after open; LaunchServices' last answer: []" "$d/said" &&
+    ! grep -qF 'Syndeo runs' "$d/said" && ! grep -q '^RUNNING_PID' "$d/said"; then ok=yes; fi
+  expect "came_up: never there: fails at 30 seconds, saying the last answer, and checks nothing after" test "$ok" = yes
+
+  d="$T/up-always-two"
+  st_up_run "$d" 11,12
+  ok=no
+  if [ "$(cat "$d/status")" != 0 ] &&
+    grep -qF "probe: not exactly one application is com.sum.syndeo 30 seconds after open; LaunchServices' last answer: [11 12]" "$d/said" &&
+    ! grep -qF 'Syndeo runs' "$d/said"; then ok=yes; fi
+  expect "came_up: always two: fails at 30 seconds, saying both" test "$ok" = yes
+}
+
 # --- macOS: the root scripts, under a temporary root ------------------------
 
 # st_new: a fresh case. C is its directory; R the root, with a space in it,
@@ -2370,6 +2461,7 @@ self_test() {
   st_render "$T/render"
   st_harness
   st_launchservices
+  st_came_up
   st_release
   if [ "$(uname -s)" = Darwin ]; then
     st_tools
