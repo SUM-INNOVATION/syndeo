@@ -200,7 +200,6 @@ wait_for() {
   done
 }
 gone() { ! alive "$1"; }
-the_app_runs() { [ -n "$("$APPCTL" pids "$ID")" ]; }
 no_app() { [ -z "$("$APPCTL" pids "$ID")" ]; }
 keystore_item() { security find-generic-password -s com.sum.syndeo.keystore >/dev/null 2>&1 && echo present || echo absent; }
 
@@ -217,20 +216,34 @@ EXAMPLE_BODY='This domain is for use in documentation examples'
 # it as $ID, from APP, with an on-screen window, and its one child is the
 # proxy from APP's Contents/Helpers; no keystore process exists. Sets PID and
 # HELPER; returns non-zero if there is no app to check further.
+#
+# The count and the pid come from one answer of Launch Services per poll,
+# never from two: an application in one answer and missing from the next
+# would otherwise pass as exactly one, with no pid, and every check after
+# would ask about nothing.
 started() {
-  local app="$1" round="$2" children image windows
+  local app="$1" round="$2" children image windows pids='' until
   PID='' HELPER=''
   # This instance's own query for example.com: random, and nothing else.
   # WebKit's cache persists from one instance to the next, so a page another
   # instance opened could otherwise be shown without this one fetching it.
   FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
   open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" || { bad "open ($round)" "open failed"; return 1; }
-  if ! wait_for 30 the_app_runs; then
-    bad "running ($round)" "no running application is $ID 30 s after open"
+  until=$((SECONDS + 30))
+  while :; do
+    pids="$("$APPCTL" pids "$ID")"
+    if [ -n "$pids" ] && [ "$(printf '%s\n' "$pids" | wc -l | tr -d ' ')" = 1 ]; then
+      PID="$pids"
+      break
+    fi
+    [ "$SECONDS" -lt "$until" ] || break
+    sleep 0.5
+  done
+  if [ -z "$PID" ]; then
+    bad "running ($round)" "not exactly one running application is $ID 30 s after open; Launch Services' last answer: [$(printf '%s' "$pids" | tr '\n' ' ')]"
     return 1
   fi
-  PID="$("$APPCTL" pids "$ID" | head -n 1)"
-  must "$([ "$("$APPCTL" pids "$ID" | wc -l | tr -d ' ')" = 1 ] && echo yes)" "one running application is $ID ($round, pid $PID)" "$("$APPCTL" pids "$ID" | tr '\n' ' ')"
+  ok "one running application is $ID ($round, pid $PID)"
   must "$([ "$("$APPCTL" bundle "$PID")" = "$ID" ] && echo yes)" "Launch Services has pid $PID as $ID ($round)" "$("$APPCTL" bundle "$PID")"
   image="$(image_of "$PID")"
   must "$([ "$image" = "$app/Contents/MacOS/Syndeo" ] && echo yes)" "it runs $app/Contents/MacOS/Syndeo ($round)" "$image"
