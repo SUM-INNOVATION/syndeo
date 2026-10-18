@@ -1,12 +1,54 @@
 //! `run --announce` says where the proxy listens, once it does, and says
 //! nothing else on stdout. Without it, nothing about a plain `run` changes.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 const PROXY: &str = env!("CARGO_BIN_EXE_syndeo-proxy");
+
+/// Set for a test [`alone`] runs, and only for it.
+const ALONE: &str = "SYNDEO_TEST_ALONE";
+
+/// Run the `#[ignore]`d test `name` in a test process of its own with only
+/// that test in it, and require that it ran and passed.
+///
+/// For a test that rests on a pipe closing: the proxy's stdin, or its stdout
+/// or stderr read to the end. On macOS the standard library makes a pipe and
+/// only then marks both ends close-on-exec, and spawns without asking for
+/// everything else to be closed, so a child another test spawns at that
+/// moment inherits both ends and keeps the pipe open for as long as it lives.
+/// In a process running one test, nothing else spawns. What that process
+/// says goes to a file rather than a pipe, and is read once it has exited, so
+/// no other test's child can hold this one up either.
+fn alone(name: &str) {
+    let mut said = tempfile::tempfile().unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(ALONE, "1")
+        .stdin(Stdio::null())
+        .stdout(said.try_clone().unwrap())
+        .stderr(said.try_clone().unwrap())
+        .status()
+        .unwrap();
+    let mut all = Vec::new();
+    said.rewind().unwrap();
+    said.read_to_end(&mut all).unwrap();
+    let said = String::from_utf8_lossy(&all);
+    assert!(
+        status.success()
+            && said.contains("test result: ok. 1 passed")
+            && said.contains(&format!("alone: {name} ran")),
+        "{name}, alone:\n{said}"
+    );
+}
 
 /// Everything a pipe produces until it closes, collected on its own thread.
 fn collect(mut pipe: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<Vec<u8>> {
@@ -21,6 +63,16 @@ fn collect(mut pipe: impl Read + Send + 'static) -> std::sync::mpsc::Receiver<Ve
 
 #[test]
 fn the_record_comes_first_names_a_real_port_and_is_all_that_stdout_carries() {
+    alone("the_record_comes_first_names_a_real_port_and_is_all_that_stdout_carries_alone");
+}
+
+/// The test above, as [`alone`] runs it.
+#[test]
+#[ignore = "run alone, by the_record_comes_first_names_a_real_port_and_is_all_that_stdout_carries"]
+fn the_record_comes_first_names_a_real_port_and_is_all_that_stdout_carries_alone() {
+    if std::env::var_os(ALONE).is_none() {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let mut child = Command::new(PROXY)
         .args([
@@ -88,6 +140,9 @@ fn the_record_comes_first_names_a_real_port_and_is_all_that_stdout_carries() {
     assert!(
         String::from_utf8_lossy(&logs).contains("proxy up"),
         "the logs should have gone to stderr"
+    );
+    println!(
+        "alone: the_record_comes_first_names_a_real_port_and_is_all_that_stdout_carries_alone ran"
     );
 }
 
@@ -162,6 +217,16 @@ fn stats_through(address: SocketAddr, credential: Option<&str>) -> String {
 
 #[test]
 fn a_credential_handed_over_on_stdin_is_required_and_never_printed() {
+    alone("a_credential_handed_over_on_stdin_is_required_and_never_printed_alone");
+}
+
+/// The test above, as [`alone`] runs it.
+#[test]
+#[ignore = "run alone, by a_credential_handed_over_on_stdin_is_required_and_never_printed"]
+fn a_credential_handed_over_on_stdin_is_required_and_never_printed_alone() {
+    if std::env::var_os(ALONE).is_none() {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let mut child = Command::new(PROXY)
         .args([
@@ -226,10 +291,21 @@ fn a_credential_handed_over_on_stdin_is_required_and_never_printed() {
         assert!(!printed.contains(secret), "the credential was printed");
     }
     assert!(printed.contains("proxy up"), "trace logging was not on");
+    println!("alone: a_credential_handed_over_on_stdin_is_required_and_never_printed_alone ran");
 }
 
 #[test]
 fn a_bad_credential_frame_ends_the_proxy_with_status_2_and_says_nothing_of_it() {
+    alone("a_bad_credential_frame_ends_the_proxy_with_status_2_and_says_nothing_of_it_alone");
+}
+
+/// The test above, as [`alone`] runs it.
+#[test]
+#[ignore = "run alone, by a_bad_credential_frame_ends_the_proxy_with_status_2_and_says_nothing_of_it"]
+fn a_bad_credential_frame_ends_the_proxy_with_status_2_and_says_nothing_of_it_alone() {
+    if std::env::var_os(ALONE).is_none() {
+        return;
+    }
     let good = frame(&TOKEN);
     let mut bad_magic = good.clone();
     bad_magic[0] = b'X';
@@ -263,4 +339,7 @@ fn a_bad_credential_frame_ends_the_proxy_with_status_2_and_says_nothing_of_it() 
         assert!(said.contains("credential frame"), "{said}");
         assert!(!said.contains("ZZZZ") && !said.contains("5a5a"), "{said}");
     }
+    println!(
+        "alone: a_bad_credential_frame_ends_the_proxy_with_status_2_and_says_nothing_of_it_alone ran"
+    );
 }

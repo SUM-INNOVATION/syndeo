@@ -1,19 +1,62 @@
 //! A proxy that syndeo-webkit started goes when syndeo-webkit goes, however it
 //! goes; a proxy anybody else started stays up.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const PROXY: &str = env!("CARGO_BIN_EXE_syndeo-proxy");
 
+/// Set for a test [`alone`] runs, and only for it.
+const ALONE: &str = "SYNDEO_TEST_ALONE";
+
+/// Run the `#[ignore]`d test `name` in a test process of its own with only
+/// that test in it, and require that it ran and passed.
+///
+/// Every test here rests on a pipe closing or on a port staying free. On
+/// macOS the standard library makes a pipe or a socket and only then marks it
+/// close-on-exec, and spawns without asking for everything else to be closed,
+/// so a child another test spawns at that moment inherits it: the pipe stays
+/// open, or the port taken, for as long as that child lives. In a process
+/// running one test, nothing else spawns. What that process says goes to a
+/// file rather than a pipe, and is read once it has exited, so no other
+/// test's child can hold this one up either.
+fn alone(name: &str) {
+    let mut said = tempfile::tempfile().unwrap();
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([
+            name,
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(ALONE, "1")
+        .stdin(Stdio::null())
+        .stdout(said.try_clone().unwrap())
+        .stderr(said.try_clone().unwrap())
+        .status()
+        .unwrap();
+    let mut all = Vec::new();
+    said.rewind().unwrap();
+    said.read_to_end(&mut all).unwrap();
+    let said = String::from_utf8_lossy(&all);
+    assert!(
+        status.success()
+            && said.contains("test result: ok. 1 passed")
+            && said.contains(&format!("alone: {name} ran")),
+        "{name}, alone:\n{said}"
+    );
+}
+
 /// A free port below the ephemeral range. Polling an ephemeral port that is
 /// not yet listening can be given that same port as its source, which is a TCP
 /// connection to itself and looks like the proxy answering.
 ///
-/// Each call starts further along, because the tests run at once in one
-/// process and would otherwise all be handed the same port.
+/// Each call starts further along, so that calls in one process are not all
+/// handed the same port; each test runs in a process of its own (see
+/// [`alone`]), and a process's own id moves where its calls start.
 fn free_address() -> SocketAddr {
     static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let offset = CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) * 100;
@@ -72,6 +115,16 @@ fn gone_within(pid: u32, within: Duration) -> bool {
 
 #[test]
 fn it_exits_when_the_pipe_from_its_parent_closes() {
+    alone("it_exits_when_the_pipe_from_its_parent_closes_alone");
+}
+
+/// The test above, as [`alone`] runs it.
+#[test]
+#[ignore = "run alone, by it_exits_when_the_pipe_from_its_parent_closes"]
+fn it_exits_when_the_pipe_from_its_parent_closes_alone() {
+    if std::env::var_os(ALONE).is_none() {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let address = free_address();
     let mut child = proxy(home.path(), address, true, Stdio::piped());
@@ -88,6 +141,7 @@ fn it_exits_when_the_pipe_from_its_parent_closes() {
         std::thread::sleep(Duration::from_millis(50));
     };
     assert!(status.success());
+    println!("alone: it_exits_when_the_pipe_from_its_parent_closes_alone ran");
 }
 
 /// The parent dies by SIGKILL, which runs no destructors and closes nothing
@@ -113,7 +167,17 @@ fn it_exits_when_its_parent_is_killed() {
         let _ = child.wait();
         return;
     }
+    alone("it_exits_when_its_parent_is_killed_alone");
+}
 
+/// The test above, as [`alone`] runs it: this process starts the parent, as
+/// that test, and kills it.
+#[test]
+#[ignore = "run alone, by it_exits_when_its_parent_is_killed"]
+fn it_exits_when_its_parent_is_killed_alone() {
+    if std::env::var_os(ALONE).is_none() {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let address = free_address();
     let mut parent = Command::new(std::env::current_exe().unwrap())
@@ -147,10 +211,21 @@ fn it_exits_when_its_parent_is_killed() {
         gone_within(pid, Duration::from_secs(5)),
         "the proxy outlived a parent that was killed"
     );
+    println!("alone: it_exits_when_its_parent_is_killed_alone ran");
 }
 
 #[test]
 fn without_the_flag_a_closed_stdin_is_not_a_reason_to_exit() {
+    alone("without_the_flag_a_closed_stdin_is_not_a_reason_to_exit_alone");
+}
+
+/// The test above, as [`alone`] runs it.
+#[test]
+#[ignore = "run alone, by without_the_flag_a_closed_stdin_is_not_a_reason_to_exit"]
+fn without_the_flag_a_closed_stdin_is_not_a_reason_to_exit_alone() {
+    if std::env::var_os(ALONE).is_none() {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let address = free_address();
     let mut child = proxy(home.path(), address, false, Stdio::null());
@@ -164,13 +239,24 @@ fn without_the_flag_a_closed_stdin_is_not_a_reason_to_exit() {
     );
     child.kill().unwrap();
     child.wait().unwrap();
+    println!("alone: without_the_flag_a_closed_stdin_is_not_a_reason_to_exit_alone ran");
 }
 
 /// Taking commands, the proxy answers `clear-cache` on its stdout after its
 /// announcement, and still goes when the pipe from its parent closes.
 #[test]
 fn taking_commands_it_clears_when_asked_and_exits_when_the_pipe_closes() {
+    alone("taking_commands_it_clears_when_asked_and_exits_when_the_pipe_closes_alone");
+}
+
+/// The test above, as [`alone`] runs it.
+#[test]
+#[ignore = "run alone, by taking_commands_it_clears_when_asked_and_exits_when_the_pipe_closes"]
+fn taking_commands_it_clears_when_asked_and_exits_when_the_pipe_closes_alone() {
     use std::io::Write;
+    if std::env::var_os(ALONE).is_none() {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let mut child = Command::new(PROXY)
         .args([
@@ -217,4 +303,7 @@ fn taking_commands_it_clears_when_asked_and_exits_when_the_pipe_closes() {
         std::thread::sleep(Duration::from_millis(50));
     };
     assert!(status.success());
+    println!(
+        "alone: taking_commands_it_clears_when_asked_and_exits_when_the_pipe_closes_alone ran"
+    );
 }
