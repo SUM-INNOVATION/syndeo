@@ -7,6 +7,7 @@ mod auth;
 mod ca;
 mod keychain;
 mod stats;
+mod websocket;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -315,6 +316,12 @@ struct Proxy {
     /// carries. Past it, the tunnel is closed without a certificate minted or
     /// an origin asked.
     tunnel_first_byte: std::time::Duration,
+    /// The resolver a WebSocket's own connection to its origin uses: the one
+    /// every other fetch uses, configured by `--dns`.
+    dns: syndeo_net::dns::Dns,
+    /// The TLS a `wss://` WebSocket's own connection to its origin speaks;
+    /// see [`websocket::client_config`].
+    upstream_tls: Arc<rustls::ClientConfig>,
     /// Requests this proxy has been asked to handle, so a test can see that a
     /// loop stopped rather than only that an answer came back.
     #[cfg(test)]
@@ -345,6 +352,7 @@ async fn run(args: RunArgs) -> Result<()> {
         .parse()
         .map_err(|e: String| anyhow::anyhow!("--dns: {e}"))?;
 
+    let resolver = syndeo_net::dns::Dns::new(&dns).context("the resolver for WebSockets")?;
     let root = cache_root(&home(), args.cache.as_deref());
     let net = open_net(net_config(&root, args.shared, dns))?;
 
@@ -358,6 +366,8 @@ async fn run(args: RunArgs) -> Result<()> {
         max_request_body: args.max_request_body,
         auth,
         tunnel_first_byte: TUNNEL_FIRST_BYTE,
+        dns: resolver,
+        upstream_tls: websocket::client_config()?,
         #[cfg(test)]
         handled: Default::default(),
     });
@@ -671,8 +681,9 @@ fn connect(proxy: Arc<Proxy>, req: Request<Incoming>, local: SocketAddr) -> Resp
             };
             let origin = tunnel_origin("https", &host, port);
             let service = tunnel_service(proxy, origin, local);
+            // With upgrades, so a `wss://` WebSocket can switch protocols.
             if let Err(err) = ServerBuilder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(tls), service)
+                .serve_connection_with_upgrades(TokioIo::new(tls), service)
                 .await
             {
                 tracing::debug!(%host, %err, "tunnelled connection closed");
@@ -681,9 +692,10 @@ fn connect(proxy: Arc<Proxy>, req: Request<Incoming>, local: SocketAddr) -> Resp
             let origin = tunnel_origin("http", &host, port);
             let service = tunnel_service(proxy, origin, local);
             // Keep-alive, so one tunnel carries as many requests as the browser
-            // sends down it.
+            // sends down it; with upgrades, so a `ws://` WebSocket can switch.
             if let Err(err) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(io), service)
+                .with_upgrades()
                 .await
             {
                 tracing::debug!(%host, %err, "plain tunnelled connection closed");
@@ -814,6 +826,15 @@ async fn forward(
     }
     if url_targets_this_proxy(&url, local) {
         return loop_detected();
+    }
+
+    // A WebSocket goes its own way, and never near the cache; see websocket.rs.
+    match websocket::upgrading(req.method(), req.version(), req.headers()) {
+        websocket::Upgrading::WebSocket { key } => {
+            return websocket::open(proxy, req, url, key).await
+        }
+        websocket::Upgrading::Refused(why) => return websocket::refused(why),
+        websocket::Upgrading::No => {}
     }
 
     let mut headers = forwardable(req.headers());
@@ -1306,6 +1327,16 @@ mod tests {
         dir: &std::path::Path,
         config: NetConfig,
     ) -> (SocketAddr, Arc<Proxy>) {
+        start_proxy_trusting(dir, config, websocket::client_config().unwrap()).await
+    }
+
+    /// A real proxy, fetching with `config`, whose WebSockets' own TLS to
+    /// their origins verifies with `upstream_tls`.
+    async fn start_proxy_trusting(
+        dir: &std::path::Path,
+        config: NetConfig,
+        upstream_tls: Arc<rustls::ClientConfig>,
+    ) -> (SocketAddr, Arc<Proxy>) {
         let net = open_net(config).unwrap();
         let authority = CertificateAuthority::load_or_create(dir.join("proxy")).unwrap();
         let proxy = Arc::new(Proxy {
@@ -1315,6 +1346,8 @@ mod tests {
             max_request_body: 16,
             auth: None,
             tunnel_first_byte: std::time::Duration::from_millis(300),
+            dns: syndeo_net::dns::Dns::new(&DnsMode::System).unwrap(),
+            upstream_tls,
             handled: Default::default(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1362,6 +1395,7 @@ mod tests {
             ("ca.rs", include_str!("ca.rs")),
             ("keychain.rs", include_str!("keychain.rs")),
             ("stats.rs", include_str!("stats.rs")),
+            ("websocket.rs", include_str!("websocket.rs")),
         ] {
             let found = syndeo_cache::redact::unredacted(source);
             assert!(found.is_empty(), "{file}: {found:#?}");
@@ -2241,6 +2275,8 @@ mod tests {
             max_request_body: DEFAULT_MAX_REQUEST_BODY,
             auth: Some(auth::ProxyAuth::read_frame(&mut frame.as_slice()).unwrap()),
             tunnel_first_byte: std::time::Duration::from_millis(300),
+            dns: syndeo_net::dns::Dns::new(&DnsMode::System).unwrap(),
+            upstream_tls: websocket::client_config().unwrap(),
             handled: Default::default(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2602,5 +2638,613 @@ mod tests {
         // With a local authority the usual path applies instead.
         CertificateAuthority::load_or_create(&dir).unwrap();
         assert!(!untrust_without_local_ca(&dir, &Empty, &Never, &mut Vec::new()).unwrap());
+    }
+
+    // ------------------------------------------------------- WebSockets
+
+    /// How a test WebSocket origin answers a handshake.
+    #[derive(Clone, Copy)]
+    enum Answering {
+        /// 101 as RFC 6455 says, a frame of its own in the same write, then
+        /// every text frame echoed.
+        Echo,
+        /// 101, accepting some other key.
+        WrongAccept,
+        /// 101 without Upgrade.
+        NoUpgrade,
+        /// 403, with a body, that any cache may keep for ten minutes.
+        Refuse,
+    }
+
+    /// A WebSocket origin on a free loopback port, over TLS when given a
+    /// config. It keeps every handshake head it is sent.
+    struct WsOrigin {
+        address: SocketAddr,
+        heads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WsOrigin {
+        async fn start(answering: Answering, tls: Option<Arc<rustls::ServerConfig>>) -> WsOrigin {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let heads = Arc::new(Mutex::new(Vec::new()));
+            let kept = heads.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let kept = kept.clone();
+                    let tls = tls.clone();
+                    tokio::spawn(async move {
+                        match tls {
+                            Some(config) => {
+                                if let Ok(tls) =
+                                    tokio_rustls::TlsAcceptor::from(config).accept(stream).await
+                                {
+                                    ws_answer(tls, answering, kept).await;
+                                }
+                            }
+                            None => ws_answer(stream, answering, kept).await,
+                        }
+                    });
+                }
+            });
+            WsOrigin { address, heads }
+        }
+
+        fn heads(&self) -> Vec<String> {
+            self.heads.lock().unwrap().clone()
+        }
+    }
+
+    /// Everything up to and including the blank line, read a byte at a time
+    /// so nothing after it is taken.
+    async fn ws_head<S: tokio::io::AsyncRead + Unpin>(io: &mut S) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if io.read(&mut byte).await.unwrap_or(0) == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    /// One header's value in a head, by name, ignoring ASCII case.
+    fn ws_header(head: &str, name: &str) -> Option<String> {
+        head.lines().find_map(|line| {
+            let (n, v) = line.split_once(':')?;
+            n.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_string())
+        })
+    }
+
+    /// A frame of at most 125 bytes, masked as a client must send it.
+    fn ws_frame(opcode: u8, payload: &[u8], masked: bool) -> Vec<u8> {
+        assert!(payload.len() < 126);
+        let mask = [0x37, 0xfa, 0x21, 0x3d];
+        let mut out = vec![
+            0x80 | opcode,
+            payload.len() as u8 | if masked { 0x80 } else { 0 },
+        ];
+        if masked {
+            out.extend_from_slice(&mask);
+            out.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        } else {
+            out.extend_from_slice(payload);
+        }
+        out
+    }
+
+    /// One frame, unmasked: its opcode and payload.
+    async fn ws_read<S: tokio::io::AsyncRead + Unpin>(io: &mut S) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let mut head = [0u8; 2];
+        io.read_exact(&mut head).await.unwrap();
+        let length = (head[1] & 0x7f) as usize;
+        assert!(length < 126);
+        let mut mask = [0u8; 4];
+        if head[1] & 0x80 != 0 {
+            io.read_exact(&mut mask).await.unwrap();
+        }
+        let mut payload = vec![0u8; length];
+        io.read_exact(&mut payload).await.unwrap();
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+        (head[0] & 0x0f, payload)
+    }
+
+    async fn ws_answer<S>(mut io: S, answering: Answering, kept: Arc<Mutex<Vec<String>>>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+        let head = ws_head(&mut io).await;
+        kept.lock().unwrap().push(head.clone());
+        let key = ws_header(&head, "sec-websocket-key").unwrap_or_default();
+        let right = websocket::accept(&key);
+        let wrong = websocket::accept("AAAAAAAAAAAAAAAAAAAAAA==");
+        let answer = match answering {
+            Answering::Echo => format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {right}\r\nSec-WebSocket-Protocol: chat\r\n\r\n"
+            ),
+            Answering::WrongAccept => format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {wrong}\r\n\r\n"
+            ),
+            Answering::NoUpgrade => format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {right}\r\n\r\n"
+            ),
+            Answering::Refuse => "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\
+                 Cache-Control: public, max-age=600\r\nContent-Length: 7\r\n\r\ngo away"
+                .to_string(),
+        };
+        let mut out = answer.into_bytes();
+        if !matches!(answering, Answering::Echo) {
+            let _ = io.write_all(&out).await;
+            return;
+        }
+        // Its own first frame in the same write as the 101: whatever comes
+        // with the switch has to reach the client too.
+        out.extend(ws_frame(0x1, b"hello", false));
+        if io.write_all(&out).await.is_err() {
+            return;
+        }
+        loop {
+            let (opcode, payload) = ws_read(&mut io).await;
+            match opcode {
+                0x1 => {
+                    if io.write_all(&ws_frame(0x1, &payload, false)).await.is_err() {
+                        return;
+                    }
+                }
+                0x8 => {
+                    let _ = io.write_all(&ws_frame(0x8, &payload, false)).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// RFC 6455 section 1.3's own example key.
+    const WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+
+    /// Send a handshake for `target` with `extra` header lines, and read the
+    /// head of what came back.
+    async fn ws_open<S>(io: &mut S, target: &str, host: &str, extra: &[&str]) -> String
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n\
+             Sec-WebSocket-Key: {WS_KEY}\r\nSec-WebSocket-Version: 13\r\n"
+        );
+        if !extra
+            .iter()
+            .any(|line| line.to_ascii_lowercase().starts_with("connection:"))
+        {
+            request.push_str("Connection: Upgrade\r\n");
+        }
+        for line in extra {
+            request.push_str(line);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        io.write_all(request.as_bytes()).await.unwrap();
+        within(ws_head(io)).await
+    }
+
+    /// After a 101: the origin's own first frame, then a ping echoed.
+    async fn ws_carries<S>(io: &mut S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+        assert_eq!(within(ws_read(io)).await, (0x1, b"hello".to_vec()));
+        io.write_all(&ws_frame(0x1, b"ping", true)).await.unwrap();
+        assert_eq!(within(ws_read(io)).await, (0x1, b"ping".to_vec()));
+        io.write_all(&ws_frame(0x8, &1000u16.to_be_bytes(), true))
+            .await
+            .unwrap();
+        assert_eq!(within(ws_read(io)).await.0, 0x8);
+    }
+
+    fn ws_switched(head: &str) {
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert_eq!(
+            ws_header(head, "upgrade").as_deref(),
+            Some("websocket"),
+            "{head}"
+        );
+        assert_eq!(
+            ws_header(head, "sec-websocket-accept"),
+            Some(websocket::accept(WS_KEY)),
+            "{head}"
+        );
+    }
+
+    fn ws_status(head: &str) -> u16 {
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn websocket_through_a_plain_tunnel_reaches_its_origin_and_carries_both_ways() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = WsOrigin::start(Answering::Echo, None).await;
+        let (proxy, handle) = start_proxy_with_count(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+
+        let (mut stream, status) = open_tunnel(proxy, &authority).await;
+        assert_eq!(status, 200);
+        let head = ws_open(
+            &mut stream,
+            "/chat?room=private",
+            &authority,
+            &[
+                "Connection: Upgrade, X-Hop",
+                "X-Hop: named by Connection, so hop-by-hop",
+                "Keep-Alive: timeout=5",
+                "Proxy-Connection: keep-alive",
+                "Proxy-Authorization: Basic c3luZGVvOnNlY3JldA==",
+                "Sec-WebSocket-Protocol: chat",
+                "Origin: http://localhost",
+            ],
+        )
+        .await;
+        ws_switched(&head);
+        assert_eq!(
+            ws_header(&head, "sec-websocket-protocol").as_deref(),
+            Some("chat")
+        );
+        ws_carries(&mut stream).await;
+
+        let heads = origin.heads();
+        assert_eq!(heads.len(), 1);
+        let sent = &heads[0];
+        assert!(
+            sent.starts_with("GET /chat?room=private HTTP/1.1\r\n"),
+            "{sent}"
+        );
+        for (name, value) in [
+            ("upgrade", "websocket"),
+            ("connection", "Upgrade"),
+            ("sec-websocket-key", WS_KEY),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-protocol", "chat"),
+            ("origin", "http://localhost"),
+            ("host", authority.as_str()),
+            ("via", "1.1 syndeo"),
+        ] {
+            assert_eq!(
+                ws_header(sent, name).as_deref(),
+                Some(value),
+                "{name} in {sent}"
+            );
+        }
+        for gone in [
+            "x-hop",
+            "keep-alive",
+            "proxy-connection",
+            "proxy-authorization",
+        ] {
+            assert!(
+                ws_header(sent, gone).is_none(),
+                "{gone} reached the origin: {sent}"
+            );
+        }
+        assert_eq!(handle.authority.leaf_count(), 0);
+    }
+
+    /// A TLS origin with a leaf for localhost from an authority of its own,
+    /// and the client config that trusts that authority and nothing else.
+    fn ws_tls_origin(
+        dir: &std::path::Path,
+    ) -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+        let authority = CertificateAuthority::load_or_create(dir.join("origin-authority")).unwrap();
+        let server = authority.server_config("localhost").unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut authority.certificate_pem().as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let mut client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        (server, Arc::new(client))
+    }
+
+    /// TLS to the proxy inside a tunnel, trusting the proxy's own authority,
+    /// as a Syndeo window does.
+    async fn ws_tls_to_proxy(
+        stream: tokio::net::TcpStream,
+        proxy: &Proxy,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut proxy.authority.certificate_pem().as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        within(tokio_rustls::TlsConnector::from(Arc::new(config)).connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        ))
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn websocket_over_tls_through_a_tunnel_reaches_its_origin_over_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, trusting) = ws_tls_origin(dir.path());
+        let origin = WsOrigin::start(Answering::Echo, Some(server)).await;
+        let mut config = net_config(&cache_root(dir.path(), None), true, DnsMode::System);
+        config.cache_public_addresses_only = false;
+        let (proxy, handle) = start_proxy_trusting(dir.path(), config, trusting).await;
+        let authority = format!("localhost:{}", origin.address.port());
+
+        let (stream, status) = open_tunnel(proxy, &authority).await;
+        assert_eq!(status, 200);
+        let mut tls = ws_tls_to_proxy(stream, &handle).await;
+        let head = ws_open(&mut tls, "/secure", &authority, &[]).await;
+        ws_switched(&head);
+        ws_carries(&mut tls).await;
+        assert_eq!(
+            origin.heads().len(),
+            1,
+            "the handshake did not reach the origin over TLS"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_over_tls_to_an_origin_the_system_does_not_trust_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, _) = ws_tls_origin(dir.path());
+        let origin = WsOrigin::start(Answering::Echo, Some(server)).await;
+        // The platform's verifier, which has never heard of that authority.
+        let (proxy, handle) = start_proxy_with_count(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let mut tls = ws_tls_to_proxy(stream, &handle).await;
+        let head = ws_open(&mut tls, "/secure", &authority, &[]).await;
+        assert_eq!(ws_status(&head), 502, "{head}");
+        assert!(
+            origin.heads().is_empty(),
+            "a handshake went out over unverified TLS"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_in_proxy_form_reaches_its_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = WsOrigin::start(Answering::Echo, None).await;
+        let proxy = start_proxy(dir.path()).await;
+        let authority = format!("127.0.0.1:{}", origin.address.port());
+
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let head = ws_open(
+            &mut stream,
+            &format!("http://{authority}/plain"),
+            &authority,
+            &[],
+        )
+        .await;
+        ws_switched(&head);
+        ws_carries(&mut stream).await;
+        assert!(origin.heads()[0].starts_with("GET /plain HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn websocket_nothing_of_one_is_cached_nor_asked_of_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let refusing = WsOrigin::start(Answering::Refuse, None).await;
+        let echoing = WsOrigin::start(Answering::Echo, None).await;
+        // A proxy that would cache this loopback origin's answers.
+        let (proxy, handle) = start_proxy_with_count(dir.path()).await;
+
+        for round in 0..2 {
+            let authority = format!("localhost:{}", refusing.address.port());
+            let (mut stream, _) = open_tunnel(proxy, &authority).await;
+            let head = ws_open(&mut stream, "/refused", &authority, &[]).await;
+            // An ordinary answer, relayed as one, body and all.
+            assert_eq!(ws_status(&head), 403, "round {round}: {head}");
+            assert_eq!(
+                ws_header(&head, "cache-control").as_deref(),
+                Some("public, max-age=600")
+            );
+            let mut body = [0u8; 7];
+            within(tokio::io::AsyncReadExt::read_exact(&mut stream, &mut body))
+                .await
+                .unwrap();
+            assert_eq!(&body, b"go away");
+        }
+        assert_eq!(
+            refusing.heads().len(),
+            2,
+            "the second handshake was answered from a cache"
+        );
+
+        let authority = format!("localhost:{}", echoing.address.port());
+        let (mut stream, _) = open_tunnel(proxy, &authority).await;
+        ws_switched(&ws_open(&mut stream, "/echo", &authority, &[]).await);
+        ws_carries(&mut stream).await;
+
+        let stats = handle.net.cache().stats().unwrap();
+        assert_eq!(
+            (stats.requests, stats.stores, stats.entries),
+            (0, 0, 0),
+            "a WebSocket went near the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_handshakes_short_of_well_formed_are_refused_and_reach_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = WsOrigin::start(Answering::Echo, None).await;
+        let proxy = start_proxy(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+        let key = format!("Sec-WebSocket-Key: {WS_KEY}\r\n");
+        for (what, request) in [
+            ("no key", "GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n".to_string()),
+            ("a short key", "GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: c2hvcnQ=\r\nSec-WebSocket-Version: 13\r\n\r\n".to_string()),
+            ("version 8", format!("GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n{key}Sec-WebSocket-Version: 8\r\n\r\n")),
+            ("websocket and h2c", format!("GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket, h2c\r\nConnection: Upgrade\r\n{key}Sec-WebSocket-Version: 13\r\n\r\n")),
+            ("no Connection: Upgrade", format!("GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: keep-alive\r\n{key}Sec-WebSocket-Version: 13\r\n\r\n")),
+            ("a POST", format!("POST / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n{key}Sec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n")),
+            ("a body", format!("GET / HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n{key}Sec-WebSocket-Version: 13\r\nContent-Length: 5\r\n\r\nhello")),
+            ("HTTP/1.0", format!("GET / HTTP/1.0\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n{key}Sec-WebSocket-Version: 13\r\n\r\n")),
+        ] {
+            let (mut stream, _) = open_tunnel(proxy, &authority).await;
+            tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes()).await.unwrap();
+            let head = within(ws_head(&mut stream)).await;
+            assert_eq!(ws_status(&head), 400, "{what}: {head}");
+        }
+        assert!(
+            origin.heads().is_empty(),
+            "a refused handshake reached the origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_an_origin_that_does_not_complete_the_switch_is_not_joined() {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = start_proxy(dir.path()).await;
+        for answering in [Answering::WrongAccept, Answering::NoUpgrade] {
+            let origin = WsOrigin::start(answering, None).await;
+            let authority = format!("localhost:{}", origin.address.port());
+            let (mut stream, _) = open_tunnel(proxy, &authority).await;
+            let head = ws_open(&mut stream, "/", &authority, &[]).await;
+            assert_eq!(ws_status(&head), 502, "{head}");
+            assert_eq!(origin.heads().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_another_upgrade_goes_the_ordinary_way_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"ordinary"))).await;
+        let proxy = start_proxy(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let mut sender = http_over(stream).await;
+        let reply = get(
+            &mut sender,
+            "/",
+            &[
+                ("host", &authority),
+                ("upgrade", "h2c"),
+                ("connection", "Upgrade"),
+            ],
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(&reply.body[..], b"ordinary");
+        let seen = origin.seen();
+        assert!(!seen[0].headers.contains_key("upgrade"));
+    }
+
+    /// Set for a test [`alone`] runs, and only for it.
+    const ALONE: &str = "SYNDEO_TEST_ALONE";
+
+    /// Run the `#[ignore]`d test `name`, of this module, in a test process of
+    /// its own with only that test in it, and require that it ran and passed.
+    ///
+    /// For a test that reads the log. tracing decides once for each log site
+    /// whether anything is listening, and another test reaching the same
+    /// site on another thread as this one starts listening can leave it
+    /// decided as nothing: the warning a WebSocket test reads went missing
+    /// that way in one run of three. In a process running one test, nothing
+    /// else reaches it. What that process says goes to a file, read once it
+    /// has exited.
+    fn alone(name: &str) {
+        use std::io::{Read, Seek};
+        let module = module_path!();
+        let test = format!(
+            "{}::{name}",
+            module.split_once("::").map_or(module, |(_, m)| m)
+        );
+        let mut said = tempfile::tempfile().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                test.as_str(),
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(ALONE, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(said.try_clone().unwrap())
+            .stderr(said.try_clone().unwrap())
+            .status()
+            .unwrap();
+        let mut all = Vec::new();
+        said.rewind().unwrap();
+        said.read_to_end(&mut all).unwrap();
+        let said = String::from_utf8_lossy(&all);
+        assert!(
+            status.success()
+                && said.contains("test result: ok. 1 passed")
+                && said.contains(&format!("alone: {name} ran")),
+            "{test}, alone:\n{said}"
+        );
+    }
+
+    #[test]
+    fn websocket_is_logged_with_its_origin_and_nothing_of_its_path_or_query() {
+        alone("websocket_is_logged_with_its_origin_and_nothing_of_its_path_or_query_alone");
+    }
+
+    /// The test above, as [`alone`] runs it.
+    #[tokio::test]
+    #[ignore = "run alone, by websocket_is_logged_with_its_origin_and_nothing_of_its_path_or_query"]
+    async fn websocket_is_logged_with_its_origin_and_nothing_of_its_path_or_query_alone() {
+        if std::env::var_os(ALONE).is_none() {
+            return;
+        }
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = start_proxy(dir.path()).await;
+        // An origin that does not complete the switch, so the proxy logs it.
+        let origin = WsOrigin::start(Answering::WrongAccept, None).await;
+        let authority = format!("127.0.0.1:{}", origin.address.port());
+        let (mut stream, _) = open_tunnel(proxy, &authority).await;
+        let head = ws_open(&mut stream, "/reset/private?token=private", &authority, &[]).await;
+        assert_eq!(ws_status(&head), 502);
+        // And one carried to its close, which is logged when it ends.
+        let echoing = WsOrigin::start(Answering::Echo, None).await;
+        let carried = format!("127.0.0.1:{}", echoing.address.port());
+        let (mut stream, _) = open_tunnel(proxy, &carried).await;
+        ws_switched(&ws_open(&mut stream, "/reset/private?token=private", &carried, &[]).await);
+        ws_carries(&mut stream).await;
+        drop(stream);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let log = captured.text();
+        assert!(log.contains("did not answer the handshake"), "{log}");
+        assert!(log.contains(&format!("http://{authority}")), "{log}");
+        for private in ["private", "token", "/reset"] {
+            assert!(!log.contains(private), "{private} in {log}");
+        }
+        println!(
+            "alone: websocket_is_logged_with_its_origin_and_nothing_of_its_path_or_query_alone ran"
+        );
     }
 }
