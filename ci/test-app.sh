@@ -1673,6 +1673,31 @@ rt_carried() {
   return 1
 }
 
+# rt_answered SEEN FROM: the origin saw a handshake from FROM, with Upgrade
+# websocket, answered it 101, and echoed its one message.
+#
+# Each of these is a function, never a case inside "$(...)": the bash these
+# run under on the runner, macOS's 3.2, cannot parse a case pattern's ")"
+# there, and says so only when the line runs.
+rt_answered() {
+  case "$1" in *"a handshake from $2,"*"Upgrade 'websocket'"*"answered 101; echoed 1 message(s)"*) return 0 ;; esac
+  return 1
+}
+
+# rt_rtc_there SAID: the WebRTC page found RTCPeerConnection a function.
+rt_rtc_there() {
+  case "$1" in *"RTCPeerConnection: a function"*) return 0 ;; esac
+  return 1
+}
+
+# rt_rtc_around SEEN: this Mac's STUN server had at least one Binding
+# request, and none of them from the proxy.
+rt_rtc_around() {
+  [ "$(printf '%s\n' "$1" | tr ';' '\n' | grep -c 'binding from')" -ge 1 ] || return 1
+  case "$1" in *syndeo-proxy*) return 1 ;; esac
+  return 0
+}
+
 # rt_through_syndeo: a WebSocket to this Mac by a public name for 127.0.0.1,
 # which goes through Syndeo, has to be carried: open, echoed and closed
 # cleanly in the page; at the origin, one handshake from the proxy with
@@ -1683,7 +1708,7 @@ rt_carried() {
 rt_through_syndeo() {
   rt_websocket name
   must "$(rt_carried "$RT_SAID" && echo yes)" "a WebSocket through Syndeo opens, carries its ping back and closes cleanly in the page" "${RT_SAID:-the page said nothing}"
-  must "$(case "$RT_SEEN" in *"a handshake from syndeo-proxy,"*"Upgrade 'websocket'"*"answered 101; echoed 1 message(s)"*) echo yes ;; esac)" \
+  must "$(rt_answered "$RT_SEEN" syndeo-proxy && echo yes)" \
     "a WebSocket through Syndeo reaches its origin from the proxy, with Upgrade websocket, is answered 101 and carries its message" "the origin saw: $RT_SEEN"
   must "$([ -n "$RT_BEFORE" ] && [ "$RT_BEFORE" = "$RT_AFTER" ] && echo yes)" \
     "a WebSocket through Syndeo is kept from the proxy's cache: its count did not move" "$RT_BEFORE before, $RT_AFTER after"
@@ -1693,7 +1718,7 @@ rt_through_syndeo() {
 
 # realtime APP: see the top of this script.
 realtime() {
-  local app P iface lan t from before said seen stun
+  local app P iface lan t from before said seen
   [ -d "${1:-}" ] || { say "usage: $0 realtime <Syndeo.app>"; exit 2; }
   app="$(cd "$1" && pwd -P)"
   no_app || { say "refusing: $ID is already running"; exit 2; }
@@ -1714,7 +1739,7 @@ realtime() {
     "the start page says WebRTC connects directly, not through Syndeo, and that Syndeo is not a VPN" "$(page_text)"
 
   rt_websocket loop
-  must "$(rt_carried "$RT_SAID" && case "$RT_SEEN" in *"a handshake from com.apple.WebKit.Networking,"*"answered 101; echoed 1 message(s)"*) echo yes ;; esac)" \
+  must "$(rt_carried "$RT_SAID" && rt_answered "$RT_SEEN" com.apple.WebKit.Networking && echo yes)" \
     "a WebSocket to this Mac's loopback address, which WebKit opens itself, opens, carries its ping back and closes cleanly" \
     "the page: ${RT_SAID:-nothing}; the origin: $RT_SEEN"
   rt_through_syndeo
@@ -1733,13 +1758,12 @@ realtime() {
   wait_for 40 page_says "RT-DONE-$t" || true
   said="$(rt_said "$t" RTC | tr '\n' '|' | sed 's/|$//; s/|/ | /g')"
   seen="$(rt_udp "$from")"
-  stun="$(printf '%s\n' "$seen" | tr ';' '\n' | grep -c 'binding from')"
   counted "after WebRTC"
   # What the start page says about WebRTC, kept true: it is there, and it
   # goes around Syndeo — its STUN reaches this Mac's server, and none of it
   # from the proxy, and the proxy's count does not move.
-  must "$(case "$said" in *"RTCPeerConnection: a function"*) echo yes ;; esac)" "WebRTC is there: RTCPeerConnection is a function" "${said:-the page said nothing}"
-  must "$([ "$stun" -ge 1 ] && case "$seen" in *syndeo-proxy*) ;; *) echo yes ;; esac)" \
+  must "$(rt_rtc_there "$said" && echo yes)" "WebRTC is there: RTCPeerConnection is a function" "${said:-the page said nothing}"
+  must "$(rt_rtc_around "$seen" && echo yes)" \
     "WebRTC goes around Syndeo: this Mac's STUN server had Binding requests, none from syndeo-proxy" "the STUN server had: $seen"
   must "$([ -n "$before" ] && [ "$before" = "$COUNTED" ] && echo yes)" "WebRTC goes around Syndeo: the proxy's count did not move" "$before before, $COUNTED after"
   rt_record "WebRTC, from a page on this Mac's loopback; STUN at ${lan:-no LAN address}:$P, 127.0.0.1:$P and stun.l.google.com:19302" \
