@@ -97,18 +97,30 @@ welcome as a second opinion; they are not treated as new.
   (RUSTSEC-2023-0071) and unmaintained crates. What ships is built with default
   features, and that dependency tree has to pass the advisory check on every
   commit; the renderer's is reported weekly, separately, and never gates.
-- **`syndeo-webkit` is kept behind `syndeo-proxy` by configuration, not by a
-  sandbox.** Its web view is configured to send its traffic through the proxy,
-  with the proxy's certificate pinned. Anything WebKit does not send through
-  that setting is not covered by it. WebKit was seen to send requests for
-  localhost and loopback addresses directly, never to the proxy, so a page in
-  it can reach local services without the proxy seeing the request. WebRTC is
-  another candidate and has not been measured. WebSockets do not work through
-  the proxy.
-- **What can reach the local proxy.** The proxy `syndeo-webkit` starts listens
-  on a loopback port the system picks and answers only requests carrying a
-  credential generated for that launch, which is handed to it and to WebKit
-  and to nothing else; a request without it gets 407 and reaches no origin.
+- **Syndeo.app and `syndeo-webkit` are kept behind `syndeo-proxy` by
+  configuration, not by a sandbox.** Their web views are configured to send
+  their traffic through the proxy, with the proxy's certificate pinned.
+  Anything WebKit does not send through that setting is not covered by it.
+  WebKit was seen to send requests for localhost and loopback addresses
+  directly, never to the proxy, so a page in it can reach local services
+  without the proxy seeing the request. WebRTC was measured connecting
+  directly, so a page can learn your public IP address through it, and may
+  learn your address on your local network; Syndeo.app's start page says so,
+  and that Syndeo is not a VPN. WebKit has no supported control to turn
+  WebRTC off or proxy it ([#41](https://github.com/SUM-INNOVATION/syndeo/issues/41)).
+  WebSockets go through the proxy, which checks their handshakes and never
+  caches them.
+- **Syndeo.app's own certificate authority.** It is made on the Mac, its
+  private key readable only by the user, in
+  `~/Library/Application Support/Syndeo/proxy`. Syndeo.app's windows pin it,
+  and macOS is never asked to trust it, so anyone who could read that key
+  could impersonate any site to Syndeo's windows, and to no other
+  application.
+- **What can reach the local proxy.** The proxy Syndeo.app or `syndeo-webkit`
+  starts listens on a loopback port the system picks and answers only
+  requests carrying a credential generated for that launch, which is handed
+  to it and to WebKit and to nothing else; a request without it gets 407 and
+  reaches no origin.
   It keeps out a process that can reach the port and nothing more; it is no
   defence against code already able to inspect the browser process itself. A
   `syndeo-proxy run` started by hand asks for no
@@ -117,8 +129,10 @@ welcome as a second opinion; they are not treated as new.
   answered from its cache, for as long as it runs. Neither limits how many
   connections it accepts. Request bodies are limited, to 64 MiB by default.
 - **Proxy traffic is not partitioned by site, and says it is a proxy.** The
-  proxy — and so `syndeo-webkit` — has no top-level site to partition its
-  cache by, and every request it forwards carries `Via: 1.1 syndeo`.
+  proxy — and so Syndeo.app and `syndeo-webkit` — has no top-level site to
+  partition its cache by, and every request it forwards carries
+  `Via: 1.1 syndeo`. Syndeo.app has one browsing profile, whose cookies and
+  website storage every site shares.
 - **Losing both the passphrase and the recovery phrase is unrecoverable.** That
   is what the recovery phrase is for.
 
