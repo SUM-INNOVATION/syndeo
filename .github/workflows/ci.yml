@@ -374,12 +374,14 @@ jobs:
       # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
       # mutants.py): the pinning delegate, the main frame's navigation policy,
       # the schemes a new tab may open, the address field's guard for typing,
-      # the bar's rule for names, and the refusal of a link to an IPv6 address
-      # with a zone. Each is built from this tree, which is then put back, and
-      # the test has to catch each by the checks meant to, with every other
-      # check passing. All six are run whatever any one does, each recorded
-      # on its own and cleaned up after; the step fails at the end if any was
-      # not caught exactly as intended.
+      # the bar's rule for names, the refusal of a link to an IPv6 address
+      # with a zone, Reload asking the origin, and, in the proxy, a WebSocket
+      # carried rather than stripped of its Upgrade. Each is built from this
+      # tree, the app and its helper, which is then put back, and the test has
+      # to catch each by the checks meant to, with every other check passing.
+      # All of them are run whatever any one does, each recorded on its own
+      # and cleaned up after; the step fails at the end if any was not caught
+      # exactly as intended.
       - name: Build each mutant, and require the test to catch it
         shell: bash
         run: |
@@ -391,11 +393,11 @@ jobs:
             echo "::group::mutant $name"
             built=no
             if python3 -I ci/macos-app/mutants.py apply "$name" . &&
-              cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app; then
+              cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app -p syndeo-proxy; then
               built=yes
             fi
             # Put back whatever happened, and exactly.
-            git checkout -- crates/syndeo-app
+            git checkout -- crates/syndeo-app crates/syndeo-proxy
             if ! git diff --quiet; then
               echo "::error::the tree was not put back after mutant $name"
               exit 1
@@ -439,10 +441,10 @@ jobs:
         if: always()
         run: bash ci/test-app.sh routes "$PWD/dist/Syndeo.app"
 
-      # What WebSockets and WebRTC do in Syndeo.app, kept in realtime.txt in
-      # the logs for the owner's decision. Nothing it sees is judged; it fails
-      # only when it cannot measure.
-      - name: WebSockets and WebRTC in Syndeo.app (measured, not a gate)
+      # WebSockets through Syndeo, carried and kept from its cache; WebRTC
+      # around it, as the start page says; public servers measured, not
+      # gated. Kept in realtime.txt in the logs.
+      - name: WebSockets through Syndeo, and WebRTC around it, as the start page says
         if: always()
         run: bash ci/test-app.sh realtime "$PWD/dist/Syndeo.app"
 

@@ -36,12 +36,19 @@ back.
   let Syndeo's proxy answer from its own fresh copy without asking the
   origin. The reload must then be seen not consulting the origin: neither
   the proxy's revalidations nor its misses rise.
+- websocket-headers-stripped: in the proxy, a WebSocket handshake goes the
+  ordinary way, which drops Upgrade and Connection with the other
+  hop-by-hop headers, as it did before; that is what CI 39198465745
+  measured. A WebSocket through Syndeo must then be seen failing: in the
+  page, at the origin, which is sent no Upgrade, and in the proxy's count,
+  which the handshake then moves.
 """
 import os
 import sys
 
 BROWSER = "crates/syndeo-app/src/browser_macos.rs"
 ADDRESS = "crates/syndeo-app/src/address.rs"
+PROXY = "crates/syndeo-proxy/src/main.rs"
 
 MUTANTS = {
     "no-pinning-delegate": [
@@ -124,6 +131,15 @@ MUTANTS = {
             BROWSER,
             "                    unsafe { web.view.reloadFromOrigin() };\n",
             "                    unsafe { web.view.reload() };\n",
+        ),
+    ],
+    "websocket-headers-stripped": [
+        (
+            PROXY,
+            "        websocket::Upgrading::WebSocket { key } => {\n"
+            "            return websocket::open(proxy, req, url, key).await\n"
+            "        }\n",
+            "        websocket::Upgrading::WebSocket { .. } => {}\n",
         ),
     ],
 }

@@ -99,8 +99,9 @@
 # page's links in the window for no-navigation-policy, in a new tab for
 # any-scheme-in-a-new-tab, typing kept through a page's arrival for
 # no-editing-guard, the bar for a name for direct-for-every-name, a link to
-# an IPv6 address with a zone for zoned-links-followed, and Reload consulting
-# the origin for reload-from-cache. Any other failure is a failure.
+# an IPv6 address with a zone for zoned-links-followed, Reload consulting
+# the origin for reload-from-cache, and a WebSocket through Syndeo for
+# websocket-headers-stripped. Any other failure is a failure.
 #
 # routes, which gates: the bar's route against what WebKit actually does,
 # the proxy caching nothing from this Mac, and Clear Browsing Data. From a
@@ -146,22 +147,27 @@
 # it had kept. It puts lo0 and /etc/hosts back and requires them, and the
 # trust settings, exactly as they were.
 #
-# realtime, which only reports: what WebSockets and WebRTC do in Syndeo.app,
+# realtime, which gates WebSockets through Syndeo and WebRTC around it,
 # against ci/macos-app/realtime-origin.py, which logs every handshake it is
 # sent, with its Upgrade and Connection headers and the process it came from,
 # and every STUN datagram, with the process it came from. Each case is a page
-# whose script says what happened; the page's words, what the origin saw and
-# the proxy's count before and after are kept in realtime.txt:
-#   - a WebSocket, ws://, to this Mac by its loopback address, which WebKit
-#     reaches directly; to this Mac by a public name for 127.0.0.1, which goes
-#     through Syndeo; and to a public echo server, by ws:// and by wss://;
-#   - WebRTC: whether RTCPeerConnection exists, the ICE candidates a data
-#     channel's offer gathers with STUN at this Mac's LAN address, at
-#     127.0.0.1 and at a public server, and whether two connections in the
-#     page connect and pass a message, and by which candidates; and which
-#     processes hold UDP sockets while they try.
-# It fails only when it cannot measure: the app or the origin does not
-# start, or a page the origin serves does not open.
+# on this Mac's loopback, which WebKit reaches by itself, whose script says
+# what happened; kept in realtime.txt with what the origin saw and the
+# proxy's count before and after:
+#   - the start page says that WebRTC connects directly, not through
+#     Syndeo, and that Syndeo is not a VPN;
+#   - a WebSocket to 127.0.0.1, which WebKit opens itself, opens, carries a
+#     ping back and closes cleanly;
+#   - a WebSocket through Syndeo, by a public name for 127.0.0.1, does the
+#     same, and reaches the origin from the proxy with Upgrade: websocket,
+#     answered 101; and the proxy's count does not move, since a WebSocket
+#     never goes near its cache;
+#   - WebRTC is there, and goes around Syndeo, as the start page says: STUN
+#     at this Mac's LAN address and at 127.0.0.1 reaches this Mac's server,
+#     none of it from the proxy, and the proxy's count does not move.
+# Measured, not gated, because what they do is theirs: a WebSocket to a
+# public echo server by ws:// and wss://, what a public STUN server answered,
+# and whether two connections in one page join.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -957,6 +963,7 @@ mutant() {
     direct-for-every-name) intended='^the bar for a name' ;;
     zoned-links-followed) intended='^a link to an IPv6 address with a zone' ;;
     reload-from-cache) intended="^the reload consulted the origin through Syndeo's proxy" ;;
+    websocket-headers-stripped) intended='^a WebSocket through Syndeo' ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
   if started "$app" "mutant-$name"; then
@@ -968,11 +975,13 @@ mutant() {
       no-editing-guard) editing ;;
       direct-for-every-name | zoned-links-followed) routes_lite ;;
       reload-from-cache) reload_gate ;;
+      websocket-headers-stripped) realtime_origin && rt_through_syndeo ;;
       *) policy "$log" ;;
     esac
   fi
   origin_stop
   route_origin_stop
+  realtime_origin_stop
   stopped "mutant-$name"
   printf '\n'
   caught="$(printf '%s' "$FAILED" | grep -E "$intended")"
@@ -1637,13 +1646,58 @@ rt_record() {
   for l in "$@"; do printf '             %s\n' "$l" | tee -a "$LOGS/realtime.txt"; done
 }
 
+# rt_websocket WHERE: the WebSocket page for WHERE (see realtime-origin.py),
+# opened from this Mac's loopback origin, which WebKit reaches by itself, so
+# that only the WebSocket can move the proxy's count. Sets RT_SAID, what the
+# page said; RT_SEEN, what the origin saw; and RT_BEFORE and RT_AFTER, the
+# proxy's count around it.
+RT_SAID='' RT_SEEN='' RT_BEFORE='' RT_AFTER=''
+rt_websocket() {
+  local where="$1" t from base="http://127.0.0.1:$RT_PORT"
+  t="$(token)"
+  counted "before the WebSocket ($where)"
+  RT_BEFORE="$COUNTED"
+  from="$(rt_lines)"
+  visit "$base/ws?t=$t&to=$where" "$base/ws?t=$t&to=$where" "RT-WS-$t" "the WebSocket page opens ($where)"
+  wait_for 30 page_says "RT-DONE-$t" || true
+  RT_SAID="$(rt_said "$t" WS)"
+  RT_SEEN="$(rt_origin "$from" "$t")"
+  counted "after the WebSocket ($where)"
+  RT_AFTER="$COUNTED"
+}
+
+# rt_carried SAID: the page saw its WebSocket open, its ping echoed, and a
+# clean close with 1000 (the origin gives no reason with its close).
+rt_carried() {
+  case "$1" in *"; open; message echo; close 1000 clean") return 0 ;; esac
+  return 1
+}
+
+# rt_through_syndeo: a WebSocket to this Mac by a public name for 127.0.0.1,
+# which goes through Syndeo, has to be carried: open, echoed and closed
+# cleanly in the page; at the origin, one handshake from the proxy with
+# Upgrade websocket, answered 101, its message echoed; and the proxy's
+# cache not asked, so its count does not move. The checks are named "a
+# WebSocket through Syndeo", which is what the websocket-headers-stripped
+# mutant has to fail and nothing else.
+rt_through_syndeo() {
+  rt_websocket name
+  must "$(rt_carried "$RT_SAID" && echo yes)" "a WebSocket through Syndeo opens, carries its ping back and closes cleanly in the page" "${RT_SAID:-the page said nothing}"
+  must "$(case "$RT_SEEN" in *"a handshake from syndeo-proxy,"*"Upgrade 'websocket'"*"answered 101; echoed 1 message(s)"*) echo yes ;; esac)" \
+    "a WebSocket through Syndeo reaches its origin from the proxy, with Upgrade websocket, is answered 101 and carries its message" "the origin saw: $RT_SEEN"
+  must "$([ -n "$RT_BEFORE" ] && [ "$RT_BEFORE" = "$RT_AFTER" ] && echo yes)" \
+    "a WebSocket through Syndeo is kept from the proxy's cache: its count did not move" "$RT_BEFORE before, $RT_AFTER after"
+  printf '  WEBSOCKET  through Syndeo: the page: %s; the origin: %s; the proxy count: %s before, %s after\n' \
+    "${RT_SAID:-nothing}" "$RT_SEEN" "$RT_BEFORE" "$RT_AFTER" >>"$LOGS/realtime.txt"
+}
+
 # realtime APP: see the top of this script.
 realtime() {
-  local app P iface lan where what base t from before said seen sockets
+  local app P iface lan t from before said seen stun
   [ -d "${1:-}" ] || { say "usage: $0 realtime <Syndeo.app>"; exit 2; }
   app="$(cd "$1" && pwd -P)"
   no_app || { say "refusing: $ID is already running"; exit 2; }
-  printf '\nWebSockets and WebRTC in Syndeo.app (measured; not a gate)\n'
+  printf '\nWebSockets through Syndeo, and WebRTC around it\n'
   : >"$LOGS/realtime.txt"
   realtime_origin || return 1
   P="$RT_PORT"
@@ -1655,48 +1709,45 @@ realtime() {
   fi
   helper_of "$app" realtime
   browses realtime
+  must "$(page_says 'WebRTC media and peer connections connect directly and are not sent through or cached by Syndeo\.' &&
+    page_says 'Syndeo is not a VPN\.' && echo yes)" \
+    "the start page says WebRTC connects directly, not through Syndeo, and that Syndeo is not a VPN" "$(page_text)"
 
-  for where in loop name echo echos; do
-    case "$where" in
-      loop) what="a WebSocket, ws://, to this Mac by its loopback address, which WebKit reaches directly"; base="http://127.0.0.1:$P" ;;
-      name) what="a WebSocket, ws://, to this Mac by a public name for 127.0.0.1, which goes through Syndeo"; base="http://127.0.0.1.nip.io:$P" ;;
-      echo) what="a WebSocket, ws://, to a public echo server (echo.websocket.org)"; base="http://127.0.0.1:$P" ;;
-      echos) what="a WebSocket, wss://, to the same public echo server"; base="http://127.0.0.1:$P" ;;
-    esac
-    t="$(token)"
-    counted "before the WebSocket ($where)"
-    before="$COUNTED"
-    from="$(rt_lines)"
-    visit "$base/ws?t=$t&to=$where" "$base/ws?t=$t&to=$where" "RT-WS-$t" "the WebSocket page opens ($where)"
-    wait_for 30 page_says "RT-DONE-$t" || true
-    said="$(rt_said "$t" WS)"
-    seen="$(rt_origin "$from" "$t")"
-    counted "after the WebSocket ($where)"
-    rt_record "$what" "the page: ${said:-nothing}" "the origin: $seen" "the proxy's count: $before before, $COUNTED after"
-  done
+  rt_websocket loop
+  must "$(rt_carried "$RT_SAID" && case "$RT_SEEN" in *"a handshake from com.apple.WebKit.Networking,"*"answered 101; echoed 1 message(s)"*) echo yes ;; esac)" \
+    "a WebSocket to this Mac's loopback address, which WebKit opens itself, opens, carries its ping back and closes cleanly" \
+    "the page: ${RT_SAID:-nothing}; the origin: $RT_SEEN"
+  rt_through_syndeo
+
+  # Public servers: measured, not gated, since what they do is theirs.
+  rt_websocket echo
+  rt_record "a WebSocket, ws://, to a public echo server (echo.websocket.org)" "the page: ${RT_SAID:-nothing}" "the proxy's count: $RT_BEFORE before, $RT_AFTER after"
+  rt_websocket echos
+  rt_record "a WebSocket, wss://, to the same public echo server" "the page: ${RT_SAID:-nothing}" "the proxy's count: $RT_BEFORE before, $RT_AFTER after"
 
   t="$(token)"
   counted "before WebRTC"
   before="$COUNTED"
   from="$(rt_lines)"
-  visit "http://127.0.0.1.nip.io:$P/rtc?t=$t&lan=$lan" "http://127.0.0.1.nip.io:$P/rtc?t=$t&lan=$lan" "RT-RTC-$t" "the WebRTC page opens"
-  # While it gathers and connects: which processes hold UDP sockets.
-  sleep 4
-  lsof +c 0 -nP -iUDP >"$LOGS/realtime-udp-sockets.txt" 2>&1 || true
-  sockets="$(awk 'NR > 1 {print $1}' "$LOGS/realtime-udp-sockets.txt" | sort | uniq -c | awk '{printf "%s%s %s", (NR > 1 ? ", " : ""), $2, $1}')"
+  visit "http://127.0.0.1:$P/rtc?t=$t&lan=$lan" "http://127.0.0.1:$P/rtc?t=$t&lan=$lan" "RT-RTC-$t" "the WebRTC page opens"
   wait_for 40 page_says "RT-DONE-$t" || true
   said="$(rt_said "$t" RTC | tr '\n' '|' | sed 's/|$//; s/|/ | /g')"
   seen="$(rt_udp "$from")"
+  stun="$(printf '%s\n' "$seen" | tr ';' '\n' | grep -c 'binding from')"
   counted "after WebRTC"
-  rt_record "WebRTC, from a page through Syndeo; STUN at ${lan:-no LAN address}:$P, 127.0.0.1:$P and stun.l.google.com:19302" \
-    "the page: ${said:-nothing}" "the origin's STUN server: $seen" \
-    "UDP sockets 4 s in, by process: ${sockets:-none}" "the proxy's count: $before before, $COUNTED after"
+  # What the start page says about WebRTC, kept true: it is there, and it
+  # goes around Syndeo — its STUN reaches this Mac's server, and none of it
+  # from the proxy, and the proxy's count does not move.
+  must "$(case "$said" in *"RTCPeerConnection: a function"*) echo yes ;; esac)" "WebRTC is there: RTCPeerConnection is a function" "${said:-the page said nothing}"
+  must "$([ "$stun" -ge 1 ] && case "$seen" in *syndeo-proxy*) ;; *) echo yes ;; esac)" \
+    "WebRTC goes around Syndeo: this Mac's STUN server had Binding requests, none from syndeo-proxy" "the STUN server had: $seen"
+  must "$([ -n "$before" ] && [ "$before" = "$COUNTED" ] && echo yes)" "WebRTC goes around Syndeo: the proxy's count did not move" "$before before, $COUNTED after"
+  rt_record "WebRTC, from a page on this Mac's loopback; STUN at ${lan:-no LAN address}:$P, 127.0.0.1:$P and stun.l.google.com:19302" \
+    "the page: ${said:-nothing}" "this Mac's STUN server: $seen" "the proxy's count: $before before, $COUNTED after"
 
   stopped realtime
   realtime_origin_stop
-  printf '  MEASURE  the app'"'"'s log, lines about WebSockets or upgrades: %s\n' \
-    "$(plain_log "$LOGS/app-realtime.stderr" 2>/dev/null | grep -ciE 'websocket|upgrade')" | tee -a "$LOGS/realtime.txt"
-  printf '\n%d failed to measure\n' "$fails"
+  printf '\n%d failed\n' "$fails"
   [ "$fails" = 0 ]
 }
 
