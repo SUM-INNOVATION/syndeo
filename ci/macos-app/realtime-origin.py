@@ -24,7 +24,8 @@ proxy.
                              with the Upgrade, Connection and
                              Sec-WebSocket-Key headers it was sent; answered
                              101 only when they make a handshake, and 400
-                             otherwise.
+                             otherwise. Once closed, it waits for the client
+                             to close its side too (see linger).
   /rtc?t=<token>&lan=<addr>  a page that tries WebRTC and says, after
                              RT-RTC-<token>: whether RTCPeerConnection exists;
                              the ICE candidates a data channel's offer
@@ -254,6 +255,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
         self.close_connection = True
         echoed = 0
+        ended = "the connection ending, with no close frame"
         while True:
             frame = self.frame()
             if frame is None:
@@ -266,8 +268,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_frame(0xA, payload)
             elif opcode == 0x8:
                 self.send_frame(0x8, payload[:2])
+                ended = "its close frame"
                 break
-        log({"path": "/echo", "t": entry["t"], "echoed": echoed})
+        log({"path": "/echo", "t": entry["t"], "echoed": echoed, "ended": ended})
+        self.linger()
+
+    def linger(self):
+        """Close as RFC 6455 section 7.1.1 asks a server to, but gently: send
+        nothing more, then wait, at most five seconds, for the client to close
+        its side. Closing at once can throw the close frame just sent away
+        with a reset, and the page then sees its WebSocket end abnormally
+        (1006) though both sides closed it cleanly. A page did, once in four
+        runs, on a WebSocket WebKit opened to this origin itself."""
+        try:
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_WR)
+            self.connection.settimeout(5)
+            while self.connection.recv(4096):
+                pass
+        except OSError:
+            pass
 
     def frame(self):
         """One frame a client sent, unmasked: (opcode, payload), or None at its end."""

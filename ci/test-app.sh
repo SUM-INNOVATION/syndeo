@@ -1612,7 +1612,7 @@ with open(log, encoding="utf-8") as f:
         if e.get("udp") or e.get("t") != token:
             continue
         if "echoed" in e:
-            said.append(f"echoed {e['echoed']} message(s)")
+            said.append(f"echoed {e['echoed']} message(s), ended by {e.get('ended', 'what was not kept')}")
         elif e["path"] == "/echo":
             said.append(f"a handshake from {e['process']}, Host {e['host']}, Upgrade {e['upgrade']!r}, "
                         f"Connection {e['connection']!r}, key {e['key']}, Via {e['via']!r}: answered {e['answered']}")
