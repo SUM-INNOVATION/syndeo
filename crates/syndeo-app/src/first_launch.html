@@ -23,6 +23,7 @@
 <p class="lede">A browser that fetches the web through a cache and network of its own, on this Mac.</p>
 <ul>
   <li id="proxy">Syndeo's local proxy is running, and web pages are fetched through it: the bar above a page says <b>Through Syndeo</b>. WebKit opens this Mac's own loopback addresses — <b>localhost</b>, 127.0.0.1, ::1 — directly instead, and the bar says <b>Direct — not cached by Syndeo</b>. For a local-network address typed as numbers, such as 192.168.1.10, WebKit may connect directly or through Syndeo, and the bar says <b>Local — not cached by Syndeo</b>: either way, Syndeo does not cache it. Each image, script and other part of a page is classified by its own address.</li>
+  <li id="webrtc"><b>WebRTC media and peer connections connect directly and are not sent through or cached by Syndeo. Syndeo is not a VPN.</b></li>
   <li id="secure">Secure (https) pages open as they are: each Syndeo window accepts Syndeo's own local certificate authority, and no other, for the pages its proxy fetches. Nothing is added to your keychain, and your certificate trust settings are left as they are.</li>
   <li id="search">{{SEARCH}}</li>
   <li id="clear">To remove cookies, website storage and cached pages, choose Syndeo &gt; Settings, then Clear Browsing Data.</li>

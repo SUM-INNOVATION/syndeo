@@ -1061,6 +1061,24 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
         }
     }
 
+    /// The start page says, in so many words and where every new window and
+    /// tab shows it, that WebRTC goes around Syndeo: measured in CI
+    /// 39198465745, where a page's STUN went from WebKit's own networking
+    /// process to a public server, and two connections in a page joined
+    /// directly. ci/test-app.sh realtime keeps that measurement a gate, so
+    /// the sentence cannot quietly stop being true.
+    #[test]
+    fn the_start_page_says_webrtc_goes_around_syndeo() {
+        let page = start_page(Search::DuckDuckGo);
+        assert!(
+            page.contains(
+                "<li id=\"webrtc\"><b>WebRTC media and peer connections connect directly and are \
+                 not sent through or cached by Syndeo. Syndeo is not a VPN.</b></li>"
+            ),
+            "{page}"
+        );
+    }
+
     /// Nothing in the application asks for, reads or changes the keychain's
     /// trust settings, or runs `security`, which could: each window accepts
     /// the proxy's authority itself.
