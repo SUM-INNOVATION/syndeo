@@ -439,6 +439,13 @@ jobs:
         if: always()
         run: bash ci/test-app.sh routes "$PWD/dist/Syndeo.app"
 
+      # What WebSockets and WebRTC do in Syndeo.app, kept in realtime.txt in
+      # the logs for the owner's decision. Nothing it sees is judged; it fails
+      # only when it cannot measure.
+      - name: WebSockets and WebRTC in Syndeo.app (measured, not a gate)
+        if: always()
+        run: bash ci/test-app.sh realtime "$PWD/dist/Syndeo.app"
+
       - name: What this runner allows (measured, not a gate)
         if: always()
         run: bash ci/test-app.sh measure

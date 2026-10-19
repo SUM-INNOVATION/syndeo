@@ -6,6 +6,7 @@
 #   ci/test-app.sh mutant <name> <Syndeo.app with that safeguard taken out>
 #   ci/test-app.sh routes <Syndeo.app>
 #   ci/test-app.sh customer <installed Syndeo.app> [again]
+#   ci/test-app.sh realtime <Syndeo.app>
 #   ci/test-app.sh measure
 #
 # launch, which gates: open the app with `open`, never by running its
@@ -144,6 +145,23 @@
 # runs on) and website storage, and WebKit's cache stops answering for a page
 # it had kept. It puts lo0 and /etc/hosts back and requires them, and the
 # trust settings, exactly as they were.
+#
+# realtime, which only reports: what WebSockets and WebRTC do in Syndeo.app,
+# against ci/macos-app/realtime-origin.py, which logs every handshake it is
+# sent, with its Upgrade and Connection headers and the process it came from,
+# and every STUN datagram, with the process it came from. Each case is a page
+# whose script says what happened; the page's words, what the origin saw and
+# the proxy's count before and after are kept in realtime.txt:
+#   - a WebSocket, ws://, to this Mac by its loopback address, which WebKit
+#     reaches directly; to this Mac by a public name for 127.0.0.1, which goes
+#     through Syndeo; and to a public echo server, by ws:// and by wss://;
+#   - WebRTC: whether RTCPeerConnection exists, the ICE candidates a data
+#     channel's offer gathers with STUN at this Mac's LAN address, at
+#     127.0.0.1 and at a public server, and whether two connections in the
+#     page connect and pass a message, and by which candidates; and which
+#     processes hold UDP sockets while they try.
+# It fails only when it cannot measure: the app or the origin does not
+# start, or a page the origin serves does not open.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -1533,6 +1551,155 @@ routes_lite() {
 
 # measure: report what this runner allows; fail only if it cannot put the
 # trust settings back.
+# The realtime origin (ci/macos-app/realtime-origin.py): its port and pid.
+RT_PORT='' RT_PID=''
+realtime_origin() {
+  : >"$LOGS/realtime-origin.jsonl"
+  python3 -I -u "$here/macos-app/realtime-origin.py" "$LOGS/realtime-origin.jsonl" >"$LOGS/realtime-origin.out" 2>&1 &
+  RT_PID=$!
+  if ! wait_for 10 grep -q '^port [0-9]' "$LOGS/realtime-origin.out"; then
+    bad "realtime origin" "it did not start: $(head -c 200 "$LOGS/realtime-origin.out")"
+    return 1
+  fi
+  RT_PORT="$(sed -n 's/^port \([0-9][0-9]*\)$/\1/p' "$LOGS/realtime-origin.out")"
+}
+realtime_origin_stop() {
+  local status
+  [ -n "$RT_PID" ] || return 0
+  if kill -0 "$RT_PID" 2>/dev/null; then
+    kill "$RT_PID"
+    wait "$RT_PID" 2>/dev/null
+    status=$?
+    [ "$status" = 143 ] || bad "realtime origin" "it ended with status $status, not from the SIGTERM sent"
+  else
+    wait "$RT_PID" 2>/dev/null
+    bad "realtime origin" "it had already ended, status $?, before it was stopped: $(tail -n 3 "$LOGS/realtime-origin.out" | tr '\n' ' ')"
+  fi
+  if grep -q 'Traceback' "$LOGS/realtime-origin.out"; then
+    bad "realtime origin" "it raised: $(grep -A3 'Traceback' "$LOGS/realtime-origin.out" | tail -n 1)"
+  fi
+  RT_PID=''
+}
+
+# The realtime origin's log lines so far, to read only what comes after.
+rt_lines() { wc -l <"$LOGS/realtime-origin.jsonl" | tr -d ' '; }
+
+# rt_said TOKEN KIND: what the front page says on its RT-KIND-TOKEN lines.
+rt_said() {
+  front | grep -E '^AX(StaticText|Heading)' | cut -f2,3 | tr '\t' ' ' | grep -oE "RT-$2-$1 .*" | sed 's/ *$//'
+}
+
+# rt_origin FROM TOKEN: what the realtime origin saw for TOKEN after its
+# first FROM log lines: each page, each handshake with its headers and
+# answer, and what it echoed, with the process each came from.
+rt_origin() {
+  python3 -I - "$LOGS/realtime-origin.jsonl" "$1" "$2" <<'PY'
+import json, sys
+log, start, token = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+said = []
+with open(log, encoding="utf-8") as f:
+    for line in f.readlines()[start:]:
+        e = json.loads(line)
+        if e.get("udp") or e.get("t") != token:
+            continue
+        if "echoed" in e:
+            said.append(f"echoed {e['echoed']} message(s)")
+        elif e["path"] == "/echo":
+            said.append(f"a handshake from {e['process']}, Host {e['host']}, Upgrade {e['upgrade']!r}, "
+                        f"Connection {e['connection']!r}, key {e['key']}, Via {e['via']!r}: answered {e['answered']}")
+        else:
+            said.append(f"{e['path']} from {e['process']}")
+print("; ".join(said) or "nothing")
+PY
+}
+
+# rt_udp FROM: the datagrams the realtime origin had after its first FROM
+# log lines, by where from, what they were and the process that sent them.
+rt_udp() {
+  python3 -I - "$LOGS/realtime-origin.jsonl" "$1" <<'PY'
+import collections, json, sys
+log, start = sys.argv[1], int(sys.argv[2])
+counts = collections.Counter()
+with open(log, encoding="utf-8") as f:
+    for line in f.readlines()[start:]:
+        e = json.loads(line)
+        if e.get("udp"):
+            counts[(e["from"], e["stun"], e["process"])] += 1
+print("; ".join(f"{n}x {kind} from {addr}, by {process}" for (addr, kind, process), n in sorted(counts.items())) or "none")
+PY
+}
+
+# rt_record WHAT LINE...: one measurement, said and kept in realtime.txt.
+rt_record() {
+  local what="$1" l
+  shift
+  printf '  MEASURE  %s\n' "$what" | tee -a "$LOGS/realtime.txt"
+  for l in "$@"; do printf '             %s\n' "$l" | tee -a "$LOGS/realtime.txt"; done
+}
+
+# realtime APP: see the top of this script.
+realtime() {
+  local app P iface lan where what base t from before said seen sockets
+  [ -d "${1:-}" ] || { say "usage: $0 realtime <Syndeo.app>"; exit 2; }
+  app="$(cd "$1" && pwd -P)"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  printf '\nWebSockets and WebRTC in Syndeo.app (measured; not a gate)\n'
+  : >"$LOGS/realtime.txt"
+  realtime_origin || return 1
+  P="$RT_PORT"
+  iface="$(/sbin/route -n get default 2>/dev/null | awk '/interface:/ {print $2}')"
+  lan="$([ -n "$iface" ] && ipconfig getifaddr "$iface" 2>/dev/null)"
+  if ! started "$app" realtime; then
+    realtime_origin_stop
+    return 1
+  fi
+  helper_of "$app" realtime
+  browses realtime
+
+  for where in loop name echo echos; do
+    case "$where" in
+      loop) what="a WebSocket, ws://, to this Mac by its loopback address, which WebKit reaches directly"; base="http://127.0.0.1:$P" ;;
+      name) what="a WebSocket, ws://, to this Mac by a public name for 127.0.0.1, which goes through Syndeo"; base="http://127.0.0.1.nip.io:$P" ;;
+      echo) what="a WebSocket, ws://, to a public echo server (echo.websocket.org)"; base="http://127.0.0.1:$P" ;;
+      echos) what="a WebSocket, wss://, to the same public echo server"; base="http://127.0.0.1:$P" ;;
+    esac
+    t="$(token)"
+    counted "before the WebSocket ($where)"
+    before="$COUNTED"
+    from="$(rt_lines)"
+    visit "$base/ws?t=$t&to=$where" "$base/ws?t=$t&to=$where" "RT-WS-$t" "the WebSocket page opens ($where)"
+    wait_for 30 page_says "RT-DONE-$t" || true
+    said="$(rt_said "$t" WS)"
+    seen="$(rt_origin "$from" "$t")"
+    counted "after the WebSocket ($where)"
+    rt_record "$what" "the page: ${said:-nothing}" "the origin: $seen" "the proxy's count: $before before, $COUNTED after"
+  done
+
+  t="$(token)"
+  counted "before WebRTC"
+  before="$COUNTED"
+  from="$(rt_lines)"
+  visit "http://127.0.0.1.nip.io:$P/rtc?t=$t&lan=$lan" "http://127.0.0.1.nip.io:$P/rtc?t=$t&lan=$lan" "RT-RTC-$t" "the WebRTC page opens"
+  # While it gathers and connects: which processes hold UDP sockets.
+  sleep 4
+  lsof +c 0 -nP -iUDP >"$LOGS/realtime-udp-sockets.txt" 2>&1 || true
+  sockets="$(awk 'NR > 1 {print $1}' "$LOGS/realtime-udp-sockets.txt" | sort | uniq -c | awk '{printf "%s%s %s", (NR > 1 ? ", " : ""), $2, $1}')"
+  wait_for 40 page_says "RT-DONE-$t" || true
+  said="$(rt_said "$t" RTC | tr '\n' '|' | sed 's/|$//; s/|/ | /g')"
+  seen="$(rt_udp "$from")"
+  counted "after WebRTC"
+  rt_record "WebRTC, from a page through Syndeo; STUN at ${lan:-no LAN address}:$P, 127.0.0.1:$P and stun.l.google.com:19302" \
+    "the page: ${said:-nothing}" "the origin's STUN server: $seen" \
+    "UDP sockets 4 s in, by process: ${sockets:-none}" "the proxy's count: $before before, $COUNTED after"
+
+  stopped realtime
+  realtime_origin_stop
+  printf '  MEASURE  the app'"'"'s log, lines about WebSockets or upgrades: %s\n' \
+    "$(plain_log "$LOGS/app-realtime.stderr" 2>/dev/null | grep -ciE 'websocket|upgrade')" | tee -a "$LOGS/realtime.txt"
+  printf '\n%d failed to measure\n' "$fails"
+  [ "$fails" = 0 ]
+}
+
 measure() {
   local probe out status started
   printf '\nwhat this runner allows (measured; not a gate)\n'
@@ -1577,6 +1744,7 @@ case "${1:-}" in
   mutant) shift; mutant "$@" ;;
   routes) shift; routes "$@" ;;
   customer) shift; customer "$@" ;;
+  realtime) shift; realtime "$@" ;;
   measure) measure ;;
-  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | measure"; exit 2 ;;
+  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | measure"; exit 2 ;;
 esac
