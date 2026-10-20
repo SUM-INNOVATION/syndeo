@@ -432,6 +432,19 @@ jobs:
   # the package: Developer ID Installer signing, one submission and its own
   # wait, on the same terms as the binaries', and stapling and Gatekeeper
   # only after Apple accepted exactly that file.
+  #
+  # The time. Each stapling, the bundle's before the submission and the
+  # package's after the verdict, is at most five attempts:
+  # - 225 seconds of waiting between them;
+  # - ten stapler commands, each stopped at 60 seconds;
+  # - the copies and checks.
+  # That is under 15 minutes each, 30 together. In the signed dry run of
+  # 0.2.0 (run 39363163966), everything else in this job took about 30
+  # seconds: setup, downloads, the package built, signed and submitted, and
+  # the inspection and uploads after. The wait ends at its deadline, 300
+  # minutes counted from the submission, and the package is stapled only if
+  # Apple accepted it before then. So the job's worst case is about 331
+  # minutes, inside its 350.
   package:
     name: the installer package, signed and notarized
     needs: [verify, signing-config, build-macos, notarize-binaries]
@@ -574,13 +587,16 @@ jobs:
           path: notarization/package/
           if-no-files-found: ignore
 
-      # Only when this job failed once stapling had begun: the package Apple
-      # accepted, not stapled, and the last copy stapling changed or the
-      # stapled package, if any, none of them named .pkg; each stapling
-      # attempt's record; stapler's, pkgutil's and Gatekeeper's output; and
-      # the trust settings. ci/sign-macos-pkg.sh writes them there and nowhere
-      # else. Kept a week for diagnosis, and never downloaded by any job:
-      # nothing in it can be published.
+      # Only when this job failed once stapling had begun, the bundle's or
+      # the package's:
+      # - what Apple accepted, not stapled;
+      # - the last copy stapling changed, or what was stapled, if any;
+      # - each stapling attempt's record;
+      # - stapler's output, and the other tools' view of each thing kept;
+      # - the trust settings.
+      # None of it is named .pkg. ci/sign-macos-pkg.sh writes it there and
+      # nowhere else. Kept a week for diagnosis, and never downloaded by any
+      # job: nothing in it can be published.
       - name: Keep the stapling diagnostics, on failure
         if: failure()
         uses: actions/upload-artifact@v4

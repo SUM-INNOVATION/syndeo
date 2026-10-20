@@ -1059,25 +1059,30 @@ package.
     2. `notarize-binaries` checks and runs exactly those binaries and that
        bundle again, then sends them to Apple once, together, with
        `ci/notarize.py`, and waits for the verdict.
-    3. `package` staples that same bundle, checked by its SHA-256, and
-       requires it unchanged but for its ticket, and accepted by Gatekeeper.
-       Validating the bundle's ticket is retried, up to five times over
-       about four minutes. It builds the installer package from that bundle,
-       signs it with `ci/sign-macos-pkg.sh`, sends it to Apple once, waits,
-       and only then staples it. Stapling fetches the ticket over the
-       network, so it gets up to five attempts over about four minutes:
-       - the package Apple accepted is kept unchanged;
-       - each attempt staples and validates a fresh copy of it, checked by
-         its SHA-256 before stapler sees it;
+    3. `package` staples that same bundle, checked by its SHA-256, then
+       builds the installer package from it, signs it with
+       `ci/sign-macos-pkg.sh`, sends it to Apple once, waits, and only then
+       staples the package. Each stapling fetches its ticket from Apple over
+       the network, so each gets up to five attempts, over about four
+       minutes of waiting:
+       - what Apple accepted, the bundle's ZIP or the package, is kept
+         unchanged;
+       - each attempt staples and validates a fresh copy of it. Before
+         stapler sees the copy, it is checked against what Apple accepted:
+         the package by its SHA-256; the bundle path for path, byte for byte
+         and mode for mode, with its signature verified;
        - a copy stapling changed is never stapled again;
-       - only a copy stapled and validated becomes the package;
-       - if no attempt succeeds, the job fails, and there is no package.
+       - only a copy stapled and validated is used;
+       - each stapler command is stopped at 60 seconds;
+       - if no attempt succeeds, the job fails, and there is no stapled
+         bundle or package.
 
-       Every stapler command is shown with its output and exit status. If
-       stapling the package fails, the job keeps, as an internal artifact
-       for a week:
-       - the package Apple accepted;
-       - the last copy stapling changed, or the stapled package, if any;
+       The stapled bundle has to be unchanged but for its ticket, and
+       accepted by Gatekeeper; so does the package. Every stapler command
+       is shown with its output and exit status. If either stapling fails,
+       the job keeps, as an internal artifact for a week:
+       - what Apple accepted;
+       - the last copy stapling changed, or what was stapled, if any;
        - each attempt's record;
        - what the tools said.
 

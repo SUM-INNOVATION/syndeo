@@ -75,20 +75,50 @@
 # Syndeo.app with the seven executables, was accepted, and release.yml has
 # checked <Syndeo.app.zip> is the bundle that submission carried, by its
 # SHA-256:
-#  A1. unpack it into <out-dir>, which must not exist yet, and record every
-#      path in the bundle with its bytes, mode and owner;
-#  A2. staple the ticket to it, once, and validate it, validation retried up
-#      to five attempts, after 0, 15, 30, 60 and 120 seconds;
-#  A3. require the stapled bundle identical to the one unpacked, but for one
+#  A1. keep the bundle Apple accepted: its ZIP, copied read only into the
+#      working directory, and unpacked once as the reference. Every path in
+#      it is recorded with its bytes, mode and owner. It must hold no ticket
+#      yet, and its code signature must verify, strictly, with everything
+#      nested in it. <out-dir>, which must not exist yet, is made empty;
+#  A2. staple it, in up to five attempts, after 0, 15, 30, 60 and 120
+#      seconds, on the terms of step 5 of finish:
+#      - each attempt unpacks a fresh copy from the ZIP kept. Before stapler
+#        sees the copy, the ZIP must still be the accepted bytes; the copy
+#        must be the reference, path for path, byte for byte, mode for mode;
+#        and its signature must verify. If any of this fails, staple-app
+#        stops there;
+#      - a copy is never stapled twice. One stapler changed but that did not
+#        validate is set aside, and one it left unchanged is discarded;
+#      - only a copy stapled and validated becomes <out-dir>/Syndeo.app:
+#        copied into <out-dir> under another name, checked, then renamed;
+#      - five failed attempts are fatal, and leave <out-dir> removed;
+#  A3. require the stapled bundle identical to the reference, but for one
 #      file stapler adds, Contents/CodeResources, the ticket;
 #  A4. require its code signature to verify, strictly, with everything nested
 #      in it;
 #  A5. require Gatekeeper to accept it to run, as Notarized Developer ID, from
 #      a Developer ID Application identity of MACOS_TEAM_ID.
-# If it fails once stapling has begun, it keeps, in <diagnostics-dir>, the
-# stapled bundle as a ZIP with its SHA-256, stapler's output, codesign's and
-# Gatekeeper's, with the identity's name left out, and the trust settings;
-# and it removes <out-dir>, so no package is built from it.
+# If it fails once A1 has kept the bundle, it keeps, in <diagnostics-dir>,
+# these and nothing else:
+# - the ZIP Apple accepted, as Syndeo.app.accepted.zip;
+# - the last copy stapler changed, if any, as Syndeo.app.last-candidate.zip;
+# - the stapled bundle, if A3 to A5 failed, as Syndeo.app.stapled.zip;
+# - their SHA-256s;
+# - attempts.txt and stapler's output;
+# - codesign's and Gatekeeper's view of each bundle kept, with the
+#   identity's name left out;
+# - the trust settings.
+# It removes <out-dir>, so no package is built from it. Its cleanup, like
+# finish's, removes its working directory, and failing to is fatal.
+#
+# Every stapler command, in finish and in staple-app, is stopped if it runs
+# past 60 seconds, which then counts as that attempt failing (exit 124).
+# SYNDEO_STAPLER_LIMIT_SECONDS may make that shorter, 1 to 60, and nothing
+# makes it longer. So stapling, in either mode, takes at most 225 seconds of
+# waiting and ten stapler commands of 61 seconds each: under 15 minutes,
+# with the copies and checks. The package job runs both, one before its
+# submission and one after Apple's verdict; release.yml says how that fits
+# its time.
 #
 # The secrets: sign uses MACOS_INSTALLER_CERTIFICATE_P12_BASE64,
 # MACOS_INSTALLER_CERTIFICATE_PASSWORD, MACOS_INSTALLER_SIGNING_IDENTITY and
@@ -257,18 +287,72 @@ cleanup_sign() {
   exit "$status"
 }
 
-# recorded LOG COMMAND...: run COMMAND, and show its exact command line, its
-# complete output (stdout and stderr together) and its exit status, in the
-# log and appended to LOG. Returns COMMAND's status. Only for stapler, whose
-# command line and output name nothing but the package.
+# stapler_limit: how long a stapler command may run, in seconds: 60, or
+# SYNDEO_STAPLER_LIMIT_SECONDS if it is a whole number from 1 to 60. Anything
+# else is refused, so nothing makes the limit longer.
+stapler_limit() {
+  local limit="${SYNDEO_STAPLER_LIMIT_SECONDS:-60}"
+  [[ "$limit" =~ ^[1-9][0-9]?$ ]] && [ "$limit" -le 60 ] ||
+    die "refusing: SYNDEO_STAPLER_LIMIT_SECONDS is not a whole number of seconds from 1 to 60"
+  printf '%s' "$limit"
+}
+
+# recorded LOG COMMAND...: run COMMAND, stopped if it runs past $limit
+# seconds, and show its exact command line, its complete output (stdout and
+# stderr together) and its exit status, 124 if it was stopped, in the log and
+# appended to LOG. Returns that status. Only for stapler, whose command line
+# and output name nothing but what it staples. While it runs, its process is
+# $child, for cleanup to stop.
 recorded() {
-  local log="$1" status output block
+  local log="$1" status=0 output block tenths=0
   shift
-  output="$("$@" 2>&1)" && status=0 || status=$?
+  "$@" >"$work/command.out" 2>&1 &
+  child=$!
+  while kill -0 "$child" 2>/dev/null; do
+    if [ "$tenths" -ge $((limit * 10)) ]; then
+      stop_child
+      status=124
+      printf 'stopped: still running after %s seconds\n' "$limit" >>"$work/command.out"
+      break
+    fi
+    /bin/sleep 0.1
+    tenths=$((tenths + 1))
+  done
+  if [ "$status" != 124 ]; then
+    wait "$child" && status=0 || status=$?
+  fi
+  child=''
+  output="$(cat "$work/command.out")"
   block="$(printf '$ %s\n%s[exit %s]' "$*" "${output:+$output$'\n'}" "$status")"
   printf '%s\n' "$block" >>"$log"
   printf '%s\n' "$block" | sed 's/^/    /'
   return "$status"
+}
+
+# stop_child: the stapler command recorded runs, if any, stopped: TERM, then
+# KILL a second later, and reaped.
+stop_child() {
+  [ -n "${child:-}" ] || return 0
+  if kill -0 "$child" 2>/dev/null; then
+    kill -TERM "$child" 2>/dev/null
+    /bin/sleep 1
+    kill -KILL "$child" 2>/dev/null
+  fi
+  wait "$child" 2>/dev/null
+  child=''
+}
+
+# discard STEP N PATH: attempt N's copy, at PATH, removed. If it cannot be,
+# that is said, and left for cleanup, which then fails.
+discard() {
+  rm -rf "$3" 2>/dev/null || say "$1. attempt $2: its copy could not be removed; cleanup will fail for it"
+}
+
+# attempted STEP LINE: one attempt, what it did and how it ended, shown now
+# under STEP and kept in attempts.txt.
+attempted() {
+  say "$1. $2"
+  printf '%s\n' "$2" >>"$work/attempts.txt"
 }
 
 # sha FILE: FILE's SHA-256, or nothing, failing, if it cannot be read.
@@ -289,9 +373,11 @@ finish() {
   stapling=no
   accepted=''
   last=''
+  child=''
   trap cleanup_finish EXIT
   trap 'exit 130' INT TERM HUP
   signed_yes
+  limit="$(stapler_limit)"
   not_blank MACOS_INSTALLER_SIGNING_IDENTITY
   local identity="$MACOS_INSTALLER_SIGNING_IDENTITY"
   [ -f "$out" ] || die "no $out"
@@ -358,26 +444,26 @@ PY
     recorded "$work/stapler.txt" xcrun stapler staple "$candidate" || staple=$?
     got="$(sha "$candidate")" || die "5. attempt $attempt: could not read its copy after stapler"
     if [ "$staple" != 0 ] && [ "$got" = "$want" ]; then
-      attempted "$line; stapler staple exit $staple, the copy unchanged: discarded"
-      rm -f "$candidate"
+      attempted 5 "$line; stapler staple exit $staple, the copy unchanged: discarded"
+      discard 5 "$attempt" "$candidate"
       continue
     elif [ "$staple" != 0 ]; then
-      attempted "$line; stapler staple exit $staple, and the copy changed, to $got: set aside, never stapled again"
+      attempted 5 "$line; stapler staple exit $staple, and the copy changed, to $got: set aside, never stapled again"
       set_aside "$candidate"
       continue
     elif [ "$got" = "$want" ]; then
-      attempted "$line; stapler staple exit 0, but the copy is unchanged, with no ticket: discarded"
-      rm -f "$candidate"
+      attempted 5 "$line; stapler staple exit 0, but the copy is unchanged, with no ticket: discarded"
+      discard 5 "$attempt" "$candidate"
       continue
     fi
     validate=0
     recorded "$work/stapler.txt" xcrun stapler validate "$candidate" || validate=$?
     if [ "$validate" != 0 ]; then
-      attempted "$line; stapled, $got; stapler validate exit $validate: set aside, never stapled again"
+      attempted 5 "$line; stapled, $got; stapler validate exit $validate: set aside, never stapled again"
       set_aside "$candidate"
       continue
     fi
-    attempted "$line; stapled, $got; validated"
+    attempted 5 "$line; stapled, $got; validated"
     promote "$candidate" "$got" "$mode"
     promoted=yes
     break
@@ -402,13 +488,6 @@ PY
   fi
   succeeded=yes
   say "signed, notarized and stapled: $out"
-}
-
-# attempted LINE: one attempt, what it did and how it ended, shown now and
-# kept in attempts.txt.
-attempted() {
-  say "5. $1"
-  printf '%s\n' "$1" >>"$work/attempts.txt"
 }
 
 # set_aside COPY: a copy stapler changed that did not validate, kept as the
@@ -472,6 +551,7 @@ keep_diagnostics() {
 cleanup_finish() {
   local status=$? failed=''
   set +e
+  stop_child
   if [ "$succeeded" != yes ] && [ "$stapling" = yes ]; then
     keep_diagnostics || printf 'sign-macos-pkg: could not keep all of the diagnostics in %s\n' "$diag" >&2
   fi
@@ -496,28 +576,10 @@ cleanup_finish() {
 
 # ------------------------------------------------------------------ staple-app
 
-# validated LOG PATH: stapler validate PATH, retried as finish retries it.
-# Prints the attempt it passed on; fails after five.
-validated() {
-  local log="$1" path="$2" delay attempt=0
-  for delay in 0 15 30 60 120; do
-    attempt=$((attempt + 1))
-    if [ "$delay" != 0 ]; then
-      say "the stapled ticket did not validate; validating again in ${delay}s (attempt $attempt of 5)" >&2
-      sleep "$delay"
-    fi
-    if recorded "$log" xcrun stapler validate "$path" >&2; then
-      echo "$attempt"
-      return 0
-    fi
-  done
-  return 1
-}
-
 staple_app() {
   case "$-" in *x*) die "refusing: tracing is on, and would print the secrets" ;; esac
   [ "$#" = 3 ] || die "usage: $0 staple-app <Syndeo.app.zip> <out-dir> <diagnostics-dir>"
-  local zip="$1" team attempt
+  local zip="$1" team want
   out_dir="$2"
   diag="$3"
   umask 022
@@ -526,9 +588,14 @@ staple_app() {
   stapling=no
   made=no
   app=''
+  accepted=''
+  reference=''
+  last=''
+  child=''
   trap cleanup_staple_app EXIT
   trap 'exit 130' INT TERM HUP
   signed_yes
+  limit="$(stapler_limit)"
   not_blank MACOS_TEAM_ID
   team="$MACOS_TEAM_ID"
   [[ "$team" =~ ^[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10}$ ]] || die "refusing: MACOS_TEAM_ID is not ten capital letters and digits"
@@ -536,26 +603,86 @@ staple_app() {
   [ ! -e "$out_dir" ] && [ ! -L "$out_dir" ] || die "$out_dir exists"
   [ ! -e "$diag" ] || die "refusing: $diag already exists, and diagnostics are only ever written fresh"
 
+  # A1. The bundle Apple accepted, kept: its ZIP, read only, and unpacked
+  # once as the reference every copy is held to.
   mkdir -p "$out_dir"
   made=yes
-  ditto -x -k "$zip" "$out_dir" || die "A1. could not unpack $zip"
-  app="$out_dir/Syndeo.app"
-  [ "$(cd "$out_dir" && ls -A)" = Syndeo.app ] && [ -d "$app" ] && [ ! -L "$app" ] || die "A1. $zip does not hold Syndeo.app alone"
   work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sign-macos-pkg.XXXXXX")"
-  manifest "$app" >"$work/before.manifest"
-  [ ! -e "$app/Contents/CodeResources" ] || die "A1. the bundle holds a ticket already"
-  say "A1. unpacked Syndeo.app, $(wc -l <"$work/before.manifest" | tr -d ' ') paths"
-
+  mkdir "$work/accepted" "$work/reference" "$work/attempts" "$work/manifests" "$work/last" ||
+    die "A1. could not make the working directories"
   : >"$work/stapler.txt"
+  : >"$work/attempts.txt"
+  want="$(sha "$zip")" || die "A1. could not read $zip"
+  accepted="$work/accepted/Syndeo.app.zip"
+  cp "$zip" "$accepted" && chmod 0444 "$accepted" || die "A1. could not keep $zip"
+  [ "$(sha "$accepted")" = "$want" ] || die "A1. the ZIP kept is not $zip"
+  ditto -x -k "$accepted" "$work/reference" || die "A1. could not unpack $zip"
+  reference="$work/reference/Syndeo.app"
+  [ "$(cd "$work/reference" && ls -A)" = Syndeo.app ] && [ -d "$reference" ] && [ ! -L "$reference" ] ||
+    die "A1. $zip does not hold Syndeo.app alone"
+  manifest "$reference" >"$work/manifests/accepted" || die "A1. could not record the bundle"
+  [ ! -e "$reference/Contents/CodeResources" ] || die "A1. the bundle holds a ticket already"
+  codesign --verify --strict --deep "$reference" >"$work/codesign-reference.txt" 2>&1 ||
+    die "A1. the bundle's code signature does not verify as Apple accepted it"
   stapling=yes
-  recorded "$work/stapler.txt" xcrun stapler staple "$app" || die "A2. could not staple the ticket"
-  attempt="$(validated "$work/stapler.txt" "$app")" || die "A2. the stapled ticket does not validate, after 5 attempts"
-  say "A2. the ticket is stapled and validates (validation attempt $attempt)"
+  say "A1. kept Syndeo.app as Apple accepted it: its ZIP, read only ($want), $(wc -l <"$work/manifests/accepted" | tr -d ' ') paths, its signature verifying"
 
-  manifest "$app" >"$work/after.manifest"
-  if ! grep -vE '^\./Contents/CodeResources file ' "$work/after.manifest" | cmp -s - "$work/before.manifest" ||
-    [ "$(grep -cE '^\./Contents/CodeResources file 644 ' "$work/after.manifest")" != 1 ]; then
-    diff "$work/before.manifest" "$work/after.manifest" | grep '^[<>]' | head -10 >&2 || true
+  # A2. Up to five attempts, each on a fresh copy.
+  local delay attempt=0 candidate now staple validate promoted=no line
+  for delay in 0 15 30 60 120; do
+    attempt=$((attempt + 1))
+    if [ "$delay" != 0 ]; then
+      say "A2. attempt $attempt of 5 in ${delay}s"
+      sleep "$delay"
+    fi
+    now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    # A fresh copy from the ZIP kept, the ZIP still the accepted bytes, and
+    # the copy the reference exactly, its signature verifying, before
+    # stapler sees it.
+    [ "$(sha "$accepted")" = "$want" ] ||
+      die "A2. attempt $attempt: the ZIP kept is no longer the one Apple accepted; nothing more is stapled"
+    mkdir "$work/attempts/$attempt" || die "A2. attempt $attempt: could not make its directory"
+    ditto -x -k "$accepted" "$work/attempts/$attempt" || die "A2. attempt $attempt: could not unpack a fresh copy"
+    candidate="$work/attempts/$attempt/Syndeo.app"
+    manifest "$candidate" >"$work/manifests/$attempt" 2>/dev/null && cmp -s "$work/manifests/accepted" "$work/manifests/$attempt" ||
+      die "A2. attempt $attempt: its copy is not the bundle Apple accepted, path for path; nothing is stapled"
+    codesign --verify --strict --deep "$candidate" >"$work/codesign-$attempt.txt" 2>&1 ||
+      die "A2. attempt $attempt: its copy's code signature does not verify; nothing is stapled"
+    line="attempt $attempt of 5, $now: a fresh copy of the bundle Apple accepted, its signature verifying"
+    staple=0
+    recorded "$work/stapler.txt" xcrun stapler staple "$candidate" || staple=$?
+    if [ "$staple" != 0 ] && unchanged "$candidate" "$attempt"; then
+      attempted A2 "$line; stapler staple exit $staple, the copy unchanged: discarded"
+      discard A2 "$attempt" "$work/attempts/$attempt"
+      continue
+    elif [ "$staple" != 0 ]; then
+      attempted A2 "$line; stapler staple exit $staple, and the copy changed: set aside, never stapled again"
+      set_aside_app "$candidate"
+      continue
+    elif unchanged "$candidate" "$attempt"; then
+      attempted A2 "$line; stapler staple exit 0, but the copy is unchanged, with no ticket: discarded"
+      discard A2 "$attempt" "$work/attempts/$attempt"
+      continue
+    fi
+    validate=0
+    recorded "$work/stapler.txt" xcrun stapler validate "$candidate" || validate=$?
+    if [ "$validate" != 0 ]; then
+      attempted A2 "$line; stapled; stapler validate exit $validate: set aside, never stapled again"
+      set_aside_app "$candidate"
+      continue
+    fi
+    attempted A2 "$line; stapled; validated"
+    promote_app "$candidate"
+    promoted=yes
+    break
+  done
+  [ "$promoted" = yes ] || die "A2. no attempt stapled a ticket that validates, after $attempt attempts; there is no $out_dir/Syndeo.app"
+  say "A2. the ticket is stapled and validates (attempt $attempt of 5): $app"
+
+  manifest "$app" >"$work/manifests/stapled"
+  if ! grep -vE '^\./Contents/CodeResources file ' "$work/manifests/stapled" | cmp -s - "$work/manifests/accepted" ||
+    [ "$(grep -cE '^\./Contents/CodeResources file 644 ' "$work/manifests/stapled")" != 1 ]; then
+    diff "$work/manifests/accepted" "$work/manifests/stapled" | grep '^[<>]' | head -10 >&2 || true
     die "A3. stapling changed the bundle other than by adding its ticket, Contents/CodeResources"
   fi
   say "A3. the stapled bundle is the one Apple accepted, byte for byte, with its ticket added"
@@ -580,19 +707,62 @@ staple_app() {
   say "stapled: $app"
 }
 
-# keep_app_diagnostics: what staple-app keeps once stapling has begun and it
-# fails, in $diag, and nothing else. Never changing the exit status.
+# unchanged COPY N: COPY, attempt N's, is still the reference exactly.
+unchanged() {
+  manifest "$1" >"$work/manifests/$2.after" 2>/dev/null && cmp -s "$work/manifests/accepted" "$work/manifests/$2.after"
+}
+
+# set_aside_app COPY: a copy stapler changed that did not validate, kept as
+# the last such for the diagnostics, in place of any earlier one, and never
+# used again.
+set_aside_app() {
+  rm -rf "$work/last/Syndeo.app"
+  mv "$1" "$work/last/Syndeo.app" || die "A2. could not set aside $1"
+  last="$work/last/Syndeo.app"
+}
+
+# promote_app COPY: COPY, stapled and validated, becomes <out-dir>/Syndeo.app:
+# copied into <out-dir> under another name, checked path for path, then
+# renamed, so there is never a <out-dir>/Syndeo.app other than exactly COPY.
+promote_app() {
+  local staged="$out_dir/.Syndeo.app.promoting"
+  manifest "$1" >"$work/manifests/candidate" || die "A2. could not record the stapled bundle"
+  ditto "$1" "$staged" || die "A2. could not copy the stapled bundle into $out_dir"
+  manifest "$staged" >"$work/manifests/staged" 2>/dev/null && cmp -s "$work/manifests/candidate" "$work/manifests/staged" ||
+    die "A2. the copy in $out_dir is not the stapled bundle"
+  mv "$staged" "$out_dir/Syndeo.app" || die "A2. could not rename the stapled bundle into place"
+  app="$out_dir/Syndeo.app"
+}
+
+# keep_app_diagnostics: what staple-app keeps once A1 has kept the bundle
+# and it fails, in $diag, and nothing else; see the top of this file. Never
+# changing the exit status.
 keep_app_diagnostics() {
-  local failed=0
+  local failed=0 kind bundle sums=''
   mkdir -p "$diag" || return 1
-  if [ -d "$app" ]; then
-    ditto -c -k --keepParent "$app" "$diag/Syndeo.app.zip" || failed=1
-    (cd "$diag" && shasum -a 256 Syndeo.app.zip) >"$diag/Syndeo.app.zip.sha256" || failed=1
-    codesign -dv --verbose=4 "$app" 2>&1 | sed 's/^Authority=Developer ID Application: .*/Authority=<the Application identity, not shown>/' \
-      >"$diag/codesign.txt"
-    spctl -a -vv -t execute "$app" 2>&1 | sed 's/^origin=.*/origin=<an identity, not shown>/' >"$diag/gatekeeper.txt"
-  fi
+  cp -p "$accepted" "$diag/Syndeo.app.accepted.zip" || failed=1
+  sums="$(cd "$diag" && shasum -a 256 Syndeo.app.accepted.zip)"$'\n' || failed=1
+  for kind in accepted last-candidate stapled; do
+    case "$kind" in
+      accepted) bundle="$reference" ;;
+      last-candidate) bundle="$last" ;;
+      stapled) bundle="$app" ;;
+    esac
+    [ -n "$bundle" ] && [ -d "$bundle" ] || continue
+    if [ "$kind" != accepted ]; then
+      ditto -c -k --keepParent "$bundle" "$diag/Syndeo.app.$kind.zip" || failed=1
+      sums="$sums$(cd "$diag" && shasum -a 256 "Syndeo.app.$kind.zip")"$'\n' || failed=1
+    fi
+    { printf '== %s\n' "$kind"
+      codesign -dv --verbose=4 "$bundle" 2>&1 | sed 's/^Authority=Developer ID Application: .*/Authority=<the Application identity, not shown>/'
+    } >>"$diag/codesign.txt"
+    { printf '== %s\n' "$kind"
+      spctl -a -vv -t execute "$bundle" 2>&1 | sed 's/^origin=.*/origin=<an identity, not shown>/'
+    } >>"$diag/gatekeeper.txt"
+  done
+  printf '%s' "$sums" >"$diag/Syndeo.app.sha256" || failed=1
   cp "$work/stapler.txt" "$diag/stapler.txt" || failed=1
+  cp "$work/attempts.txt" "$diag/attempts.txt" || failed=1
   {
     printf '== security dump-trust-settings (user)\n'
     security dump-trust-settings 2>&1
@@ -605,13 +775,27 @@ keep_app_diagnostics() {
   return "$failed"
 }
 
+# cleanup_staple_app: any stapler command still running stopped; the
+# diagnostics, if A1 kept the bundle and staple-app failed; then the working
+# directory removed, failing to being a failure, even of a bundle otherwise
+# stapled; then, unless it succeeded, <out-dir> removed, if this made it.
+# The first failure's status is kept.
 cleanup_staple_app() {
-  local status=$?
+  local status=$? failed=''
   set +e
+  stop_child
   if [ "$succeeded" != yes ] && [ "$stapling" = yes ]; then
     keep_app_diagnostics || printf 'sign-macos-pkg: could not keep all of the diagnostics in %s\n' "$diag" >&2
   fi
-  [ -z "$work" ] || rm -rf "$work"
+  if [ -n "$work" ]; then
+    rm -rf "$work" 2>/dev/null
+    [ ! -e "$work" ] || failed="$failed removing the working directory;"
+  fi
+  if [ -n "$failed" ]; then
+    printf 'sign-macos-pkg: cleanup failed:%s\n' "$failed" >&2
+    succeeded=no
+    [ "$status" != 0 ] || status=1
+  fi
   if [ "$succeeded" != yes ]; then
     # Only what this made: an output directory that was there is refused,
     # and left alone.
@@ -680,9 +864,8 @@ esac
 EOF
   cat >"$bin/xcrun" <<'EOF'
 #!/bin/bash
-# at PATH: for a package, " @N", N the attempt whose copy it is, by its
-# directory; nothing for the bundle.
-at() { case "$1" in *.app) ;; *) printf ' @%s' "$(basename "$(dirname "$1")")" ;; esac; }
+# at PATH: " @N", N the attempt whose copy PATH is, by its directory.
+at() { printf ' @%s' "$(basename "$(dirname "$1")")"; }
 # lost: stapler's failure when the connection to Apple is lost, as a release
 # run saw it.
 lost() {
@@ -693,45 +876,52 @@ lost() {
 }
 # lock DIR: a file in DIR that cannot be removed, until the self-test lets it.
 lock() { : >"$1/locked"; chflags uchg "$1/locked"; }
+# ticket PATH: a ticket stapled to PATH, as stapler adds one: appended to a
+# package; to a bundle, Contents/CodeResources, or none, or another change
+# besides, as STANDIN_APP_STAPLE says.
+ticket() {
+  case "$1" in
+    *.app)
+      [ "${STANDIN_APP_STAPLE:-ticket}" = none ] || { printf 'ticket' >"$1/Contents/CodeResources"; chmod 644 "$1/Contents/CodeResources"; }
+      [ "${STANDIN_APP_STAPLE:-ticket}" != changes ] || printf 'changed' >>"$1/Contents/Info.plist" ;;
+    *) printf 'ticket\n' >>"$1" ;;
+  esac
+}
 case "$1 $2" in
   "stapler staple")
     echo "xcrun stapler staple$(at "$3")" >>"$STANDIN_CALLS"
+    echo "$$" >"$STANDIN_CALLS.stapler-pid"
     echo "Processing: $3"
     if [ "${STANDIN_STAPLE_FAILS:-no}" = yes ]; then echo "The staple and validate action failed! Error 65."; exit 65; fi
-    case "$3" in
-      *.app)
-        # A ticket, as stapler adds one to a bundle; or not, or another
-        # change besides, as the case says.
-        [ "${STANDIN_APP_STAPLE:-ticket}" = none ] || { printf 'ticket' >"$3/Contents/CodeResources"; chmod 644 "$3/Contents/CodeResources"; }
-        [ "${STANDIN_APP_STAPLE:-ticket}" != changes ] || printf 'changed' >>"$3/Contents/Info.plist" ;;
-      *)
-        # STANDIN_STAPLE: a package put in its place, as if stapling had
-        # changed its contents. Otherwise STANDIN_STAPLES: each attempt's
-        # outcome, comma-separated, the last one repeated: ok (a ticket
-        # appended); lost; partial (lost, the copy changed); noticket (it says
-        # it worked, and changes nothing); tamper (lost, and the package kept
-        # changed); interrupt (finish sent TERM); lock (ok, and a file left
-        # that cannot be removed); locklost.
-        if [ -n "${STANDIN_STAPLE:-}" ]; then
-          cp "$STANDIN_STAPLE" "$3"
-        else
-          n=$(( $(cat "$STANDIN_CALLS.staples" 2>/dev/null || echo 0) + 1 ))
-          echo "$n" >"$STANDIN_CALLS.staples"
-          IFS=, read -ra outcomes <<<"${STANDIN_STAPLES:-ok}"
-          o="${outcomes[$((n - 1))]:-${outcomes[${#outcomes[@]} - 1]}}"
-          kept="$(dirname "$(dirname "$(dirname "$3")")")/accepted/$(basename "$3")"
-          case "$o" in
-            ok) printf 'ticket\n' >>"$3" ;;
-            lost) lost ;;
-            partial) printf 'half a ticket' >>"$3"; lost ;;
-            noticket) ;;
-            tamper) chmod u+w "$kept"; printf 'x' >>"$kept"; lost ;;
-            interrupt) "$(dirname "$0")/interrupt-finish"; /bin/sleep 1; exit 1 ;;
-            lock) printf 'ticket\n' >>"$3"; lock "$(dirname "$3")" ;;
-            locklost) lock "$(dirname "$3")"; lost ;;
-          esac
-        fi ;;
-    esac
+    # STANDIN_STAPLE: a package put in its place, as if stapling had changed
+    # its contents. Otherwise STANDIN_STAPLES: each attempt's outcome,
+    # comma-separated, the last one repeated: ok; lost; partial (lost, the
+    # copy changed); noticket (it says it worked, and changes nothing);
+    # tamper (lost, and what was kept of what Apple accepted changed);
+    # interrupt (the script sent TERM, stapler still running); hang (never
+    # finishing by itself); lock (ok, and a file left that cannot be
+    # removed); locklost.
+    if [ -n "${STANDIN_STAPLE:-}" ]; then
+      cp "$STANDIN_STAPLE" "$3"
+    else
+      n=$(( $(cat "$STANDIN_CALLS.staples" 2>/dev/null || echo 0) + 1 ))
+      echo "$n" >"$STANDIN_CALLS.staples"
+      IFS=, read -ra outcomes <<<"${STANDIN_STAPLES:-ok}"
+      o="${outcomes[$((n - 1))]:-${outcomes[${#outcomes[@]} - 1]}}"
+      work="$(dirname "$(dirname "$(dirname "$3")")")"
+      case "$3" in *.app) kept="$work/accepted/Syndeo.app.zip" ;; *) kept="$work/accepted/$(basename "$3")" ;; esac
+      case "$o" in
+        ok) ticket "$3" ;;
+        lost) lost ;;
+        partial) case "$3" in *.app) printf 'half a ticket' >"$3/Contents/CodeResources" ;; *) printf 'half a ticket' >>"$3" ;; esac; lost ;;
+        noticket) ;;
+        tamper) chmod u+w "$kept"; printf 'x' >>"$kept"; lost ;;
+        interrupt) "$(dirname "$0")/interrupt-finish"; exec /bin/sleep 30 ;;
+        hang) exec /bin/sleep 30 ;;
+        lock) ticket "$3"; lock "$(dirname "$3")" ;;
+        locklost) lock "$(dirname "$3")"; lost ;;
+      esac
+    fi
     echo "The staple and validate action worked!" ;;
   "stapler validate")
     echo "xcrun stapler validate$(at "$3")" >>"$STANDIN_CALLS"
@@ -765,13 +955,35 @@ EOF
 echo "pkgutil $1" >>"$STANDIN_CALLS"
 exec /usr/sbin/pkgutil "$@"
 EOF
+  # codesign: a signature that verifies, unless the path matches the
+  # pattern STANDIN_UNVERIFIED.
   cat >"$bin/codesign" <<'EOF'
 #!/bin/bash
 echo "codesign $1" >>"$STANDIN_CALLS"
 case "$1" in
-  --verify) [ "${STANDIN_UNVERIFIED:-no}" != yes ] ;;
+  # shellcheck disable=SC2254 # the pattern is a pattern
+  --verify) case "${*: -1}" in ${STANDIN_UNVERIFIED:-/nothing}) exit 1 ;; esac ;;
   -dv) echo "Authority=Developer ID Application: SECRETVALUE Org (AB12CD34EF)" >&2 ;;
 esac
+exit 0
+EOF
+  # ditto, as it is; but a bundle it makes at a path matching the pattern
+  # STANDIN_DITTO_ALTERS comes out with one byte of Info.plist different;
+  # one matching STANDIN_DITTO_MODE, with a file's mode different; one
+  # matching STANDIN_DITTO_INTERRUPTS has the script sent TERM.
+  cat >"$bin/ditto" <<'EOF'
+#!/bin/bash
+/usr/bin/ditto "$@" || exit
+dest="${*: -1}"
+bundle="$dest"
+[ ! -d "$dest/Syndeo.app" ] || bundle="$dest/Syndeo.app"
+# shellcheck disable=SC2254 # the patterns are patterns
+case "$dest" in ${STANDIN_DITTO_ALTERS:-/nothing}) printf 'x' >>"$bundle/Contents/Info.plist" ;; esac
+# shellcheck disable=SC2254
+case "$dest" in ${STANDIN_DITTO_MODE:-/nothing}) chmod 600 "$bundle/Contents/Info.plist" ;; esac
+# shellcheck disable=SC2254
+case "$dest" in ${STANDIN_DITTO_INTERRUPTS:-/nothing}) "$(dirname "$0")/interrupt-finish"; /bin/sleep 1 ;; esac
+exit 0
 EOF
   cat >"$bin/sleep" <<'EOF'
 #!/bin/bash
@@ -792,15 +1004,15 @@ case "$dest" in ${STANDIN_COPY_ALTERS:-/nothing}) chmod u+w "$dest"; printf 'x' 
 case "$dest" in ${STANDIN_COPY_INTERRUPTS:-/nothing}) "$(dirname "$0")/interrupt-finish"; /bin/sleep 1 ;; esac
 exit 0
 EOF
-  # TERM to finish itself: the topmost of this process's ancestors running
-  # finish, not one of its subshells.
+  # TERM to the script itself: the topmost of this process's ancestors
+  # running finish or staple-app, not one of its subshells.
   cat >"$bin/interrupt-finish" <<'EOF'
 #!/bin/bash
 p=$PPID
 top=''
 while [ -n "$p" ] && [ "$p" -gt 1 ]; do
   case "$(ps -o args= -p "$p" 2>/dev/null)" in
-    *" finish "*) top="$p" ;;
+    *" finish "* | *" staple-app "*) top="$p" ;;
     *) [ -z "$top" ] || break ;;
   esac
   p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
@@ -1058,6 +1270,11 @@ self_test() {
     says "$out" "$text" || verdict=no
     if printf '%s' "$out" | grep -qE 'SECRETVALUE|U0VDUkVU'; then verdict=no; fi
     if grep -q notarytool "$T/run/calls"; then verdict=no; fi
+    # No stapler left running.
+    if [ -s "$T/run/calls.stapler-pid" ] && kill -0 "$(cat "$T/run/calls.stapler-pid")" 2>/dev/null; then
+      kill -KILL "$(cat "$T/run/calls.stapler-pid")" 2>/dev/null
+      verdict=no
+    fi
     [ "$temp_may_remain" = yes ] || [ -z "$(ls -A "$T/run/temp")" ] || verdict=no
     [ ! -e "$T/run/signed.pkg.promoting" ] || verdict=no
     if [ "$want" = 0 ]; then
@@ -1157,6 +1374,12 @@ self_test() {
     0 "$(st 1),sleep 15,$(sv 2),pkgutil --expand-full,spctl" \
     "stapler staple exit 0, but the copy is unchanged, with no ticket: discarded|stapled and validates (attempt 2 of 5)" \
     accepted STANDIN_STAPLES=noticket,ok
+  finish_case "stapler running past its limit: stopped, exit 124, the attempt failed; the next stapled" \
+    0 "$(st 1),sleep 15,$(sv 2),pkgutil --expand-full,spctl" \
+    "stopped: still running after 1 seconds|[exit 124]|stapler staple exit 124, the copy unchanged: discarded|stapled and validates (attempt 2 of 5)" \
+    accepted STANDIN_STAPLES=hang,ok SYNDEO_STAPLER_LIMIT_SECONDS=1
+  finish_case "a stapler limit past 60 seconds: refused before anything" \
+    1 "" "SYNDEO_STAPLER_LIMIT_SECONDS is not a whole number of seconds from 1 to 60" accepted SYNDEO_STAPLER_LIMIT_SECONDS=61
 
   printf '\n  finish: never stapling anything but the bytes Apple accepted\n'
   finish_case "the package kept not the accepted bytes from the start: stopped before any attempt; no package" \
@@ -1237,26 +1460,67 @@ self_test() {
     printf '  WRONG %s\n%s\n' "no mode submits anything: no notarytool or notarize.py outside the comments" "$(printf '%s\n' "$submits" | sed 's/^/          | /')"
     wrong=$((wrong + 1))
   fi
-  # The validations staple-app retries.
-  local retried="xcrun stapler validate,sleep 15,xcrun stapler validate,sleep 30,xcrun stapler validate,sleep 60,xcrun stapler validate,sleep 120,xcrun stapler validate"
-
-  # A bundle, zipped as build-macos hands it on, for staple-app.
+  # A bundle, zipped as build-macos hands it on, for staple-app; and that
+  # ZIP unpacked once, as the bundle Apple accepted, to hold a stapled one to.
   mkdir -p "$T/bundle/Syndeo.app/Contents/MacOS" "$T/bundle/Syndeo.app/Contents/_CodeSignature"
   printf 'plist' >"$T/bundle/Syndeo.app/Contents/Info.plist"
   printf 'app' >"$T/bundle/Syndeo.app/Contents/MacOS/Syndeo"
   printf 'seal' >"$T/bundle/Syndeo.app/Contents/_CodeSignature/CodeResources"
   chmod 755 "$T/bundle/Syndeo.app/Contents/MacOS/Syndeo"
   ditto -c -k --keepParent "$T/bundle/Syndeo.app" "$T/Syndeo.app.zip"
+  mkdir -p "$T/unzipped"
+  ditto -x -k "$T/Syndeo.app.zip" "$T/unzipped"
+  manifest "$T/unzipped/Syndeo.app" >"$T/accepted.manifest"
   local app_origin="Developer ID Application: SECRETVALUE Org ($team)"
+
+  # app_bundle_ok DIR: the diagnostics staple-app keeps, exactly the
+  # allowlist, with the bundles app_kept names (accepted, and last-candidate
+  # or stapled as the case says) as ZIPs, their SHA-256s listed and matching;
+  # the accepted ZIP the one given, unless the case changed it; attempts.txt
+  # with attempts_kept lines; stapler's output, if it ran; codesign's and
+  # Gatekeeper's view of each bundle kept; and the trust settings.
+  app_bundle_ok() {
+    local d="$1" k n=0 f
+    for f in "$d"/* "$d"/.[!.]*; do
+      [ -e "$f" ] || continue
+      case "${f##*/}" in
+        attempts.txt | codesign.txt | gatekeeper.txt | stapler.txt | trust-settings.txt | Syndeo.app.sha256) ;;
+        Syndeo.app.accepted.zip | Syndeo.app.last-candidate.zip | Syndeo.app.stapled.zip) ;;
+        *) return 1 ;;
+      esac
+    done
+    for k in accepted last-candidate stapled; do
+      if [[ " $app_kept " == *" $k "* ]]; then
+        [ -f "$d/Syndeo.app.$k.zip" ] && grep -q "  Syndeo\.app\.$k\.zip\$" "$d/Syndeo.app.sha256" &&
+          grep -qx "== $k" "$d/codesign.txt" && grep -qx "== $k" "$d/gatekeeper.txt" || return 1
+        n=$((n + 1))
+      else
+        [ ! -e "$d/Syndeo.app.$k.zip" ] || return 1
+      fi
+    done
+    [ "$(wc -l <"$d/Syndeo.app.sha256" | tr -d ' ')" = "$n" ] && (cd "$d" && shasum -a 256 -c Syndeo.app.sha256 >/dev/null 2>&1) || return 1
+    [ "$accepted_intact" != yes ] || cmp -s "$d/Syndeo.app.accepted.zip" "$T/Syndeo.app.zip" || return 1
+    [ "$(wc -l <"$d/attempts.txt" | tr -d ' ')" = "$attempts_kept" ] || return 1
+    [ "$attempts_kept" = 0 ] || [ "$(grep -cE '^attempt [1-5] of 5, ' "$d/attempts.txt")" = "$attempts_kept" ] || return 1
+    if [ "$attempts_kept" != 0 ]; then
+      grep -q '^\$ xcrun stapler staple ' "$d/stapler.txt" && grep -qE '^\[exit [0-9]+\]$' "$d/stapler.txt" || return 1
+    fi
+    ! grep -q 'SECRETVALUE' "$d/codesign.txt" "$d/gatekeeper.txt" && grep -q 'No Trust Settings were found' "$d/trust-settings.txt"
+  }
 
   # app_case LABEL WANT-STATUS WANT-CALLS WANT-TEXT [NAME=VALUE...]:
   # staple-app exits WANT-STATUS, calls exactly WANT-CALLS, says WANT-TEXT,
-  # never prints a secret, never notarizes, leaves nothing in RUNNER_TEMP,
-  # leaves the stapled bundle only on success, and keeps the diagnostics
-  # exactly when it failed once stapling had begun.
+  # never prints a secret, never notarizes, leaves no stapler running and
+  # nothing in RUNNER_TEMP (unless temp_may_remain is yes). Only on success
+  # is there an <out-dir>: holding exactly Syndeo.app, the bundle Apple
+  # accepted with its ticket added and nothing else changed; on failure there
+  # is none. It keeps the diagnostics exactly when it failed once A1 had
+  # kept the bundle, unless diag_kept is no.
+  app_kept=accepted
   app_case() {
     local label="$1" want="$2" calls="$3" text="$4" status out verdict=yes got
     shift 4
+    chflags -R nouchg "$T/run" 2>/dev/null
     rm -rf "$T/run"
     mkdir -p "$T/run/temp"
     : >"$T/run/calls"
@@ -1270,46 +1534,159 @@ self_test() {
     if printf '%s' "$out" | grep -qE 'SECRETVALUE|U0VDUkVU'; then verdict=no; fi
     if grep -rqE 'SECRETVALUE|U0VDUkVU' "$T/run/diag" 2>/dev/null; then verdict=no; fi
     if grep -q notarytool "$T/run/calls"; then verdict=no; fi
-    [ -z "$(ls -A "$T/run/temp")" ] || verdict=no
+    if [ -s "$T/run/calls.stapler-pid" ] && kill -0 "$(cat "$T/run/calls.stapler-pid")" 2>/dev/null; then
+      kill -KILL "$(cat "$T/run/calls.stapler-pid")" 2>/dev/null
+      verdict=no
+    fi
+    [ "$temp_may_remain" = yes ] || [ -z "$(ls -A "$T/run/temp")" ] || verdict=no
     if [ "$want" = 0 ]; then
-      [ -f "$T/run/app/Syndeo.app/Contents/CodeResources" ] && [ ! -e "$T/run/diag" ] || verdict=no
+      [ "$(ls -A "$T/run/app")" = Syndeo.app ] && [ "$(cat "$T/run/app/Syndeo.app/Contents/CodeResources")" = ticket ] &&
+        manifest "$T/run/app/Syndeo.app" | grep -vE '^\./Contents/CodeResources file 644 ' | cmp -s - "$T/accepted.manifest" &&
+        [ ! -e "$T/run/diag" ] || verdict=no
     else
       [ ! -e "$T/run/app" ] || verdict=no
-      if grep -qx 'xcrun stapler staple' "$T/run/calls"; then
-        [ "$(cd "$T/run/diag" 2>/dev/null && ls -A | LC_ALL=C sort | tr '\n' ' ')" = \
-          "Syndeo.app.zip Syndeo.app.zip.sha256 codesign.txt gatekeeper.txt stapler.txt trust-settings.txt " ] || verdict=no
+      if [ "$diag_kept" != no ] && says "$out" "A1. kept Syndeo.app as Apple accepted it"; then
+        app_bundle_ok "$T/run/diag" || verdict=no
       else
         [ ! -e "$T/run/diag" ] || verdict=no
       fi
     fi
-    verdict_of "$label" "$verdict" "$got" "$out"
+    chflags -R nouchg "$T/run" 2>/dev/null
+    verdict_of "staple-app: $label" "$verdict" "$got" "$out"
   }
-  local stapled="xcrun stapler staple,xcrun stapler validate,codesign --verify,spctl"
-  local app_diagnosed="codesign -dv,spctl,security dump-trust-settings,security dump-trust-settings,security dump-trust-settings"
+  # The calls, in pieces: attempt N's copy checked and stapled; checked,
+  # stapled and validated; and the diagnostics, for K bundles kept.
+  ast() { printf 'codesign --verify,xcrun stapler staple @%s' "$1"; }
+  asv() { printf 'codesign --verify,xcrun stapler staple @%s,xcrun stapler validate @%s' "$1" "$1"; }
+  app_diagnosed() {
+    local k
+    for ((k = 0; k < $1; k++)); do printf 'codesign -dv,spctl,'; done
+    printf 'security dump-trust-settings,security dump-trust-settings,security dump-trust-settings'
+  }
+  local stapled app_lost app_unvalidated
+  stapled="codesign --verify,$(asv 1),codesign --verify,spctl"
+  app_lost="codesign --verify,$(ast 1)"
+  app_unvalidated="codesign --verify,$(asv 1)"
+  for n in 2 3 4 5; do
+    app_lost="$app_lost,$(wait_for "$n"),$(ast "$n")"
+    app_unvalidated="$app_unvalidated,$(wait_for "$n"),$(asv "$n")"
+  done
 
-  printf '\n  staple-app: the bundle Apple accepted, stapled, and nothing else changed\n'
-  app_case "accepted with the binaries: unpack, staple, validate, compare, verify, Gatekeeper" \
-    0 "$stapled" "A1. unpacked Syndeo.app|A2. the ticket is stapled|A3. the stapled bundle is the one Apple accepted|A4. its code signature verifies|A5. Gatekeeper accepts it to run|stapled:"
+  printf '\n  staple-app: the bundle Apple accepted, kept, and a fresh copy stapled, validated and promoted\n'
+  attempts_kept=0
+  app_case "accepted with the binaries: kept, a fresh copy checked, stapled, validated and promoted; compared, verified, Gatekeeper" \
+    0 "$stapled" "A1. kept Syndeo.app as Apple accepted it: its ZIP, read only|its signature verifying|A2. attempt 1 of 5, |; validated|A2. the ticket is stapled and validates (attempt 1 of 5)|A3. the stapled bundle is the one Apple accepted|A4. its code signature verifies|A5. Gatekeeper accepts it to run|stapled:"
   app_case "SYNDEO_EXPECT_SIGNED=no: refused before anything is unpacked" 1 "" "SYNDEO_EXPECT_SIGNED is not yes" SYNDEO_EXPECT_SIGNED=no
-  app_case "validation failing once, then passing: stapled once, validated twice" \
-    0 "xcrun stapler staple,xcrun stapler validate,sleep 15,xcrun stapler validate,codesign --verify,spctl" "validation attempt 2" STANDIN_VALIDATE_FAILS=1
-  app_case "validation failing every time: fails closed after five, the diagnostics kept, the bundle removed" \
-    1 "xcrun stapler staple,$retried,$app_diagnosed" "does not validate, after 5 attempts|kept the diagnostics in" STANDIN_VALIDATE_FAILS=all
-  app_case "stapling failing: fails closed, the diagnostics kept" \
-    1 "xcrun stapler staple,$app_diagnosed" "A2. could not staple the ticket" STANDIN_STAPLE_FAILS=yes
-  app_case "stapling that adds no ticket: caught" \
-    1 "xcrun stapler staple,xcrun stapler validate,$app_diagnosed" "A3. stapling changed the bundle other than by adding its ticket" STANDIN_APP_STAPLE=none
-  app_case "stapling that changes another file: caught" \
-    1 "xcrun stapler staple,xcrun stapler validate,$app_diagnosed" "A3. stapling changed the bundle other than by adding its ticket" STANDIN_APP_STAPLE=changes
-  app_case "a signature that does not verify: fails, the diagnostics kept" \
-    1 "xcrun stapler staple,xcrun stapler validate,codesign --verify,$app_diagnosed" "A4. its code signature does not verify" STANDIN_UNVERIFIED=yes
+  app_case "a stapler limit past 60 seconds: refused before anything is unpacked" \
+    1 "" "SYNDEO_STAPLER_LIMIT_SECONDS is not a whole number of seconds from 1 to 60" SYNDEO_STAPLER_LIMIT_SECONDS=90
+
+  printf '\n  staple-app: up to five attempts; nothing resubmitted\n'
+  app_case "the connection lost once, then stapled: the second attempt, on a fresh copy, after 15 s" \
+    0 "codesign --verify,$(ast 1),sleep 15,$(asv 2),codesign --verify,spctl" \
+    "[exit 68]|stapler staple exit 68, the copy unchanged: discarded|A2. attempt 2 of 5 in 15s|stapled and validates (attempt 2 of 5)|stapled:" \
+    STANDIN_STAPLES=lost,ok
+  app_case "the connection lost four times, stapled the fifth: after 15, 30, 60 and 120 s" \
+    0 "codesign --verify,$(ast 1),sleep 15,$(ast 2),sleep 30,$(ast 3),sleep 60,$(ast 4),sleep 120,$(asv 5),codesign --verify,spctl" \
+    "A2. attempt 5 of 5 in 120s|stapled and validates (attempt 5 of 5)" STANDIN_STAPLES=lost,lost,lost,lost,ok
+  app_case "validation failing once: the next attempt staples a fresh copy, not that one" \
+    0 "codesign --verify,$(asv 1),sleep 15,$(asv 2),codesign --verify,spctl" \
+    "stapler validate exit 65: set aside, never stapled again|stapled and validates (attempt 2 of 5)" STANDIN_VALIDATE_FAILS=1
+  app_case "a failure that changed the copy: set aside, never stapled again; the next attempt staples a fresh copy" \
+    0 "codesign --verify,$(ast 1),sleep 15,$(asv 2),codesign --verify,spctl" \
+    "stapler staple exit 68, and the copy changed: set aside, never stapled again|stapled and validates (attempt 2 of 5)" \
+    STANDIN_STAPLES=partial,ok
+  app_case "stapler saying it worked but adding no ticket: discarded, never promoted; the next stapled" \
+    0 "codesign --verify,$(ast 1),sleep 15,$(asv 2),codesign --verify,spctl" \
+    "stapler staple exit 0, but the copy is unchanged, with no ticket: discarded|stapled and validates (attempt 2 of 5)" \
+    STANDIN_STAPLES=noticket,ok
+  app_case "stapler running past its limit: stopped, exit 124, the attempt failed; the next stapled" \
+    0 "codesign --verify,$(ast 1),sleep 15,$(asv 2),codesign --verify,spctl" \
+    "stopped: still running after 1 seconds|stapler staple exit 124, the copy unchanged: discarded|stapled and validates (attempt 2 of 5)" \
+    STANDIN_STAPLES=hang,ok SYNDEO_STAPLER_LIMIT_SECONDS=1
+  attempts_kept=5
+  app_case "the connection lost every time: five attempts, then fatal; no bundle; each attempt in the diagnostics" \
+    1 "$app_lost,$(app_diagnosed 1)" "A2. attempt 5 of 5 in 120s|A2. no attempt stapled a ticket that validates, after 5 attempts|kept the diagnostics in" \
+    STANDIN_STAPLES=lost
+  app_case "stapler failing every time, Error 65: five attempts, then fatal" \
+    1 "$app_lost,$(app_diagnosed 1)" "The staple and validate action failed! Error 65.|no attempt stapled a ticket that validates, after 5 attempts" \
+    STANDIN_STAPLE_FAILS=yes
+  app_case "stapling that adds no ticket, every time: five discarded, then fatal" \
+    1 "$app_lost,$(app_diagnosed 1)" "but the copy is unchanged, with no ticket: discarded|no attempt stapled a ticket that validates" \
+    STANDIN_APP_STAPLE=none
+  app_kept="accepted last-candidate"
+  app_case "stapled, but never validating: five fresh copies, never one stapled twice, then fatal; the last copy kept" \
+    1 "$app_unvalidated,$(app_diagnosed 2)" "set aside, never stapled again|no attempt stapled a ticket that validates, after 5 attempts" \
+    STANDIN_VALIDATE_FAILS=all
+  app_case "failures that change the copy every time: five fresh copies, then fatal; the last changed copy kept" \
+    1 "$app_lost,$(app_diagnosed 2)" "and the copy changed: set aside, never stapled again|no attempt stapled a ticket that validates" \
+    STANDIN_STAPLES=partial
+  app_kept=accepted
+
+  printf '\n  staple-app: never stapling anything but the bundle Apple accepted, its signature intact\n'
+  attempts_kept=0
+  app_case "the ZIP kept not the one given: stopped before anything is unpacked or stapled" \
+    1 "" "A1. the ZIP kept is not" 'STANDIN_COPY_ALTERS=*/accepted/*'
+  app_case "the bundle's signature not verifying as Apple accepted it: stopped before any attempt" \
+    1 "codesign --verify" "A1. the bundle's code signature does not verify as Apple accepted it" 'STANDIN_UNVERIFIED=*/reference/*'
+  app_case "the first copy not the bundle, byte for byte: stopped before stapler sees it; no bundle" \
+    1 "codesign --verify,$(app_diagnosed 1)" "A2. attempt 1: its copy is not the bundle Apple accepted, path for path; nothing is stapled" \
+    'STANDIN_DITTO_ALTERS=*/attempts/1'
+  attempts_kept=1
+  app_case "a later copy with a file's mode changed: stopped before stapler sees it" \
+    1 "codesign --verify,$(ast 1),sleep 15,$(app_diagnosed 1)" "A2. attempt 2: its copy is not the bundle Apple accepted" \
+    STANDIN_STAPLES=lost 'STANDIN_DITTO_MODE=*/attempts/2'
+  attempts_kept=0
+  app_case "a copy whose signature does not verify: stopped before stapler sees it; no bundle" \
+    1 "codesign --verify,codesign --verify,$(app_diagnosed 1)" "A2. attempt 1: its copy's code signature does not verify; nothing is stapled" \
+    'STANDIN_UNVERIFIED=*/attempts/1/*'
+  attempts_kept=1
+  accepted_intact=no
+  app_case "the ZIP kept changed between attempts: stopped, nothing more stapled; no bundle" \
+    1 "codesign --verify,$(ast 1),sleep 15,$(app_diagnosed 1)" "A2. attempt 2: the ZIP kept is no longer the one Apple accepted; nothing more is stapled" \
+    STANDIN_STAPLES=tamper
+  accepted_intact=yes
+  app_case "the copy into <out-dir> not the stapled bundle: stopped before it is renamed into place; no bundle" \
+    1 "codesign --verify,$(asv 1),$(app_diagnosed 1)" "A2. the copy in" 'STANDIN_DITTO_ALTERS=*/.Syndeo.app.promoting'
+  attempts_kept=1
+
+  printf '\n  staple-app: interrupted, and cleanup\n'
+  attempts_kept=0
+  app_case "interrupted while stapling: exit 130 kept, stapler stopped, no further attempt, no bundle, the diagnostics kept" \
+    130 "codesign --verify,$(ast 1),$(app_diagnosed 1)" "kept the diagnostics in" STANDIN_STAPLES=interrupt
+  attempts_kept=1
+  app_case "interrupted while waiting to try again: exit 130 kept, no further attempt, no bundle" \
+    130 "codesign --verify,$(ast 1),sleep 15,$(app_diagnosed 1)" "stapler staple exit 68, the copy unchanged: discarded|kept the diagnostics in" \
+    STANDIN_STAPLES=lost STANDIN_SLEEP_INTERRUPT=yes
+  app_case "interrupted while promoting the stapled copy: exit 130 kept, no bundle and no copy left in <out-dir>" \
+    130 "codesign --verify,$(asv 1),$(app_diagnosed 1)" "; validated|kept the diagnostics in" 'STANDIN_DITTO_INTERRUPTS=*/.Syndeo.app.promoting'
+  attempts_kept=0
+  temp_may_remain=yes
+  diag_kept=no
+  app_case "stapled, validated and accepted, but its working directory cannot be removed: fatal; no bundle" \
+    1 "$stapled" "stapled:|cleanup failed: removing the working directory;" STANDIN_STAPLES=lock
+  diag_kept=auto
+  attempts_kept=5
+  app_case "five attempts lost, and the working directory cannot be removed: both said, the first failure's status, the diagnostics kept" \
+    1 "$app_lost,$(app_diagnosed 1)" "its copy could not be removed; cleanup will fail for it|no attempt stapled a ticket that validates, after 5 attempts|kept the diagnostics in|cleanup failed: removing the working directory;" \
+    STANDIN_STAPLES=locklost
+  temp_may_remain=no
+
+  printf '\n  staple-app: after stapling\n'
+  attempts_kept=1
+  app_kept="accepted stapled"
+  app_case "stapling that changes another file: caught, the stapled bundle kept as a ZIP" \
+    1 "codesign --verify,$(asv 1),$(app_diagnosed 2)" "A3. stapling changed the bundle other than by adding its ticket" STANDIN_APP_STAPLE=changes
+  app_case "a signature that does not verify once stapled: fails, the diagnostics kept" \
+    1 "codesign --verify,$(asv 1),codesign --verify,$(app_diagnosed 2)" "A4. its code signature does not verify" 'STANDIN_UNVERIFIED=*/run/app/Syndeo.app'
   app_case "Gatekeeper: Developer ID, not notarized: fails, the identity not shown" \
-    1 "$stapled,$app_diagnosed" "A5. Gatekeeper does not accept it|origin=<an identity, not shown>" "STANDIN_SOURCE=Developer ID"
+    1 "$stapled,$(app_diagnosed 2)" "A5. Gatekeeper does not accept it|origin=<an identity, not shown>" "STANDIN_SOURCE=Developer ID"
   app_case "Gatekeeper: another team's Application identity: fails" \
-    1 "$stapled,$app_diagnosed" "A5. Gatekeeper does not accept it" "STANDIN_ORIGIN=Developer ID Application: SECRETVALUE Org (ZZ99ZZ99ZZ)"
+    1 "$stapled,$(app_diagnosed 2)" "A5. Gatekeeper does not accept it" "STANDIN_ORIGIN=Developer ID Application: SECRETVALUE Org (ZZ99ZZ99ZZ)"
   app_case "Gatekeeper: an Installer identity of the team: fails" \
-    1 "$stapled,$app_diagnosed" "A5. Gatekeeper does not accept it" "STANDIN_ORIGIN=Developer ID Installer: SECRETVALUE Org ($team)"
-  app_case "Gatekeeper rejects it: fails" 1 "$stapled,$app_diagnosed" "A5. Gatekeeper does not accept it" STANDIN_SPCTL=rejected
+    1 "$stapled,$(app_diagnosed 2)" "A5. Gatekeeper does not accept it" "STANDIN_ORIGIN=Developer ID Installer: SECRETVALUE Org ($team)"
+  app_case "Gatekeeper rejects it: fails" 1 "$stapled,$(app_diagnosed 2)" "A5. Gatekeeper does not accept it" STANDIN_SPCTL=rejected
+  app_kept=accepted
+  attempts_kept=0
   mkdir -p "$T/run2"
   out="$(env -i PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin" RUNNER_TEMP="$T/run2" STANDIN_CALLS="$T/run2/calls" \
     SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID="$team" bash "$0" staple-app "$T/Syndeo.app.zip" "$T/run2" "$T/run2/diag" 2>&1)" && status=0 || status=$?
