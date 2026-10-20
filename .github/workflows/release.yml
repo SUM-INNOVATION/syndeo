@@ -574,11 +574,13 @@ jobs:
           path: notarization/package/
           if-no-files-found: ignore
 
-      # Only when this job failed once stapling had begun: the package exactly
-      # as stapling left it, with stapler's, pkgutil's and Gatekeeper's output
-      # and the trust settings, which ci/sign-macos-pkg.sh writes there and
-      # nowhere else. Kept a week for diagnosis, and never downloaded by any
-      # job: nothing in it can be published.
+      # Only when this job failed once stapling had begun: the package Apple
+      # accepted, not stapled, and the last copy stapling changed or the
+      # stapled package, if any, none of them named .pkg; each stapling
+      # attempt's record; stapler's, pkgutil's and Gatekeeper's output; and
+      # the trust settings. ci/sign-macos-pkg.sh writes them there and nowhere
+      # else. Kept a week for diagnosis, and never downloaded by any job:
+      # nothing in it can be published.
       - name: Keep the stapling diagnostics, on failure
         if: failure()
         uses: actions/upload-artifact@v4

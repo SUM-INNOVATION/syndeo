@@ -29,23 +29,47 @@
 # finish, after `ci/notarize.py submit <signed.pkg> --record R` and `wait`:
 #  4. refuse unless R says Apple accepted it, and the file R submitted, by
 #     name and SHA-256, is <signed.pkg> exactly as it is now;
-#  5. staple the ticket to it, once, and validate it. Only validation is
-#     retried, up to five attempts, after 0, 15, 30, 60 and 120 seconds; it
-#     has to pass before anything else happens. Nothing is ever submitted
-#     again. Each stapler command, its exit status and its complete output
-#     are shown in the log, and kept;
+#  5. staple it, in up to five attempts, after 0, 15, 30, 60 and 120
+#     seconds. Stapling fetches the ticket from Apple over the network, and
+#     a connection lost on the way fails it; so:
+#     - the package Apple accepted is kept, read only, in the working
+#       directory, its SHA-256 the record's, and <signed.pkg> is removed:
+#       there is no <signed.pkg> again until an attempt succeeds;
+#     - each attempt makes a fresh copy of the kept package, and requires
+#       both to be the accepted bytes before stapler sees the copy; if either
+#       is not, finish stops there;
+#     - each attempt staples its copy, then validates it. A copy is never
+#       stapled twice: one that stapler changed, whether it said it worked
+#       or not, and that did not validate, is set aside, never used again;
+#     - only a copy stapled and validated becomes <signed.pkg>: copied beside
+#       it, checked, then renamed into place;
+#     - five failed attempts are fatal, and leave no <signed.pkg>.
+#     Nothing is ever submitted again. Each attempt is shown in the log as it
+#     happens, as one line saying what it did and how it ended, with each
+#     stapler command, its exit status and its complete output, and all of
+#     it is kept;
 #  6. expand it once more, and require it identical to the unsigned package;
 #  7. require Gatekeeper to accept it as Notarized Developer ID, from the
 #     Installer identity.
 # If finish fails once stapling has begun, it keeps, in <diagnostics-dir>
-# (which must not exist yet), these and nothing else: the package exactly as
-# it is, its SHA-256, stapler's output, pkgutil --check-signature,
-# Gatekeeper's assessment, and the user, admin and system trust settings,
-# read only. Never a keychain, a certificate, a key, a password or the
+# (which must not exist yet), these and nothing else:
+# - the package Apple accepted, not stapled, as <name>.accepted;
+# - the last copy stapler changed, if any, as <name>.last-candidate;
+# - the stapled <signed.pkg>, if steps 6 or 7 failed, as <name>.stapled;
+# - their SHA-256s, in <name>.sha256;
+# - attempts.txt, one line per attempt;
+# - stapler's output;
+# - pkgutil --check-signature and Gatekeeper's assessment of each package
+#   kept;
+# - the user, admin and system trust settings, read only.
+# None of the packages kept is named .pkg: none is a release candidate. It
+# never keeps a keychain, a certificate, a key, a password or the
 # environment.
 #
 # In either mode, on any failure <signed.pkg> is removed, so nothing half-done
-# can be shipped, and the exit status is the first failure's.
+# can be shipped, and the exit status is the first failure's. finish's
+# cleanup removes its working directory, and failing to is a failure too,
+# even of a package otherwise stapled.
 #
 # staple-app, after notarize-binaries' one submission, which carried
 # Syndeo.app with the seven executables, was accepted, and release.yml has
@@ -53,8 +77,8 @@
 # SHA-256:
 #  A1. unpack it into <out-dir>, which must not exist yet, and record every
 #      path in the bundle with its bytes, mode and owner;
-#  A2. staple the ticket to it, once, and validate it, validation retried as
-#      in 5;
+#  A2. staple the ticket to it, once, and validate it, validation retried up
+#      to five attempts, after 0, 15, 30, 60 and 120 seconds;
 #  A3. require the stapled bundle identical to the one unpacked, but for one
 #      file stapler adds, Contents/CodeResources, the ticket;
 #  A4. require its code signature to verify, strictly, with everything nested
@@ -247,6 +271,9 @@ recorded() {
   return "$status"
 }
 
+# sha FILE: FILE's SHA-256, or nothing, failing, if it cannot be read.
+sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+
 finish() {
   case "$-" in *x*) die "refusing: tracing is on, and would print the secrets" ;; esac
   [ "$#" = 4 ] || die "usage: $0 finish <signed.pkg> <state-dir> <notarization-record> <diagnostics-dir>"
@@ -260,6 +287,8 @@ finish() {
   work=''
   succeeded=no
   stapling=no
+  accepted=''
+  last=''
   trap cleanup_finish EXIT
   trap 'exit 130' INT TERM HUP
   signed_yes
@@ -270,7 +299,7 @@ finish() {
   [ -f "$state/unsigned.manifest" ] || die "no $state/unsigned.manifest: was the package signed by this script's sign mode?"
 
   # 4. Apple accepted exactly this file.
-  local verdict
+  local verdict id want
   verdict="$(python3 -I - "$record" "$out" 2>&1 <<'PY'
 import hashlib, json, os, sys
 record, pkg = sys.argv[1:3]
@@ -284,31 +313,77 @@ if res.get("outcome") != "accepted" or res.get("id") != sub.get("id"):
     sys.exit("submission %s was not accepted: %s" % (sub.get("id"), res.get("outcome")))
 if sub.get("file") != os.path.basename(pkg) or sub.get("sha256") != h:
     sys.exit("submission %s was %s (%s), not this %s (%s)" % (sub.get("id"), sub.get("file"), sub.get("sha256"), os.path.basename(pkg), h))
-print(sub["id"])
+print(sub["id"], h)
 PY
 )" || die "4. refusing to staple: $verdict"
-  say "4. Apple accepted submission $verdict, which is exactly this file"
+  id="${verdict% *}"
+  want="${verdict##* }"
+  say "4. Apple accepted submission $id, which is exactly this file"
 
+  # 5. The package Apple accepted, kept read only; <signed.pkg> taken away
+  # until a copy of it is stapled and validated.
+  local name="${out##*/}" mode
   work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sign-macos-pkg.XXXXXX")"
+  mkdir "$work/accepted" "$work/attempts" "$work/last" || die "5. could not make the working directories"
   : >"$work/stapler.txt"
+  : >"$work/attempts.txt"
+  mode="$(stat -f '%Lp' "$out")" || die "5. could not read $out's mode"
+  accepted="$work/accepted/$name"
+  cp "$out" "$accepted" && chmod 0444 "$accepted" || die "5. could not keep the package Apple accepted"
+  [ "$(sha "$accepted")" = "$want" ] || die "5. the package kept is not the one Apple accepted"
   stapling=yes
-  recorded "$work/stapler.txt" xcrun stapler staple "$out" || die "5. could not staple the ticket"
-  # Only validation is retried: the ticket is stapled once, and nothing here
-  # ever submits anything again.
-  local delay attempt=0 validated=no
+  rm -f "$out"
+  [ ! -e "$out" ] || die "5. could not take $out away while it is stapled"
+  say "5. kept the package Apple accepted, read only ($want); $out is made again only from a copy stapled and validated"
+
+  local delay attempt=0 candidate now got staple validate promoted=no line
   for delay in 0 15 30 60 120; do
     attempt=$((attempt + 1))
     if [ "$delay" != 0 ]; then
-      say "5. the stapled ticket did not validate; validating again in ${delay}s (attempt $attempt of 5)"
+      say "5. attempt $attempt of 5 in ${delay}s"
       sleep "$delay"
     fi
-    if recorded "$work/stapler.txt" xcrun stapler validate "$out"; then
-      validated=yes
-      break
+    now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    # A fresh copy, it and the package kept both the accepted bytes, before
+    # stapler sees it.
+    [ "$(sha "$accepted")" = "$want" ] ||
+      die "5. attempt $attempt: the package kept is no longer the one Apple accepted; nothing more is stapled"
+    mkdir "$work/attempts/$attempt" || die "5. attempt $attempt: could not make its directory"
+    candidate="$work/attempts/$attempt/$name"
+    cp "$accepted" "$candidate" && chmod 0600 "$candidate" || die "5. attempt $attempt: could not copy the package kept"
+    got="$(sha "$candidate")" || die "5. attempt $attempt: could not read its copy"
+    [ "$got" = "$want" ] || die "5. attempt $attempt: its copy is $got, not the package Apple accepted; nothing is stapled"
+    line="attempt $attempt of 5, $now: a fresh copy of the package Apple accepted"
+    staple=0
+    recorded "$work/stapler.txt" xcrun stapler staple "$candidate" || staple=$?
+    got="$(sha "$candidate")" || die "5. attempt $attempt: could not read its copy after stapler"
+    if [ "$staple" != 0 ] && [ "$got" = "$want" ]; then
+      attempted "$line; stapler staple exit $staple, the copy unchanged: discarded"
+      rm -f "$candidate"
+      continue
+    elif [ "$staple" != 0 ]; then
+      attempted "$line; stapler staple exit $staple, and the copy changed, to $got: set aside, never stapled again"
+      set_aside "$candidate"
+      continue
+    elif [ "$got" = "$want" ]; then
+      attempted "$line; stapler staple exit 0, but the copy is unchanged, with no ticket: discarded"
+      rm -f "$candidate"
+      continue
     fi
+    validate=0
+    recorded "$work/stapler.txt" xcrun stapler validate "$candidate" || validate=$?
+    if [ "$validate" != 0 ]; then
+      attempted "$line; stapled, $got; stapler validate exit $validate: set aside, never stapled again"
+      set_aside "$candidate"
+      continue
+    fi
+    attempted "$line; stapled, $got; validated"
+    promote "$candidate" "$got" "$mode"
+    promoted=yes
+    break
   done
-  [ "$validated" = yes ] || die "5. the stapled ticket does not validate, after $attempt attempts"
-  say "5. the ticket is stapled and validates (validation attempt $attempt)"
+  [ "$promoted" = yes ] || die "5. no attempt stapled a ticket that validates, after $attempt attempts; there is no $out"
+  say "5. the ticket is stapled and validates (attempt $attempt of 5): $out ($got)"
 
   pkgutil --expand-full "$out" "$work/stapled" >/dev/null || die "6. could not expand the stapled package"
   same_as_unsigned 6.stapled "$work/stapled"
@@ -329,17 +404,55 @@ PY
   say "signed, notarized and stapled: $out"
 }
 
+# attempted LINE: one attempt, what it did and how it ended, shown now and
+# kept in attempts.txt.
+attempted() {
+  say "5. $1"
+  printf '%s\n' "$1" >>"$work/attempts.txt"
+}
+
+# set_aside COPY: a copy stapler changed that did not validate, kept as the
+# last such for the diagnostics, in place of any earlier one, and never used
+# again.
+set_aside() {
+  rm -f "$work/last/$name"
+  mv -f "$1" "$work/last/$name" || die "5. could not set aside $1"
+  last="$work/last/$name"
+}
+
+# promote COPY SHA256 MODE: COPY, stapled and validated, becomes <signed.pkg>:
+# copied beside it with MODE, checked, then renamed into place, so there is
+# never a <signed.pkg> other than exactly COPY.
+promote() {
+  local staged="$out.promoting"
+  cp "$1" "$staged" && chmod "$3" "$staged" || die "5. could not copy the stapled package beside $out"
+  [ "$(sha "$staged")" = "$2" ] || die "5. the copy beside $out is not the stapled package"
+  mv -f "$staged" "$out" || die "5. could not rename the stapled package into place"
+  [ "$(sha "$out")" = "$2" ] || die "5. $out is not the stapled package"
+}
+
 # keep_diagnostics: what finish keeps once stapling has begun and it fails,
-# in $diag, and nothing else; see the top of this file. Run before the
-# package is removed, and never changing the exit status.
+# in $diag, and nothing else; see the top of this file. Run before anything
+# is removed, and never changing the exit status. No package is kept under a
+# name ending .pkg: none of them is a release candidate.
 keep_diagnostics() {
-  local name="${out##*/}" failed=0
+  local name="${out##*/}" failed=0 kind file sums=''
   mkdir -p "$diag" || return 1
-  cp -p "$out" "$diag/$name" || failed=1
-  (cd "$diag" && shasum -a 256 "$name") >"$diag/$name.sha256" || failed=1
+  for kind in accepted last-candidate stapled; do
+    case "$kind" in
+      accepted) file="$accepted" ;;
+      last-candidate) file="$last" ;;
+      stapled) file="$out" ;;
+    esac
+    [ -n "$file" ] && [ -f "$file" ] || continue
+    cp -p "$file" "$diag/$name.$kind" || failed=1
+    sums="$sums$(cd "$diag" && shasum -a 256 "$name.$kind")"$'\n' || failed=1
+    { printf '== %s\n' "$name.$kind"; pkgutil --check-signature "$file" 2>&1; } >>"$diag/pkgutil-check-signature.txt"
+    { printf '== %s\n' "$name.$kind"; spctl -a -vv -t install "$file" 2>&1; } >>"$diag/gatekeeper.txt"
+  done
+  printf '%s' "$sums" >"$diag/$name.sha256" || failed=1
   cp "$work/stapler.txt" "$diag/stapler.txt" || failed=1
-  pkgutil --check-signature "$out" >"$diag/pkgutil-check-signature.txt" 2>&1
-  spctl -a -vv -t install "$out" >"$diag/gatekeeper.txt" 2>&1
+  cp "$work/attempts.txt" "$diag/attempts.txt" || failed=1
   {
     printf '== security dump-trust-settings (user)\n'
     security dump-trust-settings 2>&1
@@ -352,13 +465,27 @@ keep_diagnostics() {
   return "$failed"
 }
 
+# cleanup_finish: the diagnostics, if stapling began and finish failed; then
+# the working directory and anything beside <signed.pkg> removed, failing to
+# being a failure, even of a package otherwise stapled; then, unless finish
+# succeeded, <signed.pkg> removed. The first failure's status is kept.
 cleanup_finish() {
-  local status=$?
+  local status=$? failed=''
   set +e
   if [ "$succeeded" != yes ] && [ "$stapling" = yes ]; then
     keep_diagnostics || printf 'sign-macos-pkg: could not keep all of the diagnostics in %s\n' "$diag" >&2
   fi
-  [ -z "$work" ] || rm -rf "$work"
+  if [ -n "$work" ]; then
+    rm -rf "$work" 2>/dev/null
+    [ ! -e "$work" ] || failed="$failed removing the working directory;"
+  fi
+  rm -f "${out:?}.promoting" 2>/dev/null
+  [ ! -e "$out.promoting" ] || failed="$failed removing $out.promoting;"
+  if [ -n "$failed" ]; then
+    printf 'sign-macos-pkg: cleanup failed:%s\n' "$failed" >&2
+    succeeded=no
+    [ "$status" != 0 ] || status=1
+  fi
   if [ "$succeeded" != yes ]; then
     rm -f "${out:?}" 2>/dev/null || true
     [ ! -e "$out" ] || printf 'sign-macos-pkg: could not remove %s\n' "$out" >&2
@@ -553,9 +680,22 @@ esac
 EOF
   cat >"$bin/xcrun" <<'EOF'
 #!/bin/bash
+# at PATH: for a package, " @N", N the attempt whose copy it is, by its
+# directory; nothing for the bundle.
+at() { case "$1" in *.app) ;; *) printf ' @%s' "$(basename "$(dirname "$1")")" ;; esac; }
+# lost: stapler's failure when the connection to Apple is lost, as a release
+# run saw it.
+lost() {
+  echo 'error is Error Domain=NSURLErrorDomain Code=-1005 "The network connection was lost." (stand-in)'
+  echo "CloudKit's response is inconsistent with expections: (null)"
+  echo "The staple and validate action failed! Error 68."
+  exit 68
+}
+# lock DIR: a file in DIR that cannot be removed, until the self-test lets it.
+lock() { : >"$1/locked"; chflags uchg "$1/locked"; }
 case "$1 $2" in
   "stapler staple")
-    echo "xcrun stapler staple" >>"$STANDIN_CALLS"
+    echo "xcrun stapler staple$(at "$3")" >>"$STANDIN_CALLS"
     echo "Processing: $3"
     if [ "${STANDIN_STAPLE_FAILS:-no}" = yes ]; then echo "The staple and validate action failed! Error 65."; exit 65; fi
     case "$3" in
@@ -564,11 +704,37 @@ case "$1 $2" in
         # change besides, as the case says.
         [ "${STANDIN_APP_STAPLE:-ticket}" = none ] || { printf 'ticket' >"$3/Contents/CodeResources"; chmod 644 "$3/Contents/CodeResources"; }
         [ "${STANDIN_APP_STAPLE:-ticket}" != changes ] || printf 'changed' >>"$3/Contents/Info.plist" ;;
-      *) [ -z "${STANDIN_STAPLE:-}" ] || cp "$STANDIN_STAPLE" "$3" ;;
+      *)
+        # STANDIN_STAPLE: a package put in its place, as if stapling had
+        # changed its contents. Otherwise STANDIN_STAPLES: each attempt's
+        # outcome, comma-separated, the last one repeated: ok (a ticket
+        # appended); lost; partial (lost, the copy changed); noticket (it says
+        # it worked, and changes nothing); tamper (lost, and the package kept
+        # changed); interrupt (finish sent TERM); lock (ok, and a file left
+        # that cannot be removed); locklost.
+        if [ -n "${STANDIN_STAPLE:-}" ]; then
+          cp "$STANDIN_STAPLE" "$3"
+        else
+          n=$(( $(cat "$STANDIN_CALLS.staples" 2>/dev/null || echo 0) + 1 ))
+          echo "$n" >"$STANDIN_CALLS.staples"
+          IFS=, read -ra outcomes <<<"${STANDIN_STAPLES:-ok}"
+          o="${outcomes[$((n - 1))]:-${outcomes[${#outcomes[@]} - 1]}}"
+          kept="$(dirname "$(dirname "$(dirname "$3")")")/accepted/$(basename "$3")"
+          case "$o" in
+            ok) printf 'ticket\n' >>"$3" ;;
+            lost) lost ;;
+            partial) printf 'half a ticket' >>"$3"; lost ;;
+            noticket) ;;
+            tamper) chmod u+w "$kept"; printf 'x' >>"$kept"; lost ;;
+            interrupt) "$(dirname "$0")/interrupt-finish"; /bin/sleep 1; exit 1 ;;
+            lock) printf 'ticket\n' >>"$3"; lock "$(dirname "$3")" ;;
+            locklost) lock "$(dirname "$3")"; lost ;;
+          esac
+        fi ;;
     esac
     echo "The staple and validate action worked!" ;;
   "stapler validate")
-    echo "xcrun stapler validate" >>"$STANDIN_CALLS"
+    echo "xcrun stapler validate$(at "$3")" >>"$STANDIN_CALLS"
     # STANDIN_VALIDATE_FAILS: how many validations fail before one passes
     # (all, by default none).
     n=$(( $(cat "$STANDIN_CALLS.validations" 2>/dev/null || echo 0) + 1 ))
@@ -580,6 +746,7 @@ case "$1 $2" in
       exit 65
     fi
     echo "The validate action worked!" ;;
+  # Anything else, notarytool above all, is logged, and fails.
   *) echo "xcrun $1 $2" >>"$STANDIN_CALLS"; exit 1 ;;
 esac
 EOF
@@ -609,6 +776,36 @@ EOF
   cat >"$bin/sleep" <<'EOF'
 #!/bin/bash
 echo "sleep $*" >>"$STANDIN_CALLS"
+# STANDIN_SLEEP_INTERRUPT=yes: finish is sent TERM while it waits.
+[ "${STANDIN_SLEEP_INTERRUPT:-no}" != yes ] || { "$(dirname "$0")/interrupt-finish"; /bin/sleep 1; }
+EOF
+  # cp, as it is; but a copy made to a path matching the pattern
+  # STANDIN_COPY_ALTERS comes out one byte different from what it copied,
+  # and one to a path matching STANDIN_COPY_INTERRUPTS has finish sent TERM.
+  cat >"$bin/cp" <<'EOF'
+#!/bin/bash
+/bin/cp "$@" || exit
+dest="${*: -1}"
+# shellcheck disable=SC2254 # the patterns are patterns
+case "$dest" in ${STANDIN_COPY_ALTERS:-/nothing}) chmod u+w "$dest"; printf 'x' >>"$dest" ;; esac
+# shellcheck disable=SC2254
+case "$dest" in ${STANDIN_COPY_INTERRUPTS:-/nothing}) "$(dirname "$0")/interrupt-finish"; /bin/sleep 1 ;; esac
+exit 0
+EOF
+  # TERM to finish itself: the topmost of this process's ancestors running
+  # finish, not one of its subshells.
+  cat >"$bin/interrupt-finish" <<'EOF'
+#!/bin/bash
+p=$PPID
+top=''
+while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+  case "$(ps -o args= -p "$p" 2>/dev/null)" in
+    *" finish "*) top="$p" ;;
+    *) [ -z "$top" ] || break ;;
+  esac
+  p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+done
+[ -n "$top" ] && kill -TERM "$top"
 EOF
   chmod 755 "$bin"/*
 }
@@ -621,7 +818,7 @@ self_test() {
   local cases=0 wrong=0 team=AB12CD34EF
   # Not local: the EXIT trap runs after this function has returned.
   T="$(mktemp -d)"
-  trap 'rm -rf "$T"' EXIT
+  trap 'chflags -R nouchg "$T" 2>/dev/null; rm -rf "$T"' EXIT
   write_standins "$T/bin"
   local identity="Developer ID Installer: SECRETVALUE Org ($team)"
   # What the sign step is given; finish is given the identity alone.
@@ -784,31 +981,66 @@ self_test() {
     printf '{"id": "11111111-2222-4333-8444-555555555555", "outcome": "%s"}\n' "$outcome" >"$dir/result.json"
   }
 
-  # finish_case LABEL WANT-STATUS WANT-CALLS WANT-TEXT RECORD-SETUP
-  # [NAME=VALUE...]: finish, on a copy of the signed package, with the
-  # record RECORD-SETUP makes (a command given the record's directory).
-  # bundle_ok DIR: the diagnostics finish keeps, exactly the allowlist: the
-  # package with its SHA-256 matching it, stapler's recorded commands, exit
-  # statuses and output, pkgutil's and Gatekeeper's output, and the trust
-  # settings.
+  # bundle_ok DIR: the diagnostics finish keeps, exactly the allowlist, with
+  # the packages kept_pkgs names (accepted, and last-candidate or stapled as
+  # the case says), none named .pkg, their SHA-256s listed and matching;
+  # attempts.txt with attempts_kept lines, each an attempt of 5; stapler's
+  # recorded commands, exit statuses and output, if it ran; pkgutil's and
+  # Gatekeeper's output for each package kept; and the trust settings. The
+  # accepted package kept is the signed package byte for byte, unless the
+  # case changed it.
   bundle_ok() {
-    [ "$(cd "$1" && ls -A | LC_ALL=C sort | tr '\n' ' ')" = \
-      "gatekeeper.txt pkgutil-check-signature.txt signed.pkg signed.pkg.sha256 stapler.txt trust-settings.txt " ] &&
-      (cd "$1" && shasum -a 256 -c signed.pkg.sha256 >/dev/null 2>&1) &&
-      grep -q '^\$ xcrun stapler staple ' "$1/stapler.txt" && grep -qE '^\[exit [0-9]+\]$' "$1/stapler.txt" &&
-      grep -q 'Processing: ' "$1/stapler.txt" && [ -s "$1/pkgutil-check-signature.txt" ] && [ -s "$1/gatekeeper.txt" ] &&
-      grep -q 'No Trust Settings were found' "$1/trust-settings.txt"
+    local d="$1" k n=0 f
+    # Nothing but the allowlist, in which no name ends .pkg.
+    for f in "$d"/* "$d"/.[!.]*; do
+      [ -e "$f" ] || continue
+      case "${f##*/}" in
+        attempts.txt | gatekeeper.txt | pkgutil-check-signature.txt | stapler.txt | trust-settings.txt) ;;
+        signed.pkg.accepted | signed.pkg.last-candidate | signed.pkg.stapled | signed.pkg.sha256) ;;
+        *) return 1 ;;
+      esac
+    done
+    for k in accepted last-candidate stapled; do
+      if [[ " $kept_pkgs " == *" $k "* ]]; then
+        [ -f "$d/signed.pkg.$k" ] && grep -q "  signed\.pkg\.$k\$" "$d/signed.pkg.sha256" &&
+          grep -qx "== signed.pkg.$k" "$d/pkgutil-check-signature.txt" && grep -qx "== signed.pkg.$k" "$d/gatekeeper.txt" || return 1
+        n=$((n + 1))
+      else
+        [ ! -e "$d/signed.pkg.$k" ] || return 1
+      fi
+    done
+    [ "$(wc -l <"$d/signed.pkg.sha256" | tr -d ' ')" = "$n" ] && (cd "$d" && shasum -a 256 -c signed.pkg.sha256 >/dev/null 2>&1) || return 1
+    [ "$accepted_intact" != yes ] || cmp -s "$d/signed.pkg.accepted" "$T/made/signed.pkg" || return 1
+    [ "$(wc -l <"$d/attempts.txt" | tr -d ' ')" = "$attempts_kept" ] || return 1
+    [ "$attempts_kept" = 0 ] || [ "$(grep -cE '^attempt [1-5] of 5, ' "$d/attempts.txt")" = "$attempts_kept" ] || return 1
+    if [ "$attempts_kept" != 0 ]; then
+      grep -q '^\$ xcrun stapler staple ' "$d/stapler.txt" && grep -qE '^\[exit [0-9]+\]$' "$d/stapler.txt" &&
+        grep -q 'Processing: ' "$d/stapler.txt" || return 1
+    fi
+    grep -q 'No Trust Settings were found' "$d/trust-settings.txt"
   }
 
   # finish_case LABEL WANT-STATUS WANT-CALLS WANT-TEXT SETUP [NAME=VALUE...]:
-  # finish exits WANT-STATUS, calls exactly WANT-CALLS, says WANT-TEXT, never
-  # prints a secret, never notarizes, leaves nothing in RUNNER_TEMP, keeps the
-  # package only on success, and keeps the diagnostic bundle exactly when it
-  # failed once stapling had begun. diag_path is where it is asked to keep it.
+  # finish, on a copy of the signed package, with the notarization record
+  # SETUP makes (a command given the record's directory). It exits
+  # WANT-STATUS, calls exactly WANT-CALLS, says WANT-TEXT, never prints a
+  # secret, never notarizes, and leaves nothing in RUNNER_TEMP (unless
+  # temp_may_remain is yes, for a case that breaks its removal). Only on
+  # success is there a signed.pkg: the copy stapled, with the signed
+  # package's mode; on failure there is none, and nothing beside it. It keeps
+  # the diagnostic bundle exactly when it failed once stapling had begun:
+  # once it says it kept the package Apple accepted, unless diag_kept is no.
+  # diag_path is where it is asked to keep it.
   diag_path=''
+  temp_may_remain=no
+  diag_kept=auto
+  kept_pkgs=accepted
+  attempts_kept=0
+  accepted_intact=yes
   finish_case() {
     local label="$1" want="$2" calls="$3" text="$4" setup="$5" status out verdict=yes got diag
     shift 5
+    chflags -R nouchg "$T/run" 2>/dev/null
     rm -rf "$T/run"
     mkdir -p "$T/run/temp"
     : >"$T/run/calls"
@@ -826,13 +1058,22 @@ self_test() {
     says "$out" "$text" || verdict=no
     if printf '%s' "$out" | grep -qE 'SECRETVALUE|U0VDUkVU'; then verdict=no; fi
     if grep -q notarytool "$T/run/calls"; then verdict=no; fi
-    [ -z "$(ls -A "$T/run/temp")" ] || verdict=no
-    if [ "$want" = 0 ]; then [ -f "$T/run/signed.pkg" ] || verdict=no; else [ ! -e "$T/run/signed.pkg" ] || verdict=no; fi
-    if [ "$want" != 0 ] && [ -z "$diag_path" ] && grep -qx 'xcrun stapler staple' "$T/run/calls"; then
-      bundle_ok "$diag" || verdict=no
-    elif [ -z "$diag_path" ]; then
-      [ ! -e "$diag" ] || verdict=no
+    [ "$temp_may_remain" = yes ] || [ -z "$(ls -A "$T/run/temp")" ] || verdict=no
+    [ ! -e "$T/run/signed.pkg.promoting" ] || verdict=no
+    if [ "$want" = 0 ]; then
+      [ -f "$T/run/signed.pkg" ] && { cat "$T/made/signed.pkg"; printf 'ticket\n'; } | cmp -s - "$T/run/signed.pkg" &&
+        [ "$(stat -f '%Lp' "$T/run/signed.pkg")" = "$(stat -f '%Lp' "$T/made/signed.pkg")" ] || verdict=no
+    else
+      [ ! -e "$T/run/signed.pkg" ] || verdict=no
     fi
+    if [ -z "$diag_path" ]; then
+      if [ "$want" != 0 ] && [ "$diag_kept" != no ] && says "$out" "5. kept the package Apple accepted"; then
+        bundle_ok "$diag" || verdict=no
+      else
+        [ ! -e "$diag" ] || verdict=no
+      fi
+    fi
+    chflags -R nouchg "$T/run" 2>/dev/null
     verdict_of "$label" "$verdict" "$got" "$out"
   }
   accepted() { record "$1" accepted; }
@@ -841,45 +1082,142 @@ self_test() {
   invalid() { record "$1" invalid; }
   other_file() { record "$1" accepted other.pkg; }
   other_bytes() { record "$1" accepted signed.pkg 0000000000000000000000000000000000000000000000000000000000000000; }
-  local finished="xcrun stapler staple,xcrun stapler validate,pkgutil --expand-full,spctl"
-  local diagnosed="pkgutil --check-signature,spctl,security dump-trust-settings,security dump-trust-settings,security dump-trust-settings"
-  local retried="xcrun stapler validate,sleep 15,xcrun stapler validate,sleep 30,xcrun stapler validate,sleep 60,xcrun stapler validate,sleep 120,xcrun stapler validate"
+  # The calls, in pieces: attempt N stapled; attempt N stapled and
+  # validated; the wait before attempt N; and the diagnostics, for K
+  # packages kept.
+  st() { printf 'xcrun stapler staple @%s' "$1"; }
+  sv() { printf 'xcrun stapler staple @%s,xcrun stapler validate @%s' "$1" "$1"; }
+  wait_for() { case "$1" in 2) printf 'sleep 15' ;; 3) printf 'sleep 30' ;; 4) printf 'sleep 60' ;; 5) printf 'sleep 120' ;; esac; }
+  diagnosed() {
+    local k
+    for ((k = 0; k < $1; k++)); do printf 'pkgutil --check-signature,spctl,'; done
+    printf 'security dump-trust-settings,security dump-trust-settings,security dump-trust-settings'
+  }
+  local finished n all_lost all_unvalidated
+  finished="$(sv 1),pkgutil --expand-full,spctl"
+  all_lost="$(st 1)"
+  all_unvalidated="$(sv 1)"
+  for n in 2 3 4 5; do
+    all_lost="$all_lost,$(wait_for "$n"),$(st "$n")"
+    all_unvalidated="$all_unvalidated,$(wait_for "$n"),$(sv "$n")"
+  done
 
   printf '\n  finish: only after Apple accepted exactly this file\n'
-  finish_case "accepted: staple, validate, compare, Gatekeeper; stapler's commands, output and exit statuses shown" \
-    0 "$finished" "4. Apple accepted submission|    \$ xcrun stapler staple |The staple and validate action worked!|    \$ xcrun stapler validate |The validate action worked!|[exit 0]|signed, notarized and stapled" accepted
+  finish_case "accepted: the package kept, a fresh copy stapled, validated and promoted, compared, Gatekeeper; stapler's commands, output and exit statuses shown" \
+    0 "$finished" "4. Apple accepted submission|5. kept the package Apple accepted, read only|    \$ xcrun stapler staple |The staple and validate action worked!|    \$ xcrun stapler validate |The validate action worked!|[exit 0]|5. attempt 1 of 5, |; validated|stapled and validates (attempt 1 of 5)|signed, notarized and stapled" accepted
   finish_case "no notarization record: refused, nothing stapled, the package removed" 1 "" "refusing to staple: no notarization record" none
   finish_case "a submission still unresolved at its deadline: refused, nothing stapled" 1 "" "was not accepted: unresolved-deadline" unresolved
   finish_case "an Invalid submission: refused, nothing stapled" 1 "" "was not accepted: invalid" invalid
   finish_case "Apple accepted another file: refused" 1 "" "not this signed.pkg" other_file
   finish_case "Apple accepted other bytes under this name: refused" 1 "" "not this signed.pkg" other_bytes
   finish_case "SYNDEO_EXPECT_SIGNED=no: refused" 1 "" "SYNDEO_EXPECT_SIGNED is not yes" accepted SYNDEO_EXPECT_SIGNED=no
-  printf '\n  finish: stapled once, validation retried, nothing resubmitted\n'
-  finish_case "validation failing once, then passing: accepted after 15 s, the ticket stapled once" \
-    0 "xcrun stapler staple,xcrun stapler validate,sleep 15,xcrun stapler validate,pkgutil --expand-full,spctl" \
-    "does not have a ticket stapled to it|[exit 65]|validating again in 15s (attempt 2 of 5)|validation attempt 2|signed, notarized and stapled" \
-    accepted STANDIN_VALIDATE_FAILS=1
-  finish_case "validation failing four times, passing the fifth: accepted, after 15, 30, 60 and 120 s" \
-    0 "xcrun stapler staple,$retried,pkgutil --expand-full,spctl" "validation attempt 5|signed, notarized and stapled" \
-    accepted STANDIN_VALIDATE_FAILS=4
-  finish_case "validation failing every time: five attempts, then it fails closed; nothing compared or inspected; the diagnostics kept" \
-    1 "xcrun stapler staple,$retried,$diagnosed" "does not validate, after 5 attempts|kept the diagnostics in" \
-    accepted STANDIN_VALIDATE_FAILS=all
-  finish_case "stapling failing: fails closed, nothing validated, the diagnostics kept" \
-    1 "xcrun stapler staple,$diagnosed" "The staple and validate action failed! Error 65.|[exit 65]|5. could not staple the ticket" \
+
+  printf '\n  finish: up to five attempts, each on a fresh copy of the package Apple accepted; nothing resubmitted\n'
+  finish_case "the connection lost once, then stapled: the second attempt, on a fresh copy, after 15 s" \
+    0 "$(st 1),sleep 15,$(sv 2),pkgutil --expand-full,spctl" \
+    "Error Domain=NSURLErrorDomain Code=-1005|[exit 68]|stapler staple exit 68, the copy unchanged: discarded|attempt 2 of 5 in 15s|stapled and validates (attempt 2 of 5)|signed, notarized and stapled" \
+    accepted STANDIN_STAPLES=lost,ok
+  finish_case "the connection lost four times, stapled the fifth: after 15, 30, 60 and 120 s" \
+    0 "$(st 1),sleep 15,$(st 2),sleep 30,$(st 3),sleep 60,$(st 4),sleep 120,$(sv 5),pkgutil --expand-full,spctl" \
+    "attempt 5 of 5 in 120s|stapled and validates (attempt 5 of 5)|signed, notarized and stapled" \
+    accepted STANDIN_STAPLES=lost,lost,lost,lost,ok
+  attempts_kept=5
+  finish_case "the connection lost every time: five attempts, then fatal; no package; each attempt in the diagnostics" \
+    1 "$all_lost,$(diagnosed 1)" \
+    "attempt 5 of 5 in 120s|no attempt stapled a ticket that validates, after 5 attempts; there is no|kept the diagnostics in" \
+    accepted STANDIN_STAPLES=lost
+  finish_case "stapler failing every time, Error 65: five attempts, then fatal; no package" \
+    1 "$all_lost,$(diagnosed 1)" "The staple and validate action failed! Error 65.|[exit 65]|no attempt stapled a ticket that validates, after 5 attempts" \
     accepted STANDIN_STAPLE_FAILS=yes
-  finish_case "stapling that changes the contents: caught, the diagnostics kept" \
-    1 "xcrun stapler staple,xcrun stapler validate,pkgutil --expand-full,$diagnosed" "6.stapled: the package's contents differ" accepted \
+  kept_pkgs="accepted last-candidate"
+  finish_case "stapled, but never validating: five fresh copies, never one stapled twice, then fatal; the last copy kept, not as .pkg" \
+    1 "$all_unvalidated,$(diagnosed 2)" "stapler validate exit 65: set aside, never stapled again|no attempt stapled a ticket that validates, after 5 attempts" \
+    accepted STANDIN_VALIDATE_FAILS=all
+  kept_pkgs=accepted
+  attempts_kept=0
+  finish_case "stapled, but not validating once: the next attempt staples a fresh copy, not that one" \
+    0 "$(sv 1),sleep 15,$(sv 2),pkgutil --expand-full,spctl" \
+    "does not have a ticket stapled to it|stapler validate exit 65: set aside, never stapled again|stapled and validates (attempt 2 of 5)" \
+    accepted STANDIN_VALIDATE_FAILS=1
+  finish_case "stapled, but validating only the fifth time: five copies, the fifth promoted" \
+    0 "$all_unvalidated,pkgutil --expand-full,spctl" "stapled and validates (attempt 5 of 5)|signed, notarized and stapled" \
+    accepted STANDIN_VALIDATE_FAILS=4
+  finish_case "a failure that changed the copy: set aside, never stapled again; the next attempt staples a fresh copy" \
+    0 "$(st 1),sleep 15,$(sv 2),pkgutil --expand-full,spctl" \
+    "stapler staple exit 68, and the copy changed, to|set aside, never stapled again|stapled and validates (attempt 2 of 5)" \
+    accepted STANDIN_STAPLES=partial,ok
+  kept_pkgs="accepted last-candidate"
+  attempts_kept=5
+  finish_case "failures that change the copy every time: five fresh copies, then fatal; the last changed copy kept" \
+    1 "$all_lost,$(diagnosed 2)" "and the copy changed, to|no attempt stapled a ticket that validates, after 5 attempts" \
+    accepted STANDIN_STAPLES=partial
+  kept_pkgs=accepted
+  attempts_kept=0
+  finish_case "stapler saying it worked but adding no ticket: discarded, not validated, never promoted" \
+    0 "$(st 1),sleep 15,$(sv 2),pkgutil --expand-full,spctl" \
+    "stapler staple exit 0, but the copy is unchanged, with no ticket: discarded|stapled and validates (attempt 2 of 5)" \
+    accepted STANDIN_STAPLES=noticket,ok
+
+  printf '\n  finish: never stapling anything but the bytes Apple accepted\n'
+  finish_case "the package kept not the accepted bytes from the start: stopped before any attempt; no package" \
+    1 "" "5. the package kept is not the one Apple accepted" accepted 'STANDIN_COPY_ALTERS=*/accepted/*'
+  finish_case "the first copy not the accepted bytes: stopped before stapler sees it; no package" \
+    1 "$(diagnosed 1)" "5. attempt 1: its copy is|not the package Apple accepted; nothing is stapled|kept the diagnostics in" \
+    accepted 'STANDIN_COPY_ALTERS=*/attempts/1/*'
+  attempts_kept=1
+  finish_case "a later copy not the accepted bytes: stopped there, nothing more stapled" \
+    1 "$(st 1),sleep 15,$(diagnosed 1)" "5. attempt 2: its copy is|nothing is stapled" \
+    accepted STANDIN_STAPLES=lost 'STANDIN_COPY_ALTERS=*/attempts/2/*'
+  accepted_intact=no
+  finish_case "the package kept changed between attempts: stopped, nothing more stapled; no package" \
+    1 "$(st 1),sleep 15,$(diagnosed 1)" "5. attempt 2: the package kept is no longer the one Apple accepted; nothing more is stapled" \
+    accepted STANDIN_STAPLES=tamper
+  accepted_intact=yes
+  attempts_kept=1
+  finish_case "the copy beside signed.pkg not the stapled bytes: stopped before it is renamed into place; no package" \
+    1 "$(sv 1),$(diagnosed 1)" "5. the copy beside|is not the stapled package" accepted 'STANDIN_COPY_ALTERS=*.promoting'
+
+  printf '\n  finish: interrupted, and cleanup\n'
+  attempts_kept=0
+  finish_case "interrupted while stapling: exit 130 kept, no further attempt, no package, the diagnostics kept" \
+    130 "$(st 1),$(diagnosed 1)" "kept the diagnostics in" accepted STANDIN_STAPLES=interrupt
+  attempts_kept=1
+  finish_case "interrupted while promoting the stapled copy: exit 130 kept, neither signed.pkg nor the copy beside it left" \
+    130 "$(sv 1),$(diagnosed 1)" "; validated|kept the diagnostics in" accepted 'STANDIN_COPY_INTERRUPTS=*.promoting'
+  finish_case "interrupted while waiting to try again: exit 130 kept, no further attempt, no package, the diagnostics kept" \
+    130 "$(st 1),sleep 15,$(diagnosed 1)" "stapler staple exit 68, the copy unchanged: discarded|kept the diagnostics in" \
+    accepted STANDIN_STAPLES=lost STANDIN_SLEEP_INTERRUPT=yes
+  attempts_kept=0
+  temp_may_remain=yes
+  diag_kept=no
+  finish_case "stapled, validated and accepted, but its working directory cannot be removed: fatal; no package" \
+    1 "$finished" "signed, notarized and stapled|cleanup failed: removing the working directory;" \
+    accepted STANDIN_STAPLES=lock
+  diag_kept=auto
+  attempts_kept=5
+  finish_case "five attempts lost, and the working directory cannot be removed: both said, the first failure's status, the diagnostics kept" \
+    1 "$all_lost,$(diagnosed 1)" "no attempt stapled a ticket that validates, after 5 attempts|kept the diagnostics in|cleanup failed: removing the working directory;" \
+    accepted STANDIN_STAPLES=locklost
+  temp_may_remain=no
+  attempts_kept=0
+
+  printf '\n  finish: after stapling\n'
+  attempts_kept=1
+  kept_pkgs="accepted stapled"
+  finish_case "stapling that changes the contents: caught, the stapled package kept as .stapled, not as .pkg" \
+    1 "$(sv 1),pkgutil --expand-full,$(diagnosed 2)" "6.stapled: the package's contents differ" accepted \
     STANDIN_STAPLE="$d/payload.pkg"
   finish_case "Gatekeeper accepts it, but as Developer ID, not notarized: fails, the diagnostics kept" \
-    1 "$finished,$diagnosed" "does not accept it as Notarized Developer ID" accepted "STANDIN_SOURCE=Developer ID"
+    1 "$finished,$(diagnosed 2)" "does not accept it as Notarized Developer ID" accepted "STANDIN_SOURCE=Developer ID"
   finish_case "Gatekeeper accepts it from another identity: fails, the diagnostics kept" \
-    1 "$finished,$diagnosed" "does not accept it as Notarized Developer ID" accepted "STANDIN_ORIGIN=Developer ID Installer: Someone Else (ZZ99ZZ99ZZ)"
-  finish_case "Gatekeeper rejects it: fails, the diagnostics kept" 1 "$finished,$diagnosed" "does not accept it as Notarized Developer ID" accepted STANDIN_SPCTL=rejected
+    1 "$finished,$(diagnosed 2)" "does not accept it as Notarized Developer ID" accepted "STANDIN_ORIGIN=Developer ID Installer: Someone Else (ZZ99ZZ99ZZ)"
+  finish_case "Gatekeeper rejects it: fails, the diagnostics kept" 1 "$finished,$(diagnosed 2)" "does not accept it as Notarized Developer ID" accepted STANDIN_SPCTL=rejected
+  kept_pkgs=accepted
+  attempts_kept=0
   mkdir -p "$T/readonly" && chmod 555 "$T/readonly"
   diag_path="$T/readonly/diag"
-  finish_case "diagnostics that cannot be written: it still fails, with the first failure's status, and the package is still removed" \
-    1 "xcrun stapler staple,$retried" "does not validate, after 5 attempts|could not keep all of the diagnostics" \
+  finish_case "diagnostics that cannot be written: it still fails, with the first failure's status, and there is no package" \
+    1 "$all_unvalidated" "no attempt stapled a ticket that validates, after 5 attempts|could not keep all of the diagnostics" \
     accepted STANDIN_VALIDATE_FAILS=all
   mkdir -p "$T/existing/diag"
   diag_path="$T/existing/diag"
@@ -887,6 +1225,20 @@ self_test() {
     1 "" "already exists, and diagnostics are only ever written fresh" accepted
   chmod 755 "$T/readonly"
   diag_path=
+
+  # Nothing in this script submits anything: no notarytool, and no
+  # notarize.py, outside its comments and this self-test.
+  local submits
+  submits="$(sed -n '1,/^# -* self-test$/p' "$0" | grep -vE '^[[:space:]]*#' | grep -nE 'notarytool|notarize\.py' || true)"
+  cases=$((cases + 1))
+  if [ -z "$submits" ]; then
+    printf '  ok    %s\n' "no mode submits anything: no notarytool or notarize.py outside the comments"
+  else
+    printf '  WRONG %s\n%s\n' "no mode submits anything: no notarytool or notarize.py outside the comments" "$(printf '%s\n' "$submits" | sed 's/^/          | /')"
+    wrong=$((wrong + 1))
+  fi
+  # The validations staple-app retries.
+  local retried="xcrun stapler validate,sleep 15,xcrun stapler validate,sleep 30,xcrun stapler validate,sleep 60,xcrun stapler validate,sleep 120,xcrun stapler validate"
 
   # A bundle, zipped as build-macos hands it on, for staple-app.
   mkdir -p "$T/bundle/Syndeo.app/Contents/MacOS" "$T/bundle/Syndeo.app/Contents/_CodeSignature"

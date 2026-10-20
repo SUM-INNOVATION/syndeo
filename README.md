@@ -1061,13 +1061,27 @@ package.
        `ci/notarize.py`, and waits for the verdict.
     3. `package` staples that same bundle, checked by its SHA-256, and
        requires it unchanged but for its ticket, and accepted by Gatekeeper.
-       It builds the installer package from it, signs it with
-       `ci/sign-macos-pkg.sh`, sends it to Apple once, waits, and only then
-       staples it. Every stapler
-       command is shown with its output and exit status. Validating the
-       stapled ticket is retried, up to five times over about four minutes,
-       and has to pass; if it never does, the job fails and keeps the package
-       and what the tools said as an internal artifact, for a week.
+       Validating the bundle's ticket is retried, up to five times over
+       about four minutes. It builds the installer package from that bundle,
+       signs it with `ci/sign-macos-pkg.sh`, sends it to Apple once, waits,
+       and only then staples it. Stapling fetches the ticket over the
+       network, so it gets up to five attempts over about four minutes:
+       - the package Apple accepted is kept unchanged;
+       - each attempt staples and validates a fresh copy of it, checked by
+         its SHA-256 before stapler sees it;
+       - a copy stapling changed is never stapled again;
+       - only a copy stapled and validated becomes the package;
+       - if no attempt succeeds, the job fails, and there is no package.
+
+       Every stapler command is shown with its output and exit status. If
+       stapling the package fails, the job keeps, as an internal artifact
+       for a week:
+       - the package Apple accepted;
+       - the last copy stapling changed, or the stapled package, if any;
+       - each attempt's record;
+       - what the tools said.
+
+       Nothing in that artifact is named `.pkg`.
 
     Each wait has its own job, and its own deadline inside that job's time
     limit. A deadline reached means Apple has not decided, which is not a
