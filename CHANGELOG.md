@@ -226,10 +226,20 @@ from the tarball and the install script, on macOS and Linux.
 
 - **rustls 0.23.45 → 0.23.46**, for RUSTSEC-2026-0346, RUSTSEC-2026-0347,
   RUSTSEC-2026-0348 and RUSTSEC-2026-0349.
-- **wasmtime 48.0.4 → 48.0.6**, with pulley and cranelift to match, for
-  eleven advisories against 48.0.4: RUSTSEC-2026-0353 to RUSTSEC-2026-0359,
-  and RUSTSEC-2026-0361 to RUSTSEC-2026-0364. Only the agent's tools run on
-  wasmtime.
+- **rustls-webpki 0.103.15 → 0.103.16**, for RUSTSEC-2026-0382: certificate
+  verification could accept paths through distrusted emSign intermediates,
+  whose private keys are now well known. It is under rustls in `syndeo-net`,
+  and through it in `syndeo-proxy`.
+- **wasmtime 48.0.4 → 48.0.7**, with pulley and cranelift to match, in two
+  steps:
+  - 48.0.6, for eleven advisories against 48.0.4: RUSTSEC-2026-0353 to
+    RUSTSEC-2026-0359, and RUSTSEC-2026-0361 to RUSTSEC-2026-0364;
+  - 48.0.7, for two against 48.0.6: RUSTSEC-2026-0378, a panic lowering a
+    host-created component model stream into a guest that expects another
+    payload type, and RUSTSEC-2026-0379, Cranelift's aarch64 backend jumping
+    to the wrong target on a large Wasm `br_table`.
+
+  Only the agent's tools run on wasmtime.
 - **Three unmaintained zbus 5 crates are accepted for now:** zvariant,
   zbus_names and zvariant_derive (RUSTSEC-2026-0370, RUSTSEC-2026-0371 and
   RUSTSEC-2026-0372).
