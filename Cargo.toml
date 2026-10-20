@@ -3,20 +3,20 @@ resolver = "2"
 members = ["crates/syndeo-cache", "crates/syndeo-net", "crates/syndeo-proxy", "crates/syndeo-ipc", "crates/syndeo-keystore", "crates/syndeo-dom", "crates/syndeo-agent", "crates/syndeo-shell", "crates/syndeo-peer", "crates/syndeo-ui", "crates/syndeo-servo", "crates/syndeo-webkit", "crates/syndeo-app"]
 
 [workspace.package]
-version = "0.1.7"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/SUM-INNOVATION/syndeo"
 
 [workspace.dependencies]
-syndeo-cache = { path = "crates/syndeo-cache", version = "0.1.0" }
-syndeo-net = { path = "crates/syndeo-net", version = "0.1.0" }
-syndeo-ipc = { path = "crates/syndeo-ipc", version = "0.1.0" }
-syndeo-keystore = { path = "crates/syndeo-keystore", version = "0.1.0" }
-syndeo-dom = { path = "crates/syndeo-dom", version = "0.1.0" }
-syndeo-peer = { path = "crates/syndeo-peer", version = "0.1.0" }
-syndeo-shell = { path = "crates/syndeo-shell", version = "0.1.0" }
-syndeo-webkit = { path = "crates/syndeo-webkit", version = "0.1.0" }
+syndeo-cache = { path = "crates/syndeo-cache", version = "0.2.0" }
+syndeo-net = { path = "crates/syndeo-net", version = "0.2.0" }
+syndeo-ipc = { path = "crates/syndeo-ipc", version = "0.2.0" }
+syndeo-keystore = { path = "crates/syndeo-keystore", version = "0.2.0" }
+syndeo-dom = { path = "crates/syndeo-dom", version = "0.2.0" }
+syndeo-peer = { path = "crates/syndeo-peer", version = "0.2.0" }
+syndeo-shell = { path = "crates/syndeo-shell", version = "0.2.0" }
+syndeo-webkit = { path = "crates/syndeo-webkit", version = "0.2.0" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "sync", "time", "process", "signal"] }
 tokio-util = { version = "0.7", features = ["codec"] }

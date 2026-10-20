@@ -3,6 +3,278 @@
 The release workflow reads the section matching the tag and puts it in the
 release notes, so a heading here is `## <version>` and nothing else.
 
+## 0.2.0
+
+The first release of Syndeo.app, a desktop browser for the Mac, and the
+first whose macOS installer package installs that application instead of the
+command-line tools. The command-line tools are installed as before: per user,
+from the tarball and the install script, on macOS and Linux.
+
+**Before you upgrade**
+
+- **The package installs Syndeo.app, and only Syndeo.app.**
+  `Syndeo-0.2.0.pkg` puts `/Applications/Syndeo.app` on the Mac and nothing
+  else: no command in `/usr/local/bin`, nothing under `/usr/local/libexec`,
+  and nothing in a home folder. Its receipt, `com.sum.syndeo.app`, is new
+  with this release.
+- **It removes the v0.1.6 or v0.1.7 command-line package, if that is
+  installed exactly as its own package left it.**
+  - What it removes, in this order:
+    1. that package's seven links in `/usr/local/bin`;
+    2. its tree under `/usr/local/libexec/syndeo`;
+    3. `/usr/local/libexec` itself, only if it is an empty directory exactly
+       as that package created it and no other package claims it;
+    4. its receipt, `com.sum.syndeo.pkg`, last.
+  - `/usr/local/bin` itself, everything else in it, and every command
+    `install.sh` put anywhere stay as they are.
+  - In any other state, the package refuses and touches none of it: a file
+    changed, missing or added, or a command `install.sh` put over one of its
+    links. Repair it by installing that version's own package again, or
+    remove it with its own uninstaller; then install this one.
+  - Quit its programs first: the package refuses while any of them runs from
+    its tree.
+- **To keep the command-line tools, install them per user** with the install
+  script, into `~/.local/bin`. The package leaves `~/.syndeo`, the
+  keystore's keychain item and every other file in your home folder as they
+  are.
+- **Quit Syndeo before installing or upgrading.** The package refuses while
+  Syndeo.app or its helper runs.
+
+**Syndeo.app**
+
+- **A Mac application.** It is AppKit with WebKit in its windows, opened from
+  `/Applications` like any other application. It has:
+  - a Dock icon;
+  - the Syndeo, File, Edit, View, History and Window menus, with their usual
+    shortcuts;
+  - macOS's own tabs.
+
+  Closing the last window leaves it running until it is quit. It needs no
+  terminal and no address to start.
+- **Browsing.**
+  - An address field, with Back, Forward, Reload and Stop beside it.
+  - An `http://` or `https://` address opens as typed, and a host without a
+    scheme opens over `https`. Other schemes are refused.
+  - Reload asks the site again, past every cache.
+  - A page that asks for a new window gets a new tab.
+  - Plain `http` pages load, as in any browser. The application's own
+    connections keep App Transport Security.
+- **Search.** Words typed in the address field are searched for when Return
+  is pressed, and only then, with the engine chosen in Syndeo > Settings:
+  DuckDuckGo by default, Startpage, Brave Search, Google, Bing, or Off.
+  Syndeo makes no suggestions, so nothing is sent while you type. With Off,
+  typed words are sent nowhere.
+- **Clear Browsing Data**, in Settings, stops every window's loading. It then
+  removes cookies, website storage and cached pages from WebKit's store,
+  empties Syndeo's own cache, and says how each went.
+- **A start page** says how pages are reached, what WebRTC does, how secure
+  pages open, where search goes, and how to clear browsing data.
+- **It fails closed.** A window gets a web view only once all of this holds:
+  - Syndeo's proxy is listening;
+  - a configuration routed through it has been built;
+  - its authority is on disk and pinned.
+
+  If any of it fails, the window shows a native message saying why, and no
+  web view at all.
+- **One helper, from inside the bundle.** Its proxy, `syndeo-proxy`, starts
+  from `Contents/Helpers` and nowhere else; neither `PATH` nor an install of
+  the command-line tools decides which one runs. The proxy stops when Syndeo
+  quits, and exits by itself if Syndeo dies.
+- **No keystore.** Syndeo.app holds no keys or identities, and signs
+  nothing. It never starts the keystore, makes no keychain entry, and asks
+  for no passphrase.
+- **Your data.** It is kept in three places:
+  - `~/Library/Application Support/Syndeo`: Syndeo's cache and its
+    authority;
+  - Syndeo's preferences: the search engine;
+  - WebKit's own website data, for `com.sum.syndeo`.
+
+  Removing the application, by its uninstaller or the Trash, leaves all of
+  it. The README says where each part is, and how to delete it.
+
+**How pages are reached, and what is cached**
+
+- **The bar above each page says how the page was reached:**
+  - **Through Syndeo:** every name, whatever it resolves to, and every public
+    address. WebKit sends these through Syndeo's proxy.
+  - **Direct — not cached by Syndeo:** `localhost` and loopback addresses,
+    which WebKit opens itself.
+  - **Local — not cached by Syndeo:** a private, link-local or shared
+    (carrier-grade NAT) address typed as numbers. WebKit may open it
+    directly or through the proxy.
+
+  An IPv4 address written in IPv6 (`::ffff:a.b.c.d`) is classified as that
+  IPv4 address. Each part of a page is reached by its own address. **Not
+  every request goes through Syndeo.**
+- **The proxy caches only what came from the public internet.** An answer is
+  stored only if the address the proxy actually connected to is public. One
+  from a loopback, private, link-local or shared address is passed on and
+  never stored, whatever name led there.
+- **One browsing profile and one cache, shared by every site.**
+  - Cookies and website storage are WebKit's one store, shared by every
+    window and kept between launches.
+  - The proxy's cache is not partitioned by site, so a site can tell from
+    timing whether something is already in it.
+
+  Clear Browsing Data empties both.
+
+**WebSockets and WebRTC**
+
+- **WebSockets now work through Syndeo's proxy, `ws://` and `wss://`.** Until
+  now the proxy removed the `Upgrade` header a WebSocket handshake needs, so
+  every WebSocket through it failed.
+  - **The handshake it accepts:** a GET over HTTP/1.1, with:
+    - exactly one `Upgrade: websocket`;
+    - a `Connection` header naming `upgrade`;
+    - one key of 16 bytes;
+    - version 13;
+    - no body.
+
+    It refuses anything malformed or ambiguous with 400.
+  - **Then:**
+    1. it opens its own connection to the site;
+    2. it checks the site's 101 answer: its `Upgrade`, `Connection` and
+       `Sec-WebSocket-Accept`;
+    3. only then does it carry the connection both ways.
+  - **Other answers:** an answer from the site that is not 101 is passed on
+    as an ordinary response.
+  - **Never cached:** not the handshake, not the answer, and not what the
+    connection carries.
+  - **`wss://`:** the operating system's verifier checks the site's
+    certificate.
+- **WebRTC connects directly, not through Syndeo.** On CI, WebKit's WebRTC
+  reached a STUN server on the internet and connected peers, and none of it
+  went through the proxy. So a page can learn your public IP address through
+  WebRTC, and may learn your address on your local network. Syndeo.app's
+  start page says: "WebRTC media and peer connections connect directly and
+  are not sent through or cached by Syndeo. Syndeo is not a VPN." WebKit
+  gives an application no supported way to turn WebRTC off or proxy it.
+  [#41](https://github.com/SUM-INNOVATION/syndeo/issues/41) tracks doing one
+  or the other if it does.
+
+**Secure pages**
+
+- **Syndeo's own authority, pinned and not trusted.**
+  - The proxy's certificate authority is made on the Mac the first time
+    Syndeo.app opens. Its private key is readable only by you.
+  - Each window accepts that authority, and no other, for the pages its proxy
+    fetches.
+  - Nothing is added to the keychain, trust settings are left as they are,
+    and no password is asked for.
+  - macOS checks the site's own certificate when the proxy fetches the page.
+  - Anyone who could read the authority's private key could impersonate any
+    site to Syndeo's windows, and to no other application.
+
+**Requirements**
+
+- **Syndeo.app:** Apple Silicon and macOS 13 or later, and an administrator
+  to install it. The package's own metadata refuses Intel Macs and earlier
+  macOS. Other platforms are tracked at
+  [#17](https://github.com/SUM-INNOVATION/syndeo/issues/17).
+- **The command-line tools:** as before, macOS 13 or later on Apple Silicon,
+  and Linux with glibc 2.35 or later, on x86_64 or arm64.
+
+**The installer package**
+
+- **Its name is `Syndeo-<version>.pkg`.** It is built from the signed,
+  notarized and stapled Syndeo.app, then signed with a Developer ID Installer
+  identity, notarized, and stapled.
+- **Its preinstall writes nothing. It refuses:**
+  - while Syndeo or its helper runs;
+  - a `Syndeo.app` there that no Syndeo package installed;
+  - one changed since it was signed, or not what its receipt says;
+  - an older package than the one installed, including after the
+    application was moved to the Trash, until its receipt is forgotten.
+- **Its postinstall** checks that the application is exactly this version,
+  its signature intact, then removes the v0.1.x package as above.
+- **A failed upgrade** is finished by installing the same package again.
+- **Removing it:**
+  - `sudo /bin/sh /Applications/Syndeo.app/Contents/Resources/uninstall.sh`
+    removes the application and forgets the receipt, and changes nothing
+    unless all of it is exactly as installed;
+  - or move it to the Trash.
+
+  Neither touches your data.
+- **Signing.**
+  - Syndeo.app and its helper are signed as the command-line binaries are:
+    with a Developer ID Application identity, the hardened runtime and a
+    secure timestamp, and no entitlements.
+  - They are notarized in one submission with the seven binaries, and the
+    application's ticket is stapled.
+
+**The command-line tools**
+
+- **Distributed separately:** the tarballs, still
+  `syndeo-<version>-<target>.tar.gz`, and the per-user install script, with
+  no `sudo`. The package no longer carries them, and Syndeo.app does not use
+  them.
+- **`syndeo-proxy`:**
+  - It carries WebSockets, as above.
+  - It caches only what came from the public internet, as above.
+  - A browser's own proxy, `syndeo-webkit`'s as well as Syndeo.app's, no
+    longer traces each request.
+  - A proxy started with its control pipe empties its cache when its owner
+    asks.
+  - A normal quit writes the cache's statistics to disk before the proxy
+    exits.
+- **Logs and errors show only a URL's origin:** never its path, query,
+  userinfo or fragment, in `syndeo-net`, `syndeo-cache` and `syndeo-proxy`.
+  The request trace, which a hand-started `syndeo-proxy run` writes by
+  default, still shows URLs whole.
+
+**Security**
+
+- **rustls 0.23.45 → 0.23.46**, for RUSTSEC-2026-0346, RUSTSEC-2026-0347,
+  RUSTSEC-2026-0348 and RUSTSEC-2026-0349.
+- **wasmtime 48.0.4 → 48.0.6**, with pulley and cranelift to match, for
+  eleven advisories against 48.0.4: RUSTSEC-2026-0353 to RUSTSEC-2026-0359,
+  and RUSTSEC-2026-0361 to RUSTSEC-2026-0364. Only the agent's tools run on
+  wasmtime.
+- **Three unmaintained zbus 5 crates are accepted for now:** zvariant,
+  zbus_names and zvariant_derive (RUSTSEC-2026-0370, RUSTSEC-2026-0371 and
+  RUSTSEC-2026-0372).
+  - The notices are informational, not vulnerabilities.
+  - They reach only Linux, under `syndeo-ui`'s screen reader support:
+    eframe → accesskit_unix → atspi → zbus 5. Nothing on macOS reaches them.
+  - There is no compatible migration yet.
+
+  They are temporary exceptions, to be removed when AccessKit moves to
+  zbus 6.
+
+**What was and was not tested**
+
+- **Every pull request:**
+  - Syndeo.app is opened, browsed, quit and opened again on a disposable
+    runner. Its route bar is held to what WebKit does, its Clear Browsing
+    Data and its search settings are checked, and one whose proxy cannot
+    start has to refuse to browse.
+  - A WebSocket through Syndeo has to open, carry its message both ways and
+    close cleanly, with nothing of it cached.
+  - WebRTC has to go around Syndeo, as the start page says.
+  - Eight mutants, each the application with one safeguard taken out, have
+    to be caught.
+  - The package is installed, upgraded, reinstalled, refused and removed,
+    and the published v0.1.6 and v0.1.7 packages are migrated.
+  - One customer's journey runs on a pristine runner, with the exact package
+    that was built.
+- **A release** runs the same package test and journey on its signed
+  package, where Gatekeeper has to accept it. The package published is the
+  package accepted, by its SHA-256.
+- **The tag waits for two more checks:**
+  - a signed dry run of the release commit;
+  - the check by hand. The signed, notarized package is installed from
+    Finder on a fresh standard user account, with a separate
+    administrator's name and password when Installer asks. Syndeo.app is
+    then opened from `/Applications` and the customer journey completed,
+    with no trust setting or keychain changed.
+- **Measured, not gated:** WebSockets to a public echo server, `ws://` and
+  `wss://`, and WebRTC with a public STUN server.
+- **Not tested:**
+  - the package's refusal of Intel Macs and of macOS before 13, which rests
+    on its metadata alone;
+  - Gatekeeper on a browser-downloaded tarball;
+  - Secure Enclave presence, which no build enforces.
+
 ## 0.1.7
 
 The first release whose macOS binaries and installer package are signed with
