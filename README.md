@@ -343,10 +343,12 @@ separate, and removing the application touches neither.
     page says;
   - eight mutants, each the application with one safeguard taken out, every
     one of which the test has to catch.
-- **Checked by hand, for every signed release:** installing by opening the
-  package in Finder, which runs Installer's window and asks for an
-  administrator's password, then opening Syndeo.app from `/Applications`. CI
-  cannot drive either, so it is a required manual check before the release's
+- **Checked by hand, for every signed release:** from a fresh standard
+  user account, installing by opening the package in Finder, which runs
+  Installer's window and asks for a separate administrator's name and
+  password; then opening Syndeo.app from `/Applications` and using it as a
+  customer would, with no trust setting or keychain changed. CI cannot drive
+  Installer's window, so it is a required manual check before the release's
   tag (see [Releasing](#releasing)), not something a pull request waits on.
 - **What was not tested:** the refusal of Intel Macs and of macOS before 13,
   which rests on the package's metadata alone, with no such runners to try
@@ -1095,15 +1097,28 @@ package.
 - **A `workflow_dispatch` run is a dry run.** It does all of this, but
   rehearses the publication on a draft it deletes, and publishes nothing.
 - **Finder, by hand, before a signed release is tagged.** CI installs the
-  package with `installer`; it cannot drive Installer's window or its
-  password prompt. So for every signed release:
-  1. Download the signed dry run's `Syndeo-<version>.pkg` in a browser, on a
-     Mac with no Syndeo on it.
-  2. Open it in Finder, and install it through Installer's window.
-  3. Open Syndeo.app from `/Applications`, and browse a page.
+  package with `installer`, as root; it cannot drive Installer's window or
+  its password prompt, and never browses as a standard user. So for every
+  signed release:
+  1. On a Mac with no Syndeo on it, log in to a fresh standard user account,
+     made for this check: a standard account, not an administrator.
+  2. Record that account's trust settings and keychains, and the Mac's.
+  3. In a browser there, download the signed dry run's
+     `Syndeo-<version>.pkg`: the signed, notarized and stapled package the
+     release would publish.
+  4. Open it in Finder, and install it through Installer's window. When
+     Installer asks for an administrator's name and password, give those of
+     a separate administrator account; the standard account stays standard.
+  5. Open Syndeo.app from `/Applications`, as that standard user.
+  6. Complete the customer journey there: the start page; an `http` page and
+     an `https` page, each opened through Syndeo, as the bar says; Reload;
+     quit, then open Syndeo again and browse again.
+  7. Check that the trust settings and keychains are exactly as recorded:
+     nothing was added to or changed in either, by Syndeo or by hand.
 
-  Gatekeeper has to accept both without a warning. A tag waits for this,
-  and its result is recorded with the release's evidence.
+  Gatekeeper has to accept the package and the application without a
+  warning. A tag waits for this, and its result is recorded with the
+  release's evidence.
 - **Checks on every pull request.** `ci/check-workflows.py` checks that no
   pull request can see a secret, and that release.yml keeps them to that one
   job. It also checks every link of the package's SHA-256 from `package` to

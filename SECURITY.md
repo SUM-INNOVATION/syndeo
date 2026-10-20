@@ -54,20 +54,42 @@ welcome as a second opinion; they are not treated as new.
   Gatekeeper rejects it; the one-line installer is not quarantined. From
   v0.1.7 the binaries are signed with a Developer ID and notarized, and the
   package is signed, notarized and stapled.
-- **The macOS installer package runs two scripts as root.** v0.1.6 is the
-  first release to include the package, and the v0.1.6 package is unsigned;
-  from v0.1.7 it is signed with a Developer ID Installer identity, notarized
-  and stapled. Signing says who built it, not that its scripts are harmless.
-  - Its preinstall refuses to install over anything it cannot account for.
-    The reason is normally recorded in `/var/log/install.log`, but is not
-    guaranteed to appear there.
-  - One version is installed at a time. An upgrade leaves the commands
-    unavailable for a moment, and a Syndeo left running from the replaced
-    version stops at the next program it needs.
-  - Gatekeeper is expected to reject the unsigned package when it comes from
-    a browser download. The documented route downloads it with `curl` and
-    checks it against `SHA256SUMS`.
-  - Installing it from Finder is untested.
+- **Each macOS installer package runs two scripts as root.** There have
+  been two packages, and they are not the same. Signing says who built one,
+  not that its scripts are harmless.
+  - **The Syndeo.app package, from v0.2.0** (receipt `com.sum.syndeo.app`).
+    It installs `/Applications/Syndeo.app` and nothing else, and in a signed
+    release it is signed with a Developer ID Installer identity, notarized
+    and stapled.
+    - Its preinstall writes nothing, and refuses to install over anything it
+      cannot account for. The reason is normally recorded in
+      `/var/log/install.log`, but is not guaranteed to appear there.
+    - Its postinstall checks the application it installed, then removes the
+      legacy v0.1.x package below, only if that is exactly as its own
+      package left it.
+    - It is exercised by automated installation from the command line, with
+      `installer` as root, on disposable runners: every pull request installs,
+      upgrades, reinstalls and removes it, and takes it through one customer's
+      journey. CI cannot drive Installer's window or its password prompt, so
+      installing it from Finder is a manual check that every signed release
+      requires before it is tagged (the README's *Releasing*).
+  - **Legacy: the v0.1.x command-line package, v0.1.6 and v0.1.7** (receipt
+    `com.sum.syndeo.pkg`). It installed the command-line tools under
+    `/usr/local`, and no application. What follows describes those two
+    releases as they were published, and is kept as their record:
+    - v0.1.6 is the first release to include the package, and the v0.1.6
+      package is unsigned; the v0.1.7 one is signed with a Developer ID
+      Installer identity, notarized and stapled.
+    - Its preinstall refuses to install over anything it cannot account for.
+      The reason is normally recorded in `/var/log/install.log`, but is not
+      guaranteed to appear there.
+    - One version is installed at a time. An upgrade leaves the commands
+      unavailable for a moment, and a Syndeo left running from the replaced
+      version stops at the next program it needs.
+    - Gatekeeper is expected to reject the unsigned package when it comes
+      from a browser download. The documented route downloads it with `curl`
+      and checks it against `SHA256SUMS`.
+    - Installing it from Finder is untested.
 - **A peer learns which hashes you want, and when.** It never learns a URL, and
   that is not the same as anonymous. `syndeo-peer`'s crate documentation is
   explicit about it.
