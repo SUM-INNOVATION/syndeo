@@ -61,6 +61,8 @@
 //                                option joined by +), with <button> (left or middle)
 //   appctl keys <pid> <key> <keys>    bring pid to the front and press <key> (a digit,
 //                                a letter, [, ], \ or escape) holding <keys>, as above
+//   appctl tab-press <pid> <index>    press the front window's tab <index>, counted from 1,
+//                                as a click on it would; exits 1 if there is no such tab
 //   appctl menu-enabled <pid> <menu> <item>   "enabled" or "disabled", for that menu
 //                                item, read with its menu open, as a person sees it;
 //                                exits 1 if there is no such item
@@ -492,16 +494,33 @@ case "click-web" where args.count == 6:
     let button: CGMouseButton = args[5] == "middle" ? .center : .left
     click(CGPoint(x: box.midX, y: box.midY), button, flags(args[4]))
 case "keys" where args.count == 5:
+    // As a person presses them, through the system's own event stream: the
+    // keys held pressed first and let go last, so the application sees a
+    // shortcut, not a character.
     guard let pid = Int32(args[2]), let code = keyCodes[args[3]] else { exit(2) }
     guard activate(pid) else { print("not frontmost"); exit(1) }
     let source = CGEventSource(stateID: .hidSystemState)
-    let typed = args[3] == "escape" ? "\u{1b}" : args[3]
-    for down in [true, false] {
-        guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { continue }
-        event.flags = flags(args[4])
-        event.keyboardSetUnicodeString(stringLength: typed.utf16.count, unicodeString: Array(typed.utf16))
-        event.postToPid(pid)
-        usleep(30_000)
+    let held = flags(args[4])
+    var down: CGEventFlags = []
+    for (modifier, flag) in modifierKeys(held) {
+        down.insert(flag)
+        let event = CGEvent(keyboardEventSource: source, virtualKey: modifier, keyDown: true)
+        event?.flags = down
+        event?.post(tap: .cghidEventTap)
+        usleep(50_000)
+    }
+    for pressed in [true, false] {
+        let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: pressed)
+        event?.flags = held
+        event?.post(tap: .cghidEventTap)
+        usleep(50_000)
+    }
+    for (modifier, flag) in modifierKeys(held).reversed() {
+        down.remove(flag)
+        let event = CGEvent(keyboardEventSource: source, virtualKey: modifier, keyDown: false)
+        event?.flags = down
+        event?.post(tap: .cghidEventTap)
+        usleep(50_000)
     }
 case "menu-enabled" where args.count == 5:
     // Opened first, as a person opens it, so AppKit asks the application
@@ -519,6 +538,11 @@ case "menu-enabled" where args.count == 5:
     }
     guard let enabled else { exit(1) }
     print(enabled ? "enabled" : "disabled")
+case "tab-press" where args.count == 4:
+    guard let pid = Int32(args[2]), let index = Int(args[3]) else { exit(2) }
+    let tabs = tabButtons(pid)
+    guard index >= 1, index <= tabs.count else { print("no tab \(args[3]) of \(tabs.count)"); exit(1) }
+    exit(AXUIElementPerformAction(tabs[index - 1], kAXPressAction as CFString) == .success ? 0 : 1)
 case "submenu-items" where args.count == 5:
     guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
     for entry in children(item).flatMap({ children($0) }) {

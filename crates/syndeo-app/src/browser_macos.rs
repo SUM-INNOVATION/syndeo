@@ -41,7 +41,8 @@ use objc2_app_kit::{
     NSTextField, NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
-    ns_string, NSError, NSNotification, NSNumber, NSPoint, NSRect, NSSize, NSString, NSTimer,
+    ns_string, NSError, NSKeyValueObservingOptions, NSNotification, NSNumber,
+    NSObjectNSKeyValueObserverRegistration, NSPoint, NSRect, NSSize, NSString,
     NSURLAuthenticationChallenge, NSURLRequest, NSURL,
 };
 use objc2_web_kit::{
@@ -330,6 +331,7 @@ define_class!(
             let web = self.ivars().web.borrow_mut().take();
             if let Some(web) = web {
                 unsafe {
+                    web.view.removeObserver_forKeyPath(self, ns_string!("title"));
                     web.view.stopLoading();
                     web.view.setNavigationDelegate(None);
                     web.view.setUIDelegate(None);
@@ -469,26 +471,25 @@ define_class!(
         /// not pinned.
         #[unsafe(method(syndeoCloseOtherTabs:))]
         fn close_other_tabs(&self, _sender: Option<&AnyObject>) {
-            for window in self.others_to_close() {
+            let closing = self.others_to_close();
+            let tabs = self.window().map(|w| tabs_macos::tabs_of(&w).len()).unwrap_or(0);
+            tracing::info!(tabs, closing = closing.len(), "other tabs closed");
+            for window in closing {
                 window.close();
             }
         }
 
-        /// View > Show All Tabs, as AppKit shows them; and again, to leave.
-        #[unsafe(method(syndeoShowAllTabs:))]
-        fn show_all_tabs(&self, _sender: Option<&AnyObject>) {
-            let Some(window) = self.window() else { return };
-            let group = window.tabGroup();
-            // Read before it changes, and a second after, so the log says
-            // what AppKit had and has: it shows the overview in its own time.
-            let was = group.as_ref().is_some_and(|group| group.isOverviewVisible());
-            window.toggleTabOverview(None);
-            tracing::info!(was, "the tab overview toggled");
-            let later = block2::RcBlock::new(move |_timer: std::ptr::NonNull<NSTimer>| {
-                let shown = group.as_ref().is_some_and(|group| group.isOverviewVisible());
-                tracing::info!(shown, "the tab overview, a second later");
-            });
-            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0, false, &later) };
+        /// The page's title changed, which it may do at any time: the
+        /// window's, and so its tab's, follows it.
+        #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
+        fn observe_value(
+            &self,
+            _key_path: Option<&NSString>,
+            _object: Option<&AnyObject>,
+            _change: Option<&AnyObject>,
+            _context: *mut std::ffi::c_void,
+        ) {
+            self.refresh();
         }
 
         /// ⌘1 to ⌘8 show that tab, and ⌘9 the last: the item's tag is the
@@ -621,6 +622,17 @@ impl BrowserController {
         *self.ivars().ui.borrow_mut() = Some(ui);
         *self.ivars().hooks.borrow_mut() = Some(hooks);
         *self.ivars().badge.borrow_mut() = Some(Badge::new(self.mtm(), window));
+        if let Some(web) = &*self.ivars().web.borrow() {
+            // Removed again when the window closes.
+            unsafe {
+                web.view.addObserver_forKeyPath_options_context(
+                    self,
+                    ns_string!("title"),
+                    NSKeyValueObservingOptions::New,
+                    std::ptr::null_mut(),
+                )
+            };
+        }
         self.refresh();
     }
 

@@ -924,7 +924,12 @@ impl AppDelegate {
                 Some(to_window),
             ),
             NSMenuItem::separatorItem(mtm),
-            tabs_macos::item(mtm, "Show All Tabs", sel!(syndeoShowAllTabs:), Some(to_tab)),
+            tabs_macos::item(
+                mtm,
+                "Show All Tabs",
+                sel!(toggleTabOverview:),
+                Some(to_window),
+            ),
         ] {
             menu.addItem(&entry);
         }
@@ -1151,16 +1156,19 @@ fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> (Retained<NSMenu>, R
         &bar,
         "View",
         &[
-            item(mtm, "Reload Page", sel!(reloadPage:), "r"),
-            item(mtm, "Stop Loading", sel!(stopPage:), "."),
-            NSMenuItem::separatorItem(mtm),
+            // AppKit's own tab items, which it would add itself, first, as it
+            // would put them: here, so that Show All Tabs has its shortcut.
+            item(mtm, "Show Tab Bar", sel!(toggleTabBar:), ""),
             item_with(
                 mtm,
                 "Show All Tabs",
-                sel!(syndeoShowAllTabs:),
+                sel!(toggleTabOverview:),
                 "\\",
                 NSEventModifierFlags::Shift | command,
             ),
+            NSMenuItem::separatorItem(mtm),
+            item(mtm, "Reload Page", sel!(reloadPage:), "r"),
+            item(mtm, "Stop Loading", sel!(stopPage:), "."),
         ],
     );
     let recent = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Recently Closed"));

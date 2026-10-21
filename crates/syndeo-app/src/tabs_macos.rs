@@ -232,32 +232,19 @@ pub fn index_of(window: &NSWindow) -> usize {
 }
 
 /// Put `window`, a new tab or one of `beside`'s, at `index` among
-/// `beside`'s window's tabs, counted without it.
+/// `beside`'s window's tabs, counted without it. Through the tab group's
+/// `insertWindow:atIndex:`: `addTabbedWindow:ordered:` is, as AppKit's
+/// header says, now only a cover for `addWindow:`.
 pub fn place(beside: &NSWindow, window: &NSWindow, index: usize) {
-    if let Some(group) = window.tabGroup() {
-        if group.windows().iter().any(|w| std::ptr::eq(&*w, beside))
-            && !std::ptr::eq(beside, window)
-        {
-            group.removeWindow(window);
-        }
+    let Some(group) = beside.tabGroup() else {
+        beside.addTabbedWindow_ordered(window, objc2_app_kit::NSWindowOrderingMode::Above);
+        return;
+    };
+    if !std::ptr::eq(beside, window) && group.windows().iter().any(|w| std::ptr::eq(&*w, window)) {
+        group.removeWindow(window);
     }
-    let others: Vec<Retained<NSWindow>> = tabs_of(beside)
-        .into_iter()
-        .filter(|w| !std::ptr::eq(&**w, window))
-        .collect();
-    match index.checked_sub(1).and_then(|before| others.get(before)) {
-        Some(before) => {
-            before.addTabbedWindow_ordered(window, objc2_app_kit::NSWindowOrderingMode::Above)
-        }
-        None => {
-            match others.first() {
-                Some(first) => first
-                    .addTabbedWindow_ordered(window, objc2_app_kit::NSWindowOrderingMode::Below),
-                None => beside
-                    .addTabbedWindow_ordered(window, objc2_app_kit::NSWindowOrderingMode::Above),
-            }
-        }
-    }
+    let count = group.windows().len();
+    group.insertWindow_atIndex(window, index.min(count) as isize);
 }
 
 /// The accessibility role of an element AppKit hands back, if it has one.

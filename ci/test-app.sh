@@ -198,25 +198,28 @@
 # windows" setting as the runner has it, on pages this Mac serves, reached
 # through Syndeo by a public name for 127.0.0.1:
 #   - History > Reopen Last Closed Tab is ⇧⌘T and View > Show All Tabs ⇧⌘\;
-#     File has Close Other Tabs, Window Duplicate Tab and Pin Tab, History
-#     Reopen All Windows from Last Session and Recently Closed;
+#     View has Show Tab Bar and Show All Tabs once each, AppKit adding none of
+#     its own; File has Close Other Tabs, Window Duplicate Tab and Pin Tab,
+#     History Reopen All Windows from Last Session and Recently Closed;
+#   - the window takes its title from its page, and so does its tab;
 #   - with the mouse, as a person clicks: ⌘-click and a middle-click on a
 #     link each open it in a tab behind the page, which stays in front, the
-#     tabs in the order they were opened, with their pages' titles; ⇧⌘-click
-#     opens one in front; each tab's page came through Syndeo; ⌘-click on a
-#     file: link opens no tab, leaves the page and shows nothing of the file;
+#     tabs after it in the order they were opened, with their pages' titles;
+#     ⇧⌘-click opens one in front, right after the page; each tab's page came
+#     through Syndeo; ⌘-click on a file: link opens no tab, leaves the page
+#     and shows nothing of the file;
 #   - ⌘1, ⌘2 and ⌘3 show those tabs, and ⌘9 the last;
-#   - the tab bar shows the icon a page names, and a tab loading, until its
+#   - a tab shows the icon its page names, and that it is loading, until its
 #     page has arrived;
-#   - Window > Duplicate Tab opens the page again in front, with its history;
-#     Window > Pin Tab puts the tab first, marked; a secondary click on a tab
+#   - Window > Duplicate Tab opens the page again in front, right after it,
+#     with its history; Window > Pin Tab puts the tab first, marked; a secondary click on a tab
 #     opens Syndeo's menu for it, Unpin Tab for a pinned one, and its
 #     Duplicate Tab duplicates that tab;
 #   - File > Close Other Tabs closes all but the pinned one and this one;
 #     History > Recently Closed lists them by title; ⇧⌘T opens the last one
 #     closed again, and Recently Closed > Page A that one;
-#   - View > Show All Tabs, and ⇧⌘\, show AppKit's overview, as AppKit says
-#     a second later, and Escape leaves it;
+#   - View > Show All Tabs, and ⇧⌘\, show AppKit's overview, one more window
+#     to Accessibility, and Escape leaves it;
 #   - quit: the session is kept, readable by this user alone, with one tab
 #     pinned; opened again, the pinned tab is first, beside the start page,
 #     and opens its page when shown; History > Reopen All Windows from Last
@@ -2099,6 +2102,9 @@ EOF
   for menu in File View History Window; do
     "$APPCTL" menu-items "$PID" "$menu" >"$LOGS/tabs-menu-$menu.txt" 2>&1
   done
+  must "$([ "$(grep -cx 'Show All Tabs' "$LOGS/tabs-menu-View.txt")" = 1 ] && [ "$(grep -cx 'Show Tab Bar' "$LOGS/tabs-menu-View.txt")" = 1 ] && echo yes)" \
+    "View has Show Tab Bar and Show All Tabs once each, AppKit adding none of its own" "$(tr '\n' '|' <"$LOGS/tabs-menu-View.txt")"
+  printf '  MEASURE  View > Show Tab Bar: %s\n' "$("$APPCTL" shortcut "$PID" View "Show Tab Bar")"
   must "$(grep -qx 'Close Other Tabs' "$LOGS/tabs-menu-File.txt" && echo yes)" "File has Close Other Tabs" "$(tr '\n' '|' <"$LOGS/tabs-menu-File.txt")"
   must "$(grep -qx 'Duplicate Tab' "$LOGS/tabs-menu-Window.txt" && grep -qx 'Pin Tab' "$LOGS/tabs-menu-Window.txt" && echo yes)" \
     "Window has Duplicate Tab and Pin Tab" "$(tr '\n' '|' <"$LOGS/tabs-menu-Window.txt")"
@@ -2135,20 +2141,47 @@ tabs_cleared() {
     "Clear Browsing Data forgets the session: History > Reopen All Windows from Last Session is not offered"
 }
 
+# ax_windows: how many windows Accessibility has for the app; AppKit's tab
+# overview is one more.
+ax_windows() { "$APPCTL" ax-tree "$PID" | grep -c '^AXWindow'; }
+
+# show_tab N ADDRESS PAGE WHAT: ⌘N, and the tab it shows at ADDRESS saying
+# PAGE. If it does not, that tab is pressed in the tab bar instead, so the
+# checks after this one still start where they should.
+show_tab() {
+  press_keys "$1" cmd
+  if wait_for 15 at "$2" "$3"; then
+    ok "$4"
+  else
+    bad "$4" "address field: '$(address)'; tabs: $(tab_list)"
+    if [ "$1" = 9 ]; then "$APPCTL" tab-press "$PID" "$("$APPCTL" tabs "$PID" | wc -l | tr -d ' ')"; else "$APPCTL" tab-press "$PID" "$1"; fi
+    wait_for 15 at "$2" "$3" || true
+  fi
+}
+
 # tabbing LOG: links opened in tabs by ⌘ and the middle button, ⌘ digits,
 # a refused address, icons and loading in the tab bar, Duplicate, Pin, the
 # tab's own menu, Close Other Tabs, Reopen Last Closed Tab and Recently
 # Closed, and Show All Tabs.
 tabbing() {
-  local log="$1" list last_closed items
+  local log="$1" list last_closed items before
   visit "$TP/tabs.html" "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "a page with links opens, by a public name"
   must "$(route_is 'Through Syndeo' && echo yes)" "and came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
+  if wait_for 10 sh -c '[ "$("$1" titles "$2" | head -n 1)" = "Tabs test" ]' _ "$APPCTL" "$PID"; then
+    ok "the window takes its title from the page"
+  else
+    bad "the window takes its title from the page" "titles: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
 
   "$APPCTL" click-web "$PID" "Page A link" cmd left || bad "⌘-click" "no Page A link to click"
   opens "$log" 2 "⌘-click on a link opens it in a new tab"
   sleep 2
   arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "behind: the page clicked on stays in front, as it was"
-  if wait_for 15 sh -c '"$1" tabs "$2" | grep -qx "  Page A"' _ "$APPCTL" "$PID"; then ok "and the tab behind it has its page's title, Page A"; else bad "⌘-click's tab" "tabs: $(tab_list)"; fi
+  if wait_for 15 sh -c '[ "$("$1" tabs "$2" | tr "\n" "|")" = "* Tabs test|  Page A|" ]' _ "$APPCTL" "$PID"; then
+    ok "and the tab behind it is after it, with its page's title, Page A"
+  else
+    bad "⌘-click's tab" "tabs: $(tab_list)"
+  fi
 
   "$APPCTL" click-web "$PID" "Page B link" none middle || bad "middle-click" "no Page B link to click"
   opens "$log" 3 "a middle-click on a link opens it in a new tab"
@@ -2164,48 +2197,50 @@ tabbing() {
   opens "$log" 4 "⇧⌘-click on a link opens it in a new tab"
   arrive "$TP/page-c.html" 'SYNDEO-PAGE-C' "in front"
   must "$(route_is 'Through Syndeo' && echo yes)" "and the tab came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
-  "$APPCTL" tabs "$PID" >"$LOGS/tabs-four.txt" 2>&1
+  if wait_for 10 sh -c '[ "$("$1" tabs "$2" | tr "\n" "|")" = "  Tabs test|* Page C|  Page A|  Page B|" ]' _ "$APPCTL" "$PID"; then
+    ok "right after the page it was opened from"
+  else
+    bad "a tab opened in front goes right after its page" "tabs: $(tab_list)"
+  fi
 
-  press_keys 1 cmd
-  arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "⌘1 shows the first tab"
+  show_tab 1 "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "⌘1 shows the first tab"
   "$APPCTL" click-web "$PID" "File link" cmd left || bad "⌘-click on a file: link" "no File link to click"
   sleep 3
   must "$([ "$(open_now "$log")" = 4 ] && echo yes)" "⌘-click on a file: link opens no tab" "the app says $(open_now "$log") open"
   must "$(at "$TP/tabs.html" 'SYNDEO-TABS-PAGE' && echo yes)" "and leaves the page as it was" "address '$(address)'"
   must "$("$APPCTL" ax-tree "$PID" | grep -q 'root:' && echo no || echo yes)" "and shows nothing of that file"
 
-  press_keys 9 cmd
-  arrive "$TP/page-b.html" 'SYNDEO-PAGE-B' "⌘9 shows the last tab, the middle-click's"
+  show_tab 9 "$TP/page-b.html" 'SYNDEO-PAGE-B' "⌘9 shows the last tab, the middle-click's"
   must "$(route_is 'Through Syndeo' && echo yes)" "which came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
-  press_keys 2 cmd
-  arrive "$TP/page-c.html" 'SYNDEO-PAGE-C' "⌘2 shows the second tab"
-  press_keys 3 cmd
-  arrive "$TP/page-a.html" 'SYNDEO-PAGE-A' "⌘3 shows the third, the ⌘-click's"
+  show_tab 2 "$TP/page-c.html" 'SYNDEO-PAGE-C' "⌘2 shows the second tab"
+  show_tab 3 "$TP/page-a.html" 'SYNDEO-PAGE-A' "⌘3 shows the third, the ⌘-click's"
   must "$(route_is 'Through Syndeo' && echo yes)" "which came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
-  logged "$log" "a page's icon, for its tab found=true" 1 || true
-  "$APPCTL" front-tree "$PID" >"$LOGS/tabs-bar-tree.txt" 2>&1
   if wait_for 15 "$APPCTL" ids "$PID" syndeo.tab-icon; then
-    ok "the tab bar shows the icon Page A names: $("$APPCTL" ids "$PID" syndeo.tab-icon | head -n 1 | tr '\t' ' ')"
+    ok "its tab shows the icon Page A names: $("$APPCTL" ids "$PID" syndeo.tab-icon | head -n 1 | tr '\t' ' ')"
   else
-    bad "the tab bar shows the icon Page A names" "no syndeo.tab-icon; the bar: $("$APPCTL" front-tree "$PID" | grep -A12 'AXTabGroup' | tr '\t\n' ' |' | head -c 300)"
+    bad "its tab shows the icon Page A names" "no syndeo.tab-icon; the app: $(grep "a page's icon" "$log" | tail -n 2 | tr '\n' ' ')"
   fi
+  "$APPCTL" front-tree "$PID" >"$LOGS/tabs-bar-tree.txt" 2>&1
 
-  press_keys 1 cmd
-  arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "⌘1 shows the first tab again"
-  "$APPCTL" click-web "$PID" "Slow link" cmd left || bad "⌘-click on Slow link" "no Slow link to click"
-  opens "$log" 5 "⌘-click on a slow page opens a tab behind"
-  if wait_for 5 "$APPCTL" ids "$PID" syndeo.tab-loading; then ok "the tab bar shows that tab loading"; else bad "the tab bar shows that tab loading" "no syndeo.tab-loading"; fi
-  if wait_for 30 sh -c '! "$1" ids "$2" syndeo.tab-loading' _ "$APPCTL" "$PID"; then ok "and stops once its page has arrived"; else bad "the tab bar stops showing it loading" "still loading 30 s later"; fi
+  show_tab 1 "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "⌘1 shows the first tab again"
+  "$APPCTL" click-web "$PID" "Slow link" cmd+shift left || bad "⇧⌘-click on Slow link" "no Slow link to click"
+  opens "$log" 5 "⇧⌘-click on a slow page opens a tab in front"
+  if wait_for 6 "$APPCTL" ids "$PID" syndeo.tab-loading; then ok "its tab shows it loading"; else bad "its tab shows it loading" "no syndeo.tab-loading"; fi
+  arrive "$TP/slow.html" 'SYNDEO-SLOW-PAGE' "the slow page arrives"
+  if wait_for 10 sh -c '! "$1" ids "$2" syndeo.tab-loading' _ "$APPCTL" "$PID"; then ok "and its tab stops showing it loading"; else bad "its tab stops showing it loading" "still loading"; fi
 
+  show_tab 1 "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "⌘1 shows the first tab, to duplicate"
   choose Window "Duplicate Tab"
   opens "$log" 6 "Window > Duplicate Tab opens a tab"
   arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "with the same page, in front"
   must "$(logged "$log" 'a tab duplicated' 1 && echo yes)" "the app says a tab was duplicated"
   must "$([ "$("$APPCTL" enabled "$PID" syndeo.back)" = enabled ] && echo yes)" "with its history: Back is offered" "$(controls)"
+  list="$(tab_list)"
+  must "$([ "$list" = "  Tabs test|* Tabs test|  Slow page|  Page C|  Page A|  Page B|" ] && echo yes)" "right after the tab it duplicates" "tabs: $list"
 
   choose Window "Pin Tab"
   must "$(logged "$log" 'a tab pinned or unpinned pinned=true' 1 && echo yes)" "Window > Pin Tab pins it"
-  if wait_for 10 sh -c '"$1" tabs "$2" | head -n 1 | grep -qx "\* Tabs test"' _ "$APPCTL" "$PID"; then
+  if wait_for 10 sh -c '[ "$("$1" tabs "$2" | tr "\n" "|")" = "* Tabs test|  Tabs test|  Slow page|  Page C|  Page A|  Page B|" ]' _ "$APPCTL" "$PID"; then
     ok "and puts it first"
   else
     bad "a pinned tab goes first" "tabs: $(tab_list)"
@@ -2213,7 +2248,7 @@ tabbing() {
   if wait_for 5 "$APPCTL" ids "$PID" syndeo.tab-pinned; then ok "marked pinned in the tab bar"; else bad "a pinned tab is marked" "no syndeo.tab-pinned"; fi
 
   items="$("$APPCTL" tab-menu "$PID" 1 | tr '\n' '|')"
-  must "$(printf '%s' "$items" | grep -q 'Unpin Tab' && echo yes)" "a pinned tab's own menu offers Unpin Tab" "$items"
+  must "$(printf '%s' "|$items" | grep -qF '|Unpin Tab|' && echo yes)" "a pinned tab's own menu offers Unpin Tab" "$items"
   items="$("$APPCTL" tab-menu "$PID" 2 | tr '\n' '|')"
   printf '%s\n' "$items" >"$LOGS/tabs-tab-menu.txt"
   must "$(for want in 'Duplicate Tab' 'Pin Tab' 'Close Tab' 'Close Other Tabs' 'Move Tab to New Window' 'Show All Tabs'; do
@@ -2226,7 +2261,7 @@ tabbing() {
   choose File "Close Other Tabs"
   opens "$log" 2 "File > Close Other Tabs closes every other tab but the pinned one"
   list="$(tab_list)"
-  must "$([ "$list" = "  Tabs test|* Tabs test|" ] && echo yes)" "leaving the pinned tab first, and this one" "tabs: $list"
+  must "$([ "$list" = "  Tabs test|* Tabs test|" ] && echo yes)" "leaving the pinned tab first, and this one" "tabs: $list; $(grep 'other tabs closed' "$log" | tail -n 1)"
   items="$("$APPCTL" submenu-items "$PID" History "Recently Closed" | tr '\n' '|')"
   printf '%s\n' "$items" >"$LOGS/tabs-recently-closed.txt"
   must "$(for want in 'Page A' 'Page B' 'Page C' 'Slow page'; do printf '%s' "|$items" | grep -qF "|$want|" || exit 1; done && echo yes)" \
@@ -2246,17 +2281,18 @@ tabbing() {
     arrive "$TP/page-a.html" 'SYNDEO-PAGE-A' "in front, with its page"
   fi
 
+  before="$(ax_windows)"
   choose View "Show All Tabs"
-  must "$(logged "$log" 'the tab overview toggled was=false' 1 && echo yes)" "View > Show All Tabs is pressed"
-  must "$(logged "$log" 'the tab overview, a second later shown=true' 1 && echo yes)" "and AppKit shows its overview of the tabs" \
-    "$(grep 'the tab overview' "$log" | tail -n 2 | tr '\n' ' ')"
+  if wait_for 10 sh -c '[ "$("$1" ax-tree "$2" | grep -c "^AXWindow")" -gt "$3" ]' _ "$APPCTL" "$PID" "$before"; then
+    ok "View > Show All Tabs shows AppKit's overview of the tabs"
+  else
+    bad "View > Show All Tabs shows AppKit's overview of the tabs" "Accessibility has $(ax_windows) windows, as before ($before)"
+  fi
   "$APPCTL" ax-tree "$PID" >"$LOGS/tabs-overview-tree.txt" 2>&1
   press_keys escape none
-  sleep 2
+  if wait_for 10 sh -c '[ "$("$1" ax-tree "$2" | grep -c "^AXWindow")" = "$3" ]' _ "$APPCTL" "$PID" "$before"; then ok "Escape leaves it"; else bad "Escape leaves the overview" "$(ax_windows) windows"; fi
   press_keys '\' cmd+shift
-  must "$(logged "$log" 'the tab overview toggled was=false' 2 && echo yes)" "Escape leaves it, and ⇧⌘\\ shows it again" \
-    "$(grep 'the tab overview' "$log" | tail -n 3 | tr '\n' ' ')"
-  must "$(logged "$log" 'the tab overview, a second later shown=true' 2 && echo yes)" "AppKit shows it"
+  if wait_for 10 sh -c '[ "$("$1" ax-tree "$2" | grep -c "^AXWindow")" -gt "$3" ]' _ "$APPCTL" "$PID" "$before"; then ok "⇧⌘\\ shows it again"; else bad "⇧⌘\\ shows the overview" "$(ax_windows) windows"; fi
   press_keys escape none
   if wait_for 10 "$APPCTL" value "$PID" syndeo.address; then ok "and Escape leaves it again, with the window as it was"; else bad "leaving the overview" "no address field in front"; fi
 }
@@ -2307,7 +2343,8 @@ tabs_test() {
     must "$(logged "$log" 'tabs from the last session opened windows=1' 1 && echo yes)" "History > Reopen All Windows from Last Session opens the rest"
     arrive "$TP/page-a.html" 'SYNDEO-PAGE-A' "in a window of their own, with the tab that was in front, in front"
     "$APPCTL" tabs "$PID" >"$LOGS/tabs-session-window.txt" 2>&1
-    must "$(grep -q 'Slow page' "$LOGS/tabs-session-window.txt" && echo yes)" "and the other tabs it had" "tabs: $(tab_list)"
+    must "$(grep -qx '  Tabs test' "$LOGS/tabs-session-window.txt" && grep -qx '\* Page A' "$LOGS/tabs-session-window.txt" && echo yes)" \
+      "and the other tabs it had, by their titles, not yet opened" "tabs: $(tab_list)"
   fi
   stopped tabs-pinned
 
