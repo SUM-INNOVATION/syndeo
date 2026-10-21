@@ -2102,6 +2102,10 @@ mod tests {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
+        // An HTTP/1 connection takes the next request only once it has
+        // finished with the last one; sent sooner, hyper refuses it as not
+        // ready.
+        within(sender.ready()).await.unwrap();
         let response = within(sender.send_request(request.body(Full::new(Bytes::new())).unwrap()))
             .await
             .unwrap();
