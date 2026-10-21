@@ -77,13 +77,17 @@
 # again. With `again`, after a reinstall: one opening, the same checks. It
 # made no keystore changes.
 # In the first opening, Reload: a fresh https page, then the bar's Reload,
-# pressed as a person presses it, has to consult the origin through Syndeo's
-# proxy — the proxy's revalidations or misses rise, whether the origin then
-# answers 304 or a new page — and a reload the proxy answered from its own
-# cache alone fails; the address and the page stay the page's. The proxy's
-# counters are read in a tab of their own, then closed, so they bracket the
-# reload and nothing else; no exact count is required, since what a page
-# loads and how its server marks it can vary. Kept in reload.txt too.
+# pressed as a person presses it. The address and the page have to stay the
+# page's. The reload has to consult the origin through Syndeo's proxy:
+# - the proxy's revalidations or misses rise, whether the origin then
+#   answers 304 or a new page;
+# - and nothing is answered from the proxy's cache alone: its hits rise no
+#   more than its revalidations, and it serves nothing stale.
+# A reload the proxy answered from its cache, even with a miss beside it for
+# something else, fails. The proxy's counters are read in a tab of their own,
+# then closed, so they bracket the reload and nothing else. No exact count is
+# required, since what a page loads and how its server marks it can vary.
+# Kept in reload.txt too.
 #
 # refuse, which gates: a bundle whose proxy cannot start opens all the same,
 # its window says it cannot browse and holds no web view, and no helper runs.
@@ -832,6 +836,20 @@ rose() {
   [ -n "$was" ] && [ -n "$is" ] && [ "$was" != '?' ] && [ "$is" != '?' ] && [ "$is" -gt "$was" ]
 }
 
+# cached_alone BEFORE AFTER: how many more answers came from the proxy's
+# cache without asking the origin: hits beyond revalidations, which count as
+# hits too, and stale serves. Prints ? for a counter it cannot read.
+cached_alone() {
+  local h0 h1 r0 r1 s0 s1 v
+  h0="$(stat_of hits "$1")" h1="$(stat_of hits "$2")"
+  r0="$(stat_of revalidations "$1")" r1="$(stat_of revalidations "$2")"
+  s0="$(stat_of stale "$1")" s1="$(stat_of stale "$2")"
+  for v in "$h0" "$h1" "$r0" "$r1" "$s0" "$s1"; do
+    [[ "$v" =~ ^[0-9]+$ ]] || { echo '?'; return; }
+  done
+  echo $(( (h1 - h0) - (r1 - r0) + (s1 - s0) ))
+}
+
 # change BEFORE AFTER: each counter's change between two STATS lines.
 change() {
   awk -v a="$1" -v b="$2" 'BEGIN {
@@ -857,7 +875,7 @@ stats_aside() {
 
 # reload_gate: see the top of this script.
 reload_gate() {
-  local a b at pressed=no stop_seen=no reloaded=no consulted=no out="$LOGS/reload.txt"
+  local a b at pressed=no stop_seen=no reloaded=no consulted=no alone out="$LOGS/reload.txt"
   FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
   at="https://example.com/?$FRESH"
   visit "$at" "$at" "$EXAMPLE_BODY" "a fresh https page opens, to reload"
@@ -872,15 +890,17 @@ reload_gate() {
   arrive "$at" "$EXAMPLE_BODY" "after Reload, the address is still the page's, and the page shows its own text"
   stats_aside "$at" "$EXAMPLE_BODY" "after Reload"
   b="$STATS"
-  if rose revalidations "$a" "$b" || rose misses "$a" "$b"; then consulted=yes; fi
+  alone="$(cached_alone "$a" "$b")"
+  if { rose revalidations "$a" "$b" || rose misses "$a" "$b"; } && [ "$alone" = 0 ]; then consulted=yes; fi
   {
     printf 'a fresh https page, then the bar'"'"'s Reload\n  before: %s\n  after:  %s\n  change: %s\n' "$a" "$b" "$(change "$a" "$b")"
     printf 'Reload pressed: %s; the bar showed Stop then: %s; it read Reload again within 30 s: %s\n' "$pressed" "$stop_seen" "$reloaded"
-    printf 'the origin consulted through the proxy (revalidations or misses rose): %s\n' "$consulted"
+    printf 'answers from the cache alone (hits beyond revalidations, and stale): %s\n' "$alone"
+    printf 'the origin consulted through the proxy (revalidations or misses rose, and nothing from the cache alone): %s\n' "$consulted"
   } >"$out"
   sed 's/^/  RELOAD  /' "$out"
-  must "$consulted" "the reload consulted the origin through Syndeo's proxy: its revalidations or misses rose ($(change "$a" "$b"))" \
-    "a reload the proxy answered from its own cache alone"
+  must "$consulted" "the reload consulted the origin through Syndeo's proxy: its revalidations or misses rose, and nothing came from its cache alone ($(change "$a" "$b"))" \
+    "a reload the proxy answered, in part or whole, from its own cache alone"
 }
 
 # customer_round APP ROUND [reload]: one opening, as customer describes it.
