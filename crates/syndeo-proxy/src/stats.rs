@@ -14,9 +14,14 @@ pub type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error
 const HOSTS: &[&str] = &["http://syndeo.local/", "https://syndeo.local/"];
 
 /// Answer `syndeo.local` locally instead of sending it to a name server.
-pub fn intercept(net: &Net, url: &str) -> Option<Response<Body>> {
+///
+/// Once every entry being written has been, so the numbers count every
+/// answer the proxy has already given: an entry is written just after its
+/// body has gone to the browser (see `Net::landed`).
+pub async fn intercept(net: &Net, url: &str) -> Option<Response<Body>> {
     let path = HOSTS.iter().find_map(|prefix| url.strip_prefix(prefix))?;
     let (path, _) = path.split_once('?').unwrap_or((path, ""));
+    net.landed().await;
 
     let stats = match net.cache().stats() {
         Ok(s) => s,

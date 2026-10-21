@@ -429,6 +429,7 @@ fn announce_ready(out: &mut impl std::io::Write, address: SocketAddr) -> std::io
 /// each answer actually came from: the cache is shared by every page that
 /// goes through the proxy, and nothing from this Mac's own services or the
 /// local network belongs in it, even when a public name resolves there.
+
 fn net_config(root: &std::path::Path, shared: bool, dns: DnsMode) -> NetConfig {
     NetConfig {
         cache_root: root.to_path_buf(),
@@ -816,7 +817,7 @@ async fn forward(
         Err(refusal) => return text(StatusCode::BAD_REQUEST, refusal),
     };
 
-    if let Some(response) = stats::intercept(&proxy.net, &url) {
+    if let Some(response) = stats::intercept(&proxy.net, &url).await {
         return response;
     }
     if direct {
@@ -1588,6 +1589,7 @@ mod tests {
             paths, expected,
             "a second request was answered from the cache"
         );
+        running.net.landed().await;
         let stats = running.net.cache().stats().unwrap();
         assert_eq!((stats.entries, stats.blobs), (0, 0), "{stats:?}");
     }
@@ -1847,6 +1849,36 @@ mod tests {
             2,
             "one request from the client, one from ourselves"
         );
+    }
+
+    /// The statistics count every answer already given. An entry is written
+    /// just after its body has gone to the browser, so the page waits for
+    /// the entries still being written before it counts them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_statistics_count_every_answer_already_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|path| {
+            let mut body = path.as_bytes().to_vec();
+            body.resize(64 * 1024, b'.');
+            Response::builder()
+                .header("cache-control", "max-age=600")
+                .body(Full::new(Bytes::from(body)))
+                .unwrap()
+        }))
+        .await;
+        let proxy = start_proxy(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let mut sender = http_over(stream).await;
+        const PAGES: usize = 40;
+        for n in 0..PAGES {
+            let reply = get(&mut sender, &format!("/{n}"), &[("host", &authority)]).await;
+            assert_eq!(reply.status, StatusCode::OK);
+        }
+
+        let page = through(proxy, "http://syndeo.local/stats.json", &[]).await;
+        let stats: serde_json::Value = serde_json::from_slice(&page.body).unwrap();
+        assert_eq!(stats["entries"], PAGES, "{stats}");
     }
 
     #[tokio::test]
@@ -3081,6 +3113,7 @@ mod tests {
         ws_switched(&ws_open(&mut stream, "/echo", &authority, &[]).await);
         ws_carries(&mut stream).await;
 
+        handle.net.landed().await;
         let stats = handle.net.cache().stats().unwrap();
         assert_eq!(
             (stats.requests, stats.stores, stats.entries),
