@@ -161,25 +161,37 @@ final class Driver: NSObject, WKNavigationDelegate {
     }
 
     // Through the proxy, a server's certificate is accepted only when it
-    // chains to the proxy's own authority, which no trust settings hold.
+    // chains to the proxy's own authority, which no trust settings hold. Bound
+    // to WebKit's selector by name, so no compiler's reading of the
+    // completion handler's attributes can leave WebKit without it: without
+    // it WebKit rejects every challenge. Each challenge is logged to stderr.
+    @objc(webView:didReceiveAuthenticationChallenge:completionHandler:)
     func webView(
         _ webView: WKWebView, didReceive challenge: URLAuthenticationChallenge,
-        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+        completionHandler: @escaping @MainActor @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-            let proxy, let trust = challenge.protectionSpace.serverTrust
+        let space = challenge.protectionSpace
+        guard space.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+            let proxy, let trust = space.serverTrust
         else {
+            note("challenge \(space.host) \(space.authenticationMethod): default handling")
             completionHandler(.performDefaultHandling, nil)
             return
         }
         SecTrustSetAnchorCertificates(trust, [proxy.anchor] as CFArray)
         SecTrustSetAnchorCertificatesOnly(trust, true)
-        if SecTrustEvaluateWithError(trust, nil) {
+        var error: CFError?
+        if SecTrustEvaluateWithError(trust, &error) {
             completionHandler(.useCredential, URLCredential(trust: trust))
         } else {
+            note("challenge \(space.host): refused: \(error.map { String(describing: $0) } ?? "no reason")")
             completionHandler(.cancelAuthenticationChallenge, nil)
         }
     }
+}
+
+func note(_ line: String) {
+    FileHandle.standardError.write("pageload: \(line)\n".data(using: .utf8)!)
 }
 
 let app = NSApplication.shared

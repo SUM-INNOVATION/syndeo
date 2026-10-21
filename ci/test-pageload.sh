@@ -120,6 +120,10 @@ for variant in ("direct", "syndeo", "syndeo-dns-system"):
         for l in rows:
             if not l.get("ok"):
                 print("    FAILED  run %s: %s" % (l.get("run"), l.get("error")))
+        said = os.path.join(logs, variant + ".stderr")
+        if len(good) < len(rows) and os.path.exists(said):
+            for line in sorted(set(open(said, errors="replace").read().splitlines()))[:3]:
+                print("    stderr  %s" % line[:300])
     if variant != "direct":
         cold = [l for l in lines if l.get("visit") == "cold" and l.get("ok")]
         if cold and not all(l.get("protocols", {}).get("h2") for l in cold):
