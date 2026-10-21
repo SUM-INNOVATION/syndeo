@@ -784,6 +784,7 @@ impl BrowserController {
             if me.ivars().page.get() == page {
                 if let Some(badge) = &*me.ivars().badge.borrow() {
                     badge.set_icon(icon.as_deref());
+                    tracing::info!(found = icon.is_some(), "a page's icon, for its tab");
                 }
             }
         });

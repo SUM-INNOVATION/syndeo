@@ -195,19 +195,41 @@ func flags(_ words: String) -> CGEventFlags {
     return held
 }
 
-/// A click at `point`, as a person makes it: the pointer moved there, then the
-/// button down and up, holding `held`.
+/// The modifier keys in `held`, each with its virtual key code.
+func modifierKeys(_ held: CGEventFlags) -> [(CGKeyCode, CGEventFlags)] {
+    [(55, .maskCommand), (56, .maskShift), (58, .maskAlternate), (59, .maskControl)].filter { held.contains($0.1) }
+}
+
+/// A click at `point`, as a person makes it: the pointer moved there, the
+/// keys in `held` pressed, the button down and up, and the keys let go.
 func click(_ point: CGPoint, _ button: CGMouseButton, _ held: CGEventFlags) {
     let source = CGEventSource(stateID: .hidSystemState)
     CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?
         .post(tap: .cghidEventTap)
     usleep(150_000)
-    let (down, up): (CGEventType, CGEventType) = switch button {
+    var down: CGEventFlags = []
+    for (code, flag) in modifierKeys(held) {
+        down.insert(flag)
+        let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true)
+        event?.flags = down
+        event?.post(tap: .cghidEventTap)
+        usleep(50_000)
+    }
+    defer {
+        for (code, flag) in modifierKeys(held).reversed() {
+            down.remove(flag)
+            let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)
+            event?.flags = down
+            event?.post(tap: .cghidEventTap)
+            usleep(50_000)
+        }
+    }
+    let (pressed, released): (CGEventType, CGEventType) = switch button {
     case .left: (.leftMouseDown, .leftMouseUp)
     case .right: (.rightMouseDown, .rightMouseUp)
     default: (.otherMouseDown, .otherMouseUp)
     }
-    for type in [down, up] {
+    for type in [pressed, released] {
         guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else { continue }
         event.flags = held
         event.setIntegerValueField(.mouseEventClickState, value: 1)

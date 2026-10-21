@@ -2049,6 +2049,8 @@ tabbing() {
   press_keys 3 cmd
   arrive "$TP/page-a.html" 'SYNDEO-PAGE-A' "⌘3 shows the third, the ⌘-click's"
   must "$(route_is 'Through Syndeo' && echo yes)" "which came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
+  logged "$log" "a page's icon, for its tab found=true" 1 || true
+  "$APPCTL" front-tree "$PID" >"$LOGS/tabs-bar-tree.txt" 2>&1
   if wait_for 15 "$APPCTL" ids "$PID" syndeo.tab-icon; then
     ok "the tab bar shows the icon Page A names: $("$APPCTL" ids "$PID" syndeo.tab-icon | head -n 1 | tr '\t' ' ')"
   else
