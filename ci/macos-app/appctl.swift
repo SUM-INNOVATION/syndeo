@@ -5,6 +5,9 @@
 //   appctl bundle <pid>          the bundle identifier Launch Services has for pid
 //   appctl windows <pid>         one "width height" line per on-screen, ordinary
 //                                window pid owns; exits 1 if there are none
+//   appctl window-ids <pid>      the window server's number for each of those
+//                                windows, one a line, as screencapture -l takes it;
+//                                exits 1 if there are none
 //   appctl quit <bundle-id>      ask each running application with it to quit,
 //                                as the Quit menu item would; exits 1 if none was asked
 //   appctl stop <bundle-id>      quit each running application with it and wait,
@@ -29,6 +32,8 @@
 //   appctl enabled <pid> <id>    "enabled" or "disabled", for that element
 //   appctl describe <pid> <id>   that element's description and help (its
 //                                tooltip), "description<TAB>help"
+//   appctl in-toolbar <pid> <id>   whether that element is in its window's
+//                                toolbar: says so, or exits 1
 //   appctl menu <pid> <menu> <item>   press a menu item, as a click on it would;
 //                                exits 1 if there is no such item
 //   appctl menu-items <pid> <menu>    the title of each item in that menu, one a line
@@ -204,6 +209,19 @@ case "windows" where args.count == 3:
         found += 1
     }
     exit(found > 0 ? 0 : 1)
+case "window-ids" where args.count == 3:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    let list = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        as? [[String: Any]]) ?? []
+    var found = 0
+    for window in list {
+        guard (window[kCGWindowOwnerPID as String] as? Int32) == pid,
+              (window[kCGWindowLayer as String] as? Int) == 0,
+              let number = window[kCGWindowNumber as String] as? Int else { continue }
+        print(number)
+        found += 1
+    }
+    exit(found > 0 ? 0 : 1)
 case "quit" where args.count == 3:
     var asked = false
     for app in NSRunningApplication.runningApplications(withBundleIdentifier: args[2]) {
@@ -283,6 +301,18 @@ case "enabled" where args.count == 4:
 case "describe" where args.count == 4:
     guard let pid = Int32(args[2]), let element = identified(pid, args[3]) else { exit(1) }
     print("\(oneLine(attribute(element, kAXDescriptionAttribute)))\t\(oneLine(attribute(element, kAXHelpAttribute)))")
+case "in-toolbar" where args.count == 4:
+    guard let pid = Int32(args[2]), var element = identified(pid, args[3]) else { exit(1) }
+    for _ in 0..<12 {
+        if (attribute(element, kAXRoleAttribute) as? String) == "AXToolbar" {
+            print("in the toolbar")
+            exit(0)
+        }
+        guard let parent = asElement(attribute(element, kAXParentAttribute)) else { break }
+        element = parent
+    }
+    print("not in a toolbar")
+    exit(1)
 case "menu" where args.count == 5:
     guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
     exit(AXUIElementPerformAction(item, kAXPressAction as CFString) == .success ? 0 : 1)
