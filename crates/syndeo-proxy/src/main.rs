@@ -2190,6 +2190,80 @@ mod tests {
         );
     }
 
+    /// TLS to the proxy inside a tunnel, offering `protocols` by ALPN and
+    /// trusting the proxy's own authority, as a Syndeo window does.
+    async fn tls_to_proxy_offering(
+        stream: tokio::net::TcpStream,
+        proxy: &Proxy,
+        protocols: &[&[u8]],
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut proxy.authority.certificate_pem().as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = protocols.iter().map(|p| p.to_vec()).collect();
+        within(tokio_rustls::TlsConnector::from(Arc::new(config)).connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        ))
+        .await
+        .unwrap()
+    }
+
+    /// A client that offers HTTP/2, as WebKit does, gets it inside the tunnel,
+    /// and its requests share that one connection, answered side by side:
+    /// over HTTP/1.1 WebKit opened six tunnels to a host and queued the rest
+    /// of a page's requests behind them. A client that offers only HTTP/1.1,
+    /// as a WebSocket's does, still gets HTTP/1.1, and nothing else.
+    #[tokio::test]
+    async fn tls_in_a_tunnel_speaks_h2_to_a_client_that_offers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"plain"))).await;
+        let (proxy, handle) = start_proxy_with_count(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let tls = tls_to_proxy_offering(stream, &handle, &[b"h2", b"http/1.1"]).await;
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        let (mut sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(connection);
+        let target = format!("https://{authority}/secure");
+        let ask = |sender: &mut hyper::client::conn::http2::SendRequest<Full<Bytes>>| {
+            sender.send_request(
+                Request::builder()
+                    .uri(target.as_str())
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+        };
+        // Two requests at once on the one connection. The origin speaks
+        // plain HTTP and cannot answer the https the tunnel carries, so each
+        // is the proxy's own 502: answered through the same path as any.
+        let (first, second) = tokio::join!(ask(&mut sender.clone()), ask(&mut sender));
+        for reply in [first, second] {
+            let reply = reply.expect("the proxy should answer over h2");
+            assert_eq!(reply.version(), http::Version::HTTP_2);
+            assert_eq!(reply.status(), StatusCode::BAD_GATEWAY);
+        }
+
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let tls = tls_to_proxy_offering(stream, &handle, &[b"http/1.1"]).await;
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+        let mut sender = http_over(tls).await;
+        let reply = get(&mut sender, "/secure", &[("host", &authority)]).await;
+        assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+
+        assert!(origin.seen().is_empty(), "a request went out as plain HTTP");
+    }
+
     /// The browser's own `Accept-Encoding` reaches the origin, and the answer
     /// comes back in the encoding it asked for, untouched, for the browser to
     /// decode; the next one comes from the cache the same way. Without this
