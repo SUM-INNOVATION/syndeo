@@ -39,9 +39,13 @@
 //! The keystore is not part of this application: it is never started, no
 //! keychain entry is made for it, no passphrase is asked for and no recovery
 //! phrase is generated.
+//!
+//! Agents — programs on this Mac the person allows — drive it through
+//! `control_macos`, in windows made here exactly as every other is.
 
 use crate::address::{self, Search};
 use crate::browser_macos::{browser_content, BrowserController, Hooks};
+use crate::control_macos;
 use crate::settings_macos::{self, Clearing, SettingsController};
 use anyhow::{Context, Result};
 use objc2::rc::{Retained, Weak};
@@ -293,6 +297,7 @@ define_class!(
         fn did_finish_launching(&self, _notification: &NSNotification) {
             self.prepare();
             self.open_window();
+            self.agents();
             let app = NSApplication::sharedApplication(self.mtm());
             #[allow(deprecated)] // `activate` is macOS 14 and later; this runs on 13.
             app.activateIgnoringOtherApps(true);
@@ -318,6 +323,7 @@ define_class!(
         /// ends the process without running Rust's destructors.
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _notification: &NSNotification) {
+            control_macos::quit();
             self.ivars().browsing.borrow_mut().take();
             if let Some(proxy) = self.ivars().proxy.borrow_mut().take() {
                 tracing::info!(pid = proxy.pid(), "stopping the proxy");
@@ -343,6 +349,12 @@ define_class!(
         #[unsafe(method(showSettings:))]
         fn show_settings(&self, _sender: Option<&AnyObject>) {
             self.settings().show();
+        }
+
+        /// Syndeo > Agent Access….
+        #[unsafe(method(showAgentAccess:))]
+        fn show_agent_access(&self, _sender: Option<&AnyObject>) {
+            control_macos::show_access();
         }
     }
 );
@@ -458,6 +470,39 @@ impl AppDelegate {
         settings
     }
 
+    /// Agents: allowed in if the person turned them on, and given windows
+    /// made here, exactly as the person's are.
+    fn agents(&self) {
+        let (make, find) = (
+            Weak::from_retained(&self.retain()),
+            Weak::from_retained(&self.retain()),
+        );
+        let hooks = control_macos::AppHooks {
+            new_window: Box::new(move || {
+                let app = make.load().expect("the application outlives its agents");
+                let window = app.new_window(None);
+                let controller = app
+                    .controller_of(&window)
+                    .expect("every window it made is in its list");
+                (window, controller)
+            }),
+            controller_of: Box::new(move |window| {
+                find.load().and_then(|app| app.controller_of(window))
+            }),
+        };
+        control_macos::install(self.mtm(), &self.ivars().home, hooks);
+    }
+
+    /// The controller of an open window.
+    fn controller_of(&self, window: &NSWindow) -> Option<Retained<BrowserController>> {
+        self.ivars()
+            .windows
+            .borrow()
+            .iter()
+            .find(|(open, _)| std::ptr::eq(&**open, window))
+            .map(|(_, controller)| controller.clone())
+    }
+
     /// Bring a window to the front, or open one if there is none.
     fn show_a_window(&self) {
         let existing = self
@@ -481,7 +526,12 @@ impl AppDelegate {
 
     /// A new tab beside `parent`: `request`, or the start page.
     fn open_tab(&self, parent: &NSWindow, request: Option<Retained<NSURLRequest>>) {
+        let asked_by_page = request.is_some();
         let window = self.new_window(request);
+        if asked_by_page {
+            // A page in an agent's tab opens another of that agent's.
+            control_macos::opened_beside(parent, &window);
+        }
         parent.addTabbedWindow_ordered(&window, NSWindowOrderingMode::Above);
         window.makeKeyAndOrderFront(None);
     }
@@ -490,6 +540,7 @@ impl AppDelegate {
     /// Kept until the next window opens or closes, so nothing is freed while
     /// AppKit is still closing it.
     fn forget(&self, window: &NSWindow) {
+        control_macos::window_closed(window);
         let state = self.ivars();
         state.retired.borrow_mut().clear();
         let mut windows = state.windows.borrow_mut();
@@ -639,6 +690,7 @@ fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> Retained<NSMenu> {
             item(mtm, "About Syndeo", sel!(orderFrontStandardAboutPanel:), ""),
             NSMenuItem::separatorItem(mtm),
             item(mtm, "Settings…", sel!(showSettings:), ","),
+            item(mtm, "Agent Access…", sel!(showAgentAccess:), ""),
             NSMenuItem::separatorItem(mtm),
             item(mtm, "Hide Syndeo", sel!(hide:), "h"),
             hide_others,
@@ -1090,6 +1142,10 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
             ("settings_macos.rs", include_str!("settings_macos.rs")),
             ("address.rs", include_str!("address.rs")),
             ("main.rs", include_str!("main.rs")),
+            ("agent.rs", include_str!("agent.rs")),
+            ("agent_client.rs", include_str!("agent_client.rs")),
+            ("control_macos.rs", include_str!("control_macos.rs")),
+            ("peer_macos.rs", include_str!("peer_macos.rs")),
         ] {
             let code = source.split("#[cfg(test)]").next().unwrap();
             for touch in [

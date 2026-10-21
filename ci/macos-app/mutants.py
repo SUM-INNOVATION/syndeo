@@ -42,6 +42,18 @@ back.
   measured. A WebSocket through Syndeo must then be seen failing: in the
   page, at the origin, which is sent no Upgrade, and in the proxy's count,
   which the handshake then moves.
+- agent-approval-skipped: an agent's request for leave is granted for the
+  session without the person being asked. The prompts must then be seen
+  missing, and JavaScript denied must be seen running.
+- agent-grant-unenforced: whatever an agent was allowed, every request is
+  taken as allowed. JavaScript without the script grant, and a tab opened by
+  an agent allowed only to read, must then be seen.
+- agent-peer-unchecked: the socket's peer is not checked to be this user. A
+  connection from root must then be seen not refused, and asked about.
+- agent-unproxied-tab: an agent's tab browses in a web view of its own
+  making, with WebKit's default configuration, rather than its window's,
+  which is routed through the proxy and pinned. The agent's pages must then
+  be seen not coming through Syndeo's proxy.
 """
 import os
 import sys
@@ -49,6 +61,8 @@ import sys
 BROWSER = "crates/syndeo-app/src/browser_macos.rs"
 ADDRESS = "crates/syndeo-app/src/address.rs"
 PROXY = "crates/syndeo-proxy/src/main.rs"
+CONTROL = "crates/syndeo-app/src/control_macos.rs"
+AGENT = "crates/syndeo-app/src/agent.rs"
 
 MUTANTS = {
     "no-pinning-delegate": [
@@ -140,6 +154,53 @@ MUTANTS = {
             "            return websocket::open(proxy, req, url, key).await\n"
             "        }\n",
             "        websocket::Upgrading::WebSocket { .. } => {}\n",
+        ),
+    ],
+    "agent-approval-skipped": [
+        (
+            CONTROL,
+            "        let response = alert.runModal();\n",
+            "        let response = NSAlertThirdButtonReturn;\n",
+        ),
+    ],
+    "agent-grant-unenforced": [
+        (
+            AGENT,
+            "        self.0 & scope.bit() != 0\n",
+            "        let _ = scope;\n        true\n",
+        ),
+    ],
+    "agent-peer-unchecked": [
+        (
+            CONTROL,
+            "    if peer_macos::uid_of(&stream).ok() != Some(own_uid) {\n",
+            "    if false && own_uid == 0 {\n",
+        ),
+    ],
+    "agent-unproxied-tab": [
+        (
+            CONTROL,
+            "        // The tab browses in its window's own web view: routed through the\n"
+            "        // proxy and pinned to its authority, as every window's is.\n"
+            "        let Some(view) = controller.web_view() else {\n",
+            "        let view = Some(unsafe {\n"
+            "            WKWebView::initWithFrame_configuration(\n"
+            "                WKWebView::alloc(self.mtm),\n"
+            "                window.frame(),\n"
+            "                &objc2_web_kit::WKWebViewConfiguration::new(self.mtm),\n"
+            "            )\n"
+            "        });\n"
+            "        if let Some(plain) = &view {\n"
+            "            window.setContentView(Some(plain));\n"
+            "        }\n"
+            "        let Some(view) = view else {\n",
+        ),
+        (
+            CONTROL,
+            "        controller.load(&request);\n"
+            "        tracing::info!(tab = id, \"an agent opened a tab\");\n",
+            "        let _ = unsafe { view.loadRequest(&request) };\n"
+            "        tracing::info!(tab = id, \"an agent opened a tab\");\n",
         ),
     ],
 }

@@ -13,10 +13,20 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 url.workspace = true
+# Agents: their requests and answers, as JSON (`agent`).
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Agents: the socket's peer, and the parent of a client.
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 syndeo-shell.workspace = true
 syndeo-webkit.workspace = true
+# Agents: their screenshots, as base64; and their requests, handed to the
+# main thread, where AppKit and WebKit run.
+base64.workspace = true
+dispatch2 = "0.3"
 
 # The versions syndeo-webkit builds its web view configuration and pinning
 # delegate with: a different objc2 is a different `Retained<T>`, and the
@@ -32,6 +42,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSAccessibilityProtocols",
     "NSAlert",
     "NSApplication",
+    "NSBitmapImageRep",
     "NSButton",
     "NSCell",
     "NSColor",
@@ -40,6 +51,8 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSFont",
     "NSGraphics",
     "NSImage",
+    "NSImageRep",
+    "NSLayoutConstraint",
     "NSMenu",
     "NSMenuItem",
     "NSPopUpButton",
@@ -47,8 +60,10 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSResponder",
     "NSText",
     "NSTextField",
+    "NSTitlebarAccessoryViewController",
     "NSRunningApplication",
     "NSView",
+    "NSViewController",
     "NSWindow",
 ] }
 objc2-web-kit = "0.3"

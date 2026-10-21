@@ -7,6 +7,7 @@
 #   ci/test-app.sh routes <Syndeo.app>
 #   ci/test-app.sh customer <installed Syndeo.app> [again]
 #   ci/test-app.sh realtime <Syndeo.app>
+#   ci/test-app.sh agents <Syndeo.app>
 #   ci/test-app.sh measure
 #
 # launch, which gates: open the app with `open`, never by running its
@@ -105,7 +106,15 @@
 # no-editing-guard, the bar for a name for direct-for-every-name, a link to
 # an IPv6 address with a zone for zoned-links-followed, Reload consulting
 # the origin for reload-from-cache, and a WebSocket through Syndeo for
-# websocket-headers-stripped. Any other failure is a failure.
+# websocket-headers-stripped. For the agents' four, the part of agents each
+# has to fail, after agents are turned on: the prompts (approval:) and
+# JavaScript refused (grants:) for agent-approval-skipped, what a grant allows
+# (grants:) for agent-grant-unenforced, root refused (peer:) for
+# agent-peer-unchecked, and the agent's pages through the proxy (agent
+# traffic:) for agent-unproxied-tab. Any other failure is a failure.
+#
+# agents, which gates programs on this Mac driving Syndeo with the person's
+# leave: see the section of that name below.
 #
 # routes, which gates: the bar's route against what WebKit actually does,
 # the proxy caching nothing from this Mac, and Clear Browsing Data. From a
@@ -234,6 +243,9 @@ keystore_item() { security find-generic-password -s com.sum.syndeo.keystore >/de
 CANNOT_BROWSE="Syndeo can't open websites right now."
 # This instance's query for example.com (see started).
 FRESH=''
+# Arguments started hands the application through open, after --args when
+# set: none, unless a check says otherwise.
+OPEN_ARGS=()
 
 # What example.com's page itself says. Its <title> is "Example Domain", and
 # the window takes its title from the page through its controller, so that is
@@ -256,7 +268,7 @@ started() {
   # WebKit's cache persists from one instance to the next, so a page another
   # instance opened could otherwise be shown without this one fetching it.
   FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-  open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" || { bad "open ($round)" "open failed"; return 1; }
+  open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" ${OPEN_ARGS[@]+"${OPEN_ARGS[@]}"} || { bad "open ($round)" "open failed"; return 1; }
   until=$((SECONDS + 30))
   while :; do
     pids="$("$APPCTL" pids "$ID")"
@@ -416,6 +428,19 @@ origin() {
 <p><button onclick="window.open('data:text/html,<h1>SYNDEO-DATA-PAGE</h1>')">data in a new tab</button></p>
 <p><a href="http://example.com/" target="_blank">Example in a new tab</a></p>
 EOF
+  # What agents act on: a field, a button, a form, a link, and room to scroll.
+  cat >"$dir/agent.html" <<'EOF'
+<!doctype html><meta charset="utf-8"><title>Agent test</title>
+<h1>Agent test</h1>
+<form onsubmit="event.preventDefault(); document.getElementById('out').textContent = 'SUBMITTED ' + this.who.value">
+<p><label>Name <input name="who" id="who"></label>
+<button type="button" onclick="document.getElementById('out').textContent = 'CLICKED ' + document.getElementById('who').value">Say it</button></p>
+</form>
+<p id="out">nothing yet</p>
+<p><a href="/second.html">Second page</a></p>
+<div style="height: 4000px"></div>
+EOF
+  printf '<!doctype html><meta charset="utf-8"><title>Second</title><p>SYNDEO-SECOND-PAGE</p>\n' >"$dir/second.html"
   python3 -I -u -c '
 import http.server, os, socketserver, sys, time
 os.chdir(sys.argv[1])
@@ -984,8 +1009,14 @@ mutant() {
     zoned-links-followed) intended='^a link to an IPv6 address with a zone' ;;
     reload-from-cache) intended="^the reload consulted the origin through Syndeo's proxy" ;;
     websocket-headers-stripped) intended='^a WebSocket through Syndeo' ;;
+    agent-approval-skipped) intended='^(approval|grants):' ;;
+    agent-grant-unenforced) intended='^grants:' ;;
+    agent-peer-unchecked) intended='^peer:' ;;
+    agent-unproxied-tab) intended='^agent traffic:' ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
+  # Agents off, as they are until someone turns them on.
+  defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
   if started "$app" "mutant-$name"; then
     helper_of "$app" "mutant-$name"
     browses "mutant-$name"
@@ -996,6 +1027,7 @@ mutant() {
       direct-for-every-name | zoned-links-followed) routes_lite ;;
       reload-from-cache) reload_gate ;;
       websocket-headers-stripped) realtime_origin && rt_through_syndeo ;;
+      agent-*) agents_mutant "$name" "$app" ;;
       *) policy "$log" ;;
     esac
   fi
@@ -1003,6 +1035,7 @@ mutant() {
   route_origin_stop
   realtime_origin_stop
   stopped "mutant-$name"
+  defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
   printf '\n'
   caught="$(printf '%s' "$FAILED" | grep -E "$intended")"
   unrelated="$(printf '%s' "$FAILED" | grep -vE "$intended")"
@@ -1795,6 +1828,526 @@ realtime() {
   [ "$fails" = 0 ]
 }
 
+# ------------------------------------------------------------- agents
+#
+# agents, which gates: programs on this Mac driving Syndeo (issue #51),
+# through Syndeo's own executable as a client, `Syndeo control` and
+# `Syndeo mcp`, with the person's leave given at the prompt, by presses as a
+# person gives it. Each check's name starts with what it is about:
+#   launch:  opened by Launch Services with a client's arguments, it is the
+#            application, with its window, and prints nothing a client would;
+#   off:     agents are off until turned on: no socket, and a client says
+#            Syndeo cannot be reached;
+#   on:      Syndeo > Agent Access… turns them on: the socket, 600 and this
+#            user's, in a folder only this user may enter (700); the setting
+#            kept;
+#   peer:    a connection from another user (root, by sudo) is refused before
+#            anything is asked;
+#   approval: a program's first request raises the prompt — the name it
+#            gives, the program that started it and its signature, what it
+#            asks, and not JavaScript — and nothing is answered until the
+#            person answers; allowed for the session, it is answered. Another
+#            program is asked about on its own; denied, it is refused and opens
+#            nothing. JavaScript is asked for with a prompt of its own; denied,
+#            it is refused, and refused again at once without a new prompt;
+#            allowed, it is granted;
+#   agent traffic: the agent's pages, http and https, open in tabs of its
+#            own, load, are Through Syndeo, show their own text, and come
+#            through Syndeo's proxy (its count rises), https with Syndeo's
+#            authority in no trust settings;
+#   visible: its tabs say who controls them, with Stop, in a window of their
+#            own on screen;
+#   act:     on a page this test serves, the agent types into a field, clicks
+#            a button, submits a form, scrolls, follows a link and waits for
+#            the page, and goes back; a reference from another page is refused;
+#   read:    a screenshot is a PNG of its tab; its list of tabs is its own;
+#   grants:  JavaScript without the script grant is refused, and runs once
+#            granted; a program allowed only to read cannot open a tab;
+#   stop:    Agent Access lists what the agent is allowed; Stop disconnects a
+#            session at once; its tabs stay open without saying so; what it was
+#            allowed is gone, so it is asked about again, and its old tabs are
+#            out of its reach;
+#   mcp:     `Syndeo mcp` initializes, lists its tools, and its first tool call
+#            raises the prompt with the name its client gave; allowed, it opens
+#            and reads a page, and exits when its client closes;
+#   revoke:  Agent Access > Revoke All takes a session's leave back;
+#   off:     turned off, the socket is gone and a client cannot reach Syndeo.
+# Nothing of any address an agent opened is in a log. The trust settings are
+# as they were, no keystore was made, and the setting is removed again.
+AGENT_BIN='' AGENT_SOCK='' AGENT_T1='' AGENT_T2='' AGENT_BG=''
+
+# agent_paths APP: the client, which is APP's own executable, and the socket.
+agent_paths() {
+  AGENT_BIN="$1/Contents/MacOS/Syndeo"
+  AGENT_SOCK="$HOME/Library/Application Support/Syndeo/agents/control.sock"
+}
+driver() { python3 -I "$here/macos-app/agent-driver.py" "$@"; }
+# agent OUT REQUEST: one request, as the program ci-agent, by `Syndeo control`;
+# its answer in OUT. Returns the client's exit status.
+agent() { "$AGENT_BIN" control --name ci-agent "$2" >"$1" 2>"$1.err"; }
+# agent_bg OUT REQUEST: the same, in the background, as AGENT_BG.
+agent_bg() {
+  "$AGENT_BIN" control --name ci-agent "$2" >"$1" 2>"$1.err" &
+  AGENT_BG=$!
+}
+# finished PID: the exit status of the client PID, waited for up to 90 s; 124
+# if it had to be stopped.
+finished() {
+  if ! wait_for 90 gone "$1"; then
+    kill "$1" 2>/dev/null
+    wait "$1" 2>/dev/null
+    return 124
+  fi
+  wait "$1"
+}
+# answered OUT PATH: the value at PATH in the answer in OUT.
+answered() { driver field "$1" "$2" 2>/dev/null; }
+code_of() { answered "$1" error.code; }
+# showing TEXT: one of the application's windows shows TEXT.
+showing() { "$APPCTL" ax-tree "$PID" | grep -qF "$1"; }
+# window_says NEAR TEXT: the window that says NEAR also says TEXT.
+window_says() { "$APPCTL" window-text "$PID" "$1" | grep -qF "$2"; }
+# press_in NEAR BUTTON: press syndeo.agent-BUTTON in the window that says NEAR.
+press_in() { "$APPCTL" press-near "$PID" "$1" "syndeo.agent-$2"; }
+access_open() {
+  choose Syndeo "Agent Access…"
+  wait_for 10 "$APPCTL" value "$PID" syndeo.agent-status || bad "Agent Access" "Syndeo > Agent Access… shows no Agent Access window: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+}
+access_close() {
+  "$APPCTL" activate "$PID" >/dev/null || true
+  "$APPCTL" menu-key "$PID" File W >/dev/null || true
+  wait_for 10 "$APPCTL" value "$PID" syndeo.address || true
+}
+access_says() { "$APPCTL" value "$PID" "$1" | grep -qF "$2"; }
+mode_of() { stat -f '%Lp' "$1" 2>/dev/null; }
+
+# The prompt about ci-agent's leave.
+ASKING='Allow “ci-agent” to control Syndeo?'
+ASKING_SCRIPT='Allow “ci-agent” to run its own JavaScript in its tabs?'
+
+agents_launch() {
+  local app="$1" round=agents-launch
+  OPEN_ARGS=(--args control '{"cmd":"status"}')
+  if started "$app" "$round"; then
+    OPEN_ARGS=()
+    browses "$round"
+    must "$([ ! -s "$LOGS/app-$round.stdout" ] && echo yes)" \
+      "launch: opened by Launch Services with a client's arguments, it is the application, and printed nothing a client would" \
+      "$(head -c 200 "$LOGS/app-$round.stdout")"
+    stopped "$round"
+  fi
+  OPEN_ARGS=()
+}
+
+agents_off() {
+  local out="$LOGS/agent-off.json" st
+  must "$([ ! -e "$AGENT_SOCK" ] && echo yes)" "off: agents are off until turned on: there is no socket" "$(ls -la "$AGENT_SOCK" 2>&1)"
+  agent "$out" '{"cmd":"status"}'
+  st=$?
+  must "$([ "$st" = 3 ] && [ "$(code_of "$out")" = off ] && echo yes)" "off: and a client says Syndeo cannot be reached" "exit $st: $(head -c 200 "$out")"
+}
+
+agents_on() {
+  local dir
+  access_open
+  must "$(access_says syndeo.agent-status 'Off' && echo yes)" "on: Agent Access says agents are off" "$("$APPCTL" value "$PID" syndeo.agent-status)"
+  "$APPCTL" press "$PID" syndeo.agent-switch || bad "on: Agent Access's switch is pressed" "no syndeo.agent-switch to press"
+  if wait_for 10 test -S "$AGENT_SOCK"; then
+    ok "on: turned on in Agent Access, the socket is there"
+  else
+    bad "on: turned on in Agent Access, the socket is there" "no socket at $AGENT_SOCK; Agent Access says: $("$APPCTL" value "$PID" syndeo.agent-status)"
+  fi
+  dir="$(dirname "$AGENT_SOCK")"
+  must "$([ "$(mode_of "$dir")" = 700 ] && [ "$(mode_of "$AGENT_SOCK")" = 600 ] && [ "$(stat -f %u "$AGENT_SOCK")" = "$(id -u)" ] && echo yes)" \
+    "on: the socket is 600 and this user's, in a folder only this user may enter (700)" \
+    "folder $(mode_of "$dir"), socket $(mode_of "$AGENT_SOCK"), owner $(stat -f %u "$AGENT_SOCK" 2>&1)"
+  must "$(access_says syndeo.agent-status 'On' && echo yes)" "on: and Agent Access says so" "$("$APPCTL" value "$PID" syndeo.agent-status)"
+  must "$([ "$(defaults read "$ID" AgentControl 2>/dev/null)" = 1 ] && echo yes)" "on: the setting is kept" "$(defaults read "$ID" AgentControl 2>&1)"
+  access_close
+}
+
+agents_peer() {
+  local said
+  said="$(sudo -n python3 -I "$here/macos-app/agent-driver.py" raw "$AGENT_SOCK" ci-root 2>&1)"
+  printf '%s\n' "$said" >"$LOGS/agent-root.txt"
+  must "$(printf '%s' "$said" | grep -qF '"code":"other_user"' && echo yes)" \
+    "peer: a connection from another user, root, is refused before anything is asked" "$said"
+  if showing 'ci-root'; then
+    bad "peer: and the person is asked nothing about it" "a prompt about ci-root is showing"
+    press_in 'ci-root' deny || true
+  else
+    ok "peer: and the person is asked nothing about it"
+  fi
+}
+
+agents_approval() {
+  local out="$LOGS/agent-first.json" st
+  agent_bg "$out" '{"cmd":"status"}'
+  if wait_for 30 showing "$ASKING"; then
+    ok "approval: a program's first request raises Syndeo's prompt, with the name it gave"
+  else
+    bad "approval: a program's first request raises Syndeo's prompt, with the name it gave" "no such prompt: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+  "$APPCTL" window-text "$PID" "$ASKING" >"$LOGS/agent-prompt.txt" 2>&1
+  must "$(grep -q 'Program: /' "$LOGS/agent-prompt.txt" && grep -q 'Signature: ' "$LOGS/agent-prompt.txt" &&
+    grep -qF 'read the pages it opens' "$LOGS/agent-prompt.txt" && grep -qF 'open, close and navigate tabs of its own' "$LOGS/agent-prompt.txt" &&
+    grep -qF 'click, type and scroll in its tabs' "$LOGS/agent-prompt.txt" && ! grep -qF 'JavaScript' "$LOGS/agent-prompt.txt" && echo yes)" \
+    "approval: the prompt says which program asks, its signature, and what it asks for, and not JavaScript" "$(head -c 600 "$LOGS/agent-prompt.txt")"
+  must "$(alive "$AGENT_BG" && [ ! -s "$out" ] && echo yes)" "approval: nothing is answered before the person answers" "$(head -c 200 "$out")"
+  press_in "$ASKING" allow-session || bad "approval: Allow for This Session is pressed" "no such button in a prompt about ci-agent"
+  finished "$AGENT_BG"
+  st=$?
+  must "$([ "$st" = 0 ] && [ "$(answered "$out" result.granted)" = '["read", "navigate", "act"]' ] && echo yes)" \
+    "approval: allowed for the session, the request is answered, with read, navigate and act" "exit $st: $(head -c 300 "$out")"
+}
+
+agents_traffic() {
+  local out before
+  counted "before an agent's page"
+  before="$COUNTED"
+  out="$LOGS/agent-open.json"
+  agent "$out" "{\"cmd\":\"open\",\"url\":\"http://example.com/?agent$FRESH\"}"
+  AGENT_T1="$(answered "$out" result.tab)"
+  must "$([ -n "$AGENT_T1" ] && [ "$(answered "$out" result.loaded)" = true ] && echo yes)" \
+    "agent traffic: an agent opens http://example.com in a tab of its own, and it loads" "$(head -c 300 "$out")"
+  must "$([ "$(answered "$out" result.route)" = 'Through Syndeo' ] && echo yes)" "agent traffic: its route is Through Syndeo" "$(answered "$out" result.route)"
+  agent "$LOGS/agent-read.json" "{\"cmd\":\"read\",\"tab\":${AGENT_T1:-1}}"
+  must "$(answered "$LOGS/agent-read.json" result.text | grep -qF "$EXAMPLE_BODY" && echo yes)" \
+    "agent traffic: the agent reads the page's own text" "$(head -c 300 "$LOGS/agent-read.json")"
+  counted "after an agent's page"
+  risen "$before" "agent traffic: the proxy fetched the agent's page over http"
+  before="$COUNTED"
+  out="$LOGS/agent-open-https.json"
+  agent "$out" "{\"cmd\":\"open\",\"url\":\"https://example.com/?agents$FRESH\"}"
+  agent "$LOGS/agent-read-https.json" "{\"cmd\":\"read\",\"tab\":$(answered "$out" result.tab || echo 1)}"
+  must "$([ "$(answered "$out" result.loaded)" = true ] && answered "$LOGS/agent-read-https.json" result.text | grep -qF "$EXAMPLE_BODY" && echo yes)" \
+    "agent traffic: https://example.com opens for the agent and shows its own text, with Syndeo's authority in no trust settings" \
+    "$(head -c 300 "$out")"
+  counted "after an agent's https page"
+  risen "$before" "agent traffic: the proxy fetched the agent's page over https"
+  must "$(showing 'Controlled by “ci-agent”' && window_says 'Controlled by “ci-agent”' 'Stop' && echo yes)" \
+    "visible: the agent's tab says who controls it, with Stop" "$("$APPCTL" titles "$PID" | tr '\n' '|')"
+  must "$([ "$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')" = 2 ] && echo yes)" \
+    "visible: its tabs are in a window of their own, on screen beside the person's" "$("$APPCTL" windows "$PID" | tr '\n' ';')"
+}
+
+agents_act() {
+  local page out e_who e_say e_link st
+  origin || return 1
+  page="http://127.0.0.1:$ORIGIN_PORT/agent.html"
+  out="$LOGS/agent-act-open.json"
+  agent "$out" "{\"cmd\":\"open\",\"url\":\"$page\"}"
+  AGENT_T2="$(answered "$out" result.tab)"
+  must "$([ "$(answered "$out" result.title)" = 'Agent test' ] && echo yes)" "act: a page of this Mac's own opens for the agent" "$(head -c 300 "$out")"
+  agent "$LOGS/agent-snapshot.json" "{\"cmd\":\"snapshot\",\"tab\":${AGENT_T2:-1}}"
+  e_who="$(driver ref "$LOGS/agent-snapshot.json" textbox Name)"
+  e_say="$(driver ref "$LOGS/agent-snapshot.json" button 'Say it')"
+  e_link="$(driver ref "$LOGS/agent-snapshot.json" link 'Second page')"
+  must "$([ -n "$e_who" ] && [ -n "$e_say" ] && [ -n "$e_link" ] && echo yes)" \
+    "act: its snapshot lists the page's field, button and link, each with a reference" "$(head -c 500 "$LOGS/agent-snapshot.json")"
+  agent "$LOGS/agent-type.json" "{\"cmd\":\"type\",\"tab\":${AGENT_T2:-1},\"ref\":\"${e_who:-e0}\",\"text\":\"syndeo agent\"}"
+  agent "$LOGS/agent-click.json" "{\"cmd\":\"click\",\"tab\":${AGENT_T2:-1},\"ref\":\"${e_say:-e0}\"}"
+  agent "$LOGS/agent-act-read.json" "{\"cmd\":\"read\",\"tab\":${AGENT_T2:-1}}"
+  must "$(answered "$LOGS/agent-act-read.json" result.text | grep -qF 'CLICKED syndeo agent' && echo yes)" \
+    "act: the agent typed into a field and clicked a button, and the page saw both" \
+    "type: $(head -c 160 "$LOGS/agent-type.json"); click: $(head -c 160 "$LOGS/agent-click.json"); page: $(answered "$LOGS/agent-act-read.json" result.text | head -c 160)"
+  agent "$LOGS/agent-submit.json" "{\"cmd\":\"type\",\"tab\":${AGENT_T2:-1},\"ref\":\"${e_who:-e0}\",\"text\":\"second try\",\"submit\":true}"
+  agent "$LOGS/agent-act-read.json" "{\"cmd\":\"read\",\"tab\":${AGENT_T2:-1}}"
+  must "$(answered "$LOGS/agent-act-read.json" result.text | grep -qF 'SUBMITTED second try' && echo yes)" \
+    "act: typing with submit submits the field's form" "$(head -c 200 "$LOGS/agent-submit.json")"
+  agent "$LOGS/agent-scroll.json" "{\"cmd\":\"scroll\",\"tab\":${AGENT_T2:-1},\"dy\":600}"
+  must "$([ "$(answered "$LOGS/agent-scroll.json" result.y)" -gt 0 ] 2>/dev/null && echo yes)" \
+    "act: the agent scrolls the page" "$(head -c 200 "$LOGS/agent-scroll.json")"
+  agent "$LOGS/agent-follow.json" "{\"cmd\":\"click\",\"tab\":${AGENT_T2:-1},\"ref\":\"${e_link:-e0}\"}"
+  sleep 1
+  agent "$LOGS/agent-wait.json" "{\"cmd\":\"wait\",\"tab\":${AGENT_T2:-1},\"timeout_ms\":15000}"
+  agent "$LOGS/agent-second.json" "{\"cmd\":\"read\",\"tab\":${AGENT_T2:-1}}"
+  must "$([ "$(answered "$LOGS/agent-wait.json" result.loaded)" = true ] &&
+    answered "$LOGS/agent-second.json" result.text | grep -qF 'SYNDEO-SECOND-PAGE' && echo yes)" \
+    "act: a link the agent clicks is followed, and it waits for the page" "wait: $(head -c 200 "$LOGS/agent-wait.json"); read: $(head -c 200 "$LOGS/agent-second.json")"
+  out="$LOGS/agent-stale.json"
+  agent "$out" "{\"cmd\":\"click\",\"tab\":${AGENT_T2:-1},\"ref\":\"${e_say:-e0}\"}"
+  st=$?
+  must "$([ "$st" = 1 ] && [ "$(code_of "$out")" = page_error ] && answered "$out" error.message | grep -qF 'take a new snapshot' && echo yes)" \
+    "act: a reference from the page before is refused, not guessed at" "exit $st: $(head -c 200 "$out")"
+  out="$LOGS/agent-back.json"
+  agent "$out" "{\"cmd\":\"back\",\"tab\":${AGENT_T2:-1}}"
+  must "$([ "$(answered "$out" result.loaded)" = true ] && [ "$(answered "$out" result.url)" = "$page" ] && echo yes)" \
+    "act: Back goes back, and waits for the page" "$(head -c 200 "$out")"
+}
+
+agents_read() {
+  local shot
+  agent "$LOGS/agent-shot.json" "{\"cmd\":\"screenshot\",\"tab\":${AGENT_T2:-1}}"
+  if shot="$(driver png "$LOGS/agent-shot.json" 2>&1)"; then
+    ok "read: a screenshot is a PNG of the agent's tab: $shot"
+  else
+    bad "read: a screenshot is a PNG of the agent's tab" "$shot; $(head -c 200 "$LOGS/agent-shot.json")"
+  fi
+  agent "$LOGS/agent-tabs.json" '{"cmd":"tabs"}'
+  must "$(answered "$LOGS/agent-tabs.json" result.tabs | grep -qF '"url": "http://example.com/?agent' &&
+    answered "$LOGS/agent-tabs.json" result.tabs | grep -qF 'agent.html' &&
+    ! answered "$LOGS/agent-tabs.json" result.tabs | grep -qF 'syndeo.local' && echo yes)" \
+    "read: the agent's list of tabs is of its own tabs, none of the person's" "$(head -c 400 "$LOGS/agent-tabs.json")"
+}
+
+agents_grants() {
+  local out st bg tab="${AGENT_T2:-${AGENT_T1:-1}}"
+  out="$LOGS/agent-eval-refused.json"
+  agent "$out" "{\"cmd\":\"eval\",\"tab\":$tab,\"script\":\"return 1 + 1\"}"
+  st=$?
+  must "$([ "$st" = 1 ] && [ "$(code_of "$out")" = not_granted ] && echo yes)" \
+    "grants: without the script grant, the agent's JavaScript is refused" "exit $st: $(head -c 200 "$out")"
+  out="$LOGS/agent-reader.json"
+  driver as-agent "$AGENT_BIN" control --name ci-reader --scopes read '{"cmd":"open","url":"http://example.com/?reader"}' >"$out" 2>"$out.err" &
+  bg=$!
+  if wait_for 30 showing 'Allow “ci-reader” to control Syndeo?'; then
+    ok "grants: a program that asks only to read is asked about"
+  else
+    bad "grants: a program that asks only to read is asked about" "no such prompt"
+  fi
+  must "$(window_says 'ci-reader' 'read the pages it opens' && ! window_says 'ci-reader' 'open, close and navigate' && echo yes)" \
+    "grants: and its prompt lists reading, and nothing else" "$("$APPCTL" window-text "$PID" 'ci-reader' | head -c 400)"
+  press_in 'ci-reader' allow-once || bad "grants: Allow Once is pressed for ci-reader" "no such button"
+  finished "$bg"
+  st=$?
+  must "$([ "$st" = 1 ] && [ "$(code_of "$out")" = not_granted ] && echo yes)" \
+    "grants: allowed only to read, it cannot open a tab" "exit $st: $(head -c 200 "$out")"
+}
+
+agents_script() {
+  local out st tab="${AGENT_T2:-${AGENT_T1:-1}}"
+  out="$LOGS/agent-script-deny.json"
+  agent_bg "$out" '{"cmd":"request","scope":"script"}'
+  if wait_for 30 showing "$ASKING_SCRIPT"; then
+    ok "approval: asking for JavaScript raises a prompt of its own"
+  else
+    bad "approval: asking for JavaScript raises a prompt of its own" "no such prompt"
+  fi
+  must "$(window_says "$ASKING_SCRIPT" "including what you are signed in to there" && echo yes)" \
+    "approval: which says what JavaScript can do there" "$("$APPCTL" window-text "$PID" "$ASKING_SCRIPT" | head -c 400)"
+  press_in "$ASKING_SCRIPT" deny || bad "approval: Deny is pressed" "no such button"
+  finished "$AGENT_BG"
+  st=$?
+  must "$([ "$st" = 1 ] && [ "$(code_of "$out")" = denied ] && echo yes)" "approval: denied, JavaScript is refused" "exit $st: $(head -c 200 "$out")"
+  out="$LOGS/agent-eval-denied.json"
+  agent "$out" "{\"cmd\":\"eval\",\"tab\":$tab,\"script\":\"return 1 + 1\"}"
+  must "$([ "$(code_of "$out")" = not_granted ] && echo yes)" \
+    "grants: after the person denied it, the agent's JavaScript is still refused" "$(head -c 200 "$out")"
+  out="$LOGS/agent-script-again.json"
+  agent "$out" '{"cmd":"request","scope":"script"}'
+  st=$?
+  must "$([ "$st" = 1 ] && [ "$(code_of "$out")" = denied ] && ! showing "$ASKING_SCRIPT" && echo yes)" \
+    "approval: asked again at once, it is refused without a new prompt" "exit $st: $(head -c 200 "$out")"
+  sleep 11
+  out="$LOGS/agent-script-allow.json"
+  agent_bg "$out" '{"cmd":"request","scope":"script"}'
+  wait_for 30 showing "$ASKING_SCRIPT" || bad "approval: asked again later, it is asked about" "no prompt"
+  press_in "$ASKING_SCRIPT" allow-session || bad "approval: Allow for This Session is pressed for JavaScript" "no such button"
+  finished "$AGENT_BG"
+  st=$?
+  must "$([ "$st" = 0 ] && [ "$(answered "$out" result.granted)" = '["read", "navigate", "act", "script"]' ] && echo yes)" \
+    "approval: asked again later and allowed, JavaScript is granted" "exit $st: $(head -c 200 "$out")"
+  out="$LOGS/agent-eval.json"
+  agent "$out" "{\"cmd\":\"eval\",\"tab\":$tab,\"script\":\"return [document.readyState === 'complete', 1 + 1]\"}"
+  must "$([ "$(answered "$out" result.value)" = '[true, 2]' ] && echo yes)" \
+    "grants: with the script grant, the agent's JavaScript runs in its page and returns its value" "$(head -c 200 "$out")"
+}
+
+agents_deny() {
+  local log="$1" out="$LOGS/agent-stranger.json" opened bg st
+  opened="$(grep -c 'a window opened' "$log")"
+  driver as-agent "$AGENT_BIN" control --name ci-stranger '{"cmd":"open","url":"http://example.com/?stranger"}' >"$out" 2>"$out.err" &
+  bg=$!
+  if wait_for 30 showing 'Allow “ci-stranger” to control Syndeo?'; then
+    ok "approval: another program is asked about on its own"
+  else
+    bad "approval: another program is asked about on its own" "no such prompt"
+  fi
+  press_in 'ci-stranger' deny || bad "approval: Deny is pressed for ci-stranger" "no such button"
+  finished "$bg"
+  st=$?
+  must "$([ "$st" = 1 ] && [ "$(code_of "$out")" = denied ] && echo yes)" "approval: denied, it is refused" "exit $st: $(head -c 200 "$out")"
+  must "$([ "$(grep -c 'a window opened' "$log")" = "$opened" ] && echo yes)" "approval: and a program denied opened nothing" \
+    "$(grep 'a window' "$log" | tail -n 2 | tr '\n' ' ')"
+}
+
+agents_stop() {
+  local session="$LOGS/agent-session" st on_screen out
+  access_open
+  must "$(access_says syndeo.agent-grants '“ci-agent” — read, navigate, act, script for this session' && echo yes)" \
+    "stop: Agent Access lists what ci-agent is allowed, for the session" "$("$APPCTL" value "$PID" syndeo.agent-grants)"
+  access_close
+  # A write to the session's stdin after it has gone fails, and kills nothing.
+  trap '' PIPE
+  rm -f "$session.in"
+  mkfifo "$session.in"
+  "$AGENT_BIN" control --name ci-agent <"$session.in" >"$session.out" 2>"$session.err" &
+  AGENT_BG=$!
+  exec 7>"$session.in"
+  wait_for 30 sh -c '[ "$(grep -c . "$1")" -ge 1 ]' _ "$session.out"
+  printf '%s\n' '{"cmd":"status"}' >&7
+  wait_for 30 sh -c '[ "$(grep -c . "$1")" -ge 2 ]' _ "$session.out"
+  must "$([ "$(driver field "$session.out" ok 2>/dev/null)" = true ] && echo yes)" "stop: a session of the agent's runs, already allowed" "$(head -c 300 "$session.out")"
+  on_screen="$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')"
+  press_in 'Controlled by “ci-agent”' stop || bad "stop: Stop is pressed in the agent's tab" "no Stop in a window saying it is controlled by ci-agent"
+  sleep 2
+  alive "$AGENT_BG" && printf '%s\n' '{"cmd":"tabs"}' >&7
+  exec 7>&-
+  trap - PIPE
+  finished "$AGENT_BG"
+  st=$?
+  must "$([ "$st" = 3 ] && [ "$(driver field "$session.out" error.code 2>/dev/null)" = closed ] && echo yes)" \
+    "stop: Stop disconnects the agent at once" "exit $st: $(tail -n 1 "$session.out" | head -c 200)"
+  must "$(showing 'Controlled by “ci-agent”' && echo no || echo yes)" "stop: its tabs no longer say an agent controls them"
+  must "$([ "$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')" = "$on_screen" ] && echo yes)" "stop: and they stay open, the person's now" \
+    "$on_screen windows before, $("$APPCTL" windows "$PID" | wc -l | tr -d ' ') after"
+  out="$LOGS/agent-after-stop.json"
+  agent_bg "$out" '{"cmd":"tabs"}'
+  if wait_for 30 showing "$ASKING"; then
+    ok "stop: what it was allowed is gone: it is asked about again"
+  else
+    bad "stop: what it was allowed is gone: it is asked about again" "no prompt; it answered: $(head -c 200 "$out")"
+  fi
+  press_in "$ASKING" allow-once || true
+  finished "$AGENT_BG"
+  st=$?
+  must "$([ "$st" = 0 ] && [ "$(answered "$out" result.tabs)" = '[]' ] && echo yes)" "stop: and its old tabs are out of its reach" "exit $st: $(head -c 300 "$out")"
+}
+
+agents_mcp() {
+  local bg out="$LOGS/mcp.json"
+  driver mcp "$AGENT_BIN" "http://example.com/?mcp$FRESH" "$out" &
+  bg=$!
+  if wait_for 30 showing 'Allow “ci-mcp 1.0” to control Syndeo?'; then
+    ok "mcp: an MCP client's first tool call raises the prompt, with the name its client gave"
+  else
+    bad "mcp: an MCP client's first tool call raises the prompt, with the name its client gave" "no such prompt"
+  fi
+  press_in 'ci-mcp' allow-once || bad "mcp: Allow Once is pressed" "no such button"
+  finished "$bg" || true
+  must "$(python3 -I - "$out" "$EXAMPLE_BODY" <<'EOF' && echo yes
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r.get("exit") == 0, r
+assert r["initialize"]["result"]["serverInfo"]["name"] == "syndeo", r
+assert {"syndeo_open", "syndeo_read", "syndeo_click", "syndeo_eval"} <= set(r["tools"]), r
+assert not r["open"]["result"]["isError"], r
+assert json.loads(r["open"]["result"]["content"][0]["text"])["title"] == "Example Domain", r
+assert sys.argv[2] in r["read"]["text"], r
+EOF
+)" "mcp: it initializes, lists its tools, opens and reads a page, and exits when its client closes" "$(head -c 400 "$out" 2>&1)"
+}
+
+agents_revoke() {
+  local out="$LOGS/agent-revoke.json" st
+  agent_bg "$out" '{"cmd":"status"}'
+  wait_for 30 showing "$ASKING" || bad "revoke: a program is asked about" "no prompt"
+  press_in "$ASKING" allow-session || bad "revoke: Allow for This Session is pressed" "no such button"
+  finished "$AGENT_BG"
+  access_open
+  must "$(access_says syndeo.agent-grants '“ci-agent” — read, navigate, act for this session' && echo yes)" \
+    "revoke: Agent Access lists the session's leave" "$("$APPCTL" value "$PID" syndeo.agent-grants)"
+  "$APPCTL" press "$PID" syndeo.agent-revoke-all || bad "revoke: Revoke All is pressed" "no such button"
+  if wait_for 10 access_says syndeo.agent-grants 'No agent is allowed anything.'; then
+    ok "revoke: Revoke All takes it back"
+  else
+    bad "revoke: Revoke All takes it back" "$("$APPCTL" value "$PID" syndeo.agent-grants)"
+  fi
+  access_close
+  agent_bg "$out" '{"cmd":"status"}'
+  if wait_for 30 showing "$ASKING"; then ok "revoke: and the agent is asked about again"; else bad "revoke: and the agent is asked about again" "it answered: $(head -c 200 "$out")"; fi
+  press_in "$ASKING" deny || true
+  finished "$AGENT_BG"
+  st=$?
+  must "$([ "$st" = 1 ] && echo yes)" "revoke: and, denied, it is refused" "exit $st"
+}
+
+agents_off_again() {
+  local out="$LOGS/agent-off-again.json" st
+  access_open
+  "$APPCTL" press "$PID" syndeo.agent-switch || bad "off: Agent Access's switch is pressed" "no syndeo.agent-switch to press"
+  if wait_for 10 sh -c '! test -e "$1"' _ "$AGENT_SOCK"; then ok "off: turned off in Agent Access, the socket is gone"; else bad "off: turned off in Agent Access, the socket is gone" "$(ls -la "$AGENT_SOCK" 2>&1)"; fi
+  must "$(access_says syndeo.agent-status 'Off' && [ "$(defaults read "$ID" AgentControl 2>/dev/null)" = 0 ] && echo yes)" \
+    "off: Agent Access says so, and the setting is kept off" "$("$APPCTL" value "$PID" syndeo.agent-status); setting $(defaults read "$ID" AgentControl 2>&1)"
+  access_close
+  agent "$out" '{"cmd":"status"}'
+  st=$?
+  must "$([ "$st" = 3 ] && [ "$(code_of "$out")" = off ] && echo yes)" "off: and a client cannot reach Syndeo" "exit $st: $(head -c 200 "$out")"
+}
+
+# agents_mutant NAME APP: the part of agents that mutant NAME has to fail,
+# with what it needs before it; the application is running.
+agents_mutant() {
+  agent_paths "$2"
+  agents_on
+  case "$1" in
+    agent-peer-unchecked) agents_peer ;;
+    agent-approval-skipped)
+      agents_approval
+      agents_traffic
+      agents_script
+      agents_deny "$LOGS/app-mutant-$1.stderr"
+      ;;
+    agent-grant-unenforced)
+      agents_approval
+      agents_traffic
+      agents_grants
+      ;;
+    agent-unproxied-tab)
+      agents_approval
+      agents_traffic
+      ;;
+  esac
+}
+
+agents() {
+  local app log keystore_before home
+  [ -d "${1:-}" ] || { say "usage: $0 agents <Syndeo.app>"; exit 2; }
+  app="$(cd "$1" && pwd -P)"
+  home="$HOME/Library/Application Support/Syndeo"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  agent_paths "$app"
+  security dump-trust-settings >"$LOGS/trust-before-agents.txt" 2>&1 || true
+  keystore_before="$(keystore_item)"
+  defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
+  printf '\nSyndeo.app, driven by agents: %s\n' "$app"
+  agents_launch "$app"
+  if started "$app" agents; then
+    helper_of "$app" agents
+    browses agents
+    log="$LOGS/app-agents.stderr"
+    arrive "" 'Welcome to Syndeo' "a window shows the start page (agents)"
+    agents_off
+    agents_on
+    agents_peer
+    agents_approval
+    agents_traffic
+    agents_act
+    agents_read
+    agents_grants
+    agents_script
+    agents_deny "$log"
+    agents_stop
+    agents_mcp
+    agents_revoke
+    agents_off_again
+    origin_stop
+    stopped agents
+    must "$([ -n "$FRESH" ] && ! grep -q "$FRESH" "$log" && ! grep -qE 'agent\.html|second\.html' "$log" && echo yes)" \
+      "nothing of any address an agent opened is in the app's log or its proxy's" "$(grep -cE "$FRESH|agent.html|second.html" "$log") lines"
+    must "$([ ! -e "$AGENT_SOCK" ] && echo yes)" "after quitting, no socket is left" "$(ls -la "$AGENT_SOCK" 2>&1)"
+  fi
+  printf '\nwhat it left\n'
+  must "$([ ! -e "$home/.keystore" ] && [ "$keystore_before" = absent ] && [ "$(keystore_item)" = absent ] && echo yes)" "no keystore, and no keychain item for one"
+  security dump-trust-settings >"$LOGS/trust-after-agents.txt" 2>&1 || true
+  must "$(cmp -s "$LOGS/trust-before-agents.txt" "$LOGS/trust-after-agents.txt" && echo yes)" "the user's trust settings are as they were" \
+    "$(diff "$LOGS/trust-before-agents.txt" "$LOGS/trust-after-agents.txt" | head -5)"
+  defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
+  printf '\n%d failed\n' "$fails"
+  [ "$fails" = 0 ]
+}
+
 measure() {
   local probe out status started
   printf '\nwhat this runner allows (measured; not a gate)\n'
@@ -1840,6 +2393,7 @@ case "${1:-}" in
   routes) shift; routes "$@" ;;
   customer) shift; customer "$@" ;;
   realtime) shift; realtime "$@" ;;
+  agents) shift; agents "$@" ;;
   measure) measure ;;
-  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | measure"; exit 2 ;;
+  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | agents <Syndeo.app> | measure"; exit 2 ;;
 esac

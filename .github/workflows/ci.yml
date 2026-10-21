@@ -380,7 +380,9 @@ jobs:
       # the schemes a new tab may open, the address field's guard for typing,
       # the bar's rule for names, the refusal of a link to an IPv6 address
       # with a zone, Reload asking the origin, and, in the proxy, a WebSocket
-      # carried rather than stripped of its Upgrade. Each is built from this
+      # carried rather than stripped of its Upgrade; and, for agents, the
+      # person's prompt, what a grant allows, the socket's peer being this
+      # user, and an agent's tab being its window's own. Each is built from this
       # tree, the app and its helper, which is then put back, and the test has
       # to catch each by the checks meant to, with every other check passing.
       # All of them are run whatever any one does, each recorded on its own
@@ -461,6 +463,56 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-app-logs
+          path: ${{ runner.temp }}/syndeo-app-test/
+          if-no-files-found: warn
+
+  macos-agents:
+    name: Syndeo.app, driven by agents with the person's leave
+    # Programs on this Mac driving Syndeo (issue #51), through its own
+    # executable as `Syndeo control` and `Syndeo mcp`, on a disposable runner:
+    # off until Agent Access turns them on, and then a socket only this user
+    # can reach; the person's prompt before anything, given by presses as a
+    # person gives it; the agent's pages in tabs of its own, through Syndeo's
+    # proxy and pinned, saying who controls them; reading, acting, a
+    # screenshot, JavaScript only with its own leave; Stop and Revoke All;
+    # MCP; and root refused. ci/test-app.sh agents says each check.
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      SYNDEO_ALLOW_APP_TEST: "yes"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      # macos-app's build, restored; that job keeps it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-app
+          save-if: false
+
+      - name: Build the app and its helper
+        run: cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app -p syndeo-proxy
+
+      - name: Assemble Syndeo.app, then sign it ad hoc, the helper first
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          mkdir -p dist
+          bash ci/package-macos-app.sh "$version" target/aarch64-apple-darwin/release dist
+          codesign --force --sign - --options runtime dist/Syndeo.app/Contents/Helpers/syndeo-proxy
+          codesign --force --sign - --options runtime dist/Syndeo.app
+          codesign --verify --strict --verbose=2 dist/Syndeo.app
+
+      - name: Agents drive it, with the person's leave, in the open, through Syndeo
+        run: bash ci/test-app.sh agents "$PWD/dist/Syndeo.app"
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-agents-logs
           path: ${{ runner.temp }}/syndeo-app-test/
           if-no-files-found: warn
 

@@ -473,6 +473,16 @@ impl BrowserController {
         self.stop();
     }
 
+    /// The window's web view, routed through the proxy and pinned by this
+    /// controller; none in a window that cannot browse, or once it closed.
+    pub fn web_view(&self) -> Option<Retained<WKWebView>> {
+        self.ivars()
+            .web
+            .borrow()
+            .as_ref()
+            .map(|web| web.view.clone())
+    }
+
     fn stop(&self) {
         if let Some(web) = &*self.ivars().web.borrow() {
             unsafe { web.view.stopLoading() };

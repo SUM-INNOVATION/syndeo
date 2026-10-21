@@ -164,6 +164,89 @@ It never starts the keystore, makes no keychain entry for one, asks for no
 passphrase and makes no recovery phrase. Keys, identities and signing are
 the command-line tools' (see [Keys](#keys)).
 
+### Letting agents drive it
+
+Programs on your Mac — a command-line agent such as Claude Code, a script, a
+test — can drive Syndeo, in windows you can watch, once you allow them. It is
+off until you turn it on: Syndeo > Agent Access… > **Allow agents to control
+Syndeo**.
+
+A program does so through Syndeo's own executable, which, run by another
+program rather than opened as an application, is a client of the Syndeo that
+is running:
+
+- `/Applications/Syndeo.app/Contents/MacOS/Syndeo mcp` is a Model Context
+  Protocol server on stdio. To add it to Claude Code:
+
+  ```sh
+  claude mcp add syndeo -- /Applications/Syndeo.app/Contents/MacOS/Syndeo mcp
+  ```
+
+  Its tools are `syndeo_open`, `syndeo_goto`, `syndeo_tabs`, `syndeo_read`,
+  `syndeo_snapshot`, `syndeo_click`, `syndeo_type`, `syndeo_scroll`,
+  `syndeo_navigate`, `syndeo_wait`, `syndeo_screenshot`, `syndeo_select`,
+  `syndeo_close` and `syndeo_eval`.
+- `/Applications/Syndeo.app/Contents/MacOS/Syndeo control '<request>'` makes
+  one request, a JSON object, and prints its answer; with no request, it reads
+  one a line from stdin and answers each, as a session. For example:
+
+  ```sh
+  syndeo=/Applications/Syndeo.app/Contents/MacOS/Syndeo
+  $syndeo control '{"cmd": "open", "url": "https://example.com"}'
+  $syndeo control '{"cmd": "snapshot", "tab": 1}'
+  $syndeo control '{"cmd": "click", "tab": 1, "ref": "e3"}'
+  ```
+
+  The requests are `open`, `goto`, `back`, `forward`, `reload`, `stop`,
+  `wait`, `select`, `close`, `tabs`, `read`, `snapshot`, `screenshot`,
+  `click`, `type`, `scroll`, `eval`, `request` and `status`. `--name` gives
+  the name you are shown, and `--scopes` the access it asks for.
+  `Syndeo control --help` says more. It exits 0 when a request is done, 1 when
+  it is refused or fails, and 3 when Syndeo cannot be reached.
+
+**Nothing happens until you allow it.** A program's first request brings up
+Syndeo's prompt, which says who asks: the name the program gives, which
+Syndeo cannot check, and the program that started it, with its signature, as
+macOS reads it. It says what the program asks to do, too. You choose:
+
+- **Deny**, the default;
+- **Allow Once**, for that connection only;
+- **Allow for This Session**, until Syndeo quits or you take it back.
+
+Each kind of access is allowed on its own:
+
+- **read** — the pages it opens: their text, a list of their links and
+  fields, and pictures of them;
+- **navigate** — open, close and navigate tabs of its own;
+- **act** — click, type and scroll in its tabs;
+- **script** — run its own JavaScript in its tabs' pages, with everything
+  those pages can read and change. This one is never implied by the others.
+  A program asks for it separately, and you are asked separately.
+
+**In the open, and only in its own tabs.** A program opens its pages in tabs
+of its own, in windows of their own. Each says, below its title bar, which
+program controls it, and offers **Stop**. Stop disconnects the program and
+takes back everything it was allowed, and its tabs become yours. A program
+never sees your own tabs. Its pages are opened as yours are: through
+Syndeo's proxy, pinned to Syndeo's authority, and only `http` and `https`
+addresses. It cannot reach Settings, Clear Browsing Data, cookies or storage
+except as a page in its tab could, the proxy's controls or anything else of
+Syndeo's. Agent Access lists what each program is allowed, and **Revoke** and
+**Revoke All** take it back. Turning agents off disconnects every program,
+and takes back everything.
+
+**Only your own programs, and nothing on the network.** While agents are on,
+Syndeo listens on a Unix socket, `control.sock`, in
+`~/Library/Application Support/Syndeo/agents`. That folder only your account
+can enter, and the socket is readable and writable by you alone. Whoever
+connects, macOS says which user they are, and Syndeo refuses any but you
+before reading a word. There is no network port. Programs running as you can
+ask, and only you can say yes.
+
+Clicks and typing are done in the page's own document, as a script would do
+them, so a page may tell them from yours. Requests are limited in size and
+rate.
+
 ### Removing it
 
 Quit Syndeo first. Then either:
@@ -341,7 +424,13 @@ separate, and removing the application touches neither.
   - a WebSocket through Syndeo, opened, carried both ways and closed cleanly,
     with nothing of it cached, and WebRTC going around Syndeo, as the start
     page says;
-  - eight mutants, each the application with one safeguard taken out, every
+  - agents driving it, on a runner of their own: off until turned on; the
+    prompt, answered by presses as you would answer it, before anything is
+    done; allowed, denied, once and for the session; their pages through
+    Syndeo's proxy in tabs saying who controls them; reading, clicking,
+    typing, scrolling and a screenshot; JavaScript only with its own leave;
+    Stop and Revoke All; MCP; and a connection from another user refused;
+  - twelve mutants, each the application with one safeguard taken out, every
     one of which the test has to catch.
 - **Checked by hand, for every signed release:** from a fresh standard
   user account, installing by opening the package in Finder, which runs

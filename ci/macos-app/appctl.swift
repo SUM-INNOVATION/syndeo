@@ -48,6 +48,11 @@
 //                                a person would; exits 1 if there is no such item
 //   appctl popup-items <pid> <id>     open that pop-up, print each item's title, one a
 //                                line, and close it again choosing nothing
+//   appctl press-near <pid> <text> <id>   press the element with that identifier in
+//                                the first of pid's windows (a dialog, a tab) whose
+//                                text contains <text>; exits 1 if there is none
+//   appctl window-text <pid> <text>   all the text, whole, of the first of pid's
+//                                windows whose text contains <text>; exits 1 if none
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -339,6 +344,21 @@ case "popup-items" where args.count == 4:
     if AXUIElementPerformAction(menu, kAXCancelAction as CFString) != .success {
         key(pid, 53, "\u{1b}")
     }
+case "press-near" where args.count == 5:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    for window in windows(of: pid) where text(of: window, depth: 12).contains(args[3]) {
+        if let element = find(window, depth: 12, { (attribute($0, "AXIdentifier") as? String) == args[4] }) {
+            exit(AXUIElementPerformAction(element, kAXPressAction as CFString) == .success ? 0 : 1)
+        }
+    }
+    exit(1)
+case "window-text" where args.count == 4:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    for window in windows(of: pid) {
+        let all = text(of: window, depth: 12)
+        if all.contains(args[3]) { print(all); exit(0) }
+    }
+    exit(1)
 default:
     exit(2)
 }
