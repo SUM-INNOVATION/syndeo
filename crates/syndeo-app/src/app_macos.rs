@@ -50,8 +50,17 @@
 //! The keystore is not part of this application: it is never started, no
 //! keychain entry is made for it, no passphrase is asked for and no recovery
 //! phrase is generated.
+//!
+//! It is a web browser to macOS: its Info.plist claims http and https, so it
+//! can be chosen as the default browser, and another application can ask it
+//! to open an address (`open -a Syndeo <address>`, or a link in Mail). Each
+//! such address opens in a tab made as every tab is, or is refused there as
+//! typing it would be (`address::asked`); none is opened before launch has
+//! decided whether this application can browse. At launch it also says, in
+//! its log, what it can do with passkeys (`passkeys`): without Apple's
+//! browser passkey entitlement, which it does not hold, nothing.
 
-use crate::address::{self, Search};
+use crate::address::{self, Asked, Search};
 use crate::browser_macos::{
     browser_content, controller_of, BrowserController, Hooks, Place, Snapshot, Start,
 };
@@ -69,9 +78,11 @@ use objc2_app_kit::{
     NSEventModifierFlags, NSMenu, NSMenuItem, NSMenuItemValidation, NSTextField, NSView, NSWindow,
     NSWindowStyleMask,
 };
-use objc2_foundation::{ns_string, NSNotification, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    ns_string, NSArray, NSNotification, NSPoint, NSRect, NSSize, NSString, NSURLRequest, NSURL,
+};
 use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -299,6 +310,10 @@ pub struct State {
     recent: RefCell<Option<Retained<NSMenu>>>,
     /// What answers a secondary click on a tab, kept while it answers.
     tab_clicks: RefCell<Option<Retained<AnyObject>>>,
+    /// Launch has finished, and decided whether this application can browse.
+    launched: Cell<bool>,
+    /// Addresses other applications asked this one to open before then.
+    asked: RefCell<Vec<String>>,
 }
 
 define_class!(
@@ -314,8 +329,35 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
             self.prepare();
-            self.open_first_windows();
+            crate::passkeys::report();
+            self.ivars().launched.set(true);
+            // Opened to open addresses: those, and no start page beside them.
+            let asked = self.ivars().asked.take();
+            self.open_first_windows(asked.is_empty());
+            for address in asked {
+                self.open_asked(&address);
+            }
             self.watch_tab_clicks();
+            let app = NSApplication::sharedApplication(self.mtm());
+            #[allow(deprecated)] // `activate` is macOS 14 and later; this runs on 13.
+            app.activateIgnoringOtherApps(true);
+        }
+
+        /// Another application asks this one to open addresses. Before
+        /// launch has decided whether it can browse, they wait for it.
+        #[unsafe(method(application:openURLs:))]
+        fn open_urls(&self, _application: &NSApplication, urls: &NSArray<NSURL>) {
+            let addresses: Vec<String> = urls
+                .iter()
+                .map(|url| url.absoluteString().map(|text| text.to_string()).unwrap_or_default())
+                .collect();
+            if !self.ivars().launched.get() {
+                self.ivars().asked.borrow_mut().extend(addresses);
+                return;
+            }
+            for address in addresses {
+                self.open_asked(&address);
+            }
             let app = NSApplication::sharedApplication(self.mtm());
             #[allow(deprecated)] // `activate` is macOS 14 and later; this runs on 13.
             app.activateIgnoringOtherApps(true);
@@ -581,21 +623,11 @@ impl AppDelegate {
         window
     }
 
-    /// The browser window in front, or else any.
-    fn front_window(&self) -> Option<Retained<NSWindow>> {
-        let windows = self.ivars().windows.borrow();
-        windows
-            .iter()
-            .find(|(window, _)| window.isKeyWindow())
-            .or_else(|| windows.first())
-            .map(|(window, _)| window.clone())
-    }
-
     /// Open a closed tab again, beside the window in front, or as a window.
     fn reopen(&self, snapshot: Snapshot) {
         self.show_recent();
         let pinned = snapshot.pinned;
-        let window = match self.front_window() {
+        let window = match self.front_browser() {
             Some(front) => self.open_tab(&front, &front, Start::Again(snapshot), Place::Front),
             None => {
                 let window = self.new_window(Start::Again(snapshot));
@@ -644,36 +676,100 @@ impl AppDelegate {
         );
     }
 
+    /// An address another application asked this one to open, in a new tab
+    /// beside the browser window in front, or a new window if there is none:
+    /// made by `new_window`, as every tab is, so it browses only through the
+    /// proxy, pinned to its authority, and placed as every new tab is. One
+    /// `address::asked` refuses gets Syndeo's page saying why. The log has
+    /// its scheme, and nothing else of it.
+    fn open_asked(&self, address: &str) {
+        let scheme = address::explicit_scheme(address).unwrap_or_default();
+        let (request, refused) = match address::asked(address) {
+            Asked::Open(url) => match NSURL::URLWithString(&NSString::from_str(url.as_str())) {
+                Some(url) => (Some(NSURLRequest::requestWithURL(&url)), None),
+                None => (None, Some("That address could not be read.".to_string())),
+            },
+            Asked::Refused(why) => (None, Some(why)),
+        };
+        if refused.is_some() {
+            tracing::info!(scheme = %scheme, "refused an address another application asked to open");
+        } else {
+            tracing::info!(scheme = %scheme, "opening an address another application asked to open");
+        }
+        let start = request.map(Start::Request).unwrap_or(Start::Page);
+        let window = match self.front_browser() {
+            Some(parent) => self.open_tab(&parent, &parent, start, Place::Front),
+            None => {
+                let window = self.new_window(start);
+                window.center();
+                window.makeKeyAndOrderFront(None);
+                window
+            }
+        };
+        if let (Some(why), Some(controller)) = (refused, controller_of(&window)) {
+            controller.refuse(address, &why);
+        }
+    }
+
+    /// The browser window in front: the main window, if it is one of this
+    /// application's browser windows, or else the one opened last.
+    fn front_browser(&self) -> Option<Retained<NSWindow>> {
+        let windows = self.ivars().windows.borrow();
+        let ours = |window: &NSWindow| {
+            windows
+                .iter()
+                .any(|(open, _)| std::ptr::eq(&**open, window))
+        };
+        NSApplication::sharedApplication(self.mtm())
+            .mainWindow()
+            .filter(|main| ours(main))
+            .or_else(|| windows.last().map(|(window, _)| window.clone()))
+    }
+
     /// At launch: the last session's tabs, if macOS keeps windows when an
-    /// application quits; otherwise a window with the start page, and the
-    /// last session's pinned tabs before it. What is not opened is kept for
-    /// History > Reopen All Windows from Last Session.
-    fn open_first_windows(&self) {
+    /// application quits; otherwise a window with the start page, unless
+    /// Syndeo was opened to open addresses, and the last session's pinned
+    /// tabs before it. What is not opened is kept for History > Reopen All
+    /// Windows from Last Session.
+    fn open_first_windows(&self, start_page: bool) {
         let state = self.ivars();
         let mut saved = tabs_macos::read_session(&state.home);
         if state.browsing.borrow().is_none() {
-            self.open_window();
+            if start_page {
+                self.open_window();
+            }
             return;
         }
         if tabs_macos::keeps_windows() && !saved.is_empty() {
             self.open_session(&saved);
             return;
         }
-        let front = self.open_window();
+        let front = start_page.then(|| self.open_window());
         let pinned = saved.pinned();
+        let mut first: Option<Retained<NSWindow>> = None;
         for (index, tab) in pinned.iter().enumerate() {
             let start = Start::Later {
                 address: tab.address.clone(),
                 title: tab.title.clone(),
             };
             let window = self.new_window(start);
-            tabs_macos::place(&front, &window, index);
+            match front.as_ref().or(first.as_ref()) {
+                Some(beside) => tabs_macos::place(beside, &window, index),
+                None => window.center(),
+            }
             if let Some(controller) = controller_of(&window) {
                 controller.set_pinned(true);
             }
+            first.get_or_insert(window);
+        }
+        // The start page in front, before the pinned tabs; or, with none,
+        // the first pinned tab.
+        match (&front, &first) {
+            (Some(front), Some(_)) => front.makeKeyAndOrderFront(None),
+            (None, Some(first)) => first.makeKeyAndOrderFront(None),
+            _ => {}
         }
         if !pinned.is_empty() {
-            front.makeKeyAndOrderFront(None);
             for window in &mut saved.windows {
                 window.tabs.retain(|tab| !tab.pinned);
             }
@@ -1164,6 +1260,8 @@ pub fn run(install: InstallDir) -> Result<()> {
             last_session: RefCell::new(Session::default()),
             recent: RefCell::new(None),
             tab_clicks: RefCell::new(None),
+            launched: Cell::new(false),
+            asked: RefCell::new(Vec::new()),
         },
     );
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -1523,6 +1621,7 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
             ("tabs_macos.rs", include_str!("tabs_macos.rs")),
             ("tabs.rs", include_str!("tabs.rs")),
             ("address.rs", include_str!("address.rs")),
+            ("passkeys.rs", include_str!("passkeys.rs")),
             ("main.rs", include_str!("main.rs")),
         ] {
             let code = source.split("#[cfg(test)]").next().unwrap();

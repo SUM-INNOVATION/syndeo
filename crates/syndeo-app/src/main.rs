@@ -18,6 +18,8 @@ mod tabs_macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod address;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod passkeys;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod tabs;
 
 #[cfg(target_os = "macos")]
