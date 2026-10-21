@@ -45,8 +45,8 @@ back.
 - agent-approval-skipped: an agent's request for leave is granted for the
   session without the person being asked. The prompts must then be seen
   missing, and JavaScript denied must be seen running.
-- agent-grant-unenforced: whatever an agent was allowed, every request is
-  taken as allowed. JavaScript without the script grant, and a tab opened by
+- agent-grant-unenforced: whatever an agent was allowed, every request it
+  makes once allowed at all is done, whatever scope it needs. JavaScript without the script grant, and a tab opened by
   an agent allowed only to read, must then be seen.
 - agent-peer-unchecked: the socket's peer is not checked to be this user. A
   connection from root must then be seen not refused, and asked about.
@@ -62,7 +62,6 @@ BROWSER = "crates/syndeo-app/src/browser_macos.rs"
 ADDRESS = "crates/syndeo-app/src/address.rs"
 PROXY = "crates/syndeo-proxy/src/main.rs"
 CONTROL = "crates/syndeo-app/src/control_macos.rs"
-AGENT = "crates/syndeo-app/src/agent.rs"
 
 MUTANTS = {
     "no-pinning-delegate": [
@@ -165,9 +164,11 @@ MUTANTS = {
     ],
     "agent-grant-unenforced": [
         (
-            AGENT,
-            "        self.0 & scope.bit() != 0\n",
-            "        let _ = scope;\n        true\n",
+            CONTROL,
+            "                if let Some(scope) = command.needs() {\n"
+            "                    if !granted.allows(scope) {\n",
+            "                if let Some(scope) = command.needs() {\n"
+            "                    if false && !granted.allows(scope) {\n",
         ),
     ],
     "agent-peer-unchecked": [

@@ -790,8 +790,13 @@ impl Control {
 
     // ------------------------------------------------------------- the person's leave
 
-    /// Ask the person, in turn: one prompt at a time.
+    /// Ask the person, in turn: one prompt at a time. What is already
+    /// allowed waits for no one's prompt.
     fn ask(self: &Rc<Self>, ask: Ask) {
+        let already = self.conns.borrow().get(&ask.conn).map(|c| self.granted(c));
+        if let Some(already) = already.filter(|a| a.covers(ask.scopes)) {
+            return self.allowed(ask, already, "already");
+        }
         self.waiting.borrow_mut().push_back(ask);
         if self.asking.get() {
             return;
