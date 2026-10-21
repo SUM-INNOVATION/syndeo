@@ -46,10 +46,12 @@
 # notarization submission is spent on it.
 #
 # signed-app checks the signed Syndeo.app the same way, before it is
-# notarized: exactly Syndeo.app <version>, signed; the bundle and its helper
-# Developer ID Application of MACOS_TEAM_ID, hardened runtime, secure
-# timestamp, no entitlements; the helper byte for byte the tarball's
-# syndeo-proxy, and run. The application itself opens a window and is not run
+# notarized: exactly Syndeo.app <version>, signed, a release's; the bundle
+# and its helper Developer ID Application of MACOS_TEAM_ID, hardened runtime,
+# secure timestamp; the bundle claiming exactly Apple's browser passkey
+# entitlement with its App ID and team, and its embedded provisioning
+# profile authorizing it (ci/macos-app/profile.py); the helper no
+# entitlement, byte for byte the tarball's syndeo-proxy, and run. The application itself opens a window and is not run
 # here: ci/test-pkg-install.sh opens it, installed.
 #
 # installed checks what an installation left on this Mac, with the checks
@@ -77,14 +79,20 @@
 # real-runner scenario.
 #
 # Knobs, for inspect:
-#   SYNDEO_EXPECT_SIGNED  no (default, and what empty means): the package
-#                         carries no signature and Gatekeeper rejects it, and
-#                         the bundle and its helper are signed ad hoc, with no
-#                         Developer ID. yes: the bundle and its helper are
-#                         Developer ID Application of MACOS_TEAM_ID, with the
-#                         hardened runtime and a secure timestamp, no
-#                         entitlements, and the bundle's notarization ticket
-#                         stapled; the package is Developer ID Installer of
+#   SYNDEO_EXPECT_SIGNED  no (default, and what empty means): a pull
+#                         request's package: it carries no signature and
+#                         Gatekeeper rejects it, and the bundle and its
+#                         helper are signed ad hoc, with no Developer ID, no
+#                         entitlement and no provisioning profile. yes: a
+#                         release's: its scripts know the version in
+#                         ci/macos-app/profile-since, and from that version
+#                         on its bundle holds its provisioning profile; the
+#                         bundle and its helper are Developer ID Application
+#                         of MACOS_TEAM_ID, with the hardened runtime and a
+#                         secure timestamp, the bundle with exactly its three
+#                         entitlements and a profile authorizing them, the
+#                         helper with none, and the bundle's notarization
+#                         ticket stapled; the package is Developer ID Installer of
 #                         that team, chained to Apple Root CA, its ticket
 #                         stapled; and Gatekeeper accepts both as Notarized
 #                         Developer ID.
@@ -125,19 +133,20 @@ xp() { xmllint --xpath "$2" "$1" 2>/dev/null; }
 # otherwise.
 bundle_state() { if [ -e "$1/Contents/CodeResources" ]; then echo stapled; else echo signed; fi; }
 
-# expected_bom STATE: every line `lsbom -p fmugl` prints for a package of
-# Syndeo.app, signed or stapled: the payload's root, /Applications itself,
-# and the bundle, all root:wheel, no link.
+# expected_bom STATE VERSION: every line `lsbom -p fmugl` prints for a
+# package of Syndeo.app VERSION, signed or stapled: the payload's root,
+# /Applications itself, and the bundle, all root:wheel, no link.
 expected_bom() {
   local p t m
   printf '.\t40755\t0\t0\t\n./Syndeo.app\t40755\t0\t0\t\n'
+  # shellcheck disable=SC2046 # profiled_word: a word or nothing
   while read -r p t m; do
     if [ "$t" = d ]; then
       printf './Syndeo.app/%s\t40%s\t0\t0\t\n' "$p" "$m"
     else
       printf './Syndeo.app/%s\t100%s\t0\t0\t\n' "$p" "$m"
     fi
-  done < <(bash "$assembler" --manifest "$1")
+  done < <(bash "$assembler" --manifest "$1" $(profiled_word "$2"))
 }
 
 # ------------------------------------------------------------------ package-info
@@ -248,8 +257,8 @@ inspect() {
   package_info "$full/Syndeo.pkg/PackageInfo" "$version"
   scripts="$full/Syndeo.pkg/Scripts"
   mkdir "$w/expected"
-  "$builder" --render preinstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign "$w/expected/preinstall" >/dev/null
-  "$builder" --render postinstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign "$w/expected/postinstall" >/dev/null
+  "$builder" --render preinstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign "$w/expected/preinstall" "$(release_since)" >/dev/null
+  "$builder" --render postinstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign "$w/expected/postinstall" "$(release_since)" >/dev/null
   if [ "$(cd "$scripts" && ls -A | LC_ALL=C sort | tr '\n' ' ')" = "postinstall preinstall " ]; then
     ok "exactly two scripts, preinstall and postinstall"
   else
@@ -266,7 +275,7 @@ inspect() {
   note "the payload: Syndeo.app, and nothing else"
   payload="$full/Syndeo.pkg/Payload"
   state="$(bundle_state "$payload/Syndeo.app")"
-  expected_bom "$state" | LC_ALL=C sort >"$w/bom.want"
+  expected_bom "$state" "$version" | LC_ALL=C sort >"$w/bom.want"
   lsbom -p fmugl "$full/Syndeo.pkg/Bom" | LC_ALL=C sort >"$w/bom.have"
   if cmp -s "$w/bom.want" "$w/bom.have"; then
     ok "the BOM: exactly Syndeo.app ($state), all root:wheel, directories and executables 0755, everything else 0644, no link"
@@ -278,7 +287,8 @@ inspect() {
   else
     bad "payload" "it holds: $(cd "$payload" && ls -A | tr '\n' ' ')"
   fi
-  if out="$(bash "$assembler" --check "$payload/Syndeo.app" "$version" "$state" 2>&1)"; then
+  # shellcheck disable=SC2046 # a word or nothing
+  if out="$(bash "$assembler" --check "$payload/Syndeo.app" "$version" "$state" $(release_word) 2>&1)"; then
     ok "it is exactly Syndeo.app $version, $state, its uninstaller the template rendered for $version"
   else
     bad "bundle" "$(printf '%s' "$out" | tr '\n' ' ')"
@@ -301,7 +311,7 @@ inspect() {
   fi
 
   if [ "$expect" = yes ]; then
-    signed_state "$pkg" "$payload/Syndeo.app" "$team"
+    signed_state "$pkg" "$payload/Syndeo.app" "$team" "$version"
     return 0
   fi
   note "signing (expected: none on the package; the bundle ad hoc)"
@@ -352,6 +362,17 @@ same_bytes() {
 # A team identifier: ten capital letters and digits, whatever the locale.
 TEAM_RE='^[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10}$'
 
+# A release's (SYNDEO_EXPECT_SIGNED yes) or a pull request's: release_since
+# is the version from which a release's Syndeo.app holds its provisioning
+# profile, for a release, and nothing for a pull request; release_word is
+# "release" or nothing, as ci/package-macos-app.sh --check takes it.
+release_since() { if [ "${SYNDEO_EXPECT_SIGNED:-no}" = yes ]; then cat "$here/macos-app/profile-since"; fi; }
+release_word() { if [ "${SYNDEO_EXPECT_SIGNED:-no}" = yes ]; then echo release; fi; }
+# profiled_word VERSION: "profiled" if a bundle of VERSION holds the profile.
+profiled_word() {
+  if [ "${SYNDEO_EXPECT_SIGNED:-no}" = yes ] && [ "$(bash "$assembler" --profiled "$1")" = yes ]; then echo profiled; fi
+}
+
 # entitlements_are XML GROUP: XML, what codesign printed as the entitlements,
 # is exactly keychain-access-groups = [GROUP], or, with GROUP empty, nothing.
 # Every shipped executable is checked with GROUP empty: a restricted
@@ -372,12 +393,13 @@ developer_id() {
   [[ "$2" =~ ^Developer\ ID\ $1:\ .+\ \(([ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]{10})\)$ ]] && [ "${BASH_REMATCH[1]}" = "$3" ]
 }
 
-# code_problems PATH TEAM [--deep]: what keeps PATH from being signed as a
-# release has to be: Developer ID Application of TEAM, chained to Apple Root
-# CA, with the hardened runtime and a secure timestamp, and no entitlement.
-# Prints nothing if it is.
+# code_problems PATH TEAM [--deep] [app]: what keeps PATH from being signed
+# as a release has to be: Developer ID Application of TEAM, chained to Apple
+# Root CA, with the hardened runtime and a secure timestamp; and no
+# entitlement, or, for app, Syndeo.app's main executable, exactly its three
+# (ci/macos-app/profile.py). Prints nothing if it is.
 code_problems() {
-  local path="$1" team="$2" deep="${3:-}" out first last problems=""
+  local path="$1" team="$2" deep="${3:-}" kind="${4:-}" out first last problems=""
   # shellcheck disable=SC2086
   codesign --verify --strict $deep "$path" >/dev/null 2>&1 || problems="$problems does not verify;"
   out="$(codesign -dv --verbose=4 "$path" 2>&1)"
@@ -389,9 +411,31 @@ code_problems() {
     problems="$problems TeamIdentifier '$(printf '%s\n' "$out" | sed -n 's/^TeamIdentifier=//p')';"
   printf '%s\n' "$out" | grep -qE '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' || problems="$problems no hardened runtime;"
   printf '%s\n' "$out" | grep -q '^Timestamp=' || problems="$problems no secure timestamp;"
-  entitlements_are "$(codesign -d --entitlements - --xml "$path" 2>/dev/null)" "" ||
-    problems="$problems has entitlements, and no shipped executable may;"
+  if [ "$kind" = app ]; then
+    codesign -d --entitlements - --xml "$path" >"$inspect_work/entitlements.xml" 2>/dev/null
+    python3 -I "$here/macos-app/profile.py" signed "$inspect_work/entitlements.xml" "$team" >/dev/null ||
+      problems="$problems its entitlements are not exactly Apple's browser passkey entitlement, its App ID and team;"
+  else
+    entitlements_are "$(codesign -d --entitlements - --xml "$path" 2>/dev/null)" "" ||
+      problems="$problems has entitlements, and no shipped executable may;"
+  fi
   printf '%s' "${problems# }"
+}
+
+# profile_problems APP TEAM: what keeps APP's embedded provisioning profile
+# from being a Developer ID profile for TEAM's com.sum.syndeo that
+# authorizes the browser passkey entitlement, has not expired, and lists the
+# certificate APP is signed with. Prints nothing if it is.
+profile_problems() {
+  local app="$1" team="$2" profile="$1/Contents/embedded.provisionprofile" out
+  [ -f "$profile" ] && [ ! -L "$profile" ] || { printf 'there is none'; return 0; }
+  rm -f "$inspect_work"/signer*
+  if ! codesign -d --extract-certificates="$inspect_work/signer" "$app" >/dev/null 2>&1 || [ ! -s "$inspect_work/signer0" ]; then
+    printf 'the certificate Syndeo.app is signed with could not be read'
+    return 0
+  fi
+  out="$(python3 -I "$here/macos-app/profile.py" check "$profile" "$team" --certificate "$inspect_work/signer0" 2>&1)" ||
+    printf '%s' "$(printf '%s\n' "$out" | sed 's/^profile.py: //' | tr '\n' ' ' | sed 's/ $//')"
 }
 
 # signed_executables TREE TEAM: each of the seven executables in TREE is
@@ -408,18 +452,31 @@ signed_executables() {
   done
 }
 
-# signed_bundle APP TEAM: Syndeo.app and its helper are signed as a release
-# has to be, the bundle as com.sum.syndeo and verifying with everything
-# nested in it.
+# signed_bundle APP TEAM VERSION: Syndeo.app and its helper are signed as a
+# release has to be, the bundle as com.sum.syndeo and verifying with
+# everything nested in it, claiming its three entitlements where VERSION's
+# bundle holds the provisioning profile, which has to authorize them, and
+# none where it does not; the helper none.
 signed_bundle() {
-  local app="$1" team="$2" problems id
-  problems="$(code_problems "$app" "$team" --deep)"
+  local app="$1" team="$2" version="$3" problems id kind='' claims='no entitlements'
+  if [ -n "$(profiled_word "$version")" ]; then
+    kind=app claims='exactly its three entitlements'
+  fi
+  problems="$(code_problems "$app" "$team" --deep $kind)"
   id="$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^Identifier=//p')"
   [ "$id" = com.sum.syndeo ] || problems="${problems:+$problems }signed as '$id', not com.sum.syndeo;"
   if [ -z "$problems" ]; then
-    ok "Syndeo.app: com.sum.syndeo, Developer ID Application of $team, hardened runtime, secure timestamp, no entitlements, verifying deeply"
+    ok "Syndeo.app: com.sum.syndeo, Developer ID Application of $team, hardened runtime, secure timestamp, $claims, verifying deeply"
   else
     bad "Syndeo.app" "$problems"
+  fi
+  if [ "$kind" = app ]; then
+    problems="$(profile_problems "$app" "$team")"
+    if [ -z "$problems" ]; then
+      ok "its provisioning profile: Developer ID, for $team.com.sum.syndeo, authorizing the browser passkey entitlement, unexpired, listing the certificate it is signed with"
+    else
+      bad "Syndeo.app's provisioning profile" "$problems"
+    fi
   fi
   problems="$(code_problems "$app/Contents/Helpers/syndeo-proxy" "$team")"
   if [ -z "$problems" ]; then
@@ -441,13 +498,13 @@ accepted() {
   printf '%s' "${problems# }"
 }
 
-# signed_state PKG APP TEAM: what a signed release has to be, checked on the
-# package and on the bundle in its payload, which inspect has already found
-# byte-identical to the one it was built from.
+# signed_state PKG APP TEAM VERSION: what a signed release has to be, checked
+# on the package and on the bundle in its payload, which inspect has already
+# found byte-identical to the one it was built from.
 signed_state() {
-  local pkg="$1" app="$2" team="$3" out first last problems chain origin
+  local pkg="$1" app="$2" team="$3" version="$4" out first last problems chain origin
   note "signing (expected: Developer ID of $team, notarized and stapled)"
-  signed_bundle "$app" "$team"
+  signed_bundle "$app" "$team" "$version"
   if validated_ticket "$app"; then
     ok "Syndeo.app's notarization ticket is stapled, and validates"
   else
@@ -650,12 +707,12 @@ signed_app() {
   syndeo_version_valid "$v" || { echo "signed-app: '$v' is not a version" >&2; return 2; }
   name="syndeo-$v-aarch64-apple-darwin"
   note "the signed Syndeo.app $v (expected: Developer ID Application of $team)"
-  if out="$(bash "$assembler" --check "$app" "$v" signed 2>&1)"; then
-    ok "exactly Syndeo.app $v, signed, its uninstaller the template rendered for $v"
+  if out="$(bash "$assembler" --check "$app" "$v" signed release 2>&1)"; then
+    ok "exactly Syndeo.app $v, signed, a release's, its uninstaller the template rendered for $v"
   else
     bad "bundle" "$(printf '%s' "$out" | tr '\n' ' ')"
   fi
-  signed_bundle "$app" "$team"
+  signed_bundle "$app" "$team" "$v"
   mkdir "$inspect_work/binaries"
   if [ "${tarball##*/}" != "$name.tar.gz" ] || ! tar -xzf "$tarball" -C "$inspect_work/binaries" 2>/dev/null; then
     bad "tarball" "${tarball##*/} is not $name.tar.gz, or could not be unpacked"
@@ -687,7 +744,7 @@ installed() {
   CODESIGN="${SYNDEO_VERIFY_CODESIGN:-/usr/bin/codesign}"
   SCRIPT=verify
   lib="$inspect_work/libraries.sh"
-  "$builder" --library "$lib" || { bad "libraries" "could not be written"; return 0; }
+  "$builder" --library "$lib" "$(release_since)" || { bad "libraries" "could not be written"; return 0; }
   # shellcheck source=/dev/null
   . "$lib"
 
@@ -1175,7 +1232,13 @@ EOF
   chmod 755 "$C/pkgutil" "$C/codesign"
 }
 
-st_render_for() { "$builder" --render "$1" "$2" "$R" "$U" "$G" "$C/pkgutil" "$C/codesign" "$3" >/dev/null; }
+st_render_for() { "$builder" --render "$1" "$2" "$R" "$U" "$G" "$C/pkgutil" "$C/codesign" "$3" "${ST_SINCE:-}" >/dev/null; }
+
+# ST_SINCE: empty, for a pull request's package, whose bundles hold no
+# provisioning profile; or a version, for a release's, whose bundles hold one
+# from that version on. st_profiled V: a bundle of V holds one.
+ST_SINCE=''
+st_profiled() { [ -n "$ST_SINCE" ] && [ "$(syndeo_version_cmp "$1" "$ST_SINCE")" != lt ]; }
 
 # st_app V [TICKET [IDENTIFIER]]: Syndeo.app V in the case's Applications,
 # laid out as the package installs it, its uninstaller rendered for this
@@ -1189,6 +1252,7 @@ st_app() {
   printf '#!/bin/sh\necho "Syndeo %s"\n' "$v" >"$A/Contents/MacOS/Syndeo"
   printf '#!/bin/sh\necho "syndeo-proxy %s"\n' "$v" >"$A/Contents/Helpers/syndeo-proxy"
   printf 'icon' >"$A/Contents/Resources/Syndeo.icns"
+  if st_profiled "$v"; then printf 'profile' >"$A/Contents/embedded.provisionprofile"; fi
   st_render_for uninstall "$v" "$A/Contents/Resources/uninstall.sh"
   find "$A" -type d -exec chmod 755 {} +
   find "$A" -type f -exec chmod 644 {} +
@@ -1216,7 +1280,8 @@ st_app_receipt() {
   } >"$DB/com.sum.syndeo.app.info"
   {
     echo Syndeo.app
-    bash "$assembler" --manifest "$state" | while read -r p t m; do echo "Syndeo.app/$p"; done
+    # shellcheck disable=SC2046 # a word or nothing
+    bash "$assembler" --manifest "$state" $(st_profiled "$v" && echo profiled) | while read -r p t m; do echo "Syndeo.app/$p"; done
   } >"$DB/com.sum.syndeo.app.files"
 }
 
@@ -2142,17 +2207,22 @@ EOF
   tar -C "$dir/src" --format=ustar -czf "$dir/$name.tar.gz" "$name"
 }
 
-# st_fake_app DIR V [WORD]: a real Syndeo.app V in DIR/app, assembled by
-# ci/package-macos-app.sh from two small compiled programs that say their
-# names and V (and WORD, to make another bundle of the same version), and
-# signed ad hoc, as a pull request signs it.
+# st_fake_app DIR V [WORD [PROFILE]]: a real Syndeo.app V in DIR/app,
+# assembled by ci/package-macos-app.sh from two small compiled programs that
+# say their names and V (and WORD, to make another bundle of the same
+# version), and signed ad hoc, as a pull request signs it; with PROFILE, a
+# release's, that provisioning profile in it.
 st_fake_app() {
-  local dir="$1" v="$2" word="${3:-}" n
+  local dir="$1" v="$2" word="${3:-}" profile="${4:-}" n
   mkdir -p "$dir/bins" "$dir/app"
   for n in syndeo-app syndeo-proxy; do
     cc -DNAME="\"$n\"" -DVERSION="\"$v\"" -DWORD="\"$word\"" -o "$dir/bins/$n" "$T/stub.c" || return 1
   done
-  bash "$assembler" "$v" "$dir/bins" "$dir/app" >/dev/null || return 1
+  if [ -n "$profile" ]; then
+    bash "$assembler" "$v" "$dir/bins" "$dir/app" --profile "$profile" >/dev/null || return 1
+  else
+    bash "$assembler" "$v" "$dir/bins" "$dir/app" >/dev/null || return 1
+  fi
   codesign --force --sign - --options runtime "$dir/app/Syndeo.app" >/dev/null 2>&1 || return 1
   codesign --verify --strict --deep "$dir/app/Syndeo.app" >/dev/null 2>&1
 }
@@ -2227,6 +2297,20 @@ st_inspect() {
   st_signed "$pkg" "$app"
 }
 
+# st_release_pkg DIR PROFILE: a release's stand-in package of Syndeo.app at
+# the version in ci/macos-app/profile-since, its bundle holding PROFILE,
+# built as a release builds it (SYNDEO_EXPECT_SIGNED=yes). Sets RPKG, RAPP.
+st_release_pkg() {
+  local dir="$1" profile="$2" since
+  since="$(cat "$here/macos-app/profile-since")"
+  RPKG='' RAPP=''
+  mkdir -p "$dir/out"
+  st_fake_app "$dir" "$since" '' "$profile" || return 1
+  RAPP="$dir/app/Syndeo.app"
+  SOURCE_DATE_EPOCH=1 SYNDEO_EXPECT_SIGNED=yes "$builder" "$since" "$RAPP" "$dir/out" >"$dir/build.log" 2>&1 || return 1
+  RPKG="$dir/out/Syndeo-$since.pkg"
+}
+
 # st_signed PKG APP: inspect's judgement of a signed release, with stand-ins
 # for codesign, pkgutil --check-signature, xcrun stapler and spctl that
 # report what a signed, notarized and stapled package and bundle would, each
@@ -2257,7 +2341,19 @@ case "$1" in
       echo "TeamIdentifier=$team"
     } >&2 ;;
   -d)
-    # No entitlements, unless STANDIN_ENTITLED names this executable: then the
+    # The certificate the code is signed with: STANDIN_SIGNER.
+    case "$2" in --extract-certificates=*) cp "$STANDIN_SIGNER" "${2#*=}0"; exit 0 ;; esac
+    # Syndeo.app claims its three, as a release signs it, unless
+    # STANDIN_APP_ENTITLEMENTS is none, or the entitlements it claims instead.
+    if [ "$n" = Syndeo.app ]; then
+      case "${STANDIN_APP_ENTITLEMENTS:-three}" in
+        three) python3 -I "$STANDIN_PROFILE_PY" entitlements "$team" ;;
+        none) ;;
+        *) printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>%s</dict></plist>\n' "$STANDIN_APP_ENTITLEMENTS" ;;
+      esac
+      exit 0
+    fi
+    # Nothing else claims any, unless STANDIN_ENTITLED names it: then the
     # keychain access group the keystore used to claim, or STANDIN_ENTITLEMENT.
     [ "$n" = "${STANDIN_ENTITLED:-}" ] || exit 0
     printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>%s</dict></plist>\n' \
@@ -2310,15 +2406,37 @@ fi
 EOF
   chmod 755 "$bin"/*
 
-  # signed_case LABEL FAILS TEXT [NAME=VALUE...]: inspect, expecting a signed
-  # release of AB12CD34EF, fails exactly FAILS checks, one of them saying TEXT
-  # (with FAILS 0, it passes).
+  # The signing certificate, and stand-in profiles listing it (or another),
+  # forged with openssl (ci/macos-app/profile.py forge).
+  if ! command -v openssl >/dev/null 2>&1 || ! openssl cms -help >/dev/null 2>&1; then
+    expect "signed inspect (needs openssl cms, to forge stand-in provisioning profiles)" false
+    return 0
+  fi
+  local since forge="python3 -I $here/macos-app/profile.py forge" n
+  since="$(cat "$here/macos-app/profile-since")"
+  for n in signer other; do
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+      -subj "/CN=Developer ID Application: Example Org (AB12CD34EF)" -keyout "$T/$n.key" -out "$T/$n.pem" >/dev/null 2>&1
+    openssl x509 -in "$T/$n.pem" -outform DER -out "$T/$n.der"
+  done
+  $forge "$T/profile" AB12CD34EF --certificate "$T/signer.der"
+  $forge "$T/profile-expired" AB12CD34EF --certificate "$T/signer.der" --expired
+  $forge "$T/profile-no-passkeys" AB12CD34EF --certificate "$T/signer.der" --without-passkeys
+  local rpkg rapp
+  st_release_pkg "$T/release-app" "$T/profile" || { expect "a release's stand-in package of $since, with its profile, built" false; return 0; }
+  rpkg="$RPKG" rapp="$RAPP"
+
+  # signed_case LABEL FAILS TEXT [NAME=VALUE...]: inspect of a release's
+  # stand-in package of the profile-since version, expecting a signed release
+  # of AB12CD34EF, fails exactly FAILS checks, one of them saying TEXT (with
+  # FAILS 0, it passes). SIGNED_PKG and SIGNED_APP name another package.
   signed_case() {
     local label="$1" fails="$2" text="$3"
     shift 3
     rm -rf "$T/marks" && mkdir -p "$T/marks"
-    out="$(env "$@" PATH="$T/fast:$bin:$PATH" STANDIN_MARKS="$T/marks" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF \
-      bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --app "$app" 2>&1)"
+    out="$(env STANDIN_SIGNER="$T/signer.der" STANDIN_PROFILE_PY="$here/macos-app/profile.py" "$@" \
+      PATH="$T/fast:$bin:$PATH" STANDIN_MARKS="$T/marks" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF \
+      bash "$here/verify-pkg.sh" inspect "${SIGNED_PKG:-$rpkg}" "$since" --app "${SIGNED_APP:-$rapp}" 2>&1)"
     if [ "$fails" = 0 ]; then
       expect "signed inspect: $label" eval "printf '%s' \"\$out\" | grep -q '[1-9][0-9]* passed, 0 failed'"
     else
@@ -2327,13 +2445,23 @@ EOF
     printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
   }
   printf '\n  this script: inspect, of a signed release, against stand-ins for the signing tools\n'
-  signed_case "Developer ID throughout, no entitlements, notarized and stapled: passes" 0 ""
+  signed_case "Developer ID throughout, the bundle with exactly its three entitlements and a profile authorizing them, the helper none, notarized and stapled: passes" 0 ""
   signed_case "the bundle of another team, and so Gatekeeper's origin" 2 "Syndeo.app — signed by 'Developer ID Application: Example Org (ZZ99ZZ99ZZ)'; TeamIdentifier 'ZZ99ZZ99ZZ';" STANDIN_OTHER_TEAM=Syndeo.app
   signed_case "the helper of another team" 1 "syndeo-proxy, the helper — signed by 'Developer ID Application: Example Org (ZZ99ZZ99ZZ)'" STANDIN_OTHER_TEAM=syndeo-proxy
   signed_case "a bundle that does not verify" 2 "Syndeo.app — does not verify;" STANDIN_UNVERIFIED=Syndeo.app
   signed_case "the bundle without the hardened runtime" 1 "Syndeo.app — no hardened runtime;" STANDIN_NO_RUNTIME=Syndeo.app
   signed_case "the helper without a secure timestamp" 1 "syndeo-proxy, the helper — no secure timestamp;" STANDIN_NO_TIMESTAMP=syndeo-proxy
-  signed_case "the bundle with an entitlement" 1 "Syndeo.app — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=Syndeo.app "STANDIN_ENTITLEMENT=<key>com.apple.security.cs.disable-library-validation</key><true/>"
+  signed_case "the bundle with another entitlement" 1 "Syndeo.app — its entitlements are not exactly Apple's browser passkey entitlement, its App ID and team;" "STANDIN_APP_ENTITLEMENTS=<key>com.apple.security.cs.disable-library-validation</key><true/>"
+  signed_case "the bundle with no entitlement" 1 "Syndeo.app — its entitlements are not exactly" STANDIN_APP_ENTITLEMENTS=none
+  signed_case "the bundle with the passkey entitlement alone" 1 "Syndeo.app — its entitlements are not exactly" "STANDIN_APP_ENTITLEMENTS=<key>com.apple.developer.web-browser.public-key-credential</key><true/>"
+  signed_case "the bundle signed with a certificate its profile does not list" 1 "Syndeo.app's provisioning profile — the provisioning profile: it does not list the certificate Syndeo.app is signed with" STANDIN_SIGNER="$T/other.der"
+  st_release_pkg "$T/release-app-expired" "$T/profile-expired" && SIGNED_PKG="$RPKG" SIGNED_APP="$RAPP" \
+    signed_case "a bundle whose profile has expired" 1 "Syndeo.app's provisioning profile — the provisioning profile: it expired"
+  st_release_pkg "$T/release-app-no-passkeys" "$T/profile-no-passkeys" && SIGNED_PKG="$RPKG" SIGNED_APP="$RAPP" \
+    signed_case "a bundle whose profile does not authorize the passkey entitlement" 1 "it does not authorize com.apple.developer.web-browser.public-key-credential"
+  out="$(env PATH="$T/fast:$bin:$PATH" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF STANDIN_SIGNER="$T/signer.der" \
+    STANDIN_PROFILE_PY="$here/macos-app/profile.py" bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --app "$app" 2>&1)"
+  expect "signed inspect: a pull request's package, as a release's, fails: its scripts know no profile version" eval "printf '%s' \"\$out\" | grep -q ' passed, [1-9][0-9]* failed' && printf '%s' \"\$out\" | grep FAIL | grep -q 'preinstall — differs from the template'"
   signed_case "the helper with the keychain access group" 1 "syndeo-proxy, the helper — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=syndeo-proxy
   signed_case "the bundle signed as another identifier" 1 "Syndeo.app — signed as 'com.example.other', not com.sum.syndeo;" STANDIN_APP_IDENTIFIER=com.example.other
   signed_case "the bundle's ticket not stapled" 1 "Syndeo.app's notarization ticket — stapler validate fails, in every attempt" STANDIN_APP_STAPLED=no
@@ -2393,40 +2521,49 @@ EOF
   out="$(PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.2 2>&1)" && status=0 || status=$?
   expect "signed-binaries: a tarball of another version, refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'is not syndeo-0.0.2-aarch64-apple-darwin.tar.gz'"
 
-  # The stand-in tarball's own syndeo-proxy, as the helper of a bundle whose
+  # A stand-in tarball of the profile-since version, whose own syndeo-proxy is
+  # the helper of a release's bundle of that version, with its profile, whose
   # signature's paths the stand-in codesign answers for.
-  local sa="$d/signed-app"
+  local sa="$d/signed-app" rtgz
+  st_tarball "$d/rel" "$since"
+  rtgz="$d/rel/syndeo-$since-aarch64-apple-darwin.tar.gz"
   mkdir -p "$sa/bins" "$sa/out"
-  cp "$d/src/syndeo-0.0.1-aarch64-apple-darwin/syndeo-proxy" "$sa/bins/syndeo-proxy"
+  cp "$d/rel/src/syndeo-$since-aarch64-apple-darwin/syndeo-proxy" "$sa/bins/syndeo-proxy"
   printf '#!/bin/sh\n' >"$sa/bins/syndeo-app"
-  bash "$assembler" 0.0.1 "$sa/bins" "$sa/out" >/dev/null
+  bash "$assembler" "$since" "$sa/bins" "$sa/out" --profile "$T/profile" >/dev/null
   mkdir -m 755 "$sa/out/Syndeo.app/Contents/_CodeSignature"
   printf 'seal' >"$sa/out/Syndeo.app/Contents/_CodeSignature/CodeResources"
   chmod 644 "$sa/out/Syndeo.app/Contents/_CodeSignature/CodeResources"
   app_case() {
     local label="$1" fails="$2" text="$3" a="$4"
     shift 4
-    out="$(env "$@" PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF \
-      bash "$here/verify-pkg.sh" signed-app "$a" 0.0.1 --tarball "$tgz" 2>&1)"
+    out="$(env STANDIN_SIGNER="$T/signer.der" STANDIN_PROFILE_PY="$here/macos-app/profile.py" "$@" \
+      PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF \
+      bash "$here/verify-pkg.sh" signed-app "$a" "$since" --tarball "$rtgz" 2>&1)"
     if [ "$fails" = 0 ]; then
-      expect "signed-app: $label" eval "printf '%s' \"\$out\" | grep -q '5 passed, 0 failed'"
+      expect "signed-app: $label" eval "printf '%s' \"\$out\" | grep -q '6 passed, 0 failed'"
     else
       expect "signed-app: $label" eval "printf '%s' \"\$out\" | grep -q ' passed, $fails failed' && printf '%s' \"\$out\" | grep 'FAIL' | grep -qF -- \"\$text\""
     fi
     printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
   }
   printf '\n  this script: signed-app, the bundle before notarization\n'
-  app_case "the bundle and its helper Developer ID of the team, the helper the tarball's: passes" 0 "" "$sa/out/Syndeo.app"
+  app_case "the bundle and its helper Developer ID of the team, the bundle with its three entitlements and its profile, the helper the tarball's: passes" 0 "" "$sa/out/Syndeo.app"
+  app_case "the bundle without its three entitlements" 1 "Syndeo.app — its entitlements are not exactly" "$sa/out/Syndeo.app" STANDIN_APP_ENTITLEMENTS=none
+  app_case "the bundle signed with a certificate its profile does not list" 1 "does not list the certificate Syndeo.app is signed with" "$sa/out/Syndeo.app" STANDIN_SIGNER="$T/other.der"
+  cp -R "$sa/out" "$sa/unprofiled"
+  rm "$sa/unprofiled/Syndeo.app/Contents/embedded.provisionprofile"
+  app_case "the bundle without its profile" 2 "Syndeo.app's provisioning profile — there is none" "$sa/unprofiled/Syndeo.app"
   app_case "the bundle of another team" 1 "Syndeo.app — signed by 'Developer ID Application: Example Org (ZZ99ZZ99ZZ)'" "$sa/out/Syndeo.app" STANDIN_OTHER_TEAM=Syndeo.app
   app_case "the helper without the hardened runtime" 1 "syndeo-proxy, the helper — no hardened runtime;" "$sa/out/Syndeo.app" STANDIN_NO_RUNTIME=syndeo-proxy
   app_case "the helper killed at launch" 1 "helper — --version: killed by signal 9 at launch" "$sa/out/Syndeo.app" STANDIN_KILLED=syndeo-proxy
   cp -R "$sa/out" "$sa/other"
-  printf '#!/bin/sh\necho "syndeo-proxy 0.0.1"\n' >"$sa/other/Syndeo.app/Contents/Helpers/syndeo-proxy"
+  printf '#!/bin/sh\necho "syndeo-proxy %s"\n' "$since" >"$sa/other/Syndeo.app/Contents/Helpers/syndeo-proxy"
   app_case "a helper that is not the tarball's" 1 "helper — differs from the tarball's syndeo-proxy" "$sa/other/Syndeo.app"
   rm -rf "$sa/other/Syndeo.app/Contents/_CodeSignature"
   cp "$sa/out/Syndeo.app/Contents/Helpers/syndeo-proxy" "$sa/other/Syndeo.app/Contents/Helpers/syndeo-proxy"
   app_case "a bundle without its signature's paths" 1 "bundle — " "$sa/other/Syndeo.app"
-  out="$(env -u MACOS_TEAM_ID SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" signed-app "$sa/out/Syndeo.app" 0.0.1 --tarball "$tgz" 2>&1)" && status=0 || status=$?
+  out="$(env -u MACOS_TEAM_ID SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" signed-app "$sa/out/Syndeo.app" "$since" --tarball "$rtgz" 2>&1)" && status=0 || status=$?
   expect "signed-app: without MACOS_TEAM_ID, refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs MACOS_TEAM_ID'"
 
   out="$(PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=no bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --app "$app" 2>&1)"
@@ -2486,6 +2623,7 @@ self_test() {
     st_preinstall
     st_postinstall
     st_uninstall
+    st_release_line
     st_installed_mode
     st_location
     st_decisions
@@ -2495,6 +2633,38 @@ self_test() {
   fi
   printf '\n  %d cases, %d wrong\n\n' "$cases" "$wrong"
   [ "$wrong" -eq 0 ]
+}
+
+# st_release_line: a release's package scripts, which know that a release's
+# bundle holds its provisioning profile from ST_SINCE on, here 0.0.2: an
+# older release's bundle, from before, is still exactly as its package left
+# it, and is upgraded; a bundle of that version or later has to hold it, and
+# one from before may not; and the uninstaller removes it with the rest.
+st_release_line() {
+  local p='refusing:' u
+  ST_SINCE=0.0.2
+  printf '\n  a release'"'"'s scripts: the provisioning profile from %s on\n' "$ST_SINCE"
+  st_new; st_app_installed 0.0.1; pre_case "upgrade 0.0.1, from before the profile, to 0.0.2" 0 "upgrading from 0.0.1 to 0.0.2" 0.0.2
+  expect "  ... 0.0.1's bundle has no profile" test ! -e "$A/Contents/embedded.provisionprofile"
+  st_new; st_app_installed 0.0.1 yes; pre_case "  ... stapled" 0 "upgrading from 0.0.1 to 0.0.2" 0.0.2
+  st_new; st_app_installed 0.0.2; pre_case "the same version again, with its profile" 0 "reinstalling 0.0.2" 0.0.2
+  st_new; st_app_installed 0.0.2; pre_case "upgrade 0.0.2 to 0.0.3, both with the profile" 0 "upgrading from 0.0.2 to 0.0.3" 0.0.3
+  st_new; st_app_installed 0.0.2; rm "$A/Contents/embedded.provisionprofile"; st_sign
+  pre_case "refused: 0.0.2's bundle without its profile" 1 "$A/Contents/embedded.provisionprofile: is missing" 0.0.3
+  st_new; st_app_installed 0.0.1; printf 'profile' >"$A/Contents/embedded.provisionprofile"; chmod 644 "$A/Contents/embedded.provisionprofile"; st_sign
+  pre_case "refused: 0.0.1's bundle with a profile no bundle of 0.0.1 had" 1 "$A/Contents/embedded.provisionprofile: is not part of Syndeo.app" 0.0.2
+  st_new; st_app_installed 0.0.2; ST_SINCE=0.0.3 st_app_receipt 0.0.2
+  pre_case "refused: 0.0.2's receipt not listing its profile" 1 "does not list exactly Syndeo.app's paths" 0.0.3
+  st_new; st_app 0.0.2; post_case "postinstall: 0.0.2, with its profile" 0 "Syndeo.app 0.0.2 is installed in $R/Applications" 0.0.2
+  st_new; st_app 0.0.2; rm "$A/Contents/embedded.provisionprofile"; st_sign
+  post_case "postinstall refused: 0.0.2 without its profile" 1 "$A/Contents/embedded.provisionprofile: is missing" 0.0.2
+  st_new; st_app_installed 0.0.2
+  u="$A/Contents/Resources/uninstall.sh"
+  un_case "0.0.2, its profile and everything else, from inside the bundle" 0 "removed Syndeo.app 0.0.2" "$u"
+  expect "  ... the bundle gone, the receipt forgotten" eval "! [ -e '$A' ] && ! [ -f '$DB/com.sum.syndeo.app.info' ]"
+  ST_SINCE=''
+  st_new; st_app_installed 0.0.2; printf 'profile' >"$A/Contents/embedded.provisionprofile"; chmod 644 "$A/Contents/embedded.provisionprofile"; st_sign
+  pre_case "a pull request's package: refused, a bundle with a profile" 1 "$A/Contents/embedded.provisionprofile: is not part of Syndeo.app" 0.0.3
 }
 
 # st_release: the release's assets and notes, as release.yml checks them,

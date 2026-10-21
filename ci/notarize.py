@@ -31,9 +31,10 @@ Every outcome is written to DIR/result.json. Nothing in DIR holds a secret.
 
 `binaries-zip` writes the ZIP Apple is sent for the release's binaries:
 exactly the seven executables of TARBALL (syndeo-VERSION-aarch64-apple-
-darwin.tar.gz) and APP, Syndeo.app VERSION, signed, as
-ci/package-macos-app.sh --check finds it, and nothing else, made with ditto,
-as Apple's notary expects. The bundle goes in whole, its signature as it is,
+darwin.tar.gz) and APP, Syndeo.app VERSION, signed, a release's, as
+ci/package-macos-app.sh --check finds it (with its provisioning profile,
+from the version in ci/macos-app/profile-since on), and nothing else, made
+with ditto, as Apple's notary expects. The bundle goes in whole, its signature as it is,
 so that the ticket Apple issues for it staples to the same bytes.
 
 The credentials come from MACOS_NOTARY_KEY_BASE64, MACOS_NOTARY_KEY_ID and
@@ -248,10 +249,14 @@ def wait(record, deadline_s, interval_s):
             time.sleep(max(0.0, min(interval_s, (deadline - now()).total_seconds())))
 
 
-def bundle_files(state):
-    """The files of Syndeo.app, signed or stapled, as the ZIP lists them."""
+def bundle_files(state, version):
+    """The files of a release's Syndeo.app VERSION, signed or stapled, as the
+    ZIP lists them."""
     here = os.path.dirname(os.path.abspath(__file__))
-    listed = subprocess.run(["bash", os.path.join(here, "package-macos-app.sh"), "--manifest", state],
+    app_tool = os.path.join(here, "package-macos-app.sh")
+    profiled = subprocess.run(["bash", app_tool, "--profiled", version],
+                              capture_output=True, text=True, check=True).stdout.strip() == "yes"
+    listed = subprocess.run(["bash", app_tool, "--manifest", state] + (["profiled"] if profiled else []),
                             capture_output=True, text=True, check=True).stdout.splitlines()
     return ["notarize/Syndeo.app/" + line.split()[0] for line in listed if line.split()[1] == "f"]
 
@@ -265,10 +270,10 @@ def binaries_zip(tarball, version, app, out):
         raise SystemExit("notarize: %s is not a Syndeo.app" % app)
     if os.path.exists(out):
         raise SystemExit("notarize: %s exists" % out)
-    checked = subprocess.run(["bash", os.path.join(here, "package-macos-app.sh"), "--check", app, version, "signed"],
+    checked = subprocess.run(["bash", os.path.join(here, "package-macos-app.sh"), "--check", app, version, "signed", "release"],
                              capture_output=True, text=True)
     if checked.returncode != 0:
-        raise SystemExit("notarize: %s is not exactly Syndeo.app %s, signed:\n%s" % (app, version, checked.stdout + checked.stderr))
+        raise SystemExit("notarize: %s is not exactly a release's Syndeo.app %s, signed:\n%s" % (app, version, checked.stdout + checked.stderr))
     work = tempfile.mkdtemp(prefix="binaries.")
     try:
         stage = os.path.join(work, "notarize")
@@ -288,7 +293,7 @@ def binaries_zip(tarball, version, app, out):
         subprocess.run(["/usr/bin/ditto", "-c", "-k", "--keepParent", stage, out], check=True)
         listed = subprocess.run(["/usr/bin/zipinfo", "-1", out], capture_output=True, text=True, check=True).stdout.splitlines()
         files = sorted(x for x in listed if not x.endswith("/"))
-        want = sorted(["notarize/" + n for n in NAMES] + bundle_files("signed"))
+        want = sorted(["notarize/" + n for n in NAMES] + bundle_files("signed", version))
         if files != want:
             os.remove(out)
             raise SystemExit("notarize: the ZIP holds %s, not exactly the seven executables and Syndeo.app" % files)
@@ -527,15 +532,21 @@ def self_test():
 
         here = os.path.dirname(os.path.abspath(__file__))
 
-        def bundle(version="0.9.1", extra=None):
-            """Syndeo.app VERSION as ci/package-macos-app.sh assembles it, with
-            its signature's two paths: what --check calls signed."""
+        def bundle(version="0.9.1", extra=None, release=True):
+            """A release's Syndeo.app VERSION as ci/package-macos-app.sh
+            assembles it, with a stand-in provisioning profile, and its
+            signature's two paths: what --check calls signed, a release's; or,
+            without release, a pull request's."""
             d = tempfile.mkdtemp(dir=root)
             os.mkdir(os.path.join(d, "bins"))
             for n in ("syndeo-app", "syndeo-proxy"):
                 with open(os.path.join(d, "bins", n), "w") as f:
                     f.write("#!/bin/sh\n")
-            subprocess.run(["bash", os.path.join(here, "package-macos-app.sh"), version, os.path.join(d, "bins"), d],
+            profile = os.path.join(d, "stand-in.provisionprofile")
+            with open(profile, "w") as f:
+                f.write("a stand-in profile")
+            subprocess.run(["bash", os.path.join(here, "package-macos-app.sh"), version, os.path.join(d, "bins"), d]
+                           + (["--profile", profile] if release else []),
                            check=True, capture_output=True)
             app = os.path.join(d, "Syndeo.app")
             os.mkdir(os.path.join(app, "Contents", "_CodeSignature"), 0o755)
@@ -573,16 +584,24 @@ def self_test():
             else:
                 print("  ok    %s" % label)
         zip_case("exactly the seven executables, nothing else from the tarball, and Syndeo.app whole", tarball(list(NAMES)), 0,
-                 "exactly the seven executables", sorted(["notarize/" + n for n in NAMES] + bundle_files("signed")))
+                 "exactly the seven executables", sorted(["notarize/" + n for n in NAMES] + bundle_files("signed", "0.9.1")))
         zip_case("a tarball missing syndeo-webkit: refused, no ZIP", tarball(NAMES[:-1]), 1, "no regular file syndeo-webkit")
         zip_case("a tarball of another version: refused, no ZIP", tarball(list(NAMES), "0.9.2"), 1, "is not syndeo-0.9.1")
-        zip_case("Syndeo.app of another version: refused, no ZIP", tarball(list(NAMES)), 1, "is not exactly Syndeo.app 0.9.1",
+        zip_case("Syndeo.app of another version: refused, no ZIP", tarball(list(NAMES)), 1, "is not exactly a release's Syndeo.app 0.9.1",
                  app=bundle("0.9.2"))
-        zip_case("Syndeo.app with a file more: refused, no ZIP", tarball(list(NAMES)), 1, "is not exactly Syndeo.app 0.9.1",
+        zip_case("Syndeo.app with a file more: refused, no ZIP", tarball(list(NAMES)), 1, "is not exactly a release's Syndeo.app 0.9.1",
                  app=bundle(extra="extra"))
         unsigned = bundle()
         shutil.rmtree(os.path.join(unsigned, "Contents", "_CodeSignature"))
-        zip_case("Syndeo.app unsigned: refused, no ZIP", tarball(list(NAMES)), 1, "is not exactly Syndeo.app 0.9.1", app=unsigned)
+        zip_case("Syndeo.app unsigned: refused, no ZIP", tarball(list(NAMES)), 1, "is not exactly a release's Syndeo.app 0.9.1", app=unsigned)
+        zip_case("a pull request's Syndeo.app, with no profile: refused, no ZIP", tarball(list(NAMES)), 1,
+                 "is not exactly a release's Syndeo.app 0.9.1", app=bundle(release=False))
+        cases += 1
+        if "notarize/Syndeo.app/Contents/embedded.provisionprofile" in bundle_files("signed", "0.9.1"):
+            print("  ok    %s" % "  ... and a release's bundle goes to Apple with its provisioning profile")
+        else:
+            wrong += 1
+            print("  WRONG %s" % "  ... and a release's bundle goes to Apple with its provisioning profile")
 
     shutil.rmtree(root, ignore_errors=True)
     print("\n  %d cases, %d wrong\n" % (cases, wrong))

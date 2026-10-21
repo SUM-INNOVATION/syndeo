@@ -551,18 +551,25 @@ payload_app() {
 # standin V: a package of Syndeo.app V, made from the real package's own
 # bundle: its versions changed, its uninstaller rendered for V, the stapled
 # ticket dropped, the helper and then the bundle signed again ad hoc, and
-# built by the real builder.
+# built by the real builder. In a release's run (SYNDEO_EXPECT_SIGNED yes),
+# its uninstaller knows the version in ci/macos-app/profile-since, and it
+# keeps the real bundle's provisioning profile only if V is that version or
+# later, as a release's bundle of V would; ad hoc, it claims no entitlement.
 standin() {
-  local v="$1" dir app
+  local v="$1" dir app since=''
   dir="$(ST)/standins/$v"
   app="$dir/app/Syndeo.app"
   mkdir -p "$dir/app"
   ditto "$(ST)/real-payload/Syndeo.pkg/Payload/Syndeo.app" "$app" || return 1
   rm -f "$app/Contents/CodeResources"
+  if [ "${SYNDEO_EXPECT_SIGNED:-no}" = yes ]; then
+    since="$(cat "$here/macos-app/profile-since")"
+    [ "$(bash "$here/package-macos-app.sh" --profiled "$v")" = yes ] || rm -f "$app/Contents/embedded.provisionprofile"
+  fi
   plutil -replace CFBundleShortVersionString -string "$v" "$app/Contents/Info.plist" &&
     plutil -replace CFBundleVersion -string "$v" "$app/Contents/Info.plist" || return 1
   bash "$here/package-macos-pkg.sh" --render uninstall "$v" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign \
-    "$app/Contents/Resources/uninstall.sh" || return 1
+    "$app/Contents/Resources/uninstall.sh" "$since" || return 1
   codesign --force --sign - --options runtime "$app/Contents/Helpers/syndeo-proxy" >/dev/null 2>&1 &&
     codesign --force --sign - --options runtime "$app" >/dev/null 2>&1 || return 1
   SOURCE_DATE_EPOCH="$(date +%s)" bash "$here/package-macos-pkg.sh" "$v" "$app" "$dir" >"$dir/build.log" 2>&1 ||
@@ -1088,7 +1095,9 @@ fi
 exec /usr/sbin/pkgutil "\$@"
 EOF
   as_root chown -R root:wheel "$fake" && as_root chmod 755 "$fake" "$fake/pkgutil" || fail "making the stand-in pkgutil"
-  bash "$here/package-macos-pkg.sh" --render uninstall "$v" '' 0 0 "$fake/pkgutil" /usr/bin/codesign "$(ST)/uninstall-forget-fails" ||
+  # A release's knows from which version a bundle holds its profile.
+  bash "$here/package-macos-pkg.sh" --render uninstall "$v" '' 0 0 "$fake/pkgutil" /usr/bin/codesign "$(ST)/uninstall-forget-fails" \
+    "$([ "${SYNDEO_EXPECT_SIGNED:-no}" = yes ] && cat "$here/macos-app/profile-since")" ||
     fail "rendering the uninstaller with the stand-in"
   ls_unregister "$APP"
   out="$(sudo -n /bin/sh "$(ST)/uninstall-forget-fails" 2>&1)" && status=0 || status=$?

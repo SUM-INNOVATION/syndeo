@@ -71,6 +71,15 @@ Loading (⌘.); History has Back (⌘[) and Forward (⌘]). Tabs are the ones
 macOS draws. Closing the last window leaves Syndeo running, as Mac
 applications do, until you quit it (⌘Q).
 
+Syndeo is a web browser to macOS: it can be chosen as the default web
+browser (System Settings > Desktop & Dock), and another application can ask
+it to open a web address — a link clicked in Mail, or
+`open -a Syndeo https://example.com/`. Each address opens in a new tab,
+reached exactly as a typed one is. Only `http://` and `https://` addresses
+open; anything else another application asks for, a file included, is
+refused in a tab of its own with the words typing it gets, and is never
+searched for. Its log names each such address by its scheme alone.
+
 ### How each page is reached
 
 **Not every request goes through Syndeo.** The bar above each page says how
@@ -163,6 +172,27 @@ Syndeo.app has no keystore, holds no keys or identities, and signs nothing.
 It never starts the keystore, makes no keychain entry for one, asks for no
 passphrase and makes no recovery phrase. Keys, identities and signing are
 the command-line tools' (see [Keys](#keys)).
+
+### Passkeys and passwords
+
+Signing in with a passkey works in a signed release of Syndeo.app from the
+version in `ci/macos-app/profile-since` on. It fills in no passwords.
+
+- **Passkeys.** WebKit hands a page's passkey request to macOS, which
+  answers it, for any site, only from a browser that holds Apple's managed
+  entitlement `com.apple.developer.web-browser.public-key-credential`, with a
+  provisioning profile for it. A signed release holds both, and macOS shows
+  its own sheet for each request: passkeys from iCloud Keychain, from
+  another credential manager you have turned on, or a security key. A build
+  without them, an earlier release or one built from source, has neither,
+  so a page's request fails there, as it does in any application that
+  embeds a web view, and a site offers its other ways to sign in. At launch,
+  Syndeo.app says in its log which applies to the copy running, and asks
+  nothing of anyone.
+- **Passwords.** Syndeo.app keeps no passwords of its own. Apple documents
+  no way for a browser other than Safari to fill passwords into web pages
+  from the Passwords app, other than its own browser extension, which
+  Syndeo.app cannot load.
 
 ### Removing it
 
@@ -274,9 +304,15 @@ separate, and removing the application touches neither.
   ```
 - **Signing.**
   - In a signed release, Syndeo.app and its helper are signed with a
-    Developer ID Application identity, with the hardened runtime and no
-    entitlements, and notarized with the command-line binaries, the ticket
-    stapled. The package is signed with a Developer ID Installer identity,
+    Developer ID Application identity, with the hardened runtime, and
+    notarized with the command-line binaries, the ticket stapled. The helper
+    claims no entitlement. From the version in `ci/macos-app/profile-since`
+    on, Syndeo.app itself claims exactly three: Apple's browser passkey
+    entitlement, `com.apple.developer.web-browser.public-key-credential`, and
+    the App ID and team that tie it to the Developer ID provisioning profile
+    in `Contents/embedded.provisionprofile`, which authorizes it. An older
+    release's bundle, from before that version, holds no profile, and the
+    package still upgrades it. The package is signed with a Developer ID Installer identity,
     notarized, and its ticket stapled. Gatekeeper has to accept both.
   - An unsigned build's application is signed ad hoc, and its package not at
     all. Downloaded in a browser, Gatekeeper rejects both.
@@ -1034,7 +1070,8 @@ package.
   `release-macos` environment holds `SYNDEO_EXPECT_SIGNED` and any signing
   secrets. Four jobs declare it, and each is given only its own share:
   - `signing-config` decides;
-  - `build-macos` gets the Application certificate;
+  - `build-macos` gets the Application certificate, and Syndeo.app's
+    provisioning profile;
   - `notarize-binaries` gets the notary key;
   - `package` gets the Installer certificate and the notary key.
 
@@ -1043,14 +1080,20 @@ package.
   release run waits for no one.
 - **Signing is all or nothing.**
   [`ci/check-signing-config.sh`](ci/check-signing-config.sh) reads the
-  environment's `SYNDEO_EXPECT_SIGNED` and the ten secrets it names, and
-  refuses any half-configured state.
+  environment's `SYNDEO_EXPECT_SIGNED` and the eleven secrets it names, and
+  refuses any half-configured state. The eleventh,
+  `SYNDEO_PROVISIONING_PROFILE_B64`, is Syndeo.app's Developer ID
+  provisioning profile, base64: it has to be for the team's
+  `com.sum.syndeo`, authorize the browser passkey entitlement, and not have
+  expired (`ci/macos-app/profile.py`).
   - Signed, the macOS release goes through three jobs, in order:
-    1. `build-macos` signs the binaries with `ci/sign-macos.sh` (Developer ID
-       Application, the hardened runtime and a secure timestamp, and no
-       entitlements) and makes the tarball. It assembles Syndeo.app from the
-       same binaries, its helper the tarball's own `syndeo-proxy`, and signs
-       the bundle the same way. It then checks the signatures and runs every
+    1. `build-macos` checks Syndeo.app's provisioning profile, which also
+       has to list the signing certificate, then signs the binaries with
+       `ci/sign-macos.sh` (Developer ID Application, the hardened runtime and
+       a secure timestamp, and no entitlements) and makes the tarball. It
+       assembles Syndeo.app from the same binaries, its helper the tarball's
+       own `syndeo-proxy`, with the profile, and signs the bundle the same
+       way, its main executable with its three entitlements. It then checks the signatures and runs every
        binary (`ci/verify-pkg.sh signed-binaries` and `signed-app`): each
        `--version` has to exit 0 with exactly its name and version, and
        `syndeo-keystore status` has to report presence unenforced and the
@@ -1170,9 +1213,10 @@ cargo deny check licenses bans sources
 ## Known gaps
 
 Everything that is missing or deferred is filed rather than left in a comment.
-Two things are open — more platforms,
-[#17](https://github.com/SUM-INNOVATION/syndeo/issues/17), and WebRTC, below,
-[#41](https://github.com/SUM-INNOVATION/syndeo/issues/41) — and the rest of
+Three things are open — more platforms,
+[#17](https://github.com/SUM-INNOVATION/syndeo/issues/17), WebRTC, below,
+[#41](https://github.com/SUM-INNOVATION/syndeo/issues/41), and passkeys,
+[#49](https://github.com/SUM-INNOVATION/syndeo/issues/49) — and the rest of
 this is a set of honest limits rather than work waiting to be done:
 
 - `syndeo-ui` shows the headless DOM rather than a rendered page; `syndeo-servo`
@@ -1211,6 +1255,9 @@ this is a set of honest limits rather than work waiting to be done:
 - The proxy's cache is not partitioned by site, in Syndeo.app or behind
   `syndeo-webkit`, and Syndeo.app has one browsing profile for every site.
 - Syndeo.app has no keystore: no keys, identities or signing.
+- Passkeys do not work in Syndeo.app until it holds Apple's browser passkey
+  entitlement, and it fills in no passwords
+  ([#49](https://github.com/SUM-INNOVATION/syndeo/issues/49)).
 - A plain `syndeo-proxy run` asks for no credential; only the proxy
   Syndeo.app or `syndeo-webkit` starts does. Neither limits how many
   connections it accepts.
