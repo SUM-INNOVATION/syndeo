@@ -457,9 +457,10 @@ jobs:
       # github.com in WebKit by itself and through this tree's proxy, as
       # Syndeo.app runs it, cold and warm, interleaved run by run: first
       # contentful paint, load, the protocols WebKit used and the tunnels it
-      # opened (ci/test-pageload.sh). Measured, not gated, except that every
-      # load has to finish. Kept in pageload/ in the logs.
-      - name: Page load, directly and through Syndeo's proxy (measured, not a gate)
+      # opened (ci/test-pageload.sh). The times are measured, not gated; every
+      # load has to finish, and WebKit has to speak HTTP/2 through the proxy.
+      # Kept in pageload/ in the logs.
+      - name: Page load, directly and through Syndeo's proxy (times measured, not gated)
         if: always()
         run: bash ci/test-pageload.sh "$PWD/dist/Syndeo.app/Contents/Helpers/syndeo-proxy" https://github.com/ 5
 

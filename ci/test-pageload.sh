@@ -18,7 +18,9 @@
 # WebKit opened to each host. Every load's record is kept in pageload/ in the
 # logs.
 #
-# Measured, and gated only on what WebKit is shown: every load has to finish.
+# Measured, and gated only on what WebKit is shown: every load has to
+# finish, and through the proxy, WebKit has to speak HTTP/2 to it for the
+# cold loads, as it does to the page's own servers.
 # It opens windows, so like ci/test-app.sh it refuses unless
 # SYNDEO_ALLOW_APP_TEST=yes, which only CI's disposable runners set.
 set -uo pipefail
@@ -98,7 +100,7 @@ python3 -I - "$LOGS" <<'EOF'
 import glob, json, os, re, statistics, sys
 logs = sys.argv[1]
 failed = 0
-print("\npage load, in ms from the navigation's start (medians; measured, not gated)")
+print("\npage load, in ms from the navigation's start (medians; the times are measured, not gated)")
 print("  %-18s %-5s %4s %7s %7s %7s  %s" % ("variant", "visit", "n", "fcp", "load", "wall", "protocols"))
 for variant in ("direct", "syndeo", "syndeo-dns-system"):
     path = os.path.join(logs, variant + ".jsonl")
@@ -119,6 +121,10 @@ for variant in ("direct", "syndeo", "syndeo-dns-system"):
             if not l.get("ok"):
                 print("    FAILED  run %s: %s" % (l.get("run"), l.get("error")))
     if variant != "direct":
+        cold = [l for l in lines if l.get("visit") == "cold" and l.get("ok")]
+        if cold and not all(l.get("protocols", {}).get("h2") for l in cold):
+            failed += 1
+            print("    FAILED  WebKit did not speak HTTP/2 through the proxy on every cold load")
         tunnels = {}
         for stderr in glob.glob(os.path.join(logs, variant + "-*", "stderr")):
             for line in open(stderr, errors="replace"):
@@ -128,6 +134,6 @@ for variant in ("direct", "syndeo", "syndeo-dns-system"):
         runs = len(glob.glob(os.path.join(logs, variant + "-*")))
         top = sorted(tunnels.items(), key=lambda kv: -kv[1])[:6]
         print("  %-18s tunnels per run, by host: %s" % ("", ", ".join("%s %.1f" % (h, n / max(runs, 1)) for h, n in top) or "none logged"))
-print("\n%d loads failed" % failed)
+print("\n%d failed" % failed)
 sys.exit(1 if failed else 0)
 EOF
