@@ -1509,6 +1509,10 @@ fn land(state: &mut Teed) {
             request_time,
             &keep,
         );
+        // Let go of the cache before saying the write is over: whoever waited
+        // for it may close the cache next and open it again, and redb holds
+        // its file until the last handle on it goes.
+        drop(cache);
         drop(landed);
     };
     match tokio::runtime::Handle::try_current() {
