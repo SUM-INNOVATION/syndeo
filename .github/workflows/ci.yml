@@ -457,15 +457,20 @@ jobs:
         if: always()
         run: bash ci/test-app.sh realtime "$PWD/dist/Syndeo.app"
 
-      # github.com in WebKit by itself and through this tree's proxy, as
-      # Syndeo.app runs it, cold and warm, interleaved run by run: first
-      # contentful paint, load, the protocols WebKit used and the tunnels it
-      # opened (ci/test-pageload.sh). The times are measured, not gated; every
-      # load has to finish, and WebKit has to speak HTTP/2 through the proxy.
+      # Pages in WebKit by itself and through this tree's proxy, as Syndeo.app
+      # runs it, cold and warm, interleaved run by run: first contentful
+      # paint, load, the protocols WebKit used and the tunnels it opened
+      # (ci/test-pageload.sh). The times are measured, not gated. For
+      # www.rust-lang.org every load has to finish, and WebKit has to speak
+      # HTTP/2 through the proxy. github.com is measured only: on this
+      # runner's macOS every load of it through the proxy has failed its TLS
+      # handshake before WebKit asked anything of Syndeo (PR #56).
       # Kept in pageload/ in the logs.
       - name: Page load, directly and through Syndeo's proxy (times measured, not gated)
         if: always()
-        run: bash ci/test-pageload.sh "$PWD/dist/Syndeo.app/Contents/Helpers/syndeo-proxy" https://github.com/ 5
+        run: >-
+          bash ci/test-pageload.sh "$PWD/dist/Syndeo.app/Contents/Helpers/syndeo-proxy" 5
+          https://www.rust-lang.org/ measure-only:https://github.com/
 
       - name: What this runner allows (measured, not a gate)
         if: always()
