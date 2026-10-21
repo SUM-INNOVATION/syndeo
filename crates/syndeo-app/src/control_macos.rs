@@ -114,8 +114,12 @@ fn dispatch(job: Job) {
 
 /// Set up agents for this application: the socket, if the person turned
 /// agents on before, and otherwise nothing, with any socket a previous run
-/// left removed.
-pub fn install(mtm: MainThreadMarker, home: &Path, hooks: AppHooks) {
+/// left removed. The socket is under the person's home folder, as `HOME`
+/// says, where a client looks for it.
+pub fn install(mtm: MainThreadMarker, hooks: AppHooks) {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     let own = std::env::current_exe()
         .ok()
         .and_then(|path| path.canonicalize().ok())
@@ -124,7 +128,7 @@ pub fn install(mtm: MainThreadMarker, home: &Path, hooks: AppHooks) {
     let control = Rc::new(Control {
         mtm,
         hooks,
-        home: home.to_path_buf(),
+        home: home.clone(),
         own,
         server: RefCell::new(None),
         conns: RefCell::new(HashMap::new()),
@@ -144,7 +148,7 @@ pub fn install(mtm: MainThreadMarker, home: &Path, hooks: AppHooks) {
             tracing::error!("agents could not be allowed: {err}");
         }
     } else {
-        remove_socket(&agent::socket_path(home));
+        remove_socket(&agent::socket_path(&home));
     }
 }
 

@@ -490,7 +490,7 @@ impl AppDelegate {
                 find.load().and_then(|app| app.controller_of(window))
             }),
         };
-        control_macos::install(self.mtm(), &self.ivars().home, hooks);
+        control_macos::install(self.mtm(), hooks);
     }
 
     /// The controller of an open window.
