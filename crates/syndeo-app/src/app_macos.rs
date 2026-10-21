@@ -8,6 +8,17 @@
 //! Each window has its controller (`browser_macos`), which is let go when the
 //! window closes.
 //!
+//! **Tabs** (`tabs`, `tabs_macos`): each is a window of its own, tabbed by
+//! AppKit, placed here: a new one after the tab it came from, never among
+//! the pinned ones, which come first. ⌘1 to ⌘9 choose one; a closed tab is
+//! kept, in memory only, to open again from History, the last 25 of them;
+//! Show All Tabs is AppKit's overview; and a tab's context menu is Syndeo's.
+//! When Syndeo quits it keeps its tabs' addresses and titles, and which are
+//! pinned (the session), in its own folder: pinned tabs come back at every
+//! launch; the rest when macOS is set to keep windows when an application
+//! quits, or from History > Reopen All Windows from Last Session. Clear
+//! Browsing Data forgets the closed tabs and the session.
+//!
 //! **It fails closed.** A web view that can reach the network is made only
 //! from a [`Browsing`], and a `Browsing` exists only once all of this held at
 //! launch: the proxy this application started is listening, a web view
@@ -41,8 +52,12 @@
 //! phrase is generated.
 
 use crate::address::{self, Search};
-use crate::browser_macos::{browser_content, BrowserController, Hooks};
+use crate::browser_macos::{
+    browser_content, controller_of, BrowserController, Hooks, Place, Snapshot, Start,
+};
 use crate::settings_macos::{self, Clearing, SettingsController};
+use crate::tabs::{self, Closed, Session};
+use crate::tabs_macos;
 use anyhow::{Context, Result};
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
@@ -51,12 +66,10 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSEventModifierFlags, NSMenu, NSMenuItem, NSTextField, NSView, NSWindow, NSWindowOrderingMode,
+    NSEventModifierFlags, NSMenu, NSMenuItem, NSMenuItemValidation, NSTextField, NSView, NSWindow,
     NSWindowStyleMask,
 };
-use objc2_foundation::{
-    ns_string, NSNotification, NSPoint, NSRect, NSSize, NSString, NSURLRequest,
-};
+use objc2_foundation::{ns_string, NSNotification, NSPoint, NSRect, NSSize, NSString};
 use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
 use std::cell::RefCell;
 use std::io::IsTerminal;
@@ -277,6 +290,15 @@ pub struct State {
     hooks: RefCell<Option<Rc<Hooks>>>,
     /// The Settings window's controller, made the first time it is shown.
     settings: RefCell<Option<Retained<SettingsController>>>,
+    /// Tabs closed, to open again: in memory only.
+    closed: RefCell<Closed<Snapshot>>,
+    /// What History > Reopen All Windows from Last Session opens: the tabs
+    /// kept when Syndeo last quit, but for any already opened.
+    last_session: RefCell<Session>,
+    /// History > Recently Closed's menu.
+    recent: RefCell<Option<Retained<NSMenu>>>,
+    /// What answers a secondary click on a tab, kept while it answers.
+    tab_clicks: RefCell<Option<Retained<AnyObject>>>,
 }
 
 define_class!(
@@ -292,7 +314,8 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
             self.prepare();
-            self.open_window();
+            self.open_first_windows();
+            self.watch_tab_clicks();
             let app = NSApplication::sharedApplication(self.mtm());
             #[allow(deprecated)] // `activate` is macOS 14 and later; this runs on 13.
             app.activateIgnoringOtherApps(true);
@@ -318,6 +341,7 @@ define_class!(
         /// ends the process without running Rust's destructors.
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _notification: &NSNotification) {
+            self.keep_session();
             self.ivars().browsing.borrow_mut().take();
             if let Some(proxy) = self.ivars().proxy.borrow_mut().take() {
                 tracing::info!(pid = proxy.pid(), "stopping the proxy");
@@ -344,6 +368,42 @@ define_class!(
         fn show_settings(&self, _sender: Option<&AnyObject>) {
             self.settings().show();
         }
+
+        /// History > Reopen Last Closed Tab.
+        #[unsafe(method(syndeoReopenClosedTab:))]
+        fn reopen_closed_tab(&self, _sender: Option<&AnyObject>) {
+            let last = self.ivars().closed.borrow_mut().take_last();
+            if let Some(snapshot) = last {
+                self.reopen(snapshot);
+            }
+        }
+
+        /// History > Recently Closed > a tab: the item's tag is its place in
+        /// the list.
+        #[unsafe(method(syndeoReopenRecent:))]
+        fn reopen_recent(&self, sender: Option<&AnyObject>) {
+            let index = sender
+                .and_then(|s| s.downcast_ref::<NSMenuItem>())
+                .and_then(|item| usize::try_from(item.tag()).ok());
+            let taken = index.and_then(|i| self.ivars().closed.borrow_mut().take(i));
+            if let Some(snapshot) = taken {
+                self.reopen(snapshot);
+            }
+        }
+
+        /// History > Reopen All Windows from Last Session.
+        #[unsafe(method(syndeoReopenSession:))]
+        fn reopen_session(&self, _sender: Option<&AnyObject>) {
+            let session = std::mem::take(&mut *self.ivars().last_session.borrow_mut());
+            self.open_session(&session);
+        }
+    }
+
+    unsafe impl NSMenuItemValidation for AppDelegate {
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
+            self.offers(item)
+        }
     }
 );
 
@@ -369,14 +429,13 @@ impl AppDelegate {
         let (tab, closed, start) = (me.clone(), me.clone(), me);
         let search: Box<dyn Fn() -> Search> = Box::new(settings_macos::search);
         let hooks = Rc::new(Hooks {
-            open_tab: Box::new(move |window, request| {
-                if let Some(app) = tab.load() {
-                    app.open_tab(window, request);
-                }
+            open_tab: Box::new(move |parent, after, start, place| {
+                tab.load()
+                    .map(|app| app.open_tab(parent, after, start, place))
             }),
-            closed: Box::new(move |window| {
+            closed: Box::new(move |window, snapshot| {
                 if let Some(app) = closed.load() {
-                    app.forget(window);
+                    app.forget(window, snapshot);
                 }
             }),
             start_page: Box::new(move || {
@@ -446,6 +505,14 @@ impl AppDelegate {
                     controller.stop_loading();
                 }
             }),
+            forget_tabs: Box::new({
+                let me = Weak::from_retained(&self.retain());
+                move || {
+                    if let Some(app) = me.load() {
+                        app.forget_tabs();
+                    }
+                }
+            }),
             proxy: self
                 .ivars()
                 .proxy
@@ -468,29 +535,316 @@ impl AppDelegate {
             .map(|(window, _)| window.clone());
         match existing {
             Some(window) => window.makeKeyAndOrderFront(None),
-            None => self.open_window(),
+            None => {
+                self.open_window();
+            }
         }
     }
 
     /// A new window, in front, with the start page.
-    fn open_window(&self) {
-        let window = self.new_window(None);
+    fn open_window(&self) -> Retained<NSWindow> {
+        let window = self.new_window(Start::Page);
         window.center();
         window.makeKeyAndOrderFront(None);
+        window
     }
 
-    /// A new tab beside `parent`: `request`, or the start page.
-    fn open_tab(&self, parent: &NSWindow, request: Option<Retained<NSURLRequest>>) {
-        let window = self.new_window(request);
-        parent.addTabbedWindow_ordered(&window, NSWindowOrderingMode::Above);
-        window.makeKeyAndOrderFront(None);
+    /// A new tab, from `parent`, after `after`, starting as `start` says,
+    /// and placed as `place` says: never among the pinned tabs; behind,
+    /// with `parent` kept in front.
+    fn open_tab(
+        &self,
+        parent: &NSWindow,
+        after: &NSWindow,
+        start: Start,
+        place: Place,
+    ) -> Retained<NSWindow> {
+        let window = self.new_window(start);
+        if place == Place::Window {
+            window.cascadeTopLeftFromPoint(NSPoint::new(
+                parent.frame().origin.x,
+                parent.frame().origin.y + parent.frame().size.height,
+            ));
+            window.makeKeyAndOrderFront(None);
+            return window;
+        }
+        let pinned = tabs_macos::tabs_of(after)
+            .iter()
+            .filter(|w| controller_of(w).is_some_and(|c| c.is_pinned()))
+            .count();
+        let index = tabs::after_pinned(tabs_macos::index_of(after) + 1, pinned);
+        tabs_macos::place(after, &window, index);
+        match place {
+            Place::Behind => parent.makeKeyAndOrderFront(None),
+            _ => window.makeKeyAndOrderFront(None),
+        }
+        window
     }
 
-    /// A window that closed: its controller already let go of its web view.
-    /// Kept until the next window opens or closes, so nothing is freed while
-    /// AppKit is still closing it.
-    fn forget(&self, window: &NSWindow) {
+    /// The browser window in front, or else any.
+    fn front_window(&self) -> Option<Retained<NSWindow>> {
+        let windows = self.ivars().windows.borrow();
+        windows
+            .iter()
+            .find(|(window, _)| window.isKeyWindow())
+            .or_else(|| windows.first())
+            .map(|(window, _)| window.clone())
+    }
+
+    /// Open a closed tab again, beside the window in front, or as a window.
+    fn reopen(&self, snapshot: Snapshot) {
+        self.show_recent();
+        let pinned = snapshot.pinned;
+        let window = match self.front_window() {
+            Some(front) => self.open_tab(&front, &front, Start::Again(snapshot), Place::Front),
+            None => {
+                let window = self.new_window(Start::Again(snapshot));
+                window.center();
+                window.makeKeyAndOrderFront(None);
+                window
+            }
+        };
+        if pinned {
+            if let Some(controller) = controller_of(&window) {
+                controller.set_pinned(true);
+            }
+        }
+        tracing::info!("a closed tab opened again");
+    }
+
+    /// Open the tabs of `session`, window by window, each window's tab in
+    /// front opened now and the others when they are first shown.
+    fn open_session(&self, session: &Session) {
+        for saved in &session.windows {
+            let mut opened: Vec<Retained<NSWindow>> = Vec::new();
+            for tab in &saved.tabs {
+                let start = Start::Later {
+                    address: tab.address.clone(),
+                    title: tab.title.clone(),
+                };
+                let window = self.new_window(start);
+                match opened.last() {
+                    Some(last) => tabs_macos::place(last, &window, opened.len()),
+                    None => window.center(),
+                }
+                if tab.pinned {
+                    if let Some(controller) = controller_of(&window) {
+                        controller.set_pinned(true);
+                    }
+                }
+                opened.push(window);
+            }
+            if let Some(front) = opened.get(saved.selected).or(opened.first()) {
+                front.makeKeyAndOrderFront(None);
+            }
+        }
+        tracing::info!(
+            windows = session.windows.len(),
+            "tabs from the last session opened"
+        );
+    }
+
+    /// At launch: the last session's tabs, if macOS keeps windows when an
+    /// application quits; otherwise a window with the start page, and the
+    /// last session's pinned tabs before it. What is not opened is kept for
+    /// History > Reopen All Windows from Last Session.
+    fn open_first_windows(&self) {
         let state = self.ivars();
+        let mut saved = tabs_macos::read_session(&state.home);
+        if state.browsing.borrow().is_none() {
+            self.open_window();
+            return;
+        }
+        if tabs_macos::keeps_windows() && !saved.is_empty() {
+            self.open_session(&saved);
+            return;
+        }
+        let front = self.open_window();
+        let pinned = saved.pinned();
+        for (index, tab) in pinned.iter().enumerate() {
+            let start = Start::Later {
+                address: tab.address.clone(),
+                title: tab.title.clone(),
+            };
+            let window = self.new_window(start);
+            tabs_macos::place(&front, &window, index);
+            if let Some(controller) = controller_of(&window) {
+                controller.set_pinned(true);
+            }
+        }
+        if !pinned.is_empty() {
+            front.makeKeyAndOrderFront(None);
+            for window in &mut saved.windows {
+                window.tabs.retain(|tab| !tab.pinned);
+            }
+            saved = saved.kept();
+        }
+        *state.last_session.borrow_mut() = saved;
+    }
+
+    /// Every browser window's tabs, as the session keeps them.
+    fn session(&self) -> Session {
+        let windows: Vec<Retained<NSWindow>> = self
+            .ivars()
+            .windows
+            .borrow()
+            .iter()
+            .map(|(window, _)| window.clone())
+            .collect();
+        let mut seen: Vec<*const NSWindow> = Vec::new();
+        let mut session = Session::default();
+        for window in &windows {
+            if seen.contains(&Retained::as_ptr(window)) {
+                continue;
+            }
+            let tabbed = tabs_macos::tabs_of(window);
+            seen.extend(tabbed.iter().map(Retained::as_ptr));
+            let front = window.tabGroup().and_then(|group| group.selectedWindow());
+            let mut saved = tabs::SavedWindow::default();
+            for (index, tab) in tabbed.iter().enumerate() {
+                if front.as_deref().is_some_and(|f| std::ptr::eq(f, &**tab)) {
+                    saved.selected = index;
+                }
+                let snapshot = controller_of(tab).and_then(|c| c.snapshot());
+                saved.tabs.push(match snapshot {
+                    Some(s) => tabs::SavedTab {
+                        address: s.address,
+                        title: s.title,
+                        pinned: s.pinned,
+                    },
+                    None => tabs::SavedTab {
+                        address: String::new(),
+                        title: String::new(),
+                        pinned: false,
+                    },
+                });
+            }
+            session.windows.push(saved);
+        }
+        session.kept()
+    }
+
+    /// As Syndeo quits: keep the session, or none if no tab has a page. A
+    /// launch that could not browse had no tabs of its own, and leaves the
+    /// last session as it was.
+    fn keep_session(&self) {
+        if self.ivars().browsing.borrow().is_none() {
+            return;
+        }
+        let session = self.session();
+        match tabs_macos::write_session(&self.ivars().home, &session) {
+            Ok(()) => tracing::info!(windows = session.windows.len(), "the session kept"),
+            Err(err) => tracing::warn!("the session could not be kept: {err:#}"),
+        }
+    }
+
+    /// Clear Browsing Data: no closed tab to open again, and no session.
+    fn forget_tabs(&self) {
+        let state = self.ivars();
+        state.closed.borrow_mut().clear();
+        *state.last_session.borrow_mut() = Session::default();
+        self.show_recent();
+        match tabs_macos::forget_session(&state.home) {
+            Ok(()) => tracing::info!("closed tabs and the session forgotten"),
+            Err(err) => tracing::warn!("the session could not be forgotten: {err:#}"),
+        }
+    }
+
+    /// History > Recently Closed, as the closed tabs are now.
+    fn show_recent(&self) {
+        let Some(menu) = self.ivars().recent.borrow().clone() else {
+            return;
+        };
+        menu.removeAllItems();
+        for (index, snapshot) in self.ivars().closed.borrow().iter().enumerate() {
+            let entry = item(
+                self.mtm(),
+                &tabs::menu_title(&snapshot.title, &snapshot.address),
+                sel!(syndeoReopenRecent:),
+                "",
+            );
+            entry.setTag(index as isize);
+            menu.addItem(&entry);
+        }
+    }
+
+    /// Whether the menu item is offered: the History items where there is
+    /// something to open.
+    fn offers(&self, entry: &NSMenuItem) -> bool {
+        let state = self.ivars();
+        match entry.action() {
+            Some(a) if a == sel!(syndeoReopenClosedTab:) => !state.closed.borrow().is_empty(),
+            Some(a) if a == sel!(syndeoReopenRecent:) => {
+                usize::try_from(entry.tag()).is_ok_and(|i| i < state.closed.borrow().len())
+            }
+            Some(a) if a == sel!(syndeoReopenSession:) => {
+                !state.last_session.borrow().is_empty() && state.browsing.borrow().is_some()
+            }
+            _ => true,
+        }
+    }
+
+    /// Answer a secondary click on a tab with Syndeo's menu for it.
+    fn watch_tab_clicks(&self) {
+        let me = Weak::from_retained(&self.retain());
+        let monitor = tabs_macos::watch_tab_clicks(self.mtm(), move |window| {
+            me.load().and_then(|app| app.tab_menu(window))
+        });
+        *self.ivars().tab_clicks.borrow_mut() = monitor;
+    }
+
+    /// A tab's context menu: for `window`'s tab, if it is a browser's.
+    fn tab_menu(&self, window: &NSWindow) -> Option<Retained<NSMenu>> {
+        let mtm = self.mtm();
+        let controller = controller_of(window)?;
+        let to_tab: &AnyObject = controller.as_ref();
+        let to_window: &AnyObject = window.as_ref();
+        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Tab"));
+        let pin = if controller.is_pinned() {
+            "Unpin Tab"
+        } else {
+            "Pin Tab"
+        };
+        for entry in [
+            tabs_macos::item(
+                mtm,
+                "Duplicate Tab",
+                sel!(syndeoDuplicateTab:),
+                Some(to_tab),
+            ),
+            tabs_macos::item(mtm, pin, sel!(syndeoTogglePin:), Some(to_tab)),
+            NSMenuItem::separatorItem(mtm),
+            tabs_macos::item(mtm, "Close Tab", sel!(performClose:), Some(to_window)),
+            tabs_macos::item(
+                mtm,
+                "Close Other Tabs",
+                sel!(syndeoCloseOtherTabs:),
+                Some(to_tab),
+            ),
+            tabs_macos::item(
+                mtm,
+                "Move Tab to New Window",
+                sel!(moveTabToNewWindow:),
+                Some(to_window),
+            ),
+            NSMenuItem::separatorItem(mtm),
+            tabs_macos::item(mtm, "Show All Tabs", sel!(syndeoShowAllTabs:), Some(to_tab)),
+        ] {
+            menu.addItem(&entry);
+        }
+        tracing::info!("a tab's menu shown");
+        Some(menu)
+    }
+
+    /// A window that closed: its controller already let go of its web view,
+    /// and handed what it showed, to open again. Kept until the next window
+    /// opens or closes, so nothing is freed while AppKit is still closing it.
+    fn forget(&self, window: &NSWindow, snapshot: Option<Snapshot>) {
+        let state = self.ivars();
+        if let Some(snapshot) = snapshot {
+            state.closed.borrow_mut().push(snapshot);
+            self.show_recent();
+        }
         state.retired.borrow_mut().clear();
         let mut windows = state.windows.borrow_mut();
         let mut kept = Vec::with_capacity(windows.len());
@@ -508,7 +862,7 @@ impl AppDelegate {
 
     /// A window: browsing through the proxy if this application can, a
     /// window that says why not if it cannot.
-    fn new_window(&self, request: Option<Retained<NSURLRequest>>) -> Retained<NSWindow> {
+    fn new_window(&self, start: Start) -> Retained<NSWindow> {
         let mtm = self.mtm();
         let state = self.ivars();
         state.retired.borrow_mut().clear();
@@ -529,6 +883,9 @@ impl AppDelegate {
         };
         // This application holds its windows, and lets them go when they close.
         unsafe { window.setReleasedWhenClosed(false) };
+        // Syndeo opens its tabs again itself (`open_first_windows`): macOS's
+        // own window restoration is left out of it.
+        window.setRestorable(false);
         window.setTitle(ns_string!("Syndeo"));
         window.setTabbingIdentifier(&NSString::from_str(TABS));
 
@@ -543,9 +900,11 @@ impl AppDelegate {
                 let (container, ui) = browser_content(mtm, frame, &webview, &controller);
                 controller.attach(&window, ui, hooks);
                 window.setContentView(Some(&container));
-                match request {
-                    Some(request) => controller.load(&request),
-                    None => controller.show_start_page(),
+                match start {
+                    Start::Page => controller.show_start_page(),
+                    Start::Request(request) => controller.load(&request),
+                    Start::Again(snapshot) => controller.restore(snapshot),
+                    Start::Later { address, title } => controller.open_later(address, title),
                 }
                 controller
             }
@@ -605,6 +964,20 @@ fn item(mtm: MainThreadMarker, title: &str, action: Sel, key: &str) -> Retained<
     }
 }
 
+/// One menu item, as [`item`] makes it, with `modifiers` and not Command
+/// alone.
+fn item_with(
+    mtm: MainThreadMarker,
+    title: &str,
+    action: Sel,
+    key: &str,
+    modifiers: NSEventModifierFlags,
+) -> Retained<NSMenuItem> {
+    let entry = item(mtm, title, action, key);
+    entry.setKeyEquivalentModifierMask(modifiers);
+    entry
+}
+
 /// A top-level menu, its items, added to `bar`.
 fn submenu(
     mtm: MainThreadMarker,
@@ -625,8 +998,10 @@ fn submenu(
 /// The menu bar: Syndeo, File, Edit, View, History and Window, with the
 /// usual shortcuts. Browsing items have no target, so they reach the window
 /// in front through the responder chain, and are disabled where there is no
-/// browsing to do.
-fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> Retained<NSMenu> {
+/// browsing to do. With it, History > Recently Closed's menu, which changes
+/// as tabs close.
+fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> (Retained<NSMenu>, Retained<NSMenu>) {
+    let command = NSEventModifierFlags::Command;
     let bar = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
     let hide_others = item(mtm, "Hide Others", sel!(hideOtherApplications:), "h");
     hide_others
@@ -657,6 +1032,8 @@ fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> Retained<NSMenu> {
             item(mtm, "Open Location…", sel!(openLocation:), "l"),
             NSMenuItem::separatorItem(mtm),
             item(mtm, "Close", sel!(performClose:), "w"),
+            // No shortcut: ⌥⌘W is AppKit's own Close All, which it adds.
+            item(mtm, "Close Other Tabs", sel!(syndeoCloseOtherTabs:), ""),
         ],
     );
     submenu(
@@ -680,8 +1057,20 @@ fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> Retained<NSMenu> {
         &[
             item(mtm, "Reload Page", sel!(reloadPage:), "r"),
             item(mtm, "Stop Loading", sel!(stopPage:), "."),
+            NSMenuItem::separatorItem(mtm),
+            item_with(
+                mtm,
+                "Show All Tabs",
+                sel!(syndeoShowAllTabs:),
+                "\\",
+                NSEventModifierFlags::Shift | command,
+            ),
         ],
     );
+    let recent = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Recently Closed"));
+    let recently_closed = NSMenuItem::new(mtm);
+    recently_closed.setTitle(ns_string!("Recently Closed"));
+    recently_closed.setSubmenu(Some(&recent));
     submenu(
         mtm,
         &bar,
@@ -689,8 +1078,39 @@ fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> Retained<NSMenu> {
         &[
             item(mtm, "Back", sel!(syndeoBack:), "["),
             item(mtm, "Forward", sel!(syndeoForward:), "]"),
+            NSMenuItem::separatorItem(mtm),
+            item_with(
+                mtm,
+                "Reopen Last Closed Tab",
+                sel!(syndeoReopenClosedTab:),
+                "t",
+                NSEventModifierFlags::Shift | command,
+            ),
+            item(
+                mtm,
+                "Reopen All Windows from Last Session",
+                sel!(syndeoReopenSession:),
+                "",
+            ),
+            recently_closed,
         ],
     );
+    // ⌘1 to ⌘9, which choose a tab, as Safari's and every other browser's
+    // do: in the menu, so they work as any shortcut does, but not shown.
+    let choose_tab: Vec<Retained<NSMenuItem>> = (1..=9)
+        .map(|digit| {
+            let title = if digit == 9 {
+                "Show Last Tab".to_string()
+            } else {
+                format!("Show Tab {digit}")
+            };
+            let entry = item(mtm, &title, sel!(syndeoSelectTab:), &digit.to_string());
+            entry.setTag(digit);
+            entry.setHidden(true);
+            entry.setAllowsKeyEquivalentWhenHidden(true);
+            entry
+        })
+        .collect();
     let window = submenu(
         mtm,
         &bar,
@@ -699,11 +1119,17 @@ fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> Retained<NSMenu> {
             item(mtm, "Minimize", sel!(performMiniaturize:), "m"),
             item(mtm, "Zoom", sel!(performZoom:), ""),
             NSMenuItem::separatorItem(mtm),
+            item(mtm, "Duplicate Tab", sel!(syndeoDuplicateTab:), ""),
+            item(mtm, "Pin Tab", sel!(syndeoTogglePin:), ""),
+            NSMenuItem::separatorItem(mtm),
             item(mtm, "Bring All to Front", sel!(arrangeInFront:), ""),
         ],
     );
+    for entry in &choose_tab {
+        window.addItem(entry);
+    }
     app.setWindowsMenu(Some(&window));
-    bar
+    (bar, recent)
 }
 
 pub fn run(install: InstallDir) -> Result<()> {
@@ -734,10 +1160,16 @@ pub fn run(install: InstallDir) -> Result<()> {
             retired: RefCell::new(Vec::new()),
             hooks: RefCell::new(None),
             settings: RefCell::new(None),
+            closed: RefCell::new(Closed::default()),
+            last_session: RefCell::new(Session::default()),
+            recent: RefCell::new(None),
+            tab_clicks: RefCell::new(None),
         },
     );
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    app.setMainMenu(Some(&main_menu(mtm, &app)));
+    let (bar, recent) = main_menu(mtm, &app);
+    *delegate.ivars().recent.borrow_mut() = Some(recent);
+    app.setMainMenu(Some(&bar));
     app.run();
     Ok(())
 }
@@ -1088,6 +1520,8 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
             ("app_macos.rs", include_str!("app_macos.rs")),
             ("browser_macos.rs", include_str!("browser_macos.rs")),
             ("settings_macos.rs", include_str!("settings_macos.rs")),
+            ("tabs_macos.rs", include_str!("tabs_macos.rs")),
+            ("tabs.rs", include_str!("tabs.rs")),
             ("address.rs", include_str!("address.rs")),
             ("main.rs", include_str!("main.rs")),
         ] {

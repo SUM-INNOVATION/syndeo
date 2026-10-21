@@ -19,9 +19,10 @@ back.
 - no-navigation-policy: the handler that keeps a window's main frame to the
   web's own pages and Syndeo's is gone. A page's links and scripts to other
   schemes must then be seen leaving the page.
-- any-scheme-in-a-new-tab: a page asking for a new window gets a tab
-  whatever the scheme. A page's links and scripts to other schemes in a new
-  tab must then be seen opening one.
+- any-scheme-in-a-new-tab: a page asking for a new window, or a link
+  followed with ⌘ or the middle button, gets a tab whatever the scheme. A
+  page's links and scripts to other schemes in a new tab must then be seen
+  opening one.
 - no-editing-guard: the address field is written whenever a page reports
   its address, whoever is typing there. What someone types while a page is
   loading must then be seen overwritten when it arrives.
@@ -36,6 +37,10 @@ back.
   let Syndeo's proxy answer from its own fresh copy without asking the
   origin. The reload must then be seen not consulting the origin: neither
   the proxy's revalidations nor its misses rise.
+- tabs-kept-after-clear: Clear Browsing Data leaves the tabs closed, to
+  open again, and the session kept from the last quit. Both must then be
+  seen still there after a clear: History > Reopen Last Closed Tab still
+  offered, and the session file still on disk.
 - websocket-headers-stripped: in the proxy, a WebSocket handshake goes the
   ordinary way, which drops Upgrade and Connection with the other
   hop-by-hop headers, as it did before; that is what CI 39198465745
@@ -48,6 +53,7 @@ import sys
 
 BROWSER = "crates/syndeo-app/src/browser_macos.rs"
 ADDRESS = "crates/syndeo-app/src/address.rs"
+SETTINGS = "crates/syndeo-app/src/settings_macos.rs"
 PROXY = "crates/syndeo-proxy/src/main.rs"
 
 MUTANTS = {
@@ -79,6 +85,16 @@ MUTANTS = {
             "            let target = address_of(&request);\n"
             "            // Refused wherever it would load, as typing it is.\n"
             "            let zoned = address::has_zone(&target);\n"
+            "            // A link followed with ⌘ or the middle button: elsewhere, as a\n"
+            "            // new tab is made, or, for an address no tab may show, here,\n"
+            "            // where it is refused as any other.\n"
+            "            if let Some(place) = Place::of(tabs::opening(click_of(action))) {\n"
+            "                if !zoned && self.open_beside(request.clone(), place) {\n"
+            "                    self.ivars().refused.set(main_frame);\n"
+            "                    handler.call((WKNavigationActionPolicy::Cancel,));\n"
+            "                    return;\n"
+            "                }\n"
+            "            }\n"
             "            let allowed = (!main_frame || address::allowed_in_main_frame(&scheme)) && !zoned;\n"
             "            if !allowed && main_frame {\n"
             "                self.ivars().refused.set(true);\n"
@@ -96,8 +112,8 @@ MUTANTS = {
     "any-scheme-in-a-new-tab": [
         (
             BROWSER,
-            "            if address::allowed_in_main_frame(&scheme_of(&request)) {\n",
-            "            if true {\n",
+            "        if address::allowed_in_main_frame(&scheme_of(&request)) {\n",
+            "        if true {\n",
         ),
     ],
     "no-editing-guard": [
@@ -131,6 +147,13 @@ MUTANTS = {
             BROWSER,
             "                    unsafe { web.view.reloadFromOrigin() };\n",
             "                    unsafe { web.view.reload() };\n",
+        ),
+    ],
+    "tabs-kept-after-clear": [
+        (
+            SETTINGS,
+            "                (clearing.forget_tabs)();\n",
+            "",
         ),
     ],
     "websocket-headers-stripped": [

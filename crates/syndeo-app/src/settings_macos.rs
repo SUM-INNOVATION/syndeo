@@ -48,6 +48,8 @@ const PROXY_CLEAR: Duration = Duration::from_secs(30);
 pub struct Clearing {
     /// Stop every window's page loading.
     pub stop_loading: Box<dyn Fn()>,
+    /// Forget the tabs closed, and the session kept from the last quit.
+    pub forget_tabs: Box<dyn Fn()>,
     /// The proxy's pipe, when this application has a proxy.
     pub proxy: Option<ProxyControl>,
 }
@@ -108,8 +110,9 @@ define_class!(
             alert.setMessageText(ns_string!("Clear browsing data?"));
             alert.setInformativeText(ns_string!(
                 "This removes cookies, website storage and cached pages from every Syndeo \
-                 window, and empties Syndeo's own cache. Websites you are signed in to will \
-                 sign you out."
+                 window, empties Syndeo's own cache, and forgets recently closed tabs and the \
+                 tabs kept from when Syndeo last quit. Websites you are signed in to will sign \
+                 you out."
             ));
             let clear = alert.addButtonWithTitle(ns_string!("Clear"));
             clear.setAccessibilityIdentifier(Some(ns_string!("syndeo.clear-confirm")));
@@ -270,6 +273,7 @@ impl SettingsController {
         let proxy = match &*self.ivars().clearing.borrow() {
             Some(clearing) => {
                 (clearing.stop_loading)();
+                (clearing.forget_tabs)();
                 clearing.proxy.clone()
             }
             None => None,
