@@ -65,7 +65,7 @@ use std::rc::Rc;
 use syndeo_shell::supervisor::InstallDir;
 use syndeo_webkit::{owned, pin, proxied};
 
-/// The first-launch page, with `{{SEARCH}}` filled in.
+/// The first-launch page, with `{{STYLE}}` and `{{SEARCH}}` filled in.
 const FIRST_LAUNCH: &str = include_str!("first_launch.html");
 
 /// The first line of every window that cannot browse.
@@ -541,8 +541,9 @@ impl AppDelegate {
             Content::Browser(webview, controller) => {
                 let frame = NSRect::new(NSPoint::new(0.0, 0.0), engine.frame.size);
                 let (container, ui) = browser_content(mtm, frame, &webview, &controller);
-                controller.attach(&window, ui, hooks);
                 window.setContentView(Some(&container));
+                ui.dress(&window, &webview);
+                controller.attach(&window, ui, hooks);
                 match request {
                     Some(request) => controller.load(&request),
                     None => controller.show_start_page(),
@@ -580,7 +581,9 @@ fn start_page(search: Search) -> String {
             engine.title()
         ),
     };
-    FIRST_LAUNCH.replace("{{SEARCH}}", &address::escape(&words))
+    FIRST_LAUNCH
+        .replace("{{STYLE}}", address::PAGE_STYLE)
+        .replace("{{SEARCH}}", &address::escape(&words))
 }
 
 /// Where this application keeps its state: its proxy's cache and authority.
@@ -1037,6 +1040,7 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
         let off = start_page(Search::Off);
         assert!(off.contains("Search is off"), "{off}");
         assert!(!off.contains("{{"), "{off}");
+        assert!(off.contains(address::PAGE_STYLE), "{off}");
     }
 
     /// The start page says secure pages need nothing from the keychain, and
@@ -1087,6 +1091,7 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
         for (file, source) in [
             ("app_macos.rs", include_str!("app_macos.rs")),
             ("browser_macos.rs", include_str!("browser_macos.rs")),
+            ("chrome_macos.rs", include_str!("chrome_macos.rs")),
             ("settings_macos.rs", include_str!("settings_macos.rs")),
             ("address.rs", include_str!("address.rs")),
             ("main.rs", include_str!("main.rs")),

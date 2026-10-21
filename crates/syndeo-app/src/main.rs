@@ -11,6 +11,8 @@ mod app_macos;
 #[cfg(target_os = "macos")]
 mod browser_macos;
 #[cfg(target_os = "macos")]
+mod chrome_macos;
+#[cfg(target_os = "macos")]
 mod settings_macos;
 // Plain Rust, and used only by the macOS application; tested everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
