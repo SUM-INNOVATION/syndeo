@@ -73,9 +73,11 @@ const ANSWER_LIMIT: Duration = Duration::from_secs(60);
 /// After the person denies an agent, how long before it may ask again.
 const AFTER_DENIAL: Duration = Duration::from_secs(10);
 
-/// A browser window, made exactly as every other is, showing the start
-/// page, with its controller.
-pub type NewWindow = Box<dyn Fn() -> (Retained<NSWindow>, Retained<BrowserController>)>;
+/// A browser window, made exactly as every other is, opening the request
+/// given, or the start page, with its controller.
+pub type NewWindow = Box<
+    dyn Fn(Option<Retained<NSURLRequest>>) -> (Retained<NSWindow>, Retained<BrowserController>),
+>;
 /// The controller of an open window.
 pub type ControllerOf = Box<dyn Fn(&NSWindow) -> Option<Retained<BrowserController>>>;
 
@@ -1293,7 +1295,9 @@ impl Control {
     /// beside its other tabs, never among the person's.
     fn open(&self, key: &AgentKey, url: &str) -> Result<Value, Failure> {
         let request = web_request(url)?;
-        let (window, controller) = (self.hooks.new_window)();
+        // Its first and only navigation: no start page before it, which could
+        // be taken for it.
+        let (window, controller) = (self.hooks.new_window)(Some(request.clone()));
         // The tab browses in its window's own web view: routed through the
         // proxy and pinned to its authority, as every window's is.
         let Some(view) = controller.web_view() else {
@@ -1312,7 +1316,6 @@ impl Control {
         // In front, where the person can see it, without taking their keys.
         window.orderFront(None);
         let id = self.adopt(key, &window, controller.clone(), view.clone());
-        controller.load(&request);
         tracing::info!(tab = id, "an agent opened a tab");
         Ok(json!({"tab": id, "url": request_url(&request), "from": ""}))
     }

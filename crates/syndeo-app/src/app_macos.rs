@@ -520,9 +520,9 @@ impl AppDelegate {
             Weak::from_retained(&self.retain()),
         );
         let hooks = control_macos::AppHooks {
-            new_window: Box::new(move || {
+            new_window: Box::new(move |request| {
                 let app = make.load().expect("the application outlives its agents");
-                let window = app.new_window(None);
+                let window = app.new_window(request);
                 let controller = app
                     .controller_of(&window)
                     .expect("every window it made is in its list");

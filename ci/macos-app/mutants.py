@@ -192,6 +192,11 @@ MUTANTS = {
     "agent-unproxied-tab": [
         (
             CONTROL,
+            "        let (window, controller) = (self.hooks.new_window)(Some(request.clone()));\n",
+            "        let (window, controller) = (self.hooks.new_window)(None);\n",
+        ),
+        (
+            CONTROL,
             "        // The tab browses in its window's own web view: routed through the\n"
             "        // proxy and pinned to its authority, as every window's is.\n"
             "        let Some(view) = controller.web_view() else {\n",
@@ -209,7 +214,6 @@ MUTANTS = {
         ),
         (
             CONTROL,
-            "        controller.load(&request);\n"
             "        tracing::info!(tab = id, \"an agent opened a tab\");\n",
             "        let _ = unsafe { view.loadRequest(&request) };\n"
             "        tracing::info!(tab = id, \"an agent opened a tab\");\n",
