@@ -141,6 +141,7 @@ pub fn install(mtm: MainThreadMarker, hooks: AppHooks) {
         denied: RefCell::new(HashMap::new()),
         activity: RefCell::new(None),
         access: RefCell::new(None),
+        world: RefCell::new(None),
     });
     CONTROL.with(|c| *c.borrow_mut() = Some(control.clone()));
     if setting() {
@@ -390,7 +391,7 @@ fn serve(conn: u64, stream: UnixStream, own: &str) {
 fn perform(conn: u64, request: Request) -> Value {
     let id = request.id.clone();
     if let Command::Wait { tab, timeout } = request.command {
-        return match settle(conn, tab, Some(Scope::Read), timeout, false) {
+        return match settle(conn, tab, Some(Scope::Read), timeout, Arrival::Now) {
             Ok(state) => agent::ok(&id, state),
             Err(failure) => agent::err(&id, &failure),
         };
@@ -427,21 +428,43 @@ fn perform(conn: u64, request: Request) -> Value {
     if answer["ok"] != json!(true) {
         return answer;
     }
-    match settle(conn, tab, None, timeout, true) {
+    // Toward the address asked for, unless it is the one already there;
+    // Back, Forward and Reload toward whatever comes next.
+    let target = answer["result"]["url"].as_str().map(str::to_string);
+    let from = answer["result"]["from"].as_str();
+    let arrival = match (target, from) {
+        (Some(target), Some(from)) if target != from => Arrival::At(target),
+        _ => Arrival::Next,
+    };
+    match settle(conn, tab, None, timeout, arrival) {
         Ok(state) => agent::ok(&id, state),
         Err(failure) => agent::err(&id, &failure),
     }
 }
 
+/// What a wait for a tab's page waits for.
+enum Arrival {
+    /// Only that it is not loading now.
+    Now,
+    /// A page at this address, just asked for, or whatever loads instead.
+    /// A new tab's web view can take a second or more to start its web
+    /// content process, and is not loading meanwhile: not loading counts
+    /// only once it has been seen loading, or is at that address.
+    At(String),
+    /// Whatever loads next, just asked for: given a moment to start, since
+    /// a page brought back from the back-forward cache may not be seen
+    /// loading at all.
+    Next,
+}
+
 /// Wait for a tab's page to finish loading, up to `timeout`, and say how it
-/// is. Just after a navigation (`fresh`), a page not yet seen loading is
-/// given a moment to start.
+/// is.
 fn settle(
     conn: u64,
     tab: u64,
     needs: Option<Scope>,
     timeout: Duration,
-    fresh: bool,
+    arrival: Arrival,
 ) -> Result<Value, Failure> {
     let start = Instant::now();
     let mut seen = false;
@@ -449,7 +472,12 @@ fn settle(
         let mut state = probe(conn, tab, needs)?;
         let loading = state["loading"] == json!(true);
         seen |= loading;
-        if !loading && (seen || !fresh || start.elapsed() >= Duration::from_secs(1)) {
+        let arrived = match &arrival {
+            Arrival::Now => true,
+            Arrival::At(target) => seen || state["url"].as_str() == Some(target.as_str()),
+            Arrival::Next => seen || start.elapsed() >= Duration::from_secs(1),
+        };
+        if !loading && arrived {
             // A failure page may follow a failed load at once.
             std::thread::sleep(Duration::from_millis(200));
             state = probe(conn, tab, needs)?;
@@ -587,6 +615,9 @@ struct Control {
     /// Keeps macOS from napping Syndeo while an agent is connected.
     activity: RefCell<Option<Retained<ProtocolObject<dyn NSObjectProtocol>>>>,
     access: RefCell<Option<Retained<AccessController>>>,
+    /// Syndeo's own content world, kept: WebKit lets go of a named world,
+    /// and of everything kept in it, once nothing holds it.
+    world: RefCell<Option<Retained<WKContentWorld>>>,
 }
 
 impl Control {
@@ -1270,18 +1301,40 @@ impl Control {
         let id = self.adopt(key, &window, controller.clone(), view.clone());
         controller.load(&request);
         tracing::info!(tab = id, "an agent opened a tab");
-        Ok(json!({"tab": id, "url": request_url(&request)}))
+        Ok(json!({"tab": id, "url": request_url(&request), "from": ""}))
     }
 
     fn goto(&self, key: &AgentKey, tab: u64, url: &str) -> Result<Value, Failure> {
         let request = web_request(url)?;
-        let (_, tab_controller, _) = self.tab(key, tab)?;
+        let (view, tab_controller, _) = self.tab(key, tab)?;
+        let from = state(tab, &view)["url"].clone();
         tab_controller.load(&request);
-        Ok(json!({"tab": tab, "url": request_url(&request)}))
+        Ok(json!({"tab": tab, "url": request_url(&request), "from": from}))
+    }
+
+    /// Syndeo's own content world, made the first time.
+    fn world(&self) -> Retained<WKContentWorld> {
+        self.world
+            .borrow_mut()
+            .get_or_insert_with(|| unsafe {
+                WKContentWorld::worldWithName(&NSString::from_str(WORLD), self.mtm)
+            })
+            .clone()
     }
 
     fn step(&self, key: &AgentKey, tab: u64, step: Step) -> Result<Value, Failure> {
         let (view, controller, _) = self.tab(key, tab)?;
+        let nowhere = |which: &str| {
+            Failure::new(
+                "refused",
+                format!("there is no page to go {which} to in tab {tab}"),
+            )
+        };
+        match step {
+            Step::Back if !unsafe { view.canGoBack() } => return Err(nowhere("back")),
+            Step::Forward if !unsafe { view.canGoForward() } => return Err(nowhere("forward")),
+            _ => {}
+        }
         let none: Option<&AnyObject> = None;
         // The window's own Back, Forward, Reload and Stop, as its menu sends them.
         unsafe {
@@ -1309,7 +1362,7 @@ impl Control {
             Ok((view, _, _)) => view,
             Err(failure) => return reply.done(Err(failure)),
         };
-        let world = unsafe { WKContentWorld::worldWithName(&NSString::from_str(WORLD), self.mtm) };
+        let world = self.world();
         let args = args.to_string();
         let route = route_of(&view);
         run(
