@@ -520,6 +520,12 @@ impl BrowserController {
         }
     }
 
+    /// Say why `address`, which another application asked this window to
+    /// open, is refused: Syndeo's page, with the words typing it gets.
+    pub fn refuse(&self, address: &str, why: &str) {
+        self.show_page(address, why);
+    }
+
     /// Open what was typed, or say why not.
     fn go(&self, typed: &str) {
         // What was typed has been given: it is no longer being typed.
