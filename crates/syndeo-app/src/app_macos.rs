@@ -39,8 +39,17 @@
 //! The keystore is not part of this application: it is never started, no
 //! keychain entry is made for it, no passphrase is asked for and no recovery
 //! phrase is generated.
+//!
+//! It is a web browser to macOS: its Info.plist claims http and https, so it
+//! can be chosen as the default browser, and another application can ask it
+//! to open an address (`open -a Syndeo <address>`, or a link in Mail). Each
+//! such address opens in a tab made as every tab is, or is refused there as
+//! typing it would be (`address::asked`); none is opened before launch has
+//! decided whether this application can browse. At launch it also says, in
+//! its log, what it can do with passkeys (`passkeys`): without Apple's
+//! browser passkey entitlement, which it does not hold, nothing.
 
-use crate::address::{self, Search};
+use crate::address::{self, Asked, Search};
 use crate::browser_macos::{browser_content, BrowserController, Hooks};
 use crate::settings_macos::{self, Clearing, SettingsController};
 use anyhow::{Context, Result};
@@ -55,10 +64,10 @@ use objc2_app_kit::{
     NSWindowStyleMask,
 };
 use objc2_foundation::{
-    ns_string, NSNotification, NSPoint, NSRect, NSSize, NSString, NSURLRequest,
+    ns_string, NSArray, NSNotification, NSPoint, NSRect, NSSize, NSString, NSURLRequest, NSURL,
 };
 use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -277,6 +286,10 @@ pub struct State {
     hooks: RefCell<Option<Rc<Hooks>>>,
     /// The Settings window's controller, made the first time it is shown.
     settings: RefCell<Option<Retained<SettingsController>>>,
+    /// Launch has finished, and decided whether this application can browse.
+    launched: Cell<bool>,
+    /// Addresses other applications asked this one to open before then.
+    asked: RefCell<Vec<String>>,
 }
 
 define_class!(
@@ -292,7 +305,36 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
             self.prepare();
-            self.open_window();
+            crate::passkeys::report();
+            self.ivars().launched.set(true);
+            // Opened to open addresses: those, and no start page beside them.
+            let asked = self.ivars().asked.take();
+            if asked.is_empty() {
+                self.open_window();
+            }
+            for address in asked {
+                self.open_asked(&address);
+            }
+            let app = NSApplication::sharedApplication(self.mtm());
+            #[allow(deprecated)] // `activate` is macOS 14 and later; this runs on 13.
+            app.activateIgnoringOtherApps(true);
+        }
+
+        /// Another application asks this one to open addresses. Before
+        /// launch has decided whether it can browse, they wait for it.
+        #[unsafe(method(application:openURLs:))]
+        fn open_urls(&self, _application: &NSApplication, urls: &NSArray<NSURL>) {
+            let addresses: Vec<String> = urls
+                .iter()
+                .map(|url| url.absoluteString().map(|text| text.to_string()).unwrap_or_default())
+                .collect();
+            if !self.ivars().launched.get() {
+                self.ivars().asked.borrow_mut().extend(addresses);
+                return;
+            }
+            for address in addresses {
+                self.open_asked(&address);
+            }
             let app = NSApplication::sharedApplication(self.mtm());
             #[allow(deprecated)] // `activate` is macOS 14 and later; this runs on 13.
             app.activateIgnoringOtherApps(true);
@@ -484,6 +526,63 @@ impl AppDelegate {
         let window = self.new_window(request);
         parent.addTabbedWindow_ordered(&window, NSWindowOrderingMode::Above);
         window.makeKeyAndOrderFront(None);
+    }
+
+    /// An address another application asked this one to open, in a new tab
+    /// beside the browser window in front, or a new window if there is none:
+    /// made by `new_window`, as every tab is, so it browses only through the
+    /// proxy, pinned to its authority. One `address::asked` refuses gets
+    /// Syndeo's page saying why. The log has its scheme, and nothing else of
+    /// it.
+    fn open_asked(&self, address: &str) {
+        let scheme = address::explicit_scheme(address).unwrap_or_default();
+        let (request, refused) = match address::asked(address) {
+            Asked::Open(url) => match NSURL::URLWithString(&NSString::from_str(url.as_str())) {
+                Some(url) => (Some(NSURLRequest::requestWithURL(&url)), None),
+                None => (None, Some("That address could not be read.".to_string())),
+            },
+            Asked::Refused(why) => (None, Some(why)),
+        };
+        if refused.is_some() {
+            tracing::info!(scheme = %scheme, "refused an address another application asked to open");
+        } else {
+            tracing::info!(scheme = %scheme, "opening an address another application asked to open");
+        }
+        let parent = self.front_browser();
+        let window = self.new_window(request);
+        if let (Some(why), Some(controller)) = (refused, self.controller_of(&window)) {
+            controller.refuse(address, &why);
+        }
+        match parent {
+            Some(parent) => parent.addTabbedWindow_ordered(&window, NSWindowOrderingMode::Above),
+            None => window.center(),
+        }
+        window.makeKeyAndOrderFront(None);
+    }
+
+    /// The browser window in front: the main window, if it is one of this
+    /// application's browser windows, or else the one opened last.
+    fn front_browser(&self) -> Option<Retained<NSWindow>> {
+        let windows = self.ivars().windows.borrow();
+        let ours = |window: &NSWindow| {
+            windows
+                .iter()
+                .any(|(open, _)| std::ptr::eq(&**open, window))
+        };
+        NSApplication::sharedApplication(self.mtm())
+            .mainWindow()
+            .filter(|main| ours(main))
+            .or_else(|| windows.last().map(|(window, _)| window.clone()))
+    }
+
+    /// The controller of `window`, one of this application's browser windows.
+    fn controller_of(&self, window: &NSWindow) -> Option<Retained<BrowserController>> {
+        self.ivars()
+            .windows
+            .borrow()
+            .iter()
+            .find(|(open, _)| std::ptr::eq(&**open, window))
+            .map(|(_, controller)| controller.clone())
     }
 
     /// A window that closed: its controller already let go of its web view.
@@ -737,6 +836,8 @@ pub fn run(install: InstallDir) -> Result<()> {
             retired: RefCell::new(Vec::new()),
             hooks: RefCell::new(None),
             settings: RefCell::new(None),
+            launched: Cell::new(false),
+            asked: RefCell::new(Vec::new()),
         },
     );
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -1094,6 +1195,7 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
             ("chrome_macos.rs", include_str!("chrome_macos.rs")),
             ("settings_macos.rs", include_str!("settings_macos.rs")),
             ("address.rs", include_str!("address.rs")),
+            ("passkeys.rs", include_str!("passkeys.rs")),
             ("main.rs", include_str!("main.rs")),
         ] {
             let code = source.split("#[cfg(test)]").next().unwrap();

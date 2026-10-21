@@ -33,7 +33,7 @@
 #
 # --check requires a bundle to be exactly that: the paths and their modes,
 # the Info.plist's identifier, executable, versions and minimum system, its
-# App Transport Security exactly as below, the PkgInfo, an icon, and the
+# App Transport Security and URL types exactly as below, the PkgInfo, an icon, and the
 # uninstaller exactly as rendered for <version>. signed also requires the
 # code signature's two paths, Contents/_CodeSignature/ and its CodeResources;
 # stapled, those and the notarization ticket stapler adds,
@@ -44,6 +44,12 @@
 # App Transport Security: web pages may load over plain http, as they do in
 # any browser, and nothing else is relaxed. NSAllowsArbitraryLoadsInWebContent
 # applies to web views only; the application's own connections keep ATS.
+#
+# URL types: http and https, and no other scheme, as a web browser's. That is
+# what lets someone choose Syndeo as their default browser, lets another
+# application ask it to open a web address, and is one of Apple's conditions
+# for its browser passkey entitlement. Another scheme here would hand Syndeo
+# addresses it refuses anyway.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -170,6 +176,11 @@ EOF
     printf '  FAIL  Info.plist NSAppTransportSecurity — %s, not web content only\n' "$have"
     bad=1
   fi
+  have="$(plutil -extract CFBundleURLTypes json -o - "$plist" 2>/dev/null || echo '<missing>')"
+  if [ "$have" != '[{"CFBundleTypeRole":"Viewer","CFBundleURLName":"Web site URL","CFBundleURLSchemes":["http","https"]}]' ]; then
+    printf '  FAIL  Info.plist CFBundleURLTypes — %s, not http and https alone, as a web browser\n' "$have"
+    bad=1
+  fi
   if [ "$(cat "$app/Contents/PkgInfo" 2>/dev/null)" != 'APPL????' ]; then
     printf '  FAIL  PkgInfo — not APPL????\n'
     bad=1
@@ -252,6 +263,21 @@ self_test() {
   fresh
   plutil -remove NSAppTransportSecurity "$T/out-dir/Syndeo.app/Contents/Info.plist"
   expect "1:web pages held to App Transport Security, so no http page opens: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  fresh
+  plutil -remove CFBundleURLTypes "$T/out-dir/Syndeo.app/Contents/Info.plist"
+  expect "1:no URL types, so it is no web browser to macOS: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  fresh
+  plutil -insert CFBundleURLTypes.0.CFBundleURLSchemes.2 -string file "$T/out-dir/Syndeo.app/Contents/Info.plist"
+  expect "1:a scheme besides http and https (file): caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  fresh
+  plutil -remove CFBundleURLTypes.0.CFBundleURLSchemes.1 "$T/out-dir/Syndeo.app/Contents/Info.plist"
+  expect "1:http without https: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  fresh
+  plutil -insert CFBundleURLTypes.1 -json '{"CFBundleURLName":"Other","CFBundleURLSchemes":["x-other"]}' "$T/out-dir/Syndeo.app/Contents/Info.plist"
+  expect "1:a second URL type, for another scheme: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
+  fresh
+  plutil -replace CFBundleURLTypes.0.CFBundleTypeRole -string Editor "$T/out-dir/Syndeo.app/Contents/Info.plist"
+  expect "1:the URL type's role not Viewer: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
   fresh
   ln -s Syndeo "$T/out-dir/Syndeo.app/Contents/MacOS/link"
   expect "1:a link inside the bundle: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
