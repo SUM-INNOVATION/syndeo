@@ -828,7 +828,10 @@ impl Net {
 
         if uri.scheme() == Some(&http::uri::Scheme::HTTPS) && self.alt_svc.should_try(&authority) {
             if let Some(quic) = &self.quic {
-                let headers = crate::h3::with_extra(&request.headers, extra);
+                let mut headers = crate::h3::with_extra(&request.headers, extra);
+                if !asks_for_encoding(&self.config, request) {
+                    headers.remove(http::header::ACCEPT_ENCODING);
+                }
                 match quic
                     .request(&uri, &request.method, &headers, request.body.clone())
                     .await
@@ -1303,8 +1306,11 @@ async fn origin_headers(
             }
         }
         // What we cache is what the origin sent, so never invite an encoding we
-        // would then have to undo before hashing it.
-        headers.remove(http::header::ACCEPT_ENCODING);
+        // would then have to undo before hashing it — unless the caller asked
+        // for one and decodes it itself: see `asks_for_encoding`.
+        if !asks_for_encoding(config, request) {
+            headers.remove(http::header::ACCEPT_ENCODING);
+        }
     }
 
     let req = builder
@@ -1336,6 +1342,14 @@ async fn origin_headers(
         .get::<hyper_util::client::legacy::connect::HttpInfo>()
         .map(|info| info.remote_addr().ip());
     Ok((status, headers, response.into_body(), protocol, from))
+}
+
+/// Whether the request's own `Accept-Encoding` goes to the origin: only where
+/// `NetConfig::forward_accept_encoding` says the caller decodes what it asked
+/// for, and never for a request that declared integrity, which is over the
+/// decoded bytes.
+fn asks_for_encoding(config: &NetConfig, request: &FetchRequest) -> bool {
+    config.forward_accept_encoding && request.integrity.is_none()
 }
 
 /// Read a whole body into memory, refusing one past the ceiling.
@@ -1973,6 +1987,27 @@ mod tests {
         counted.await.unwrap();
         assert_eq!(net.landing.pending(), 0);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_encoding_is_asked_for_only_by_a_caller_that_decodes_and_declared_no_integrity() {
+        let forwarding = NetConfig {
+            forward_accept_encoding: true,
+            ..NetConfig::default()
+        };
+        let plain = FetchRequest::get("https://example.test/app.js");
+        assert!(asks_for_encoding(&forwarding, &plain));
+        assert!(!asks_for_encoding(&NetConfig::default(), &plain));
+        let declared = FetchRequest {
+            integrity: Some(
+                syndeo_cache::Integrity::parse(
+                    "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+                )
+                .unwrap(),
+            ),
+            ..plain
+        };
+        assert!(!asks_for_encoding(&forwarding, &declared));
     }
 
     fn keeping(public_only: bool) -> (Arc<RwLock<u64>>, Keep) {

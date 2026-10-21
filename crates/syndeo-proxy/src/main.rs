@@ -429,13 +429,16 @@ fn announce_ready(out: &mut impl std::io::Write, address: SocketAddr) -> std::io
 /// each answer actually came from: the cache is shared by every page that
 /// goes through the proxy, and nothing from this Mac's own services or the
 /// local network belongs in it, even when a public name resolves there.
-
+///
+/// The browser's own `Accept-Encoding` goes to the origin, and the answer
+/// comes back compressed as it asked, for it to decode.
 fn net_config(root: &std::path::Path, shared: bool, dns: DnsMode) -> NetConfig {
     NetConfig {
         cache_root: root.to_path_buf(),
         shared_cache: shared,
         dns,
         cache_public_addresses_only: true,
+        forward_accept_encoding: true,
         ..NetConfig::default()
     }
 }
@@ -2184,6 +2187,45 @@ mod tests {
         assert!(
             origin.seen().is_empty(),
             "the request went out as plain HTTP"
+        );
+    }
+
+    /// The browser's own `Accept-Encoding` reaches the origin, and the answer
+    /// comes back in the encoding it asked for, untouched, for the browser to
+    /// decode; the next one comes from the cache the same way. Without this
+    /// every page came uncompressed.
+    #[tokio::test]
+    async fn the_browsers_accept_encoding_reaches_the_origin_and_its_encoded_answer_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| {
+            respond(
+                200,
+                &[("content-encoding", "br"), ("cache-control", "max-age=600")],
+                b"\x1b\x03\x00 brotli bytes",
+            )
+        }))
+        .await;
+        let proxy = start_proxy(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let mut sender = http_over(stream).await;
+        let asking = [
+            ("host", authority.as_str()),
+            ("accept-encoding", "gzip, deflate, br"),
+        ];
+
+        for source in ["origin", "cache"] {
+            let reply = get(&mut sender, "/app.js", &asking).await;
+            assert_eq!(reply.status, StatusCode::OK);
+            assert_eq!(reply.headers.get("content-encoding").unwrap(), "br");
+            assert_eq!(&reply.body[..], b"\x1b\x03\x00 brotli bytes");
+            assert_eq!(reply.headers.get("x-syndeo-source").unwrap(), source);
+        }
+        let seen = origin.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].headers.get("accept-encoding").unwrap(),
+            "gzip, deflate, br"
         );
     }
 

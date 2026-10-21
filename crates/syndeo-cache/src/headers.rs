@@ -287,9 +287,89 @@ impl StoredHeaders {
     }
 }
 
+/// Whether a client whose request said `accept` (its `Accept-Encoding`, every
+/// field joined, or None without one) can take a body encoded as `content`
+/// (the stored response's `Content-Encoding`, likewise): RFC 9110 §12.5.3.
+///
+/// A request without `Accept-Encoding` takes any coding, and the identity
+/// coding is always taken. Otherwise each coding the body is in has to be
+/// named, or covered by `*`, with a weight above zero; `x-gzip` is `gzip`.
+pub fn coding_acceptable(content: Option<&str>, accept: Option<&str>) -> bool {
+    let Some(accept) = accept else {
+        return true;
+    };
+    let weights: Vec<(String, bool)> = accept
+        .split(',')
+        .filter_map(|item| {
+            let mut parts = item.split(';');
+            let name = coding_name(parts.next()?)?;
+            let wanted = parts
+                .filter_map(|param| param.split_once('='))
+                .find(|(key, _)| key.trim().eq_ignore_ascii_case("q"))
+                .map(|(_, q)| q.trim().parse::<f32>().map(|q| q > 0.0).unwrap_or(false))
+                .unwrap_or(true);
+            Some((name, wanted))
+        })
+        .collect();
+    let named = |coding: &str| {
+        weights
+            .iter()
+            .find(|(name, _)| name == coding)
+            .map(|(_, w)| *w)
+    };
+    content
+        .unwrap_or("")
+        .split(',')
+        .filter_map(coding_name)
+        .filter(|coding| coding != "identity")
+        .all(|coding| named(&coding).or_else(|| named("*")).unwrap_or(false))
+}
+
+/// A content coding's name as compared: trimmed, lower case, `x-gzip` as
+/// `gzip` and `x-compress` as `compress`; None for an empty one.
+fn coding_name(raw: &str) -> Option<String> {
+    let name = raw.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "" => None,
+        "x-gzip" => Some("gzip".to_string()),
+        "x-compress" => Some("compress".to_string()),
+        _ => Some(name),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_coding_is_acceptable_when_the_request_names_it_or_says_nothing() {
+        // No Accept-Encoding: anything (RFC 9110 §12.5.3).
+        assert!(coding_acceptable(Some("br"), None));
+        // Identity, or no coding at all, always.
+        assert!(coding_acceptable(None, Some("gzip")));
+        assert!(coding_acceptable(Some("identity"), Some("gzip")));
+        // Named, with any weight above zero, in any case and spacing.
+        assert!(coding_acceptable(Some("br"), Some("gzip, deflate, br")));
+        assert!(coding_acceptable(Some("BR"), Some(" Gzip ,br;q=0.5")));
+        assert!(coding_acceptable(Some("gzip"), Some("x-gzip")));
+        assert!(coding_acceptable(Some("x-gzip"), Some("gzip")));
+        // Covered by *.
+        assert!(coding_acceptable(Some("zstd"), Some("*")));
+        // Every coding of a body in more than one.
+        assert!(coding_acceptable(Some("gzip, br"), Some("br, gzip")));
+
+        // Not named, or refused.
+        assert!(!coding_acceptable(Some("br"), Some("gzip")));
+        assert!(!coding_acceptable(Some("br"), Some("identity")));
+        assert!(!coding_acceptable(Some("br"), Some("")));
+        assert!(!coding_acceptable(Some("br"), Some("gzip, br;q=0")));
+        assert!(!coding_acceptable(Some("br"), Some("br;q=0.0")));
+        assert!(!coding_acceptable(Some("br"), Some("*, br;q=0")));
+        assert!(!coding_acceptable(Some("zstd"), Some("*;q=0")));
+        assert!(!coding_acceptable(Some("gzip, br"), Some("gzip")));
+        // A weight that does not parse is no weight above zero.
+        assert!(!coding_acceptable(Some("br"), Some("br;q=lots")));
+    }
 
     #[test]
     fn parses_common_directives() {

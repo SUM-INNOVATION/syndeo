@@ -357,6 +357,53 @@ fn s4_1_vary_selects_the_matching_variant() {
     ));
 }
 
+/// RFC 9110 §12.5.3, where an origin left `Vary` out: a stored body in a
+/// coding the request does not accept is not served to it. A request that
+/// accepts it, or says nothing about codings, is served as before.
+#[test]
+fn s4_1_a_stored_coding_the_request_does_not_accept_is_not_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = cache_at(dir.path(), NOW);
+    let url = "https://example.test/script.js";
+    cache
+        .store(
+            None,
+            "GET",
+            url,
+            &headers(&[("accept-encoding", "gzip, deflate, br")]),
+            200,
+            &headers(&[
+                ("cache-control", "max-age=600"),
+                ("content-encoding", "br"),
+                ("date", &date(NOW)),
+            ]),
+            b"br bytes",
+            NOW,
+            NOW,
+        )
+        .unwrap();
+
+    for (accept, served) in [
+        (Some("gzip, deflate, br"), true),
+        (Some("br;q=0.5"), true),
+        (Some("*"), true),
+        (None, true),
+        (Some("gzip"), false),
+        (Some("gzip, br;q=0"), false),
+        (Some("identity"), false),
+    ] {
+        let request = match accept {
+            Some(accept) => headers(&[("accept-encoding", accept)]),
+            None => HeaderMap::new(),
+        };
+        match cache.lookup(None, "GET", url, &request).unwrap() {
+            Lookup::Fresh(r) if served => assert_eq!(r.body, b"br bytes"),
+            Lookup::Miss(_) if !served => {}
+            other => panic!("Accept-Encoding {accept:?}: expected served {served}, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn s4_1_vary_star_is_never_stored() {
     let meta = stored(200, &[("cache-control", "max-age=600"), ("vary", "*")], 0);
