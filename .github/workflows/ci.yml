@@ -75,6 +75,10 @@ jobs:
       # still applies to the source exactly once.
       - run: python3 -I ci/macos-app/mutants.py --check .
       - run: bash ci/sign-macos-pkg.sh --self-test
+      # Validating a stapled ticket, read only, in up to five attempts, each
+      # stopped at its limit; and every validation of the tests and of
+      # verify-pkg going through it. Stand-ins for stapler and sleep.
+      - run: bash ci/stapler-validate.sh --self-test
       # Where the signing secrets may go: nowhere in this workflow, and in
       # release.yml only to the four jobs that declare release-macos, each its
       # own share, after its gate; and the macOS release's order, its one

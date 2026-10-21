@@ -98,6 +98,9 @@ set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 templates="$here/macos-pkg"
+# validated_ticket: stapler validate, read only, in up to five attempts.
+# shellcheck source=ci/stapler-validate.sh
+. "$here/stapler-validate.sh"
 builder="$here/package-macos-pkg.sh"
 assembler="$here/package-macos-app.sh"
 NAMES="syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-ui syndeo-webkit"
@@ -445,10 +448,10 @@ signed_state() {
   local pkg="$1" app="$2" team="$3" out first last problems chain origin
   note "signing (expected: Developer ID of $team, notarized and stapled)"
   signed_bundle "$app" "$team"
-  if xcrun stapler validate "$app" >/dev/null 2>&1; then
+  if validated_ticket "$app"; then
     ok "Syndeo.app's notarization ticket is stapled, and validates"
   else
-    bad "Syndeo.app's notarization ticket" "stapler validate fails"
+    bad "Syndeo.app's notarization ticket" "stapler validate fails, in every attempt"
   fi
   origin="$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^Authority=//p' | head -n 1)"
   problems="$(accepted "$app" execute "$origin")"
@@ -474,10 +477,10 @@ signed_state() {
   else
     bad "package signature" "${problems# }"
   fi
-  if xcrun stapler validate "$pkg" >/dev/null 2>&1; then
+  if validated_ticket "$pkg"; then
     ok "its notarization ticket is stapled, and validates"
   else
-    bad "notarization ticket" "stapler validate fails"
+    bad "notarization ticket" "stapler validate fails, in every attempt"
   fi
   problems="$(accepted "$pkg" install "$first")"
   if [ -z "$problems" ]; then
@@ -2273,14 +2276,25 @@ printf '    1. %s\n       Expires: 2031-10-10 12:00:00 +0000\n' "${STANDIN_PKG_S
 printf '    2. Developer ID Certification Authority\n'
 printf '    3. %s\n' "${STANDIN_PKG_ROOT:-Apple Root CA}"
 EOF
+  # stapler validate: yes, no, or once (failing the first time it is asked,
+  # as when the connection to Apple is lost, then validating).
   cat >"$bin/xcrun" <<'EOF'
 #!/bin/bash
 [ "$1 $2" = "stapler validate" ] || exit 1
 case "$3" in
-  *.app) [ "${STANDIN_APP_STAPLED:-yes}" = yes ] ;;
-  *) [ "${STANDIN_STAPLED:-yes}" = yes ] ;;
+  *.app) want="${STANDIN_APP_STAPLED:-yes}" mark=app ;;
+  *) want="${STANDIN_STAPLED:-yes}" mark=pkg ;;
+esac
+case "$want" in
+  yes) exit 0 ;;
+  once) [ -e "$STANDIN_MARKS/$mark" ] && exit 0; : >"$STANDIN_MARKS/$mark"; echo "The validate action failed! Error 68."; exit 68 ;;
+  *) exit 65 ;;
 esac
 EOF
+  # sleep, for validated_ticket's waits between attempts: over at once.
+  mkdir -p "$T/fast"
+  printf '#!/bin/bash\nexit 0\n' >"$T/fast/sleep"
+  chmod 755 "$T/fast/sleep"
   cat >"$bin/spctl" <<'EOF'
 #!/bin/bash
 path="${@: -1}"
@@ -2302,7 +2316,8 @@ EOF
   signed_case() {
     local label="$1" fails="$2" text="$3"
     shift 3
-    out="$(env "$@" PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF \
+    rm -rf "$T/marks" && mkdir -p "$T/marks"
+    out="$(env "$@" PATH="$T/fast:$bin:$PATH" STANDIN_MARKS="$T/marks" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF \
       bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --app "$app" 2>&1)"
     if [ "$fails" = 0 ]; then
       expect "signed inspect: $label" eval "printf '%s' \"\$out\" | grep -q '[1-9][0-9]* passed, 0 failed'"
@@ -2321,14 +2336,17 @@ EOF
   signed_case "the bundle with an entitlement" 1 "Syndeo.app — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=Syndeo.app "STANDIN_ENTITLEMENT=<key>com.apple.security.cs.disable-library-validation</key><true/>"
   signed_case "the helper with the keychain access group" 1 "syndeo-proxy, the helper — has entitlements, and no shipped executable may;" STANDIN_ENTITLED=syndeo-proxy
   signed_case "the bundle signed as another identifier" 1 "Syndeo.app — signed as 'com.example.other', not com.sum.syndeo;" STANDIN_APP_IDENTIFIER=com.example.other
-  signed_case "the bundle's ticket not stapled" 1 "Syndeo.app's notarization ticket — stapler validate fails" STANDIN_APP_STAPLED=no
+  signed_case "the bundle's ticket not stapled" 1 "Syndeo.app's notarization ticket — stapler validate fails, in every attempt" STANDIN_APP_STAPLED=no
+  signed_case "the bundle's ticket validating only on the second attempt, after a lost connection: passes" 0 "" STANDIN_APP_STAPLED=once
+  expect "  ... and each attempt is shown, the first failing" eval "printf '%s' \"\$out\" | grep -qF '[exit 68] (attempt 1 of 5)' && printf '%s' \"\$out\" | grep -qF '[exit 0] (attempt 2 of 5)'"
   signed_case "Gatekeeper rejects the bundle" 1 "Gatekeeper, Syndeo.app — rejected;" STANDIN_APP_SPCTL=rejected
   signed_case "Gatekeeper: the bundle Developer ID, not notarized" 1 "Gatekeeper, Syndeo.app — source=Developer ID;" "STANDIN_APP_SOURCE=Developer ID"
   signed_case "the package signed by another team" 1 "package signature — signed by 'Developer ID Installer: Other Org (ZZ99ZZ99ZZ)';" "STANDIN_PKG_SIGNER=Developer ID Installer: Other Org (ZZ99ZZ99ZZ)" "STANDIN_ORIGIN=Developer ID Installer: Other Org (ZZ99ZZ99ZZ)"
   signed_case "the package signed with the Application identity" 1 "package signature — signed by 'Developer ID Application:" "STANDIN_PKG_SIGNER=Developer ID Application: Example Org (AB12CD34EF)" "STANDIN_ORIGIN=Developer ID Application: Example Org (AB12CD34EF)"
   signed_case "the package not chained to Apple Root CA" 1 "chained to 'Someone Root', not Apple Root CA;" "STANDIN_PKG_ROOT=Someone Root"
   signed_case "the package trusted, but not for distribution" 1 "package signature — Status: signed by a certificate trusted by macOS;" "STANDIN_PKG_STATUS=signed by a certificate trusted by macOS"
-  signed_case "no stapled ticket on the package" 1 "notarization ticket — stapler validate fails" STANDIN_STAPLED=no
+  signed_case "no stapled ticket on the package" 1 "notarization ticket — stapler validate fails, in every attempt" STANDIN_STAPLED=no
+  signed_case "the package's ticket validating only on the second attempt: passes" 0 "" STANDIN_STAPLED=once
   signed_case "Gatekeeper: the package Developer ID, not notarized" 1 "Gatekeeper — source=Developer ID;" "STANDIN_SOURCE=Developer ID"
   signed_case "Gatekeeper: the package from another origin" 1 "Gatekeeper — from another origin;" "STANDIN_ORIGIN=Developer ID Installer: Example Org (ZZ99ZZ99ZZ)"
   signed_case "Gatekeeper rejects the package" 1 "Gatekeeper — rejected;" STANDIN_SPCTL=rejected

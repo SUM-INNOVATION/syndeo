@@ -932,7 +932,7 @@ def self_test(directory):
     case("notarize-binaries without a time limit", ci,
          in_job(rel, "notarize-binaries", "    timeout-minutes: 350\n", ""), "notarize-binaries sets no timeout-minutes")
     case("package allowed GitHub's whole 360 minutes", ci,
-         in_job(rel, "package", "    timeout-minutes: 350\n", "    timeout-minutes: 360\n"), "package's deadline 300 and timeout 360")
+         in_job(rel, "package", "    timeout-minutes: 350\n", "    timeout-minutes: 360\n"), "package's deadline 285 and timeout 360")
     case("a deadline that leaves no time to clean up", ci,
          in_job(rel, "notarize-binaries", 'NOTARY_DEADLINE_MINUTES: "300"', 'NOTARY_DEADLINE_MINUTES: "340"'),
          "notarize-binaries's deadline 340 and timeout 350")

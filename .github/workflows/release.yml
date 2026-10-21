@@ -433,18 +433,22 @@ jobs:
   # wait, on the same terms as the binaries', and stapling and Gatekeeper
   # only after Apple accepted exactly that file.
   #
-  # The time. Each stapling, the bundle's before the submission and the
-  # package's after the verdict, is at most five attempts:
-  # - 225 seconds of waiting between them;
-  # - ten stapler commands, each stopped at 60 seconds;
-  # - the copies and checks.
-  # That is under 15 minutes each, 30 together. In the signed dry run of
-  # 0.2.0 (run 39363163966), everything else in this job took about 30
-  # seconds: setup, downloads, the package built, signed and submitted, and
-  # the inspection and uploads after. The wait ends at its deadline, 300
-  # minutes counted from the submission, and the package is stapled only if
-  # Apple accepted it before then. So the job's worst case is about 331
-  # minutes, inside its 350.
+  # The time:
+  # - each stapling, the bundle's before the submission and the package's
+  #   after the verdict, is at most five attempts: 225 seconds of waiting,
+  #   ten stapler commands each stopped at 60 seconds, and the copies and
+  #   checks. Under 15 minutes each, 30 together;
+  # - the inspection after stapling validates the bundle's ticket and the
+  #   package's with ci/stapler-validate.sh: at most five attempts each, 225
+  #   seconds of waiting and five commands of about 61 seconds, under 9
+  #   minutes. Under 18 together;
+  # - in the signed dry run of 0.2.0 (run 39520714210), everything else in
+  #   this job took under a minute;
+  # - the wait ends at its deadline, 285 minutes counted from the
+  #   submission, and stapling follows only if Apple accepted before then.
+  # So the worst case is about 332 minutes, inside the job's 350. The
+  # deadline is 285, not the binaries' 300, to make room for the
+  # validations.
   package:
     name: the installer package, signed and notarized
     needs: [verify, signing-config, build-macos, notarize-binaries]
@@ -459,7 +463,7 @@ jobs:
       TARBALL: syndeo-${{ needs.verify.outputs.version }}-aarch64-apple-darwin.tar.gz
       APPZIP: Syndeo.app.zip
       PKG: Syndeo-${{ needs.verify.outputs.version }}.pkg
-      NOTARY_DEADLINE_MINUTES: "300"
+      NOTARY_DEADLINE_MINUTES: "285"
     steps:
       - uses: actions/checkout@v4
 
@@ -618,6 +622,11 @@ jobs:
   # it, through the same guarded test every pull request runs, and the runner
   # put back. Signed, Gatekeeper has to accept it, downloaded, and the bundle
   # it installs; unsigned, to reject both. Only its logs are kept.
+  #
+  # The time. Signed, the test validates the installed bundle's ticket with
+  # ci/stapler-validate.sh: at most five attempts, under 9 minutes. The same
+  # test took 11 to 15 minutes on pull requests. So the worst case is about
+  # 24 minutes, inside 90.
   pkg-install:
     name: the package, installed and removed on a fresh runner
     needs: [verify, build-macos, notarize-binaries, package]
@@ -663,11 +672,17 @@ jobs:
   # removed; and the runner put back. Its output is the SHA-256 it accepted,
   # set only once the journey has passed; publish and rehearse upload
   # nothing else. No secrets and no environment; only its logs are kept.
+  #
+  # The time. The journey validates the package's ticket and the installed
+  # bundle's, each with ci/stapler-validate.sh, at most 9 minutes each,
+  # under 18 together. The rest of the journey took 2.5 to 3.1 minutes in
+  # runs of 2026-10-20 and 21. So the worst case is about 21 minutes, inside
+  # 30.
   acceptance:
     name: the package, a customer's journey on a fresh runner
     needs: [verify, build-macos, notarize-binaries, package]
     runs-on: macos-15
-    timeout-minutes: 15
+    timeout-minutes: 30
     outputs:
       accepted-sha256: ${{ steps.accepted.outputs.sha256 }}
     env:

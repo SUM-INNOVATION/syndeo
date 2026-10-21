@@ -140,7 +140,7 @@ run() {
   section "2. Gatekeeper, on the download"
   gatekeeper download "the download" "$q" install
   if [ "${SYNDEO_EXPECT_SIGNED:-no}" = yes ]; then
-    must "  ... its notarization ticket is stapled, and validates" xcrun stapler validate "$q"
+    must "  ... its notarization ticket is stapled, and validates" validated_ticket "$q" "$st/logs/stapler-validate-download"
   fi
 
   section "3. installed"
@@ -150,7 +150,7 @@ run() {
   section "4. Gatekeeper, on the installed Syndeo.app"
   gatekeeper installed-app "the installed Syndeo.app" "$APP" execute
   if [ "${SYNDEO_EXPECT_SIGNED:-no}" = yes ]; then
-    must "  ... its notarization ticket is stapled, and validates" xcrun stapler validate "$APP"
+    must "  ... its notarization ticket is stapled, and validates" validated_ticket "$APP" "$st/logs/stapler-validate-installed-app"
   fi
 
   section "5. opened, used, quit, and opened again"

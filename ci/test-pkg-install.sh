@@ -69,6 +69,9 @@
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# validated_ticket: stapler validate, read only, in up to five attempts.
+# shellcheck source=ci/stapler-validate.sh
+. "$here/stapler-validate.sh"
 NAMES="syndeo syndeo-net syndeo-keystore syndeo-agent syndeo-proxy syndeo-ui syndeo-webkit"
 BUNDLE_ID=com.sum.syndeo
 APP_ID=com.sum.syndeo.app
@@ -880,7 +883,7 @@ run() {
   must "  ... the installed bundle carries no quarantine" eval "! as_root xattr -r '$APP' 2>/dev/null | grep -q com.apple.quarantine"
   gatekeeper installed-app "the installed Syndeo.app" "$APP" execute
   if [ "${SYNDEO_EXPECT_SIGNED:-no}" = yes ]; then
-    must "  ... its notarization ticket is stapled, and validates" xcrun stapler validate "$APP"
+    must "  ... its notarization ticket is stapled, and validates" validated_ticket "$APP" "$st/logs/stapler-validate-installed-app"
   fi
   launched first
   before="$(package_state)"
