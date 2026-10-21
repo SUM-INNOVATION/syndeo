@@ -4,8 +4,8 @@
 #
 #   ci/test-pageload.sh <syndeo-proxy> <url> [runs]
 #
-# Each run, in turn, loads <url> in a new web view with a new, empty data
-# store (ci/macos-app/pageload.swift), once cold and once warm:
+# Each run, in turn, loads <url> in a new web view on an emptied data store
+# (ci/macos-app/pageload.swift), once cold and once warm:
 #   - direct: WebKit by itself;
 #   - syndeo: through <syndeo-proxy> as Syndeo.app runs it, started for the
 #     run with a home and a cache of its own, so nothing it kept from another
@@ -40,7 +40,10 @@ PROXY="$1" URL="$2" RUNS="${3:-5}"
 
 mkdir -p "$LOGS"
 PAGELOAD="$LOGS/pageload"
-swiftc -O -o "$PAGELOAD" "$here/macos-app/pageload.swift" >"$LOGS/swiftc.log" 2>&1 || { say "could not build pageload"; cat "$LOGS/swiftc.log"; exit 2; }
+# With Syndeo.app's App Transport Security, from pageload.plist, linked in.
+swiftc -O -o "$PAGELOAD" "$here/macos-app/pageload.swift" \
+  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$here/macos-app/pageload.plist" \
+  >"$LOGS/swiftc.log" 2>&1 || { say "could not build pageload"; cat "$LOGS/swiftc.log"; exit 2; }
 
 PROXY_PID=''
 stop_proxy() {

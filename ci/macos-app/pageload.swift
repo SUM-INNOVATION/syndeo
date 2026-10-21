@@ -8,10 +8,13 @@
 //                                                  ca.pem, as Syndeo.app's
 //                                                  windows do
 //
-// Each run is a new web view with a new, empty, non-persistent data store,
-// so nothing WebKit kept from another run answers for it: the url is loaded
-// once (cold) and then again in the same web view (warm). One JSON object a
-// line per load, on stdout:
+// As Syndeo.app does, it browses in WebKit's default data store, and its
+// App Transport Security is the app's, NSAllowsArbitraryLoadsInWebContent
+// (pageload.plist, linked into the executable): without it WebKit refuses
+// the proxy's certificates on macOS 15 before any delegate is asked. Each run
+// empties that store and opens a new web view, so nothing WebKit kept from
+// another run answers for it: the url is loaded once (cold) and then again in
+// the same web view (warm). One JSON object a line per load, on stdout:
 //
 //   {"run":1,"visit":"cold","ok":true,"fcp":812,"dcl":901,"load":1520,
 //    "wall":1604,"resources":131,"protocols":{"h2":131,"http/1.1":1}}
@@ -97,23 +100,31 @@ final class Driver: NSObject, WKNavigationDelegate {
     func next() {
         if visit == "cold", webView != nil {
             visit = "warm"
-        } else {
-            run += 1
-            visit = "cold"
-            guard run <= runs else { exit(0) }
-            let configuration = WKWebViewConfiguration()
-            let store = WKWebsiteDataStore.nonPersistent()
-            if let proxy {
-                let endpoint = NWEndpoint.hostPort(
-                    host: NWEndpoint.Host(proxy.host), port: NWEndpoint.Port(rawValue: proxy.port)!)
-                store.proxyConfigurations = [ProxyConfiguration(httpCONNECTProxy: endpoint, tlsOptions: nil)]
-            }
-            configuration.websiteDataStore = store
-            let view = WKWebView(frame: window.contentView!.bounds, configuration: configuration)
-            view.navigationDelegate = self
-            window.contentView = view
-            webView = view
+            go()
+            return
         }
+        run += 1
+        visit = "cold"
+        guard run <= runs else { exit(0) }
+        let store = WKWebsiteDataStore.default()
+        if let proxy {
+            let endpoint = NWEndpoint.hostPort(
+                host: NWEndpoint.Host(proxy.host), port: NWEndpoint.Port(rawValue: proxy.port)!)
+            store.proxyConfigurations = [ProxyConfiguration(httpCONNECTProxy: endpoint, tlsOptions: nil)]
+        }
+        // Empty, then a new web view on it.
+        store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {
+            let configuration = WKWebViewConfiguration()
+            configuration.websiteDataStore = store
+            let view = WKWebView(frame: self.window.contentView!.bounds, configuration: configuration)
+            view.navigationDelegate = self
+            self.window.contentView = view
+            self.webView = view
+            self.go()
+        }
+    }
+
+    func go() {
         asked = Date()
         timeout?.invalidate()
         timeout = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
