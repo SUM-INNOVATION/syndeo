@@ -766,7 +766,10 @@ asked_web() {
 }
 
 # asked_refused APP LOG: another application asks Syndeo to open an ftp
-# address, and a file, as `open -a` asks. Each is refused in a tab of its own
+# address, and a file, as `open -a` asks: /private/etc/passwd, by its real
+# path, since Launch Services hands an application a file by that, and
+# /etc/passwd arrives as file:///private/etc/passwd (CI 39664605039). Each is
+# refused in a tab of its own
 # with the words typing it gets, shows nothing of what it points at, and
 # starts no other application; the log names each by its scheme alone. The
 # checks are named "an ftp address ... is refused" and "a file ... is
@@ -788,7 +791,7 @@ asked_refused() {
     if opened_since "$log" "$opened"; then close_tab "the tab $what opened"; fi
   done <<'ASKED'
 an ftp address another application asks Syndeo to open|ftp://example.com/|ftp://example.com/|not ftp: ones
-a file another application asks Syndeo to open|/etc/passwd|file:///etc/passwd|not file: ones
+a file another application asks Syndeo to open|/private/etc/passwd|file:///private/etc/passwd|not file: ones
 ASKED
   must "$(plain_log "$log" | grep -q 'refused an address another application asked to open scheme=ftp' &&
     plain_log "$log" | grep -q 'refused an address another application asked to open scheme=file' && echo yes)" \
