@@ -319,9 +319,11 @@ jobs:
     # Accessibility; browsed in, by keystrokes and presses as a person would:
     # addresses, Back and Forward, refusals, search as Settings chooses it, a
     # tab opened and closed, no private URL in any log, https pinned through
-    # the proxy, a page's own links to other schemes refused; its last window
-    # closed and brought back by opening it again, quit as the Quit menu item
-    # would, and opened again; seven mutants, each of which the test has to
+    # the proxy, a page's own links to other schemes refused; addresses other
+    # applications ask it to open, opened through the proxy or refused, and
+    # opened by one; passkeys reported unavailable, asking nothing; its last
+    # window closed and brought back by opening it again, quit as the Quit
+    # menu item would, and opened again; seven mutants, each of which the test has to
     # catch; a copy whose proxy cannot start, which has to refuse to browse;
     # and the route bar against what WebKit does, the proxy's cache keeping
     # nothing from this Mac, and Clear Browsing Data. Unsigned with a
@@ -379,7 +381,8 @@ jobs:
 
       # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
       # mutants.py): the pinning delegate, the main frame's navigation policy,
-      # the schemes a new tab may open, the address field's guard for typing,
+      # the schemes a new tab may open, the schemes another application may
+      # ask Syndeo to open, the address field's guard for typing,
       # the bar's rule for names, the refusal of a link to an IPv6 address
       # with a zone, Reload asking the origin, and, in the proxy, a WebSocket
       # carried rather than stripped of its Upgrade. Each is built from this

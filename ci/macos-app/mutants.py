@@ -22,6 +22,10 @@ back.
 - any-scheme-in-a-new-tab: a page asking for a new window gets a tab
   whatever the scheme. A page's links and scripts to other schemes in a new
   tab must then be seen opening one.
+- asked-any-scheme: an address another application asks Syndeo to open is
+  opened whatever its scheme, as long as it has a host. An ftp address and a
+  file asked for that way must then be seen not refused with the words
+  typing them gets.
 - no-editing-guard: the address field is written whenever a page reports
   its address, whoever is typing there. What someone types while a page is
   loading must then be seen overwritten when it arrives.
@@ -98,6 +102,13 @@ MUTANTS = {
             BROWSER,
             "            if address::allowed_in_main_frame(&scheme_of(&request)) {\n",
             "            if true {\n",
+        ),
+    ],
+    "asked-any-scheme": [
+        (
+            ADDRESS,
+            "    if scheme != \"http\" && scheme != \"https\" {\n",
+            "    if false {\n",
         ),
     ],
     "no-editing-guard": [

@@ -53,12 +53,28 @@
 #   - an address typed while a page loads is not overwritten when it arrives,
 #     leaving the field shows the page's address again, and the field then
 #     follows navigation as before;
+#   - it says in its log that passkeys are not available in this copy, which
+#     holds no entitlement, and asked nothing of anyone: no sheet, and its
+#     one window its own;
+#   - asked by another application to open an address, as `open -a` asks:
+#     an http and an https address, each with this instance's own query,
+#     open in a new tab beside the window, the bar saying Through Syndeo, and
+#     the proxy's count rising for each, the https one with Syndeo's
+#     authority in no trust settings; an ftp address and a file are each
+#     refused in a tab of their own with the words typing them gets, showing
+#     nothing of the file and starting no other application; and the log has
+#     each one's scheme and nothing else of it;
 #   - asked to quit as the Quit menu item would, it exits, and its proxy
 #     with it;
 #   - with its last window closed, through the window's own close button, the
 #     window is let go, the same app and the same proxy keep running, and
 #     opening the bundle again brings a window back in that same process, with
 #     that same proxy;
+#   - opened by another application asking it to open an https address, as
+#     a link clicked elsewhere opens a browser that is not running: that page
+#     opens, after launch has decided it can browse, with Syndeo's authority
+#     in no trust settings, the bar saying Through Syndeo; whether a start
+#     page opens beside it is measured, not gated;
 #   - opened again, all of that holds again, and quitting again leaves nothing;
 #   - it made no keystore changes: no keystore in its home and no keychain
 #     item for one;
@@ -98,11 +114,13 @@
 #
 # mutant, which gates: the app given is one of ci/macos-app/mutants.py's,
 # with one safeguard taken out, and this passes only if the checks meant to
-# catch it fail, at least one, and no other check does: https for
-# no-pinning-delegate (while http, rendered and counted, still works), a
+# catch it fail, at least one, and no other check does: https, typed and
+# asked for by another application, for no-pinning-delegate (while http,
+# rendered and counted, still works), a
 # page's links in the window for no-navigation-policy, in a new tab for
-# any-scheme-in-a-new-tab, typing kept through a page's arrival for
-# no-editing-guard, the bar for a name for direct-for-every-name, a link to
+# any-scheme-in-a-new-tab, an ftp address and a file another application
+# asks Syndeo to open refused for asked-any-scheme, typing kept through a
+# page's arrival for no-editing-guard, the bar for a name for direct-for-every-name, a link to
 # an IPv6 address with a zone for zoned-links-followed, Reload consulting
 # the origin for reload-from-cache, and a WebSocket through Syndeo for
 # websocket-headers-stripped. Any other failure is a failure.
@@ -240,7 +258,8 @@ FRESH=''
 # no proof the page was shown; this sentence is in the page's body.
 EXAMPLE_BODY='This domain is for use in documentation examples'
 
-# started APP ROUND: open APP and check what is running: Launch Services has
+# started APP ROUND [ADDRESS]: open APP, asking it to open ADDRESS if one is
+# given, as another application would, and check what is running: Launch Services has
 # it as $ID, from APP, with an on-screen window, and its one child is the
 # proxy from APP's Contents/Helpers; no keystore process exists. Sets PID and
 # HELPER; returns non-zero if there is no app to check further.
@@ -256,7 +275,11 @@ started() {
   # WebKit's cache persists from one instance to the next, so a page another
   # instance opened could otherwise be shown without this one fetching it.
   FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-  open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" || { bad "open ($round)" "open failed"; return 1; }
+  if [ -n "${3:-}" ]; then
+    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" -a "$app" "$3" || { bad "open ($round)" "open failed"; return 1; }
+  else
+    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" || { bad "open ($round)" "open failed"; return 1; }
+  fi
   until=$((SECONDS + 30))
   while :; do
     pids="$("$APPCTL" pids "$ID")"
@@ -697,6 +720,109 @@ editing() {
   arrive "$first" 'Policy test' "and the field follows navigation again: Back shows the page before"
 }
 
+# What the log says of passkeys in a copy without Apple's browser passkey
+# entitlement, which no copy CI builds holds (see the passkeys module).
+PASSKEYS_NONE="passkeys: not available in this copy of Syndeo, which does not hold com.apple.developer.web-browser.public-key-credential; a page's passkey requests fail, and nothing was asked of anyone"
+
+# passkeys_unavailable LOG ROUND: the app says so, once, and asked nothing of
+# anyone: no sheet in its window, and its one window its own.
+passkeys_unavailable() {
+  local said
+  wait_for 10 grep -qF "$PASSKEYS_NONE" "$1" || true
+  said="$(plain_log "$1" | grep -c 'passkeys: ')"
+  must "$(plain_log "$1" | grep -qF "$PASSKEYS_NONE" && [ "$said" = 1 ] && echo yes)" \
+    "it says passkeys are not available in this copy, which holds no entitlement, and that it asked nothing ($2)" \
+    "$said passkeys lines: $(plain_log "$1" | grep 'passkeys: ' | head -n 2 | cut -c1-200 | tr '\n' ' ')"
+  must "$("$APPCTL" ax-tree "$PID" | grep -q '^AXSheet' && echo no || echo yes)" "and nothing is asked of anyone: no sheet in its window ($2)"
+  must "$([ "$("$APPCTL" titles "$PID" | grep -c .)" = 1 ] && echo yes)" "and its one window is its own ($2)" "$("$APPCTL" titles "$PID" | tr '\n' '|')"
+}
+
+# opened_since LOG N: the app reports more than N windows opened.
+opened_since() { [ "$(grep -c 'a window opened' "$1")" -gt "$2" ]; }
+
+# asked_web APP LOG SCHEME: another application asks Syndeo to open
+# SCHEME://example.com with this instance's own query, as `open -a` asks. It
+# opens in a new tab beside the window, shows the page, the bar says Through
+# Syndeo, and the proxy's count rises for it; for https, with Syndeo's
+# authority in no trust settings. The checks are named "an SCHEME address
+# another application asks Syndeo to open", which, for https, is what the
+# no-pinning-delegate mutant has to fail.
+asked_web() {
+  local app="$1" log="$2" scheme="$3" page what opened before on_screen
+  page="$scheme://example.com/?$FRESH-asked-$scheme"
+  what="an $scheme address another application asks Syndeo to open"
+  counted "before $what"
+  before="$COUNTED"
+  opened="$(grep -c 'a window opened' "$log")"
+  open -a "$app" "$page" || bad "$what opens in a new tab" "open -a failed"
+  if wait_for 15 opened_since "$log" "$opened"; then ok "$what opens in a new tab"; else bad "$what opens in a new tab" "the app reports no new window: $(grep 'a window' "$log" | tail -n 2 | tr '\n' ' ')"; fi
+  arrive "$page" "$EXAMPLE_BODY" "$what shows its page, with Syndeo's authority in no trust settings"
+  must "$([ "$(bar)" = "$SYNDEO_LABEL" ] && echo yes)" "$what: the bar says $SYNDEO_LABEL" "the bar says $(bar)"
+  on_screen="$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')"
+  must "$([ "$on_screen" = 1 ] && echo yes)" "$what: a tab beside the window, one window on screen" "$on_screen on screen"
+  counted "after $what"
+  risen "$before" "$what: the proxy fetched it"
+  close_tab "the tab $what opened"
+}
+
+# asked_refused APP LOG: another application asks Syndeo to open an ftp
+# address, and a file, as `open -a` asks: /private/etc/passwd, by its real
+# path, since Launch Services hands an application a file by that, and
+# /etc/passwd arrives as file:///private/etc/passwd (CI 39664605039). Each is
+# refused in a tab of its own
+# with the words typing it gets, shows nothing of what it points at, and
+# starts no other application; the log names each by its scheme alone. The
+# checks are named "an ftp address ... is refused" and "a file ... is
+# refused", which is what the asked-any-scheme mutant has to fail.
+asked_refused() {
+  local app="$1" log="$2" what address words shown opened apps started_now id how
+  while IFS='|' read -r what address shown words; do
+    opened="$(grep -c 'a window opened' "$log")"
+    apps="$("$APPCTL" apps)"
+    open -a "$app" "$address" || bad "$what is refused in a tab of its own" "open -a failed"
+    if wait_for 15 opened_since "$log" "$opened"; then ok "$what is refused in a tab of its own"; else bad "$what is refused in a tab of its own" "the app reports no new window"; fi
+    arrive "$shown" "$words" "$what is refused with the words typing it gets"
+    must "$(page_says 'root:' && echo no || echo yes)" "$what is refused, and nothing of what it points at is shown"
+    started_now="$(comm -13 <(printf '%s\n' "$apps") <("$APPCTL" apps))"
+    must "$([ -z "$started_now" ] && echo yes)" "$what is refused, and starts no other application" "$(printf '%s' "$started_now" | tr '\n' ' ')"
+    for id in $started_now; do
+      how="$("$APPCTL" stop "$id")" || bad "cleanup after $what" "$id, which it started, is $how"
+    done
+    if opened_since "$log" "$opened"; then close_tab "the tab $what opened"; fi
+  done <<'ASKED'
+an ftp address another application asks Syndeo to open|ftp://example.com/|ftp://example.com/|not ftp: ones
+a file another application asks Syndeo to open|/private/etc/passwd|file:///private/etc/passwd|not file: ones
+ASKED
+  must "$(plain_log "$log" | grep -q 'refused an address another application asked to open scheme=ftp' &&
+    plain_log "$log" | grep -q 'refused an address another application asked to open scheme=file' && echo yes)" \
+    "the log names each address another application asked for by its scheme alone" \
+    "$(plain_log "$log" | grep 'another application asked' | cut -c1-160 | tr '\n' ' ')"
+}
+
+# asked_launch APP: open APP by asking it to open an https address, as a link
+# clicked elsewhere opens a browser that is not running. The page opens,
+# after launch has decided it can browse, with Syndeo's authority in no trust
+# settings, the bar saying Through Syndeo. Whether the address reaches it
+# before launch finishes, and so whether a start page opens beside it, is
+# AppKit's to decide: measured, not gated.
+asked_launch() {
+  local app="$1" round=asked page log
+  page="https://example.com/?$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')-asked-launch"
+  say "opened to open an address"
+  started "$app" "$round" "$page" || return
+  helper_of "$app" "$round"
+  browses "$round"
+  log="$LOGS/app-$round.stderr"
+  arrive "$page" "$EXAMPLE_BODY" "opened to open an https address, it shows that page, with Syndeo's authority in no trust settings"
+  must "$([ "$(bar)" = "$SYNDEO_LABEL" ] && echo yes)" "and the bar says $SYNDEO_LABEL ($round)" "the bar says $(bar)"
+  must "$([ "$(plain_log "$log" | grep -c 'opening an address another application asked to open scheme=https')" = 1 ] && echo yes)" \
+    "the log says it opened the one address it was asked for, by its scheme alone ($round)"
+  printf '  MEASURE  opened to open an address: %s window(s) opened; %s\n' \
+    "$(grep -c 'a window opened' "$log")" \
+    "$(plain_log "$log" | awk '/opening an address another application asked/ && !asked {asked = NR} /a window opened open=1/ && !first {first = NR} END {print (asked && first && asked < first) ? "the address came before launch finished, so no start page" : "the address came after launch had opened the start page"}')"
+  stopped "$round"
+}
+
 # Browse as a person would, in the first window and a tab beside it.
 browsing() {
   local app="$1" round=browse log on_screen have before
@@ -733,6 +859,10 @@ browsing() {
 
   private "$log"
   pinned
+  passkeys_unavailable "$log" "$round"
+  asked_web "$app" "$log" http
+  asked_web "$app" "$log" https
+  asked_refused "$app" "$log"
   unlogged "$log"
 
   # Measured, not gated: a page on this runner's loopback, and the proxy's
@@ -798,6 +928,7 @@ launch() {
   one_launch "$app" first
   browsing "$app"
   reopened "$app"
+  asked_launch "$app"
   one_launch "$app" again
   printf '\nwhat it left\n'
   must "$([ ! -e "$home/.keystore" ] && echo yes)" "no keystore in its home ($home)" "$(ls -la "$home/.keystore" 2>&1 | head -3)"
@@ -976,9 +1107,10 @@ mutant() {
   no_app || { say "refusing: $ID is already running"; exit 2; }
   printf '\nSyndeo.app with a safeguard taken out (%s): %s\n' "$name" "$app"
   case "$name" in
-    no-pinning-delegate) intended='^(https://example\.com opens|and the proxy fetched it over https:)' ;;
+    no-pinning-delegate) intended='^(https://example\.com opens|and the proxy fetched it over https:|an https address another application asks Syndeo to open( shows|: the bar|: the proxy))' ;;
     no-navigation-policy) intended='^policy: .* is refused in the window$' ;;
     any-scheme-in-a-new-tab) intended='^policy: .* is refused and opens no tab$' ;;
+    asked-any-scheme) intended='^(an? (ftp address|file) another application asks Syndeo to open is refused with the words typing it gets|the log names each address another application asked for by its scheme alone)$' ;;
     no-editing-guard) intended="^typing in the address field while a page loads" ;;
     direct-for-every-name) intended='^the bar for a name' ;;
     zoned-links-followed) intended='^a link to an IPv6 address with a zone' ;;
@@ -991,7 +1123,8 @@ mutant() {
     browses "mutant-$name"
     log="$LOGS/app-mutant-$name.stderr"
     case "$name" in
-      no-pinning-delegate) plain_http; pinned; unlogged "$log" ;;
+      no-pinning-delegate) plain_http; pinned; asked_web "$app" "$log" https; unlogged "$log" ;;
+      asked-any-scheme) asked_refused "$app" "$log" ;;
       no-editing-guard) editing ;;
       direct-for-every-name | zoned-links-followed) routes_lite ;;
       reload-from-cache) reload_gate ;;
