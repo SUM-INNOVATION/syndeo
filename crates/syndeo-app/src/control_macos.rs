@@ -174,6 +174,19 @@ pub fn opened_beside(parent: &NSWindow, window: &NSWindow) {
     with(|control| control.opened_beside(parent, window));
 }
 
+/// Whether `window` is one of an agent's tabs, which addresses the person
+/// asks for do not open beside.
+pub fn is_agents(window: &NSWindow) -> bool {
+    with(|control| {
+        control
+            .tabs
+            .borrow()
+            .values()
+            .any(|t| t.window.load().is_some_and(|w| std::ptr::eq(&*w, window)))
+    })
+    .unwrap_or(false)
+}
+
 /// Whether the person turned agents on.
 fn setting() -> bool {
     NSUserDefaults::standardUserDefaults().boolForKey(&NSString::from_str(agent::SETTING_KEY))

@@ -601,18 +601,26 @@ impl AppDelegate {
     }
 
     /// The browser window in front: the main window, if it is one of this
-    /// application's browser windows, or else the one opened last.
+    /// application's browser windows, or else the one opened last. Never an
+    /// agent's: its windows are its own.
     fn front_browser(&self) -> Option<Retained<NSWindow>> {
         let windows = self.ivars().windows.borrow();
         let ours = |window: &NSWindow| {
             windows
                 .iter()
                 .any(|(open, _)| std::ptr::eq(&**open, window))
+                && !control_macos::is_agents(window)
         };
         NSApplication::sharedApplication(self.mtm())
             .mainWindow()
             .filter(|main| ours(main))
-            .or_else(|| windows.last().map(|(window, _)| window.clone()))
+            .or_else(|| {
+                windows
+                    .iter()
+                    .rev()
+                    .map(|(window, _)| window.clone())
+                    .find(|window| !control_macos::is_agents(window))
+            })
     }
 
     /// The controller of `window`, one of this application's browser windows.
