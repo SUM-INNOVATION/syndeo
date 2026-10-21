@@ -258,9 +258,7 @@ pub fn interpret(input: &str, search: Search) -> Typed {
             "about" if text.eq_ignore_ascii_case("about:blank") => {
                 Typed::Load(Url::parse("about:blank").expect("about:blank is a URL"))
             }
-            other => Typed::Refused(format!(
-                "Syndeo opens http and https addresses, not {other}: ones."
-            )),
+            other => Typed::Refused(other_scheme(other)),
         };
     }
     if !text.chars().any(char::is_whitespace) {
@@ -280,9 +278,51 @@ pub fn interpret(input: &str, search: Search) -> Typed {
     }
 }
 
+/// Why an address with another scheme than http or https is refused.
+fn other_scheme(scheme: &str) -> String {
+    format!("Syndeo opens http and https addresses, not {scheme}: ones.")
+}
+
+/// What Syndeo does with an address another application asks it to open: a
+/// link clicked in Mail, `open -a Syndeo <address>`, or any link at all once
+/// someone makes Syndeo their default browser.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Asked {
+    /// Open this page, in a tab made as every tab is.
+    Open(Url),
+    /// Not something Syndeo opens; says why, in the words typing it gets.
+    Refused(String),
+}
+
+/// Read an address another application asks Syndeo to open.
+///
+/// Only an `http://` or `https://` address with a host is opened. Everything
+/// else is refused: another scheme, a file, Syndeo's own `about:` pages, an
+/// IPv6 host with a zone, and anything that is not an address at all, which
+/// is never searched for: another application's words are not sent to a
+/// search engine, whichever one Settings has chosen.
+pub fn asked(address: &str) -> Asked {
+    let text = address.trim();
+    let scheme = explicit_scheme(text).unwrap_or_default();
+    if scheme != "http" && scheme != "https" {
+        return Asked::Refused(if scheme.is_empty() {
+            format!("{text} is not a web address Syndeo can open.")
+        } else {
+            other_scheme(&scheme)
+        });
+    }
+    if has_zone(text) {
+        return Asked::Refused(ZONED.to_string());
+    }
+    match Url::parse(text) {
+        Ok(url) if url.host_str().is_some_and(|host| !host.is_empty()) => Asked::Open(url),
+        _ => Asked::Refused(format!("{text} is not a web address Syndeo can open.")),
+    }
+}
+
 /// The scheme of `text`, when it plainly has one: `scheme://`, or one of the
 /// schemes written without slashes. `example.com:8080` has none.
-fn explicit_scheme(text: &str) -> Option<String> {
+pub fn explicit_scheme(text: &str) -> Option<String> {
     let (scheme, rest) = text.split_once(':')?;
     let valid = scheme
         .chars()
@@ -768,6 +808,77 @@ mod tests {
             "",
         ] {
             assert!(!allowed_in_main_frame(refused), "{refused}");
+        }
+    }
+
+    fn opened(address: &str) -> String {
+        match asked(address) {
+            Asked::Open(url) => url.to_string(),
+            other => panic!("{address:?} gave {other:?}"),
+        }
+    }
+
+    fn not_opened(address: &str) -> String {
+        match asked(address) {
+            Asked::Refused(why) => why,
+            other => panic!("{address:?} gave {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_application_asking_for_a_web_address_gets_it_opened() {
+        assert_eq!(opened("http://example.com/"), "http://example.com/");
+        assert_eq!(
+            opened("https://example.com/a?b=c#d"),
+            "https://example.com/a?b=c#d"
+        );
+        assert_eq!(opened(" HTTPS://Example.COM "), "https://example.com/");
+        assert_eq!(opened("http://127.0.0.1:8080/x"), "http://127.0.0.1:8080/x");
+        assert_eq!(opened("http://[::1]/"), "http://[::1]/");
+    }
+
+    /// Refused with the words typing the same address gets.
+    #[test]
+    fn an_application_asking_for_anything_else_is_refused() {
+        for address in [
+            "file:///etc/passwd",
+            "ftp://example.com/",
+            "javascript:alert(1)",
+            "data:text/html,<b>hi</b>",
+            "mailto:someone@example.com",
+            "blob:https://example.com/x",
+            "about:blank",
+            "about:config",
+            "x-other-app://open?thing=1",
+        ] {
+            let why = not_opened(address);
+            assert!(
+                why.starts_with("Syndeo opens http and https addresses, not "),
+                "{address}: {why}"
+            );
+        }
+        assert_eq!(
+            not_opened("file:///etc/passwd"),
+            refused("file:///etc/passwd"),
+            "not the words typing it gets"
+        );
+        assert!(not_opened("ftp://example.com/").contains("not ftp: ones"));
+        assert_eq!(not_opened("http://[fe80::1%25en0]/"), ZONED);
+        assert_eq!(not_opened("https://[fe80::1%en0]:8443/"), ZONED);
+        assert!(not_opened("http://").contains("is not a web address Syndeo can open"));
+        assert!(not_opened("").contains("is not a web address Syndeo can open"));
+    }
+
+    /// What another application asks for is never searched for, whatever
+    /// the search engine: nothing of it is sent anywhere.
+    #[test]
+    fn an_application_asking_for_words_or_a_bare_host_is_refused_never_searched() {
+        for address in ["how to bake bread", "bread", "example.com", "example.com/a"] {
+            let why = not_opened(address);
+            assert!(
+                why.contains("is not a web address Syndeo can open"),
+                "{address}: {why}"
+            );
         }
     }
 

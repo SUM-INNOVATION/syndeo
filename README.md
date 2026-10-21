@@ -71,6 +71,15 @@ Loading (⌘.); History has Back (⌘[) and Forward (⌘]). Tabs are the ones
 macOS draws. Closing the last window leaves Syndeo running, as Mac
 applications do, until you quit it (⌘Q).
 
+Syndeo is a web browser to macOS: it can be chosen as the default web
+browser (System Settings > Desktop & Dock), and another application can ask
+it to open a web address — a link clicked in Mail, or
+`open -a Syndeo https://example.com/`. Each address opens in a new tab,
+reached exactly as a typed one is. Only `http://` and `https://` addresses
+open; anything else another application asks for, a file included, is
+refused in a tab of its own with the words typing it gets, and is never
+searched for. Its log names each such address by its scheme alone.
+
 ### How each page is reached
 
 **Not every request goes through Syndeo.** The bar above each page says how
@@ -246,6 +255,25 @@ ask, and only you can say yes.
 Clicks and typing are done in the page's own document, as a script would do
 them, so a page may tell them from yours. Requests are limited in size and
 rate.
+
+### Passkeys and passwords: not yet
+
+Signing in with a passkey does not work in Syndeo.app yet, and it fills in
+no passwords.
+
+- **Passkeys.** WebKit hands a page's passkey request to macOS, which
+  answers it, for any site, only from a browser that holds Apple's managed
+  entitlement `com.apple.developer.web-browser.public-key-credential`, with a
+  provisioning profile for it. Syndeo.app is signed with neither, so a page's
+  request fails, as it does in any application that embeds a web view, and a
+  site offers its other ways to sign in. At launch, Syndeo.app says in its
+  log which applies to the copy running, and asks nothing of anyone.
+  [#49](https://github.com/SUM-INNOVATION/syndeo/issues/49) tracks the
+  entitlement.
+- **Passwords.** Syndeo.app keeps no passwords of its own. Apple documents
+  no way for a browser other than Safari to fill passwords into web pages
+  from the Passwords app, other than its own browser extension, which
+  Syndeo.app cannot load.
 
 ### Removing it
 
@@ -430,7 +458,7 @@ separate, and removing the application touches neither.
     Syndeo's proxy in tabs saying who controls them; reading, clicking,
     typing, scrolling and a screenshot; JavaScript only with its own leave;
     Stop and Revoke All; MCP; and a connection from another user refused;
-  - twelve mutants, each the application with one safeguard taken out, every
+  - thirteen mutants, each the application with one safeguard taken out, every
     one of which the test has to catch.
 - **Checked by hand, for every signed release:** from a fresh standard
   user account, installing by opening the package in Finder, which runs
@@ -1259,9 +1287,10 @@ cargo deny check licenses bans sources
 ## Known gaps
 
 Everything that is missing or deferred is filed rather than left in a comment.
-Two things are open — more platforms,
-[#17](https://github.com/SUM-INNOVATION/syndeo/issues/17), and WebRTC, below,
-[#41](https://github.com/SUM-INNOVATION/syndeo/issues/41) — and the rest of
+Three things are open — more platforms,
+[#17](https://github.com/SUM-INNOVATION/syndeo/issues/17), WebRTC, below,
+[#41](https://github.com/SUM-INNOVATION/syndeo/issues/41), and passkeys,
+[#49](https://github.com/SUM-INNOVATION/syndeo/issues/49) — and the rest of
 this is a set of honest limits rather than work waiting to be done:
 
 - `syndeo-ui` shows the headless DOM rather than a rendered page; `syndeo-servo`
@@ -1300,6 +1329,9 @@ this is a set of honest limits rather than work waiting to be done:
 - The proxy's cache is not partitioned by site, in Syndeo.app or behind
   `syndeo-webkit`, and Syndeo.app has one browsing profile for every site.
 - Syndeo.app has no keystore: no keys, identities or signing.
+- Passkeys do not work in Syndeo.app until it holds Apple's browser passkey
+  entitlement, and it fills in no passwords
+  ([#49](https://github.com/SUM-INNOVATION/syndeo/issues/49)).
 - A plain `syndeo-proxy run` asks for no credential; only the proxy
   Syndeo.app or `syndeo-webkit` starts does. Neither limits how many
   connections it accepts.

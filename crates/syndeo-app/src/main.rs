@@ -29,6 +29,8 @@ mod agent;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod agent_client;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod passkeys;
 
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
