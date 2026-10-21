@@ -632,6 +632,7 @@ fn connect(proxy: Arc<Proxy>, req: Request<Incoming>, local: SocketAddr) -> Resp
                 return;
             }
         };
+        tracing::debug!(%host, "tunnel opened");
         let mut io = TokioIo::new(upgraded);
 
         // Bounded: a tunnel that says nothing, or closes, costs no certificate
