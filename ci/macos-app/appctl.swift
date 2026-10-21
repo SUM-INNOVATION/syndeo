@@ -5,9 +5,9 @@
 //   appctl bundle <pid>          the bundle identifier Launch Services has for pid
 //   appctl windows <pid>         one "width height" line per on-screen, ordinary
 //                                window pid owns; exits 1 if there are none
-//   appctl window-ids <pid>      the window server's number for each of those
-//                                windows, one a line, as screencapture -l takes it;
-//                                exits 1 if there are none
+//   appctl front-window-id <pid>   the window server's number for pid's front
+//                                window, as Accessibility has it (see frontWindow), as
+//                                screencapture -l takes it; exits 1 if there is none
 //   appctl quit <bundle-id>      ask each running application with it to quit,
 //                                as the Quit menu item would; exits 1 if none was asked
 //   appctl stop <bundle-id>      quit each running application with it and wait,
@@ -209,19 +209,30 @@ case "windows" where args.count == 3:
         found += 1
     }
     exit(found > 0 ? 0 : 1)
-case "window-ids" where args.count == 3:
-    guard let pid = Int32(args[2]) else { exit(2) }
+case "front-window-id" where args.count == 3:
+    // The on-screen window with the front window's place and size.
+    guard let pid = Int32(args[2]), let front = frontWindow(of: pid),
+          let place = attribute(front, kAXPositionAttribute), let extent = attribute(front, kAXSizeAttribute),
+          CFGetTypeID(place) == AXValueGetTypeID(), CFGetTypeID(extent) == AXValueGetTypeID() else { exit(1) }
+    var origin = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(place as! AXValue, .cgPoint, &origin),
+          AXValueGetValue(extent as! AXValue, .cgSize, &size) else { exit(1) }
     let list = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
         as? [[String: Any]]) ?? []
-    var found = 0
     for window in list {
         guard (window[kCGWindowOwnerPID as String] as? Int32) == pid,
               (window[kCGWindowLayer as String] as? Int) == 0,
-              let number = window[kCGWindowNumber as String] as? Int else { continue }
-        print(number)
-        found += 1
+              let number = window[kCGWindowNumber as String] as? Int,
+              let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+              let rect = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { continue }
+        if abs(rect.minX - origin.x) < 1, abs(rect.minY - origin.y) < 1,
+           abs(rect.width - size.width) < 1, abs(rect.height - size.height) < 1 {
+            print(number)
+            exit(0)
+        }
     }
-    exit(found > 0 ? 0 : 1)
+    exit(1)
 case "quit" where args.count == 3:
     var asked = false
     for app in NSRunningApplication.runningApplications(withBundleIdentifier: args[2]) {

@@ -397,12 +397,13 @@ route_words() {
     "and its help tag is its words, then what each route means ($1)" "help: '${help:-none}'"
 }
 
-# look NAME: a picture of PID's front window, kept as looks-NAME.png in the
+# look NAME: a picture of PID's front window, the one Accessibility has in
+# front, which the checks before it used, kept as looks-NAME.png in the
 # logs, and how light its top and the content below it are; measured, never
 # gated, since what a runner lets a picture show is the runner's.
 look() {
   local id file="$LOGS/looks-$1.png"
-  id="$("$APPCTL" window-ids "$PID" | head -n 1)"
+  id="$("$APPCTL" front-window-id "$PID")"
   rm -f "$file"
   if [ -n "$id" ] && screencapture -x -o -l "$id" "$file" 2>/dev/null && [ -s "$file" ]; then
     printf '  MEASURE  %s: looks-%s.png, %s\n' "$1" "$1" "$(python3 -I "$here/macos-app/luma.py" "$file" 2>&1 | head -c 160)"
