@@ -147,9 +147,10 @@ EOF
   printf 'a stapled ticket\n' >"$T/Syndeo-0.0.1.pkg"
   chmod 644 "$T/Syndeo-0.0.1.pkg"
 
-  # beside: everything beside the package, with its mode and size, but the
-  # case's own directory.
-  beside() { find "$T" -mindepth 1 -maxdepth 1 ! -name run -exec stat -f '%N %Lp %z' {} + | LC_ALL=C sort; }
+  # beside: everything beside the package, with its mode, size and time,
+  # but the case's own directory. ls, not stat, whose options macOS and
+  # Linux spell differently.
+  beside() { LC_ALL=C ls -lnA "$T" | awk '$NF != "run"'; }
 
   # vcase LABEL WANT-EXIT WANT-CALLS WANT-TEXT ATTEMPTS-LOGGED [NAME=VALUE...]:
   # the caller exits WANT-EXIT, the stand-ins are called exactly WANT-CALLS,
