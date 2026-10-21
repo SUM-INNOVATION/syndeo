@@ -180,12 +180,13 @@
 # and whether two connections in one page join.
 #
 # looks, which gates the window's controls and browsing in light and in dark
-# appearance (the second opening asks for dark, as a launch argument, and
-# changes nothing of the runner's own setting), and keeps pictures of what
-# it looks like: in each, the start page, a page that came through Syndeo,
-# Syndeo's own page for an address it refuses, and Settings, each a
-# looks-*.png in the logs, with how light its top and the content below it
-# are (ci/macos-app/luma.py), measured and not gated.
+# appearance, the runner's own, set through System Events for each opening
+# and put back as it was at the end, which is gated too; and keeps pictures
+# of what it looks like: in each, the start page, a page that came through
+# Syndeo, a page on this Mac's loopback (Direct), Syndeo's own page for an
+# address it refuses, and Settings, each a looks-*.png in the logs, with how
+# light its top and the content below it are (ci/macos-app/luma.py),
+# measured and not gated.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -254,8 +255,7 @@ FRESH=''
 # no proof the page was shown; this sentence is in the page's body.
 EXAMPLE_BODY='This domain is for use in documentation examples'
 
-# started APP ROUND [ARG...]: open APP, with ARGs as its launch arguments if
-# there are any, and check what is running: Launch Services has
+# started APP ROUND: open APP and check what is running: Launch Services has
 # it as $ID, from APP, with an on-screen window, and its one child is the
 # proxy from APP's Contents/Helpers; no keystore process exists. Sets PID and
 # HELPER; returns non-zero if there is no app to check further.
@@ -266,17 +266,12 @@ EXAMPLE_BODY='This domain is for use in documentation examples'
 # would ask about nothing.
 started() {
   local app="$1" round="$2" children image windows pids='' until
-  shift 2
   PID='' HELPER=''
   # This instance's own query for example.com: random, and nothing else.
   # WebKit's cache persists from one instance to the next, so a page another
   # instance opened could otherwise be shown without this one fetching it.
   FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-  if [ "$#" -gt 0 ]; then
-    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" --args "$@" || { bad "open ($round)" "open failed"; return 1; }
-  else
-    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" || { bad "open ($round)" "open failed"; return 1; }
-  fi
+  open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" || { bad "open ($round)" "open failed"; return 1; }
   until=$((SECONDS + 30))
   while :; do
     pids="$("$APPCTL" pids "$ID")"
@@ -375,7 +370,7 @@ route_words() {
   must "$([ "$(bar)" = "$SYNDEO_LABEL" ] && echo yes)" "the address field's route says '$SYNDEO_LABEL' ($1)" "it says '$(bar)'"
   must "$("$APPCTL" in-toolbar "$PID" syndeo.route >/dev/null 2>&1 && echo yes)" "and it is in the address field, in the toolbar ($1)"
   help="$("$APPCTL" describe "$PID" syndeo.route | cut -f2)"
-  must "$(case "$help" in "$SYNDEO_LABEL. How this page was reached."*) echo yes ;; esac)" \
+  must "$([[ "$help" == "$SYNDEO_LABEL. How this page was reached."* ]] && echo yes)" \
     "and its help tag is its words, then what each route means ($1)" "help: '${help:-none}'"
 }
 
@@ -1862,20 +1857,30 @@ realtime() {
   [ "$fails" = 0 ]
 }
 
+# The runner's appearance, dark or light, as System Events has it; and
+# setting it. Each gives up after 20 s.
+appearance_now() {
+  perl -e 'alarm 20; exec @ARGV' osascript -e 'tell application "System Events" to tell appearance preferences to get dark mode' 2>/dev/null |
+    sed 's/^true$/dark/; s/^false$/light/'
+}
+appearance_set() {
+  perl -e 'alarm 20; exec @ARGV' osascript -e "tell application \"System Events\" to tell appearance preferences to set dark mode to $([ "$1" = dark ] && echo true || echo false)" >/dev/null 2>&1
+}
+
 # looks APP: see the top of this script.
 looks() {
-  local app appearance round
+  local app appearance round was page
   [ -d "${1:-}" ] || { say "usage: $0 looks <Syndeo.app>"; exit 2; }
   app="$(cd "$1" && pwd -P)"
   no_app || { say "refusing: $ID is already running"; exit 2; }
+  was="$(appearance_now)"
+  printf '\nthe runner'"'"'s appearance before: %s\n' "${was:-unknown}"
   for appearance in light dark; do
     round="looks-$appearance"
     printf '\nSyndeo.app, in %s appearance: %s\n' "$appearance" "$app"
-    if [ "$appearance" = dark ]; then
-      started "$app" "$round" -AppleInterfaceStyle Dark || continue
-    else
-      started "$app" "$round" || continue
-    fi
+    appearance_set "$appearance"
+    must "$([ "$(appearance_now)" = "$appearance" ] && echo yes)" "the runner is in $appearance appearance" "System Events says '$(appearance_now)'"
+    started "$app" "$round" || continue
     helper_of "$app" "$round"
     browses "$round"
     arrive "" 'Welcome to Syndeo' "the window shows the start page ($appearance)"
@@ -1884,6 +1889,12 @@ looks() {
     plain_http
     route_words "$appearance"
     look "$appearance-page"
+    if origin; then
+      page="http://127.0.0.1:$ORIGIN_PORT/policy.html"
+      visit "$page" "$page" 'Policy test' "a page on this Mac's loopback opens ($appearance)"
+      must "$([ "$(bar)" = "$DIRECT_LABEL" ] && echo yes)" "and the address field's route says '$DIRECT_LABEL' ($appearance)" "it says '$(bar)'"
+      look "$appearance-direct"
+    fi
     visit "file:///etc/passwd" "file:///etc/passwd" 'not file: ones' "Syndeo's own page for an address it refuses ($appearance)"
     look "$appearance-refused"
     settings_open "$appearance"
@@ -1891,6 +1902,9 @@ looks() {
     settings_close "$appearance"
     stopped "$round"
   done
+  origin_stop
+  [ -z "$was" ] || appearance_set "$was"
+  must "$([ -n "$was" ] && [ "$(appearance_now)" = "$was" ] && echo yes)" "the runner's appearance is put back as it was: ${was:-unknown}" "System Events says '$(appearance_now)'"
   printf '\n%d failed\n' "$fails"
   [ "$fails" = 0 ]
 }

@@ -49,7 +49,7 @@ const PROXY_CLEAR: Duration = Duration::from_secs(30);
 /// The Settings window's size, its margin, and each section's width and
 /// inner margin.
 const WIDTH: f64 = 520.0;
-const HEIGHT: f64 = 290.0;
+const HEIGHT: f64 = 302.0;
 const MARGIN: f64 = 20.0;
 const GROUP_WIDTH: f64 = WIDTH - 2.0 * MARGIN;
 const PAD: f64 = 14.0;
@@ -287,7 +287,7 @@ impl SettingsController {
 
         // Browsing data: what clearing removes, and how it went.
         layout.header("Browsing Data");
-        let data = layout.group(64.0);
+        let data = layout.group(76.0);
         let about_clear = NSTextField::wrappingLabelWithString(
             ns_string!(
                 "Removes cookies, website storage and cached pages from every Syndeo window, \
@@ -296,8 +296,8 @@ impl SettingsController {
             mtm,
         );
         about_clear.setFrame(NSRect::new(
-            NSPoint::new(PAD, 10.0),
-            NSSize::new(GROUP_WIDTH - 3.0 * PAD - 170.0, 44.0),
+            NSPoint::new(PAD, 8.0),
+            NSSize::new(GROUP_WIDTH - 3.0 * PAD - 170.0, 58.0),
         ));
         let clear = unsafe {
             NSButton::buttonWithTitle_target_action(
@@ -308,7 +308,7 @@ impl SettingsController {
             )
         };
         clear.setFrame(NSRect::new(
-            NSPoint::new(GROUP_WIDTH - PAD - 170.0, 16.0),
+            NSPoint::new(GROUP_WIDTH - PAD - 170.0, 22.0),
             NSSize::new(170.0, 32.0),
         ));
         clear.setAccessibilityIdentifier(Some(ns_string!("syndeo.clear")));

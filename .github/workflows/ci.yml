@@ -455,7 +455,8 @@ jobs:
         run: bash ci/test-app.sh realtime "$PWD/dist/Syndeo.app"
 
       # Its controls in the toolbar and browsing, in light appearance and in
-      # dark; pictures of the start page, a page, Syndeo's own page and
+      # dark, the runner's own, put back as it was; pictures of the start
+      # page, a page through Syndeo, a Direct page, Syndeo's own page and
       # Settings in each, kept with the logs as looks-*.png.
       - name: Its look, light and dark, with pictures kept with the logs
         if: always()
