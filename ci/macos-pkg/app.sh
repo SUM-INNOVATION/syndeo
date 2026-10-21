@@ -13,42 +13,59 @@
 # else. Its receipt lists the bundle's paths relative to /Applications. The
 # bundle holds exactly ci/macos-app/bundle.manifest (embedded below when the
 # package is built), its code signature's two paths, and, in a notarized
-# release, the stapled ticket, Contents/CodeResources. Everything is owned by
-# root:wheel, directories and executables 0755, everything else 0644.
+# release, the stapled ticket, Contents/CodeResources; and, in a release from
+# the version in ci/macos-app/profile-since on, its provisioning profile,
+# Contents/embedded.provisionprofile. Everything is owned by root:wheel,
+# directories and executables 0755, everything else 0644.
 
 APP_RECEIPT=com.sum.syndeo.app
 APP_BUNDLE_ID=com.sum.syndeo
 APP_DIR="$ROOT/Applications"
 APP="$APP_DIR/Syndeo.app"
 APP_TICKET=Contents/CodeResources
+# The provisioning profile, and the first version whose bundle holds one, in
+# a package whose bundle has one (a release's); empty in a package whose
+# bundle has none (a pull request's). See ci/package-macos-pkg.sh.
+APP_PROFILE=Contents/embedded.provisionprofile
+APP_PROFILE_SINCE='@APP_PROFILE_SINCE@'
 
-# app_manifest: every path in Syndeo.app as the package installs it,
-# relative to the bundle, with its type (d or f) and mode, signature
-# included and the ticket not.
+# app_profiled VERSION: Syndeo.app VERSION, as this kind of package installs
+# it, holds the provisioning profile.
+app_profiled() {
+    [ -n "$APP_PROFILE_SINCE" ] && [ "$(syndeo_version_cmp "$1" "$APP_PROFILE_SINCE")" != lt ]
+}
+
+# app_manifest VERSION: every path in Syndeo.app VERSION as its package
+# installs it, relative to the bundle, with its type (d or f) and mode,
+# signature included and the ticket not; the provisioning profile too, where
+# that version has one.
 app_manifest() {
     /bin/cat <<'EOF'
 @APP_MANIFEST@
 Contents/_CodeSignature d 755
 Contents/_CodeSignature/CodeResources f 644
 EOF
+    if app_profiled "$1"; then
+        echo "$APP_PROFILE f 644"
+    fi
 }
 
-# app_spec REL: "TYPE MODE" for REL, a path relative to the bundle, if the
-# package installs it there; nothing otherwise.
+# app_spec REL VERSION: "TYPE MODE" for REL, a path relative to the bundle,
+# if VERSION's package installs it there; nothing otherwise.
 app_spec() {
-    { app_manifest; printf '%s f 644\n' "$APP_TICKET"; } | while read -r _as_p _as_t _as_m; do
+    { app_manifest "$2"; printf '%s f 644\n' "$APP_TICKET"; } | while read -r _as_p _as_t _as_m; do
         if [ "$_as_p" = "$1" ]; then
             echo "$_as_t $_as_m"
         fi
     done
 }
 
-# app_receipt_files yes|no: the paths a receipt for the bundle lists, sorted,
-# with the stapled ticket or without it.
+# app_receipt_files yes|no VERSION: the paths a receipt for the bundle of
+# VERSION lists, sorted, with the stapled ticket or without it.
 app_receipt_files() {
     {
         echo Syndeo.app
-        app_manifest | while read -r _ar_p _ar_t _ar_m; do
+        app_manifest "$2" | while read -r _ar_p _ar_t _ar_m; do
             echo "Syndeo.app/$_ar_p"
         done
         if [ "$1" = yes ]; then
@@ -116,7 +133,7 @@ check_app_bundle() {
     _cb_before=$nfindings
     check_private "$APP" Directory 755
     [ "$nfindings" = "$_cb_before" ] || return 0
-    _cb_dirs=$(app_manifest | while read -r _cb_p _cb_t _cb_m; do
+    _cb_dirs=$(app_manifest "$_cb_v" | while read -r _cb_p _cb_t _cb_m; do
         if [ "$_cb_t" = d ]; then echo "$_cb_p"; fi
     done)
     for _cb_d in '' $_cb_dirs; do
@@ -131,7 +148,7 @@ check_app_bundle() {
         for _cb_e in "$_cb_dp"/* "$_cb_dp"/.[!.]* "$_cb_dp"/..?*; do
             is_present "$_cb_e" || continue
             _cb_r=${_cb_e#"$APP/"}
-            _cb_s=$(app_spec "$_cb_r")
+            _cb_s=$(app_spec "$_cb_r" "$_cb_v")
             case "$_cb_s" in
                 'd 755') check_private "$_cb_e" Directory 755 ;;
                 'f 755') check_private "$_cb_e" 'Regular File' 755 ;;
@@ -140,7 +157,7 @@ check_app_bundle() {
             esac
         done
     done
-    _cb_missing=$(app_manifest | while read -r _cb_p _cb_t _cb_m; do
+    _cb_missing=$(app_manifest "$_cb_v" | while read -r _cb_p _cb_t _cb_m; do
         is_present "$APP/$_cb_p" || echo "$_cb_p"
     done)
     for _cb_p in $_cb_missing; do
@@ -226,9 +243,9 @@ check_app_receipt_meta() {
         finding "the receipt for $APP_RECEIPT does not say the bundle is in Applications (it has $ar_locations location fields, 'location:$ar_location')"
     fi
     _cm_have=$("$PKGUTIL" --files "$APP_RECEIPT" --volume / 2>/dev/null | LC_ALL=C /usr/bin/sort) || _cm_have=''
-    if [ "$_cm_have" = "$(app_receipt_files no)" ]; then
+    if [ "$_cm_have" = "$(app_receipt_files no "$ar_version")" ]; then
         ar_ticket=no
-    elif [ "$_cm_have" = "$(app_receipt_files yes)" ]; then
+    elif [ "$_cm_have" = "$(app_receipt_files yes "$ar_version")" ]; then
         ar_ticket=yes
     else
         finding "the receipt for $APP_RECEIPT $ar_version does not list exactly Syndeo.app's paths"

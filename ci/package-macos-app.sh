@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Assemble Syndeo.app, the macOS desktop application, from built binaries.
 #
-#   ci/package-macos-app.sh <version> <binaries-dir> <out-dir>
-#   ci/package-macos-app.sh --check <Syndeo.app> <version> [unsigned|signed|stapled]
-#   ci/package-macos-app.sh --manifest [unsigned|signed|stapled]
+#   ci/package-macos-app.sh <version> <binaries-dir> <out-dir> [--profile <file>]
+#   ci/package-macos-app.sh --check <Syndeo.app> <version> [unsigned|signed|stapled] [release]
+#   ci/package-macos-app.sh --manifest [unsigned|signed|stapled] [profiled]
+#   ci/package-macos-app.sh --profiled <version>
 #   ci/package-macos-app.sh --self-test
 #
 # The bundle holds exactly these, and nothing else (ci/macos-app/bundle.manifest
@@ -16,6 +17,18 @@
 #   Syndeo.app/Contents/Helpers/syndeo-proxy      <binaries-dir>/syndeo-proxy
 #   Syndeo.app/Contents/Resources/Syndeo.icns     ci/macos-app/Syndeo.icns
 #   Syndeo.app/Contents/Resources/uninstall.sh    ci/macos-pkg/uninstall.sh.in, for <version>
+#
+# With --profile, a release's: the provisioning profile that authorizes
+# Syndeo.app's one entitlement, Apple's browser passkey entitlement (see
+# ci/macos-app/profile.py), as
+#
+#   Syndeo.app/Contents/embedded.provisionprofile <file>
+#
+# A release's bundle carries it from the version in ci/macos-app/profile-since
+# on, and a pull request's never does: no pull request has the profile. A
+# release's uninstaller knows that version, so that it can tell an older
+# release's bundle, from before the profile, from a newer one's; a pull
+# request's knows none, and expects a profile in no bundle.
 #
 # uninstall.sh removes the bundle the installer package installed, and that
 # package's receipt (see ci/package-macos-pkg.sh). It is inside the bundle so
@@ -62,12 +75,17 @@ die() {
   exit 1
 }
 
-# manifest [STATE]: the bundle's paths, relative to Syndeo.app, with each
-# one's type and mode, sorted, for an unsigned (the default), signed or
-# stapled bundle.
+# The first version a release's Syndeo.app carries a provisioning profile in.
+profile_since() { cat "$here/macos-app/profile-since"; }
+
+# manifest [STATE] [PROFILED]: the bundle's paths, relative to Syndeo.app,
+# with each one's type and mode, sorted, for an unsigned (the default),
+# signed or stapled bundle, with its provisioning profile when PROFILED is
+# yes.
 manifest() {
   {
     cat "$here/macos-app/bundle.manifest"
+    if [ "${2:-no}" = yes ]; then printf '%s\n' 'Contents/embedded.provisionprofile f 644'; fi
     case "${1:-unsigned}" in
       signed | stapled) printf '%s\n' 'Contents/_CodeSignature d 755' 'Contents/_CodeSignature/CodeResources f 644' ;;
     esac
@@ -96,9 +114,30 @@ holds() {
   )
 }
 
+# profiled VERSION RELEASE: yes if Syndeo.app VERSION holds a provisioning
+# profile: a release's (RELEASE yes) from profile-since on; no otherwise.
+profiled() {
+  if [ "$2" = yes ] && [ "$(syndeo_version_cmp "$1" "$(profile_since)")" != lt ]; then echo yes; else echo no; fi
+}
+
+# uninstaller VERSION RELEASE OUT: the uninstaller for Syndeo.app VERSION, a
+# release's (RELEASE yes) or a pull request's.
+uninstaller() {
+  local since=''
+  [ "$2" = no ] || since="$(profile_since)"
+  bash "$here/package-macos-pkg.sh" --render uninstall "$1" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign "$3" "$since"
+}
+
 assemble() {
-  local version="$1" bins="$2" out="$3" app staging
+  local version="$1" bins="$2" out="$3" profile="${4:-}" release=no app staging
   syndeo_version_valid "$version" || die "'$version' is not a version"
+  if [ -n "$profile" ]; then
+    [ -f "$profile" ] && [ ! -L "$profile" ] && [ -s "$profile" ] || die "no provisioning profile at $profile"
+    syndeo_version_valid "$(profile_since)" || die "ci/macos-app/profile-since does not hold a version"
+    [ "$(profiled "$version" yes)" = yes ] ||
+      die "$version is before $(profile_since), the first version a release's Syndeo.app carries a provisioning profile in"
+    release=yes
+  fi
   for b in syndeo-app syndeo-proxy; do
     [ -f "$bins/$b" ] && [ ! -L "$bins/$b" ] || die "no $bins/$b"
   done
@@ -114,38 +153,46 @@ assemble() {
   cp "$bins/syndeo-app" "$staging/Contents/MacOS/Syndeo"
   cp "$bins/syndeo-proxy" "$staging/Contents/Helpers/syndeo-proxy"
   cp "$here/macos-app/Syndeo.icns" "$staging/Contents/Resources/Syndeo.icns"
-  bash "$here/package-macos-pkg.sh" --render uninstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign \
-    "$staging/Contents/Resources/uninstall.sh"
+  if [ "$release" = yes ]; then
+    cp "$profile" "$staging/Contents/embedded.provisionprofile"
+  fi
+  uninstaller "$version" "$release" "$staging/Contents/Resources/uninstall.sh"
   find "$staging" -type d -exec chmod 755 {} +
   find "$staging" -type f -exec chmod 644 {} +
   chmod 755 "$staging/Contents/MacOS/Syndeo" "$staging/Contents/Helpers/syndeo-proxy" \
     "$staging/Contents/Resources/uninstall.sh"
   xattr -cr "$staging" 2>/dev/null || true
-  check "$staging" "$version" >/dev/null
+  check "$staging" "$version" unsigned "$release" >/dev/null
   mv "$staging" "$app"
   trap - EXIT
-  say "assembled $app ($version)"
+  if [ "$release" = yes ]; then say "assembled $app ($version), with its provisioning profile"; else say "assembled $app ($version)"; fi
 }
 
-# check APP VERSION [STATE]: APP is exactly the bundle for VERSION, unsigned
-# (the default), signed or stapled. Prints each failure; returns non-zero if
-# there was any.
+# check APP VERSION [STATE] [RELEASE]: APP is exactly the bundle for
+# VERSION, unsigned (the default), signed or stapled; a release's (RELEASE
+# yes), its uninstaller knowing profile-since and its provisioning profile
+# there from that version on, or a pull request's (no, the default), with
+# neither. Prints each failure; returns non-zero if there was any.
 check() {
-  local app="$1" version="$2" state="${3:-unsigned}" plist bad=0 key want have rendered
+  local app="$1" version="$2" state="${3:-unsigned}" release="${4:-no}" profiled plist bad=0 key want have rendered
   plist="$app/Contents/Info.plist"
   case "$state" in unsigned | signed | stapled) ;; *) die "no state called $state" ;; esac
+  case "$release" in yes | no) ;; *) die "release is yes or no, not $release" ;; esac
+  syndeo_version_valid "$version" || die "'$version' is not a version"
+  profiled="$(profiled "$version" "$release")"
   if [ ! -d "$app/Contents" ] || [ -L "$app" ]; then
     printf '  FAIL  bundle — %s is not a bundle\n' "$app"
     return 1
   fi
-  if [ "$(holds "$app")" != "$(manifest "$state")" ]; then
-    printf '  FAIL  manifest (%s) — %s\n' "$state" "$(diff <(manifest "$state") <(holds "$app") | grep '^[<>]' | tr '\n' ';')"
+  if [ "$(holds "$app")" != "$(manifest "$state" "$profiled")" ]; then
+    printf '  FAIL  manifest (%s%s) — %s\n' "$state" "$([ "$profiled" = yes ] && echo ', profiled')" \
+      "$(diff <(manifest "$state" "$profiled") <(holds "$app") | grep '^[<>]' | tr '\n' ';')"
     bad=1
   fi
   rendered="$(mktemp)"
-  if ! bash "$here/package-macos-pkg.sh" --render uninstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign "$rendered" 2>/dev/null ||
+  if ! uninstaller "$version" "$release" "$rendered" 2>/dev/null ||
     ! cmp -s "$rendered" "$app/Contents/Resources/uninstall.sh"; then
-    printf '  FAIL  uninstall.sh — not exactly the uninstaller rendered for %s\n' "$version"
+    printf '  FAIL  uninstall.sh — not exactly the uninstaller rendered for %s%s\n' "$version" "$([ "$release" = yes ] && echo ', a release')"
     bad=1
   fi
   rm -f "$rendered"
@@ -190,7 +237,7 @@ EOF
     bad=1
   fi
   if [ "$bad" = 0 ]; then
-    say "$app is exactly Syndeo.app $version, $state"
+    say "$app is exactly Syndeo.app $version, $state$([ "$profiled" = yes ] && echo ', with its provisioning profile')"
   fi
   return "$bad"
 }
@@ -300,6 +347,49 @@ self_test() {
   expect "0:stapled: the ticket as well" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0 stapled
   expect "1:a stapled bundle is not merely a signed one" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0 signed
   expect "1:a state that is not one: refused" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0 notarized
+  printf '\n  package-macos-app.sh: a release'"'"'s bundle, with its provisioning profile from %s on\n' "$(profile_since)"
+  local since below=0.0.1 above=999.0.0
+  since="$(profile_since)"
+  printf 'a stand-in profile' >"$T/profile"
+  rel() { rm -rf "$T/rel" && mkdir -p "$T/rel" && bash "$0" "$1" "$T/bins" "$T/rel" --profile "$T/profile" >/dev/null 2>&1; }
+  expect "0:--profiled: a release's bundle of $since holds the profile" test "$(bash "$0" --profiled "$since")" = yes
+  expect "0:--profiled: one of $above does" test "$(bash "$0" --profiled "$above")" = yes
+  expect "0:--profiled: one of $below, from before, does not" test "$(bash "$0" --profiled "$below")" = no
+  rel "$since"
+  expect "0:assembled for $since with the profile: exactly a release's bundle" bash "$0" --check "$T/rel/Syndeo.app" "$since" unsigned release
+  cases=$((cases + 1))
+  if cmp -s "$T/profile" "$T/rel/Syndeo.app/Contents/embedded.provisionprofile" &&
+    [ "$(stat -f '%Lp' "$T/rel/Syndeo.app/Contents/embedded.provisionprofile")" = 644 ]; then
+    printf '  ok    %s\n' "  ... the profile in it byte for byte, mode 0644"
+  else
+    printf '  WRONG %s\n' "  ... the profile in it byte for byte, mode 0644"
+    wrong=$((wrong + 1))
+  fi
+  expect "1:  ... and not a pull request's bundle" bash "$0" --check "$T/rel/Syndeo.app" "$since"
+  mkdir -m 755 "$T/rel/Syndeo.app/Contents/_CodeSignature"
+  printf 'seal' >"$T/rel/Syndeo.app/Contents/_CodeSignature/CodeResources"
+  chmod 644 "$T/rel/Syndeo.app/Contents/_CodeSignature/CodeResources"
+  expect "0:  ... signed, still exactly a release's bundle" bash "$0" --check "$T/rel/Syndeo.app" "$since" signed release
+  rm "$T/rel/Syndeo.app/Contents/embedded.provisionprofile"
+  expect "1:a release's bundle of $since without its profile: caught" bash "$0" --check "$T/rel/Syndeo.app" "$since" signed release
+  rm -rf "$T/pr" && mkdir -p "$T/pr" && bash "$0" "$since" "$T/bins" "$T/pr" >/dev/null 2>&1
+  expect "1:a pull request's bundle of $since is not a release's: no profile, and its uninstaller knows no version" bash "$0" --check "$T/pr/Syndeo.app" "$since" unsigned release
+  cp "$T/profile" "$T/pr/Syndeo.app/Contents/embedded.provisionprofile"
+  expect "1:a pull request's bundle with a profile put in it: caught" bash "$0" --check "$T/pr/Syndeo.app" "$since"
+  rm -rf "$T/old" && mkdir -p "$T/old" && bash "$0" "$below" "$T/bins" "$T/old" >/dev/null 2>&1
+  bash "$here/package-macos-pkg.sh" --render uninstall "$below" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign \
+    "$T/old/Syndeo.app/Contents/Resources/uninstall.sh" "$since"
+  expect "0:a release's bundle of $below, from before the profile: no profile, its uninstaller knowing $since" bash "$0" --check "$T/old/Syndeo.app" "$below" unsigned release
+  cp "$T/profile" "$T/old/Syndeo.app/Contents/embedded.provisionprofile"
+  expect "1:  ... and with a profile, which no bundle of $below had: caught" bash "$0" --check "$T/old/Syndeo.app" "$below" unsigned release
+  rm -rf "$T/early" && mkdir -p "$T/early"
+  expect "1:assembling $below with a profile, before $since: refused" bash "$0" "$below" "$T/bins" "$T/early" --profile "$T/profile"
+  expect "1:assembling with a profile that is not there: refused" bash "$0" "$since" "$T/bins" "$T/early" --profile "$T/no-such-profile"
+  cases=$((cases + 1))
+  if [ -z "$(ls -A "$T/early")" ]; then printf '  ok    %s\n' "  ... and nothing left behind"; else
+    printf '  WRONG %s\n' "  ... and nothing left behind"; wrong=$((wrong + 1)); fi
+
+  printf '\n  package-macos-app.sh: what is not a bundle\n'
   fresh
   printf 'garbage' >"$T/out-dir/Syndeo.app/Contents/Info.plist"
   expect "1:an Info.plist that is not one: caught" bash "$0" --check "$T/out-dir/Syndeo.app" 0.2.0
@@ -316,16 +406,26 @@ case "${1:-}" in
     self_test
     ;;
   --manifest)
-    [ "$#" -le 2 ] || die "usage: $0 --manifest [unsigned|signed|stapled]"
+    [ "$#" -le 3 ] || die "usage: $0 --manifest [unsigned|signed|stapled] [profiled]"
     case "${2:-unsigned}" in unsigned | signed | stapled) ;; *) die "no state called $2" ;; esac
-    manifest "${2:-unsigned}"
+    case "${3:-}" in '' | profiled) ;; *) die "usage: $0 --manifest [unsigned|signed|stapled] [profiled]" ;; esac
+    manifest "${2:-unsigned}" "$([ "${3:-}" = profiled ] && echo yes || echo no)"
+    ;;
+  --profiled)
+    [ "$#" = 2 ] && syndeo_version_valid "$2" || die "usage: $0 --profiled <version>"
+    profiled "$2" yes
     ;;
   --check)
-    [ "$#" = 3 ] || [ "$#" = 4 ] || die "usage: $0 --check <Syndeo.app> <version> [unsigned|signed|stapled]"
-    check "$2" "$3" "${4:-unsigned}"
+    [ "$#" -ge 3 ] && [ "$#" -le 5 ] || die "usage: $0 --check <Syndeo.app> <version> [unsigned|signed|stapled] [release]"
+    case "${5:-}" in '' | release) ;; *) die "usage: $0 --check <Syndeo.app> <version> [unsigned|signed|stapled] [release]" ;; esac
+    check "$2" "$3" "${4:-unsigned}" "$([ "${5:-}" = release ] && echo yes || echo no)"
     ;;
   *)
-    [ "$#" = 3 ] || die "usage: $0 <version> <binaries-dir> <out-dir> | --check <Syndeo.app> <version> [unsigned|signed|stapled] | --self-test"
-    assemble "$1" "$2" "$3"
+    if [ "$#" = 5 ] && [ "$4" = --profile ]; then
+      assemble "$1" "$2" "$3" "$5"
+    else
+      [ "$#" = 3 ] || die "usage: $0 <version> <binaries-dir> <out-dir> [--profile <file>] | --check <Syndeo.app> <version> [unsigned|signed|stapled] [release] | --self-test"
+      assemble "$1" "$2" "$3"
+    fi
     ;;
 esac

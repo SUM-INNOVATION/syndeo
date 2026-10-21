@@ -107,7 +107,7 @@ refuse_if_found
 # Everything that will be removed, as it is now: the files, the ticket if
 # stapled, uninstall.sh last; then the directories, deepest first.
 paths=$(
-    app_manifest | while read -r p t m; do
+    app_manifest "$EMBEDDED" | while read -r p t m; do
         if [ "$t" = f ] && [ "$p" != Contents/Resources/uninstall.sh ]; then
             echo "$APP/$p"
         fi
@@ -116,7 +116,7 @@ paths=$(
         echo "$APP/$APP_TICKET"
     fi
     echo "$APP/Contents/Resources/uninstall.sh"
-    app_manifest | while read -r p t m; do
+    app_manifest "$EMBEDDED" | while read -r p t m; do
         if [ "$t" = d ]; then
             echo "$APP/$p"
         fi

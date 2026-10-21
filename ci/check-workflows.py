@@ -24,9 +24,9 @@ is not an approval gate. Checked:
   workflow's run;
 - nothing outside the jobs reads a secret or the signing configuration;
 - each `secrets.` name is read only by a job approved for it:
-  signing-config (all ten, and `vars.SYNDEO_EXPECT_SIGNED`, which no other
+  signing-config (all eleven, and `vars.SYNDEO_EXPECT_SIGNED`, which no other
   job reads), build-macos (the Application certificate, its password, its
-  identity, the team), notarize-binaries (the notary key, its id, its issuer,
+  identity, the team, and Syndeo.app's provisioning profile), notarize-binaries (the notary key, its id, its issuer,
   the team) and package (the Installer certificate, its password, its
   identity, the team, and the notary key, id and issuer);
 - exactly those four declare `environment: release-macos`, and no job
@@ -98,10 +98,11 @@ APPLICATION = {"MACOS_CERTIFICATE_P12_BASE64", "MACOS_CERTIFICATE_PASSWORD", "MA
 INSTALLER = {"MACOS_INSTALLER_CERTIFICATE_P12_BASE64", "MACOS_INSTALLER_CERTIFICATE_PASSWORD", "MACOS_INSTALLER_SIGNING_IDENTITY"}
 NOTARY = {"MACOS_NOTARY_KEY_BASE64", "MACOS_NOTARY_KEY_ID", "MACOS_NOTARY_ISSUER_ID"}
 TEAM = {"MACOS_TEAM_ID"}
+PROFILE = {"SYNDEO_PROVISIONING_PROFILE_B64"}
 # job: (the secrets it may read, the stage its gate checks; None: the whole gate)
 SIGNING_JOBS = {
-    "signing-config": (APPLICATION | INSTALLER | NOTARY | TEAM, None),
-    "build-macos": (APPLICATION | TEAM, "binary-sign"),
+    "signing-config": (APPLICATION | INSTALLER | NOTARY | TEAM | PROFILE, None),
+    "build-macos": (APPLICATION | TEAM | PROFILE, "binary-sign"),
     "notarize-binaries": (NOTARY | TEAM, "binary-notarize"),
     "package": (INSTALLER | NOTARY | TEAM, "package"),
 }
@@ -761,6 +762,15 @@ def self_test(directory):
     case("the Installer certificate given to notarize-binaries", ci,
          add_to_job(rel, "notarize-binaries", "    env:\n      X: ${{ secrets.MACOS_INSTALLER_CERTIFICATE_P12_BASE64 }}"),
          "notarize-binaries reads secrets.MACOS_INSTALLER_CERTIFICATE_P12_BASE64, which it is not approved for")
+    case("Syndeo.app's provisioning profile given to package", ci,
+         add_to_job(rel, "package", "    env:\n      X: ${{ secrets.SYNDEO_PROVISIONING_PROFILE_B64 }}"),
+         "package reads secrets.SYNDEO_PROVISIONING_PROFILE_B64, which it is not approved for")
+    case("Syndeo.app's provisioning profile given to notarize-binaries", ci,
+         add_to_job(rel, "notarize-binaries", "    env:\n      X: ${{ secrets.SYNDEO_PROVISIONING_PROFILE_B64 }}"),
+         "notarize-binaries reads secrets.SYNDEO_PROVISIONING_PROFILE_B64, which it is not approved for")
+    case("Syndeo.app's provisioning profile given to the pkg-install job", ci,
+         add_to_job(rel, "pkg-install", "    env:\n      X: ${{ secrets.SYNDEO_PROVISIONING_PROFILE_B64 }}"),
+         "pkg-install reads secrets.SYNDEO_PROVISIONING_PROFILE_B64, which it is not approved for")
     case("the signing configuration read by package", ci,
          add_to_job(rel, "package", "    env:\n      X: ${{ vars.SYNDEO_EXPECT_SIGNED }}"),
          "package reads the signing configuration; only signing-config may")

@@ -139,7 +139,7 @@ jobs:
           if-no-files-found: error
 
   # Whether this release is signed, decided once: release-macos's
-  # SYNDEO_EXPECT_SIGNED and all ten signing names, all or nothing. It signs
+  # SYNDEO_EXPECT_SIGNED and all eleven signing names, all or nothing. It signs
   # nothing. Every job that signs or notarizes declares the same environment,
   # is given only its own share of the secrets, and checks that share against
   # this decision before it uses any of them.
@@ -166,6 +166,7 @@ jobs:
           MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
           MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          SYNDEO_PROVISIONING_PROFILE_B64: ${{ secrets.SYNDEO_PROVISIONING_PROFILE_B64 }}
         run: ./ci/check-signing-config.sh --github-output
 
   # The macOS binaries: built, and Developer ID signed and checked if the
@@ -198,6 +199,7 @@ jobs:
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
           MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          SYNDEO_PROVISIONING_PROFILE_B64: ${{ secrets.SYNDEO_PROVISIONING_PROFILE_B64 }}
         run: ./ci/check-signing-config.sh --stage binary-sign
 
       - uses: dtolnay/rust-toolchain@stable
@@ -219,10 +221,11 @@ jobs:
           cargo build --release --locked --target aarch64-apple-darwin \
             -p syndeo-webkit
 
-      # ci/sign-macos.sh signs and verifies the seven, then assembles
-      # Syndeo.app from them and signs the bundle; without a notary key,
-      # which this job is never given, it notarizes nothing.
-      # notarize-binaries does that.
+      # ci/sign-macos.sh checks Syndeo.app's provisioning profile, then signs
+      # and verifies the seven, then assembles Syndeo.app from them, with the
+      # profile, and signs the bundle, its main executable with Apple's
+      # browser passkey entitlement; without a notary key, which this job is
+      # never given, it notarizes nothing. notarize-binaries does that.
       - name: Sign the binaries, then Syndeo.app
         if: needs.signing-config.outputs.signed == 'yes'
         env:
@@ -230,6 +233,7 @@ jobs:
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
           TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          PROFILE: ${{ secrets.SYNDEO_PROVISIONING_PROFILE_B64 }}
         run: ./ci/sign-macos.sh "target/aarch64-apple-darwin/release" --app "$VERSION" "$RUNNER_TEMP/app"
 
       - name: Syndeo.app, signed ad hoc, as the configuration decided
@@ -517,8 +521,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/app"
           /usr/bin/ditto -x -k "dist/$APPZIP" "$RUNNER_TEMP/app"
 
+      # A signed release's package: its scripts know from which version a
+      # release's Syndeo.app holds its provisioning profile.
       - name: The package, from that Syndeo.app
         shell: bash
+        env:
+          SYNDEO_EXPECT_SIGNED: ${{ needs.signing-config.outputs.signed }}
         run: ./ci/package-macos-pkg.sh "$VERSION" "$RUNNER_TEMP/app/Syndeo.app" "$RUNNER_TEMP/unsigned"
 
       - name: Sign the package

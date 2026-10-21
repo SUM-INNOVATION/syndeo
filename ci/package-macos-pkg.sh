@@ -3,8 +3,8 @@
 #
 #   ci/package-macos-pkg.sh <version> <Syndeo.app> <out-dir>
 #   ci/package-macos-pkg.sh --render <preinstall|postinstall|uninstall> \
-#       <version> <root> <uid> <gid> <pkgutil> <codesign> <out-file>
-#   ci/package-macos-pkg.sh --library <out-file>
+#       <version> <root> <uid> <gid> <pkgutil> <codesign> <out-file> [<profile-since>]
+#   ci/package-macos-pkg.sh --library <out-file> [<profile-since>]
 #
 # It writes <out-dir>/Syndeo-<version>.pkg, the release's installer for
 # customers; the command-line tarballs keep their own names.
@@ -25,6 +25,15 @@
 # no extended attributes, and every timestamp the release commit's. The .pkg
 # file itself is not byte-for-byte reproducible: its archive carries its own
 # creation time.
+#
+# A release's bundle carries a provisioning profile, from the version in
+# ci/macos-app/profile-since on (see ci/package-macos-app.sh); a pull
+# request's never does. The scripts are told which: <profile-since> is that
+# version in a release's package, and empty, the default, in a pull
+# request's. They then expect the profile in a bundle of that version or
+# later, and in no other, so an older release's bundle, from before the
+# profile, is still exactly Syndeo.app as its own package left it. A package
+# is a release's when SYNDEO_EXPECT_SIGNED is yes.
 #
 # --render writes one of the three scripts with the given literals. Every
 # package uses root '', uid 0, gid 0, /usr/sbin/pkgutil and /usr/bin/codesign;
@@ -54,9 +63,12 @@ die() {
     exit 1
 }
 
-# libraries: version.sh, common.sh and app.sh, as every script embeds them,
-# with the bundle's manifest where app.sh says @APP_MANIFEST@.
+# libraries [SINCE]: version.sh, common.sh and app.sh, as every script
+# embeds them, with the bundle's manifest where app.sh says @APP_MANIFEST@,
+# and SINCE, a version or nothing, where it says @APP_PROFILE_SINCE@.
 libraries() {
+    local since="${1:-}"
+    [ -z "$since" ] || syndeo_version_valid "$since" || die "'$since' is not a version"
     awk -v manifest="$here/macos-app/bundle.manifest" '
         FNR == 1 && NR > 1 { print "" }
         $0 == "@APP_MANIFEST@" {
@@ -65,12 +77,12 @@ libraries() {
             next
         }
         { print }
-    ' "$templates/version.sh" "$templates/common.sh" "$templates/app.sh"
+    ' "$templates/version.sh" "$templates/common.sh" "$templates/app.sh" | sed "s|@APP_PROFILE_SINCE@|$since|g"
 }
 
 # render KIND VERSION ROOT UID GID PKGUTIL CODESIGN OUT
 render() {
-    local kind="$1" version="$2" root="$3" uid="$4" gid="$5" pkgutil="$6" codesign="$7" out="$8"
+    local kind="$1" version="$2" root="$3" uid="$4" gid="$5" pkgutil="$6" codesign="$7" out="$8" since="${9:-}"
     local template
     case "$kind" in
         preinstall | postinstall) template="$templates/$kind.in" ;;
@@ -87,7 +99,7 @@ render() {
     # The libraries go in whole where the template says @COMMON@.
     local lib
     lib="$(mktemp)"
-    libraries >"$lib"
+    libraries "$since" >"$lib"
     awk -v lib="$lib" '
         $0 == "@COMMON@" {
             while ((getline line < lib) > 0) print line
@@ -116,9 +128,20 @@ build() {
     [ -d "$app" ] && [ ! -L "$app" ] || die "no bundle at $app"
     mkdir -p "$out"
 
-    # Exactly the bundle for this version, signed, stapled or not.
+    # Exactly the bundle for this version, signed, stapled or not, with its
+    # provisioning profile or not.
     if [ -e "$app/Contents/CodeResources" ]; then state=stapled; else state=signed; fi
-    bash "$here/package-macos-app.sh" --check "$app" "$version" "$state" >&2 ||
+    local release='' since=''
+    case "${SYNDEO_EXPECT_SIGNED:-no}" in
+        yes)
+            release=release
+            since="$(cat "$here/macos-app/profile-since")"
+            ;;
+        no) ;;
+        *) die "SYNDEO_EXPECT_SIGNED must be yes or no" ;;
+    esac
+    # shellcheck disable=SC2086 # release, a word or nothing
+    bash "$here/package-macos-app.sh" --check "$app" "$version" "$state" $release >&2 ||
         die "$app is not exactly Syndeo.app $version, $state"
     codesign --verify --strict --deep "$app" || die "$app's signature does not verify"
 
@@ -135,13 +158,14 @@ build() {
     epoch="${SOURCE_DATE_EPOCH:-$(git -C "$repo" log -1 --format=%ct)}"
     stamp="$(date -u -r "$epoch" +%Y%m%d%H%M.%S)"
     find "$stage" -exec env TZ=UTC touch -h -t "$stamp" {} +
-    bash "$here/package-macos-app.sh" --check "$stage/Syndeo.app" "$version" "$state" >&2 ||
+    # shellcheck disable=SC2086 # release, a word or nothing
+    bash "$here/package-macos-app.sh" --check "$stage/Syndeo.app" "$version" "$state" $release >&2 ||
         die "the copy of $app is not exactly Syndeo.app $version"
     codesign --verify --strict --deep "$stage/Syndeo.app" || die "the copy's signature does not verify"
 
     mkdir "$work/scripts" "$work/component"
-    render preinstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign "$work/scripts/preinstall"
-    render postinstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign "$work/scripts/postinstall"
+    render preinstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign "$work/scripts/preinstall" "$since"
+    render postinstall "$version" '' 0 0 /usr/sbin/pkgutil /usr/bin/codesign "$work/scripts/postinstall" "$since"
 
     /usr/bin/pkgbuild --quiet --root "$stage" --component-plist "$templates/component.plist" \
         --identifier com.sum.syndeo.app --version "$version" --install-location /Applications \
@@ -165,12 +189,12 @@ build() {
 case "${1:-}" in
     --render)
         shift
-        [ "$#" -eq 8 ] || die "--render <kind> <version> <root> <uid> <gid> <pkgutil> <codesign> <out-file>"
-        render "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+        [ "$#" -eq 8 ] || [ "$#" -eq 9 ] || die "--render <kind> <version> <root> <uid> <gid> <pkgutil> <codesign> <out-file> [<profile-since>]"
+        render "$@"
         ;;
     --library)
-        [ "$#" -eq 2 ] || die "--library <out-file>"
-        libraries >"$2"
+        [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || die "--library <out-file> [<profile-since>]"
+        libraries "${3:-}" >"$2"
         ;;
     '' | -*)
         die "usage: $0 <version> <Syndeo.app> <out-dir>"

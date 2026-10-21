@@ -9,7 +9,7 @@
 # unset means (an undefined `vars.` value reaches a workflow as empty). Any
 # other value is refused.
 #
-# The ten signing and notarization secrets, which belong only to the
+# The eleven signing and notarization secrets, which belong only to the
 # release-macos environment, and so only to the jobs that declare it, each of
 # which is given only its own share (see --stage below):
 #
@@ -23,21 +23,27 @@
 #   MACOS_NOTARY_KEY_BASE64                 App Store Connect API key, .p8, base64
 #   MACOS_NOTARY_KEY_ID                     that key's id
 #   MACOS_NOTARY_ISSUER_ID                  the issuer it belongs to
+#   SYNDEO_PROVISIONING_PROFILE_B64         Syndeo.app's Developer ID provisioning
+#                                           profile, base64
 #
 # `no` requires every one of them to be empty: a secret that is set means
 # someone expects signing, and a release that silently ignores it is not what
-# they asked for. `yes` requires all ten, none of them blank, the team id to be
-# ten capital letters and digits, and both identities to be Developer ID
-# identities of that team. ci/sign-macos.sh signs whatever it is given; this
+# they asked for. `yes` requires all eleven, none of them blank, the team id
+# to be ten capital letters and digits, both identities to be Developer ID
+# identities of that team, and the profile a Developer ID provisioning
+# profile for that team's com.sum.syndeo that authorizes Apple's browser
+# passkey entitlement and has not expired (ci/macos-app/profile.py; that it
+# lists the signing certificate is checked where the certificate is, in
+# ci/sign-macos.sh). ci/sign-macos.sh signs whatever it is given; this
 # runs first, so the half-states it would accept never reach it.
 #
 # --stage NAME checks one job of the release, given the decision as
 # SYNDEO_EXPECT_SIGNED: under yes, that job's own secrets have to be there
 # and consistent, and every other one absent, so a job that is handed more
-# than it needs fails; under no, all ten have to be absent. The stages:
+# than it needs fails; under no, all eleven have to be absent. The stages:
 #
 #   binary-sign      the Application certificate, its password, its
-#                    identity, and the team id
+#                    identity, the team id, and Syndeo.app's profile
 #   binary-notarize  the notary key, its id, its issuer, and the team id
 #   package          the Installer certificate, its password, its identity,
 #                    the team id, and the notary key, its id and its issuer
@@ -48,12 +54,14 @@
 set -euo pipefail
 LC_ALL=C
 export LC_ALL
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NAMES=(
   MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD MACOS_SIGNING_IDENTITY
   MACOS_INSTALLER_CERTIFICATE_P12_BASE64 MACOS_INSTALLER_CERTIFICATE_PASSWORD MACOS_INSTALLER_SIGNING_IDENTITY
   MACOS_TEAM_ID
   MACOS_NOTARY_KEY_BASE64 MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID
+  SYNDEO_PROVISIONING_PROFILE_B64
 )
 
 refuse() {
@@ -69,10 +77,28 @@ identity_of_team() {
   [[ "$value" =~ ^Developer\ ID\ $kind:\ .+\ \(([A-Z0-9]{10})\)$ ]] && [ "${BASH_REMATCH[1]}" = "$team" ]
 }
 
+# profile_of_team TEAM: SYNDEO_PROVISIONING_PROFILE_B64 is a Developer ID
+# provisioning profile for TEAM's com.sum.syndeo that authorizes the browser
+# passkey entitlement and has not expired. Refuses, saying what is wrong and
+# never what it holds, if it is not.
+profile_of_team() {
+  local file why
+  file="$(mktemp)"
+  if ! printf '%s' "$SYNDEO_PROVISIONING_PROFILE_B64" | base64 --decode >"$file" 2>/dev/null; then
+    rm -f "$file"
+    refuse "SYNDEO_PROVISIONING_PROFILE_B64 is not base64"
+  fi
+  why="$(python3 -I "$here/macos-app/profile.py" check "$file" "$1" 2>&1)" || {
+    rm -f "$file"
+    refuse "SYNDEO_PROVISIONING_PROFILE_B64 is not Syndeo.app's profile: $(printf '%s\n' "$why" | sed 's/^profile.py: //' | tr '\n' ' ')"
+  }
+  rm -f "$file"
+}
+
 # stage_names STAGE: the names that stage's job is given.
 stage_names() {
   case "$1" in
-    binary-sign) echo MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD MACOS_SIGNING_IDENTITY MACOS_TEAM_ID ;;
+    binary-sign) echo MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD MACOS_SIGNING_IDENTITY MACOS_TEAM_ID SYNDEO_PROVISIONING_PROFILE_B64 ;;
     binary-notarize) echo MACOS_NOTARY_KEY_BASE64 MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID MACOS_TEAM_ID ;;
     package) echo MACOS_INSTALLER_CERTIFICATE_P12_BASE64 MACOS_INSTALLER_CERTIFICATE_PASSWORD MACOS_INSTALLER_SIGNING_IDENTITY MACOS_TEAM_ID MACOS_NOTARY_KEY_BASE64 MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID ;;
     *) return 1 ;;
@@ -112,6 +138,9 @@ check_stage() {
         identity_of_team Installer "$MACOS_INSTALLER_SIGNING_IDENTITY" "$MACOS_TEAM_ID" ||
           refuse "MACOS_INSTALLER_SIGNING_IDENTITY is not a Developer ID Installer identity of MACOS_TEAM_ID" ;;
     esac
+    case " $own " in
+      *" SYNDEO_PROVISIONING_PROFILE_B64 "*) profile_of_team "$MACOS_TEAM_ID" ;;
+    esac
   fi
   printf 'stage %s: signing %s\n' "$stage" "$expect"
 }
@@ -139,6 +168,7 @@ check() {
       refuse "MACOS_SIGNING_IDENTITY is not a Developer ID Application identity of MACOS_TEAM_ID"
     identity_of_team Installer "$MACOS_INSTALLER_SIGNING_IDENTITY" "$team" ||
       refuse "MACOS_INSTALLER_SIGNING_IDENTITY is not a Developer ID Installer identity of MACOS_TEAM_ID"
+    profile_of_team "$team"
   fi
   printf 'signing: %s\n' "$expect"
   if [ "${1:-}" = --github-output ]; then
@@ -154,9 +184,23 @@ self_test() {
   # Not local: the EXIT trap runs after this function has returned.
   T="$(mktemp -d)"
   trap 'rm -rf "$T"' EXIT
-  # Every value carries SECRETVALUE, except the team id, which cannot; no
-  # output may contain either.
-  local team=AB12CD34EF
+  # Every value carries SECRETVALUE, except the team id, which cannot, and
+  # the profile, a stand-in forged with openssl (ci/macos-app/profile.py
+  # forge), which has to be one; no output may contain any of them.
+  local team=AB12CD34EF profile n
+  if ! command -v openssl >/dev/null 2>&1 || ! openssl cms -help >/dev/null 2>&1; then
+    printf '  WRONG %s\n\n  1 cases, 1 wrong\n\n' "openssl with cms is needed, to forge a stand-in provisioning profile"
+    return 1
+  fi
+  for n in good other-team expired no-passkeys; do
+    case "$n" in
+      good) python3 -I "$here/macos-app/profile.py" forge "$T/profile-$n" "$team" ;;
+      other-team) python3 -I "$here/macos-app/profile.py" forge "$T/profile-$n" ZZ99ZZ99ZZ ;;
+      expired) python3 -I "$here/macos-app/profile.py" forge "$T/profile-$n" "$team" --expired ;;
+      no-passkeys) python3 -I "$here/macos-app/profile.py" forge "$T/profile-$n" "$team" --without-passkeys ;;
+    esac
+  done
+  profile="$(base64 <"$T/profile-good" | tr -d '\n')"
   local -a good=(
     MACOS_CERTIFICATE_P12_BASE64=U0VDUkVUVkFMVUUtYXBw.SECRETVALUE
     MACOS_CERTIFICATE_PASSWORD=SECRETVALUE-app-password
@@ -168,6 +212,7 @@ self_test() {
     MACOS_NOTARY_KEY_BASE64=U0VDUkVUVkFMVUUta2V5.SECRETVALUE
     MACOS_NOTARY_KEY_ID=SECRETVALUE-key-id
     MACOS_NOTARY_ISSUER_ID=SECRETVALUE-issuer
+    "SYNDEO_PROVISIONING_PROFILE_B64=$profile"
   )
 
   # run WANT-STATUS WANT-TEXT LABEL [NAME=VALUE...]: this script, with only
@@ -180,6 +225,7 @@ self_test() {
     [ "$status" = "$want" ] || verdict=no
     printf '%s' "$out" | grep -qF -- "$text" || verdict=no
     if printf '%s' "$out" | grep -qE "SECRETVALUE|$team\)|U0VDUkVU"; then verdict=no; fi
+    if printf '%s' "$out" | grep -qF -- "${profile:0:40}"; then verdict=no; fi
     cases=$((cases + 1))
     if [ "$verdict" = yes ]; then
       printf '  ok    %s\n' "$label"
@@ -213,10 +259,21 @@ self_test() {
     run 1 "these are set: $n" "unset, with $n set: refused" "$n=SECRETVALUE"
     run 1 "these are set: $n" "no, with $n blank: refused" SYNDEO_EXPECT_SIGNED=no "$n= "
   done
-  run 1 "these are set: ${NAMES[*]}" "no, with all ten set: refused" SYNDEO_EXPECT_SIGNED=no "${good[@]}"
+  run 1 "these are set: ${NAMES[*]}" "no, with all eleven set: refused" SYNDEO_EXPECT_SIGNED=no "${good[@]}"
 
-  printf '\n  signed: SYNDEO_EXPECT_SIGNED yes, and all ten consistent\n'
-  run 0 "signing: yes" "yes, all ten: yes" SYNDEO_EXPECT_SIGNED=yes "${good[@]}"
+  printf '\n  signed: SYNDEO_EXPECT_SIGNED yes, and all eleven consistent\n'
+  run 0 "signing: yes" "yes, all eleven: yes" SYNDEO_EXPECT_SIGNED=yes "${good[@]}"
+  local bad_profile why
+  for bad_profile in "other-team|another team's profile|its team is" "expired|an expired profile|it expired" \
+    "no-passkeys|a profile without the passkey entitlement|does not authorize"; do
+    IFS='|' read -r n label why <<<"$bad_profile"
+    load < <(with SYNDEO_PROVISIONING_PROFILE_B64 "$(base64 <"$T/profile-$n" | tr -d '\n')")
+    run 1 "$why" "yes, $label: refused" SYNDEO_EXPECT_SIGNED=yes "${env_[@]}"
+  done
+  load < <(with SYNDEO_PROVISIONING_PROFILE_B64 "U0VDUkVUVkFMVUUtbm90LWEtcHJvZmlsZQ==")
+  run 1 "not a CMS-signed property list" "yes, a profile that is not one: refused" SYNDEO_EXPECT_SIGNED=yes "${env_[@]}"
+  load < <(with SYNDEO_PROVISIONING_PROFILE_B64 "SECRETVALUE!!!")
+  run 1 "SYNDEO_PROVISIONING_PROFILE_B64 is not" "yes, a profile that is not base64: refused" SYNDEO_EXPECT_SIGNED=yes "${env_[@]}"
   for n in "${NAMES[@]}"; do
     load < <(without "$n")
     run 1 "empty or blank: $n" "yes, without $n: refused" SYNDEO_EXPECT_SIGNED=yes "${env_[@]}"
@@ -251,7 +308,7 @@ self_test() {
   printf '\n  SYNDEO_EXPECT_SIGNED itself\n'
   local e
   for e in YES Yes true 1 y "yes " " no" $'yes\n' $'no\nyes' maybe; do
-    run 1 "SYNDEO_EXPECT_SIGNED must be yes, no or empty" "$(printf '%q' "$e"), all ten set: refused" SYNDEO_EXPECT_SIGNED="$e" "${good[@]}"
+    run 1 "SYNDEO_EXPECT_SIGNED must be yes, no or empty" "$(printf '%q' "$e"), all eleven set: refused" SYNDEO_EXPECT_SIGNED="$e" "${good[@]}"
     run 1 "SYNDEO_EXPECT_SIGNED must be yes, no or empty" "$(printf '%q' "$e"), nothing set: refused" SYNDEO_EXPECT_SIGNED="$e"
   done
 
@@ -265,6 +322,7 @@ self_test() {
     [ "$status" = "$want" ] || verdict=no
     printf '%s' "$out" | grep -qF -- "$text" || verdict=no
     if printf '%s' "$out" | grep -qE "SECRETVALUE|$team\)|U0VDUkVU"; then verdict=no; fi
+    if printf '%s' "$out" | grep -qF -- "${profile:0:40}"; then verdict=no; fi
     cases=$((cases + 1))
     if [ "$verdict" = yes ]; then
       printf '  ok    %s\n' "$label"
@@ -303,6 +361,10 @@ self_test() {
   load < <(only $(stage_names binary-sign))
   stage_run 1 "MACOS_SIGNING_IDENTITY is not" "binary-sign, an Application identity of another team: refused" binary-sign \
     SYNDEO_EXPECT_SIGNED=yes "${env_[@]}" "MACOS_SIGNING_IDENTITY=Developer ID Application: SECRETVALUE Org (ZZ99ZZ99ZZ)"
+  stage_run 1 "its team is" "binary-sign, another team's profile: refused" binary-sign \
+    SYNDEO_EXPECT_SIGNED=yes "${env_[@]}" "SYNDEO_PROVISIONING_PROFILE_B64=$(base64 <"$T/profile-other-team" | tr -d '\n')"
+  stage_run 1 "it expired" "binary-sign, an expired profile: refused" binary-sign \
+    SYNDEO_EXPECT_SIGNED=yes "${env_[@]}" "SYNDEO_PROVISIONING_PROFILE_B64=$(base64 <"$T/profile-expired" | tr -d '\n')"
   # shellcheck disable=SC2046
   load < <(only $(stage_names package))
   stage_run 1 "MACOS_INSTALLER_SIGNING_IDENTITY is not" "package, an Installer identity of another team: refused" package \
