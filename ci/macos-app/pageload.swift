@@ -8,13 +8,14 @@
 //                                                  ca.pem, as Syndeo.app's
 //                                                  windows do
 //
-// As Syndeo.app does, it browses in WebKit's default data store, and its
-// App Transport Security is the app's, NSAllowsArbitraryLoadsInWebContent
-// (pageload.plist, linked into the executable): without it WebKit refuses
-// the proxy's certificates on macOS 15 before any delegate is asked. Each run
-// empties that store and opens a new web view, so nothing WebKit kept from
-// another run answers for it: the url is loaded once (cold) and then again in
-// the same web view (warm). One JSON object a line per load, on stdout:
+// It runs as Syndeo.app's windows do: from an application bundle, signed ad
+// hoc with the hardened runtime, whose Info.plist (pageload.plist) gives it
+// the app's App Transport Security, NSAllowsArbitraryLoadsInWebContent; in
+// WebKit's default data store, its proxy set as the app sets it, through the
+// Network framework's C interface. Each run empties that store and opens a
+// new web view, so nothing WebKit kept from another run answers for it: the
+// url is loaded once (cold) and then again in the same web view (warm). One
+// JSON object a line per load, on stdout:
 //
 //   {"run":1,"visit":"cold","ok":true,"fcp":812,"dcl":901,"load":1520,
 //    "wall":1604,"resources":131,"protocols":{"h2":131,"http/1.1":1}}
@@ -108,9 +109,9 @@ final class Driver: NSObject, WKNavigationDelegate {
         guard run <= runs else { exit(0) }
         let store = WKWebsiteDataStore.default()
         if let proxy {
-            let endpoint = NWEndpoint.hostPort(
-                host: NWEndpoint.Host(proxy.host), port: NWEndpoint.Port(rawValue: proxy.port)!)
-            store.proxyConfigurations = [ProxyConfiguration(httpCONNECTProxy: endpoint, tlsOptions: nil)]
+            let endpoint = nw_endpoint_create_host(proxy.host, String(proxy.port))
+            let config = nw_proxy_config_create_http_connect(endpoint, nil)
+            store.setValue([config], forKey: "proxyConfigurations")
         }
         // Empty, then a new web view on it.
         store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {

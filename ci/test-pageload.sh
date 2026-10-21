@@ -39,11 +39,16 @@ PROXY="$1" URL="$2" RUNS="${3:-5}"
 [ -x "$PROXY" ] || { say "no proxy at $PROXY"; exit 2; }
 
 mkdir -p "$LOGS"
-PAGELOAD="$LOGS/pageload"
-# With Syndeo.app's App Transport Security, from pageload.plist, linked in.
-swiftc -O -o "$PAGELOAD" "$here/macos-app/pageload.swift" \
-  -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$here/macos-app/pageload.plist" \
-  >"$LOGS/swiftc.log" 2>&1 || { say "could not build pageload"; cat "$LOGS/swiftc.log"; exit 2; }
+# An application bundle, signed as CI signs Syndeo.app: ad hoc, with the
+# hardened runtime; its Info.plist is pageload.plist.
+BUNDLE="$LOGS/pageload.app"
+rm -rf "$BUNDLE"
+mkdir -p "$BUNDLE/Contents/MacOS"
+cp "$here/macos-app/pageload.plist" "$BUNDLE/Contents/Info.plist"
+PAGELOAD="$BUNDLE/Contents/MacOS/pageload"
+{ swiftc -O -o "$PAGELOAD" "$here/macos-app/pageload.swift" &&
+  codesign --force --sign - --options runtime "$BUNDLE"; } >"$LOGS/swiftc.log" 2>&1 ||
+  { say "could not build pageload"; cat "$LOGS/swiftc.log"; exit 2; }
 
 PROXY_PID=''
 stop_proxy() {
@@ -138,6 +143,14 @@ for variant in ("direct", "syndeo", "syndeo-dns-system"):
                 m = re.search(r"tunnel opened host=(\S+)", re.sub(r"\x1b\[[0-9;]*m", "", line))
                 if m:
                     tunnels[m.group(1)] = tunnels.get(m.group(1), 0) + 1
+        if any(not l.get("ok") for l in lines):
+            refused = set()
+            for stderr in sorted(glob.glob(os.path.join(logs, variant + "-*", "stderr"))):
+                for line in open(stderr, errors="replace"):
+                    if "tls handshake failed" in line:
+                        refused.add(re.sub(r"^\S+\s+", "", re.sub(r"\x1b\[[0-9;]*m", "", line)).strip())
+            for line in sorted(refused)[:3]:
+                print("    proxy   %s" % line[:300])
         runs = len(glob.glob(os.path.join(logs, variant + "-*")))
         top = sorted(tunnels.items(), key=lambda kv: -kv[1])[:6]
         print("  %-18s tunnels per run, by host: %s" % ("", ", ".join("%s %.1f" % (h, n / max(runs, 1)) for h, n in top) or "none logged"))
