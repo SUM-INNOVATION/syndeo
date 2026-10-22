@@ -246,6 +246,10 @@ pub struct Index {
     db: Database,
     /// Accesses recorded since the last durable commit.
     since_flush: AtomicU64,
+    /// The durability each write transaction began with, so a test can see
+    /// which writes are on disk when they return.
+    #[cfg(test)]
+    began: std::sync::Mutex<Vec<redb::Durability>>,
 }
 
 impl Drop for Index {
@@ -327,6 +331,8 @@ impl Index {
         Ok(Index {
             db,
             since_flush: AtomicU64::new(0),
+            #[cfg(test)]
+            began: Default::default(),
         })
     }
 
@@ -342,11 +348,33 @@ impl Index {
     /// is the last few entries, which a cache can do without; never a
     /// half-written one. Elsewhere the two are the same flush.
     ///
-    /// [`persist`](Index::persist) stays immediate: it is the one write that
-    /// promises to be on disk when it returns.
+    /// The writes that promise something about the disk, rather than about
+    /// the cache, are [`writing_now`](Index::writing_now), and
+    /// [`persist`](Index::persist) is immediate too.
     fn writing(&self) -> Result<redb::WriteTransaction> {
+        self.beginning(redb::Durability::Eventual)
+    }
+
+    /// A write transaction that is on disk when its commit returns: redb's
+    /// `Durability::Immediate`, `F_FULLFSYNC` on macOS.
+    ///
+    /// For [`clear`](Index::clear), which Clear Browsing Data waits for: once
+    /// it returns, the cleared entries, and the URLs in them, are gone from
+    /// the disk too. Eventual would let a power cut just after bring them
+    /// back. Being immediate, it also carries every eventual commit before
+    /// it to the disk.
+    fn writing_now(&self) -> Result<redb::WriteTransaction> {
+        self.beginning(redb::Durability::Immediate)
+    }
+
+    fn beginning(&self, durability: redb::Durability) -> Result<redb::WriteTransaction> {
         let mut tx = self.db.begin_write()?;
-        tx.set_durability(redb::Durability::Eventual);
+        tx.set_durability(durability);
+        #[cfg(test)]
+        self.began
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(durability);
         Ok(tx)
     }
 
@@ -738,7 +766,8 @@ impl Index {
     /// The blob files are the caller's to delete: see `Cache::clear`, which
     /// holds the blob gate exclusively across this and that.
     pub fn clear(&self) -> Result<u64> {
-        let tx = self.writing()?;
+        // On disk when this returns: see `writing_now`.
+        let tx = self.writing_now()?;
         let entries = {
             let mut table = tx.open_table(ENTRIES)?;
             let entries = table.len()?;
@@ -1062,6 +1091,23 @@ mod tests {
 
     fn index_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
         dir.path().join("index.redb")
+    }
+
+    /// Clear Browsing Data's write is on disk when it returns; the ordinary
+    /// writes of a store or a hit are only on their way there.
+    #[test]
+    fn clearing_is_on_disk_when_it_returns_and_storing_is_on_its_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(index_path(&dir)).unwrap();
+        let last = |index: &Index| *index.began.lock().unwrap().last().unwrap();
+
+        index.bump("requests", 1).unwrap();
+        assert!(matches!(last(&index), redb::Durability::Eventual));
+        index.clear().unwrap();
+        assert!(
+            matches!(last(&index), redb::Durability::Immediate),
+            "clearing the index can be undone by a power cut"
+        );
     }
 
     #[test]
