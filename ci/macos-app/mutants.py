@@ -55,9 +55,12 @@ back.
 - agent-peer-unchecked: the socket's peer is not checked to be this user. A
   connection from root must then be seen not refused, and asked about.
 - agent-unproxied-tab: an agent's tab browses in a web view of its own
-  making, with WebKit's default configuration, rather than its window's,
-  which is routed through the proxy and pinned. The agent's pages must then
-  be seen not coming through Syndeo's proxy.
+  making, with WebKit's default configuration and no delegate, rather than
+  its window's, which is routed through the proxy and pinned to Syndeo's
+  authority. Its https page must then be seen not opening, and not fetched
+  by Syndeo's proxy, since nothing answers the proxy's certificate with
+  that authority. (Its http page may still come through the proxy, which
+  CI 39690228430 saw: the proxy is set on WebKit's data store.)
 """
 import os
 import sys

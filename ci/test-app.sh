@@ -128,8 +128,9 @@
 # has to fail, after agents are turned on: the prompts (approval:) and
 # JavaScript refused (grants:) for agent-approval-skipped, what a grant allows
 # (grants:) for agent-grant-unenforced, root refused (peer:) for
-# agent-peer-unchecked, and the agent's pages through the proxy (agent
-# traffic:) for agent-unproxied-tab. Any other failure is a failure.
+# agent-peer-unchecked, and the agent's https page through the proxy,
+# pinned (agent traffic:), for agent-unproxied-tab. Any other failure is a
+# failure.
 #
 # agents, which gates programs on this Mac driving Syndeo with the person's
 # leave: see the section of that name below.
