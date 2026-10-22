@@ -115,14 +115,33 @@ final class Web: NSObject, WKNavigationDelegate {
     var twice = false
     var first = true
 
-    func start(ephemeral: Bool, twice: Bool) {
+    /// A store made through WebKit's `_WKWebsiteDataStoreConfiguration`,
+    /// persistent or not, that lets CFNetwork honour the delegate's answer
+    /// for an HSTS host: `allowsHSTSWithUntrustedRootCertificate`.
+    func spiStore(persistent: Bool) -> WKWebsiteDataStore {
+        let configurationClass: AnyObject = NSClassFromString("_WKWebsiteDataStoreConfiguration")!
+        let allocated = configurationClass.perform(NSSelectorFromString("alloc"))!.takeUnretainedValue()
+        let configuration = allocated.perform(
+            NSSelectorFromString(persistent ? "init" : "initNonPersistentConfiguration"))!.takeUnretainedValue()
+        configuration.setValue(true, forKey: "allowsHSTSWithUntrustedRootCertificate")
+        say("SPI allowsHSTSWithUntrustedRootCertificate=\(configuration.value(forKey: "allowsHSTSWithUntrustedRootCertificate") ?? "?") persistent=\(persistent)")
+        let storeClass: AnyObject = WKWebsiteDataStore.self
+        let store = storeClass.perform(NSSelectorFromString("alloc"))!.takeUnretainedValue()
+            .perform(NSSelectorFromString("_initWithConfiguration:"), with: configuration)!.takeUnretainedValue()
+        return store as! WKWebsiteDataStore
+    }
+
+    func start(ephemeral: Bool, twice: Bool, keep: Bool = false, spi: Bool = false) {
         self.twice = twice
         window.makeKeyAndOrderFront(nil)
-        let store = ephemeral ? WKWebsiteDataStore.nonPersistent() : WKWebsiteDataStore.default()
+        let store =
+            spi
+            ? spiStore(persistent: !ephemeral)
+            : ephemeral ? WKWebsiteDataStore.nonPersistent() : WKWebsiteDataStore.default()
         let config = nw_proxy_config_create_http_connect(
             nw_endpoint_create_host(proxyHost, String(proxyPort)), nil)
         store.setValue([config], forKey: "proxyConfigurations")
-        store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {
+        let go = {
             let configuration = WKWebViewConfiguration()
             configuration.websiteDataStore = store
             let view = WKWebView(frame: self.window.contentView!.bounds, configuration: configuration)
@@ -130,6 +149,11 @@ final class Web: NSObject, WKNavigationDelegate {
             self.window.contentView = view
             self.view = view
             view.load(URLRequest(url: url))
+        }
+        if keep {
+            go()
+        } else {
+            store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { go() }
         }
     }
 
@@ -267,6 +291,9 @@ DispatchQueue.main.async {
     case "webkit": web.start(ephemeral: false, twice: false)
     case "webkit-twice": web.start(ephemeral: false, twice: true)
     case "webkit-ephemeral": web.start(ephemeral: true, twice: false)
+    case "webkit-keep": web.start(ephemeral: false, twice: false, keep: true)
+    case "webkit-spi": web.start(ephemeral: true, twice: false, spi: true)
+    case "webkit-spi-persistent": web.start(ephemeral: false, twice: false, spi: true)
     case "session": session.start()
     case "nw": bare()
     default:

@@ -5,12 +5,12 @@
 #
 #   ci/hsts-probe.sh <syndeo-proxy>
 #
-# 1. Preloaded and other hosts, loaded once each (webkit, nw).
-# 2. Hosts loaded twice in one data store: two that send their own HSTS
-#    header (www.mozilla.org, crates.io), one that does not (www.rust-lang.org).
-# 3. Preloaded hosts in an ephemeral data store.
-# 4. The same in a bundle whose ATS allows arbitrary loads everywhere, not
-#    only in web content: measured, never proposed.
+# 1. A baseline: a preloaded host and another, by WebKit as Syndeo.app runs.
+# 2. A site's own HSTS header across a relaunch: loaded in one process, then
+#    in a second that keeps the data store.
+# 3. WebKit's allowsHSTSWithUntrustedRootCertificate (SPI) on the store:
+#    preloaded hosts and others; then with an authority that is not the
+#    proxy's, which the window's pinning has to refuse.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,19 +23,16 @@ rm -rf "$LOGS"
 mkdir -p "$LOGS"
 sw_vers >"$LOGS/sw_vers.txt"
 
-# bundle NAME PLIST-SED: tlsprobe in an application bundle of its own.
+# bundle NAME: tlsprobe in an application bundle of its own.
 bundle() {
   local app="$LOGS/$1.app"
   mkdir -p "$app/Contents/MacOS"
-  sed -e 's/pageload/tlsprobe/g' -e "$2" "$here/macos-app/pageload.plist" >"$app/Contents/Info.plist"
+  sed -e 's/pageload/tlsprobe/g' "$here/macos-app/pageload.plist" >"$app/Contents/Info.plist"
   { swiftc -O -o "$app/Contents/MacOS/tlsprobe" "$here/macos-app/tlsprobe.swift" &&
     codesign --force --sign - --options runtime "$app"; } >"$LOGS/swiftc-$1.log" 2>&1 ||
     { say "could not build $1"; cat "$LOGS/swiftc-$1.log"; exit 2; }
 }
-bundle tlsprobe 's/x/x/'
-# NSAllowsArbitraryLoads alone: with NSAllowsArbitraryLoadsInWebContent beside
-# it, macOS ignores it.
-bundle tlsprobe-ats 's|<key>NSAllowsArbitraryLoadsInWebContent</key>|<key>NSAllowsArbitraryLoads</key>|'
+bundle tlsprobe
 
 PROXY_PID=''
 stop_proxy() {
@@ -46,58 +43,61 @@ stop_proxy() {
 }
 trap stop_proxy EXIT
 
+# start_proxy DIR: sets $at.
+start_proxy() {
+  mkdir -p "$1"
+  SYNDEO_HOME="$1" SYNDEO_LOG=syndeo_proxy=debug,syndeo_net=info NO_COLOR=1 \
+    "$PROXY" run --listen 127.0.0.1:0 --announce --trace-requests=false \
+    >"$1/stdout" 2>"$1/stderr" &
+  PROXY_PID=$!
+  line=''
+  for _ in $(seq 1 100); do
+    line="$(head -n 1 "$1/stdout" 2>/dev/null)"
+    case "$line" in "SYNDEO-PROXY-READY 1 "*) break ;; esac
+    sleep 0.2
+  done
+  at="${line#SYNDEO-PROXY-READY 1 }"
+}
+
+# Another authority, from a proxy home of its own: not the one in use.
+start_proxy "$LOGS/other"
+stop_proxy
+OTHER_CA="$LOGS/other/proxy/syndeo-ca.pem"
+
 dir="$LOGS/run"
-mkdir -p "$dir"
-SYNDEO_HOME="$dir" SYNDEO_LOG=syndeo_proxy=debug,syndeo_net=info NO_COLOR=1 \
-  "$PROXY" run --listen 127.0.0.1:0 --announce --trace-requests=false \
-  >"$dir/stdout" 2>"$dir/stderr" &
-PROXY_PID=$!
-line=''
-for _ in $(seq 1 100); do
-  line="$(head -n 1 "$dir/stdout" 2>/dev/null)"
-  case "$line" in "SYNDEO-PROXY-READY 1 "*) break ;; esac
-  sleep 0.2
-done
-at="${line#SYNDEO-PROXY-READY 1 }"
+start_proxy "$dir"
 say "proxy at $at"
 start="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# probe BUNDLE MODE HOST
+# probe MODE HOST [CA]
 probe() {
-  perl -e 'alarm 60; exec @ARGV' "$LOGS/$1.app/Contents/MacOS/tlsprobe" "$2" "$3" "$at" "$dir/proxy/syndeo-ca.pem" \
-    >>"$dir/probe-$1.txt" 2>>"$dir/probe-$1.stderr"
-  grep -E "^(FIRST|RESULT) $2 $3 " "$dir/probe-$1.txt" | tail -2 | cut -c1-300 | sed "s/^/  [$1] /"
+  perl -e 'alarm 60; exec @ARGV' "$LOGS/tlsprobe.app/Contents/MacOS/tlsprobe" "$1" "$2" "$at" "${3:-$dir/proxy/syndeo-ca.pem}" \
+    >>"$dir/probe.txt" 2>>"$dir/probe.stderr"
+  grep -E "^(SPI|RESULT) $1 $2 |^SPI" "$dir/probe.txt" | tail -1 | cut -c1-300 | sed "s/^/  [${3:+other CA }$1] /"
 }
 
-for host in github.com paypal.com en.wikipedia.org go.dev www.dropbox.com \
-  example.com www.rust-lang.org www.mozilla.org crates.io www.apple.com; do
-  probe tlsprobe nw "$host"
-  probe tlsprobe webkit "$host"
+probe webkit github.com
+probe webkit example.com
+for host in crates.io www.mozilla.org; do
+  probe webkit "$host"
+  probe webkit-keep "$host"
 done
-for host in www.mozilla.org crates.io www.rust-lang.org; do
-  probe tlsprobe webkit-twice "$host"
+for host in github.com paypal.com en.wikipedia.org go.dev www.dropbox.com www.apple.com example.com crates.io; do
+  probe webkit-spi "$host"
 done
-for host in github.com paypal.com; do
-  probe tlsprobe webkit-ephemeral "$host"
-done
-for host in github.com paypal.com; do
-  probe tlsprobe-ats webkit "$host"
-done
-probe tlsprobe-ats webkit-twice www.mozilla.org
+probe webkit-spi-persistent github.com
+probe webkit-spi github.com "$OTHER_CA"
+probe webkit-spi example.com "$OTHER_CA"
 stop_proxy
 
 sudo log show --start "$start" --style compact --info --debug \
   --predicate 'subsystem == "com.apple.CFNetwork" OR subsystem == "com.apple.securityd" OR process == "tlsprobe"' 2>&1 |
   cat >"$dir/unified.log"
-say "unified log: $(wc -l <"$dir/unified.log") lines; CFNetwork's trust lines:"
-grep -E 'strict TLS|TLS Trust result|HSTS|ATS exception' "$dir/unified.log" |
-  sed -E 's/^[0-9-]+ [0-9:.]+ +[A-Za-z]+ +//; s/\[[0-9]+:[0-9a-f]+\]//; s/Connection [0-9]+/Connection N/; s/Task <[^>]+>\.<[0-9]+>/Task T/' |
-  sort | uniq -c | sort -rn | head -20
-say "the proxy's TLS lines:"
-grep -E 'tls handshake|incompatible' "$dir/stderr" | sed -E 's/^[^ ]+ +//' | cut -c1-200 | sort | uniq -c | sort -rn | head -10
+say "CFNetwork's trust lines:"
+grep -E 'strict TLS|TLS Trust result' "$dir/unified.log" |
+  sed -E 's/^[0-9-]+ [0-9:.]+ +[A-Za-z]+ +//; s/\[[0-9]+:[0-9a-f]+\]//; s/Connection [0-9]+/Connection N/' |
+  sort | uniq -c | sort -rn | head -10
 
 echo
 say "summary"
-for b in tlsprobe tlsprobe-ats; do
-  grep -hE '^(FIRST|RESULT)' "$dir/probe-$b.txt" | awk -v b="$b" '{print "  " b, $1, $2, $3, $4, $5}'
-done
+grep -hE '^RESULT' "$dir/probe.txt" | awk '{print "  " $2, $3, $4, $5}'
