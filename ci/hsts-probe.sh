@@ -33,7 +33,9 @@ bundle() {
     { say "could not build $1"; cat "$LOGS/swiftc-$1.log"; exit 2; }
 }
 bundle tlsprobe 's/x/x/'
-bundle tlsprobe-ats 's|<key>NSAllowsArbitraryLoadsInWebContent</key>|<key>NSAllowsArbitraryLoads</key><true/><key>NSAllowsArbitraryLoadsInWebContent</key>|'
+# NSAllowsArbitraryLoads alone: with NSAllowsArbitraryLoadsInWebContent beside
+# it, macOS ignores it.
+bundle tlsprobe-ats 's|<key>NSAllowsArbitraryLoadsInWebContent</key>|<key>NSAllowsArbitraryLoads</key>|'
 
 PROXY_PID=''
 stop_proxy() {
