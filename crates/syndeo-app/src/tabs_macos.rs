@@ -20,7 +20,7 @@
 
 use crate::tabs::Session;
 use anyhow::{Context, Result};
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{msg_send, AnyThread, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
@@ -32,6 +32,7 @@ use objc2_foundation::{
     NSUserDefaults,
 };
 use objc2_web_kit::{WKContentWorld, WKWebView};
+use std::cell::Cell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -45,6 +46,11 @@ pub struct Badge {
     /// image it does.
     loading: Retained<NSImageView>,
     icon: Retained<NSImageView>,
+    /// The tab's window, whose tab is given the badge again when what it
+    /// shows changes.
+    window: Weak<NSWindow>,
+    /// What it shows: pinned, loading, an icon.
+    shown: Cell<(bool, bool, bool)>,
 }
 
 /// The size an icon is shown at, in points.
@@ -82,11 +88,14 @@ impl Badge {
             pin,
             loading,
             icon,
+            window: Weak::from_retained(&window.retain()),
+            shown: Cell::new((false, false, false)),
         }
     }
 
     pub fn set_pinned(&self, pinned: bool) {
         self.pin.setHidden(!pinned);
+        self.update();
     }
 
     /// That the page is loading, while it is, and its icon, if it has one,
@@ -94,6 +103,7 @@ impl Badge {
     pub fn set_loading(&self, loading: bool) {
         self.loading.setHidden(!loading);
         self.icon.setHidden(loading || self.icon.image().is_none());
+        self.update();
     }
 
     /// The page's icon, or none.
@@ -101,6 +111,27 @@ impl Badge {
         self.icon.setImage(image);
         self.icon
             .setHidden(image.is_none() || !self.loading.isHidden());
+        self.update();
+    }
+
+    /// When what it shows has changed, give the tab its badge again: AppKit
+    /// sizes a tab's accessory view when it is given one, and a part shown
+    /// after that stays out of sight, and out of Accessibility's (CI
+    /// 39732368620: an icon found, and never seen).
+    fn update(&self) {
+        let now = (
+            !self.pin.isHidden(),
+            !self.loading.isHidden(),
+            !self.icon.isHidden(),
+        );
+        if self.shown.replace(now) == now {
+            return;
+        }
+        if let Some(window) = self.window.load() {
+            let tab = window.tab();
+            tab.setAccessoryView(None);
+            tab.setAccessoryView(Some(&self.view));
+        }
     }
 
     /// Let the tab go of it.

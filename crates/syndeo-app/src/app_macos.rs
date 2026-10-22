@@ -81,7 +81,8 @@ use objc2_app_kit::{
     NSWindowStyleMask,
 };
 use objc2_foundation::{
-    ns_string, NSArray, NSNotification, NSPoint, NSRect, NSSize, NSString, NSURLRequest, NSURL,
+    ns_string, NSArray, NSNotification, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURLRequest,
+    NSURL,
 };
 use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
 use std::cell::{Cell, RefCell};
@@ -451,6 +452,8 @@ define_class!(
                     .iter()
                     .position(|item| item.action() == Some(sel!(toggleTabOverview:)))
             });
+            let group = self.front_browser().and_then(|w| w.tabGroup());
+            let was = group.as_ref().is_some_and(|g| g.isOverviewVisible());
             match (view, index) {
                 (Some(menu), Some(index)) => menu.performActionForItemAtIndex(index as isize),
                 _ => {
@@ -459,6 +462,13 @@ define_class!(
                     }
                 }
             }
+            tracing::info!(was, "the tab overview asked for");
+            // And as AppKit has it a second later, when it has shown it.
+            let later = block2::RcBlock::new(move |_timer: std::ptr::NonNull<NSTimer>| {
+                let shown = group.as_ref().is_some_and(|g| g.isOverviewVisible());
+                tracing::info!(shown, "the tab overview, a second later");
+            });
+            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0, false, &later) };
         }
 
         /// History > Reopen All Windows from Last Session.
@@ -798,10 +808,7 @@ impl AppDelegate {
             _ => {}
         }
         if !pinned.is_empty() {
-            for window in &mut saved.windows {
-                window.tabs.retain(|tab| !tab.pinned);
-            }
-            saved = saved.kept();
+            saved = saved.without_pinned();
         }
         *state.last_session.borrow_mut() = saved;
     }

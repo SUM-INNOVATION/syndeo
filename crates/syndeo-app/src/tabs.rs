@@ -227,6 +227,19 @@ impl Session {
         self
     }
 
+    /// Without its pinned tabs, each window's tab in front kept in front
+    /// where it is still there.
+    pub fn without_pinned(mut self) -> Self {
+        for window in &mut self.windows {
+            let selected = window.tabs.get(window.selected).cloned();
+            window.tabs.retain(|tab| !tab.pinned);
+            window.selected = selected
+                .and_then(|tab| window.tabs.iter().position(|kept| *kept == tab))
+                .unwrap_or(0);
+        }
+        self.kept()
+    }
+
     /// Its pinned tabs alone, as one window.
     pub fn pinned(&self) -> Vec<SavedTab> {
         self.windows
@@ -534,6 +547,37 @@ mod tests {
         assert!(!savable("about:blank"));
         assert!(!savable("file:///etc/passwd"));
         assert!(!savable("http://[fe80::1%25en0]/"));
+    }
+
+    #[test]
+    fn without_its_pinned_tabs_a_session_keeps_the_tab_in_front() {
+        let session = Session {
+            windows: vec![
+                SavedWindow {
+                    tabs: vec![
+                        tab("https://example.com/", "pinned", true),
+                        tab("https://example.org/", "a", false),
+                        tab("https://example.net/", "b", false),
+                    ],
+                    selected: 2,
+                },
+                SavedWindow {
+                    tabs: vec![tab("https://example.com/", "pinned", true)],
+                    selected: 0,
+                },
+            ],
+        }
+        .without_pinned();
+        assert_eq!(
+            session.windows.len(),
+            1,
+            "a window of pinned tabs alone is not kept"
+        );
+        assert_eq!(session.windows[0].tabs.len(), 2);
+        assert_eq!(
+            session.windows[0].tabs[session.windows[0].selected].title,
+            "b"
+        );
     }
 
     #[test]

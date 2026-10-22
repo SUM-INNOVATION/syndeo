@@ -2292,17 +2292,21 @@ tabbing() {
   fi
 
   before="$(ax_windows)"
-  choose View "Show All Tabs"
+  press_keys '\' cmd+shift
   if wait_for 10 sh -c '[ "$("$1" ax-tree "$2" | grep -c "^AXWindow")" -gt "$3" ]' _ "$APPCTL" "$PID" "$before"; then
-    ok "View > Show All Tabs shows AppKit's overview of the tabs"
+    ok "⇧⌘\\ shows AppKit's overview of the tabs"
   else
-    bad "View > Show All Tabs shows AppKit's overview of the tabs" "Accessibility has $(ax_windows) windows, as before ($before)"
+    bad "⇧⌘\\ shows AppKit's overview of the tabs" "Accessibility has $(ax_windows) windows, as before ($before); the app: $(grep 'the tab overview' "$log" | tail -n 2 | sed 's/^.*INFO //' | tr '\n' ' ')"
   fi
   "$APPCTL" ax-tree "$PID" >"$LOGS/tabs-overview-tree.txt" 2>&1
   press_keys escape none
   if wait_for 10 sh -c '[ "$("$1" ax-tree "$2" | grep -c "^AXWindow")" = "$3" ]' _ "$APPCTL" "$PID" "$before"; then ok "Escape leaves it"; else bad "Escape leaves the overview" "$(ax_windows) windows"; fi
-  press_keys '\' cmd+shift
-  if wait_for 10 sh -c '[ "$("$1" ax-tree "$2" | grep -c "^AXWindow")" -gt "$3" ]' _ "$APPCTL" "$PID" "$before"; then ok "⇧⌘\\ shows it again"; else bad "⇧⌘\\ shows the overview" "$(ax_windows) windows"; fi
+  choose View "Show All Tabs"
+  if wait_for 10 sh -c '[ "$("$1" ax-tree "$2" | grep -c "^AXWindow")" -gt "$3" ]' _ "$APPCTL" "$PID" "$before"; then
+    ok "View > Show All Tabs shows it again"
+  else
+    bad "View > Show All Tabs shows the overview" "$(ax_windows) windows"
+  fi
   press_keys escape none
   if wait_for 10 "$APPCTL" value "$PID" syndeo.address; then ok "and Escape leaves it again, with the window as it was"; else bad "leaving the overview" "no address field in front"; fi
 }
