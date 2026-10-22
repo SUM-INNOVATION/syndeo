@@ -173,6 +173,9 @@ pub struct Ivars {
     later: RefCell<Option<(String, String)>>,
     /// The tab's badge.
     badge: RefCell<Option<Badge>>,
+    /// The page's icon was looked for and not found: found again when the
+    /// tab is shown.
+    icon_missed: Cell<bool>,
     /// Which page is on screen, counted, so that an icon found for one page
     /// is never shown for the next.
     page: Cell<u64>,
@@ -346,13 +349,29 @@ define_class!(
             }
         }
 
-        /// A tab is shown: one from the last session opens its page now.
+        /// A tab is shown: one from the last session opens its page now;
+        /// one opened behind finds its page's icon, which WebKit does not
+        /// draw for a page never shown.
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
             let later = self.ivars().later.borrow_mut().take();
             if let Some((address, _)) = later {
                 self.go(&address);
+            } else if self.ivars().icon_missed.get() && !self.ivars().loading.get() {
+                self.find_icon();
             }
+        }
+
+        /// A pinned tab closes only from itself, in front: not with Close
+        /// Other Tabs, AppKit's or this one's, nor with the rest of its
+        /// window, which AppKit closes by asking each tab in turn.
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, sender: &NSWindow) -> bool {
+            let keep = self.ivars().pinned.get() && !sender.isKeyWindow();
+            if keep {
+                tracing::info!("a pinned tab kept open");
+            }
+            !keep
         }
     }
 
@@ -467,8 +486,16 @@ define_class!(
             self.set_pinned(!self.ivars().pinned.get());
         }
 
-        /// File > Close Other Tabs: every other tab of this window that is
-        /// not pinned.
+        /// A tab's own menu > Close Tab: that tab, pinned or not.
+        #[unsafe(method(syndeoCloseTab:))]
+        fn close_tab(&self, _sender: Option<&AnyObject>) {
+            if let Some(window) = self.window() {
+                window.close();
+            }
+        }
+
+        /// A tab's own menu > Close Other Tabs: every other tab of this
+        /// window that is not pinned.
         #[unsafe(method(syndeoCloseOtherTabs:))]
         fn close_other_tabs(&self, _sender: Option<&AnyObject>) {
             let closing = self.others_to_close();
@@ -794,6 +821,7 @@ impl BrowserController {
             let Some(me) = me.load() else { return };
             // Still the page it was found for.
             if me.ivars().page.get() == page {
+                me.ivars().icon_missed.set(icon.is_none());
                 if let Some(badge) = &*me.ivars().badge.borrow() {
                     badge.set_icon(icon.as_deref());
                     tracing::info!(found = icon.is_some(), "a page's icon, for its tab");

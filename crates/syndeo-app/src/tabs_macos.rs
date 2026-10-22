@@ -1,8 +1,8 @@
 //! Tabs, as macOS draws them, with what a browser adds to them.
 //!
 //! Each tab is a window of its own, tabbed with the others by AppKit; this
-//! adds, beside each tab's title, its badge: a pin for a pinned tab, a
-//! spinner while its page loads, and its page's icon. The icon is the one
+//! adds, beside each tab's title, its badge: a pin for a pinned tab, an
+//! hourglass while its page loads, and its page's icon. The icon is the one
 //! the page names (`<link rel="icon">`), fetched by the page's own web view,
 //! so through Syndeo's proxy and pinned as everything else the page loads,
 //! and drawn there at 32 by 32; nothing outside the web view fetches
@@ -24,9 +24,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{msg_send, AnyThread, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSAccessibility, NSControlSize, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType,
-    NSImage, NSImageView, NSMenu, NSMenuItem, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSStackView, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
+    NSAccessibility, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSImage, NSImageView,
+    NSMenu, NSMenuItem, NSStackView, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
 };
 use objc2_foundation::{
     NSArray, NSData, NSDataBase64DecodingOptions, NSError, NSPoint, NSSize, NSString,
@@ -41,7 +40,10 @@ use std::ptr::NonNull;
 pub struct Badge {
     view: Retained<NSStackView>,
     pin: Retained<NSImageView>,
-    spinner: Retained<NSProgressIndicator>,
+    /// A symbol, not a spinner: Accessibility was not seen to show an
+    /// `NSProgressIndicator` in a tab (CI 39695773041, 39725848720), and an
+    /// image it does.
+    loading: Retained<NSImageView>,
     icon: Retained<NSImageView>,
 }
 
@@ -55,20 +57,20 @@ impl Badge {
         if let Some(image) = symbol("pin.fill", "Pinned") {
             pin.setImage(Some(&image));
         }
-        let spinner = NSProgressIndicator::new(mtm);
-        spinner.setStyle(NSProgressIndicatorStyle::Spinning);
-        spinner.setControlSize(NSControlSize::Small);
-        spinner.setDisplayedWhenStopped(false);
+        let loading = NSImageView::new(mtm);
+        if let Some(image) = symbol("hourglass", "Loading") {
+            loading.setImage(Some(&image));
+        }
         let icon = NSImageView::new(mtm);
         icon.setAccessibilityLabel(Some(&NSString::from_str("Page icon")));
-        let views: [&NSView; 3] = [&pin, &spinner, &icon];
+        let views: [&NSView; 3] = [&pin, &loading, &icon];
         let view = NSStackView::stackViewWithViews(&NSArray::from_slice(&views), mtm);
         view.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
         view.setSpacing(2.0);
         // What Accessibility, and the UI test, find them by.
         for (part, name) in [
             (&*pin as &NSView, "syndeo.tab-pinned"),
-            (&*spinner, "syndeo.tab-loading"),
+            (&*loading, "syndeo.tab-loading"),
             (&*icon, "syndeo.tab-icon"),
         ] {
             part.setAccessibilityIdentifier(Some(&NSString::from_str(name)));
@@ -78,7 +80,7 @@ impl Badge {
         Self {
             view,
             pin,
-            spinner,
+            loading,
             icon,
         }
     }
@@ -87,17 +89,10 @@ impl Badge {
         self.pin.setHidden(!pinned);
     }
 
-    /// The spinner while the page loads, and its icon, if it has one, once
-    /// it has.
+    /// That the page is loading, while it is, and its icon, if it has one,
+    /// once it has.
     pub fn set_loading(&self, loading: bool) {
-        self.spinner.setHidden(!loading);
-        unsafe {
-            if loading {
-                self.spinner.startAnimation(None);
-            } else {
-                self.spinner.stopAnimation(None);
-            }
-        }
+        self.loading.setHidden(!loading);
         self.icon.setHidden(loading || self.icon.image().is_none());
     }
 
@@ -105,7 +100,7 @@ impl Badge {
     pub fn set_icon(&self, image: Option<&NSImage>) {
         self.icon.setImage(image);
         self.icon
-            .setHidden(image.is_none() || !self.spinner.isHidden());
+            .setHidden(image.is_none() || !self.loading.isHidden());
     }
 
     /// Let the tab go of it.

@@ -12,7 +12,9 @@
 //! AppKit, placed here: a new one after the tab it came from, never among
 //! the pinned ones, which come first. ⌘1 to ⌘9 choose one; a closed tab is
 //! kept, in memory only, to open again from History, the last 25 of them;
-//! Show All Tabs is AppKit's overview; and a tab's context menu is Syndeo's.
+//! Show All Tabs is AppKit's overview, and ⇧⌘\ opens it; AppKit's File >
+//! Close Other Tabs, and closing a window, leave pinned tabs open; and a
+//! tab's context menu is Syndeo's.
 //! When Syndeo quits it keeps its tabs' addresses and titles, and which are
 //! pinned (the session), in its own folder: pinned tabs come back at every
 //! launch; the rest when macOS is set to keep windows when an application
@@ -433,18 +435,30 @@ define_class!(
             }
         }
 
-        /// View > Show All Tabs, and a tab's own menu: AppKit's overview of
-        /// the front browser window's tabs, through its tab group, or, shown,
-        /// left again. AppKit adds no item of its own for an action an item
-        /// already has, so this one is the only Show All Tabs.
-        #[unsafe(method(toggleTabOverview:))]
-        fn toggle_tab_overview(&self, _sender: Option<&AnyObject>) {
-            let Some(group) = self.front_browser().and_then(|w| w.tabGroup()) else {
-                return;
-            };
-            let was = group.isOverviewVisible();
-            group.setOverviewVisible(!was);
-            tracing::info!(was, "the tab overview toggled");
+        /// ⇧⌘\ and a tab's own menu: AppKit's own View > Show All Tabs,
+        /// which it adds once there are tabs, pressed as a person presses it.
+        /// Its overview opens that way, and was not seen to open when this
+        /// application sent its action itself (CI 39695773041, 39725848720).
+        #[unsafe(method(syndeoShowAllTabs:))]
+        fn show_all_tabs(&self, _sender: Option<&AnyObject>) {
+            let app = NSApplication::sharedApplication(self.mtm());
+            let view = app
+                .mainMenu()
+                .and_then(|bar| bar.itemWithTitle(ns_string!("View")))
+                .and_then(|item| item.submenu());
+            let index = view.as_ref().and_then(|menu| {
+                menu.itemArray()
+                    .iter()
+                    .position(|item| item.action() == Some(sel!(toggleTabOverview:)))
+            });
+            match (view, index) {
+                (Some(menu), Some(index)) => menu.performActionForItemAtIndex(index as isize),
+                _ => {
+                    if let Some(window) = self.front_browser() {
+                        window.toggleTabOverview(None);
+                    }
+                }
+            }
         }
 
         /// History > Reopen All Windows from Last Session.
@@ -925,7 +939,7 @@ impl AppDelegate {
             ),
             tabs_macos::item(mtm, pin, sel!(syndeoTogglePin:), Some(to_tab)),
             NSMenuItem::separatorItem(mtm),
-            tabs_macos::item(mtm, "Close Tab", sel!(performClose:), Some(to_window)),
+            tabs_macos::item(mtm, "Close Tab", sel!(syndeoCloseTab:), Some(to_tab)),
             tabs_macos::item(
                 mtm,
                 "Close Other Tabs",
@@ -939,7 +953,7 @@ impl AppDelegate {
                 Some(to_window),
             ),
             NSMenuItem::separatorItem(mtm),
-            tabs_macos::item(mtm, "Show All Tabs", sel!(toggleTabOverview:), Some(to_app)),
+            tabs_macos::item(mtm, "Show All Tabs", sel!(syndeoShowAllTabs:), Some(to_app)),
         ] {
             menu.addItem(&entry);
         }
@@ -1117,26 +1131,19 @@ fn main_menu(
     delegate: &AnyObject,
 ) -> (Retained<NSMenu>, Retained<NSMenu>) {
     let command = NSEventModifierFlags::Command;
-    // Close's alternate, shown with ⌥ held, as Safari has it; given here, so
-    // that AppKit adds none of its own, whose Close Other Tabs would close
-    // pinned tabs too.
-    let close_others = item_with(
-        mtm,
-        "Close Other Tabs",
-        sel!(syndeoCloseOtherTabs:),
-        "w",
-        NSEventModifierFlags::Option | command,
-    );
-    close_others.setAlternate(true);
-    // Sent to the application, which shows the front window's tabs.
+    // ⇧⌘\, Show All Tabs as Safari has it: AppKit's own item, which it adds
+    // to View, has no shortcut. Not shown, beside it, and named apart from it
+    // so that AppKit still adds its own.
     let show_all_tabs = item_with(
         mtm,
-        "Show All Tabs",
-        sel!(toggleTabOverview:),
+        "Tab Overview",
+        sel!(syndeoShowAllTabs:),
         "\\",
         NSEventModifierFlags::Shift | command,
     );
     unsafe { show_all_tabs.setTarget(Some(delegate)) };
+    show_all_tabs.setHidden(true);
+    show_all_tabs.setAllowsKeyEquivalentWhenHidden(true);
     let bar = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
     let hide_others = item(mtm, "Hide Others", sel!(hideOtherApplications:), "h");
     hide_others
@@ -1166,8 +1173,10 @@ fn main_menu(
             item(mtm, "New Window", sel!(newWindow:), "n"),
             item(mtm, "Open Location…", sel!(openLocation:), "l"),
             NSMenuItem::separatorItem(mtm),
+            // With tabs, AppKit makes this Close Tab, and adds Close Window,
+            // Close All and Close Other Tabs (⌥⌘W) beside it; a pinned tab
+            // stays open through the last (`windowShouldClose:`).
             item(mtm, "Close", sel!(performClose:), "w"),
-            close_others,
         ],
     );
     submenu(
@@ -1189,13 +1198,9 @@ fn main_menu(
         &bar,
         "View",
         &[
-            // AppKit's own tab items, which it would add itself, first, as it
-            // would put them: here, so that Show All Tabs has its shortcut.
-            item(mtm, "Show Tab Bar", sel!(toggleTabBar:), ""),
-            show_all_tabs,
-            NSMenuItem::separatorItem(mtm),
             item(mtm, "Reload Page", sel!(reloadPage:), "r"),
             item(mtm, "Stop Loading", sel!(stopPage:), "."),
+            show_all_tabs,
         ],
     );
     let recent = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Recently Closed"));

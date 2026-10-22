@@ -197,9 +197,9 @@
 # tabs, which gates tabs, from no kept session and with macOS's own "keep
 # windows" setting as the runner has it, on pages this Mac serves, reached
 # through Syndeo by a public name for 127.0.0.1:
-#   - History > Reopen Last Closed Tab is ⇧⌘T and View > Show All Tabs ⇧⌘\;
-#     View has Show Tab Bar and Show All Tabs once each, AppKit adding none of
-#     its own; File has Close Other Tabs, Window Duplicate Tab and Pin Tab,
+#   - History > Reopen Last Closed Tab is ⇧⌘T; View has AppKit's Show Tab
+#     Bar and Show All Tabs, once each; with tabs showing, File has AppKit's
+#     Close Other Tabs, once; Window has Duplicate Tab and Pin Tab, and
 #     History Reopen All Windows from Last Session and Recently Closed;
 #   - the window takes its title from its page, and so does its tab;
 #   - with the mouse, as a person clicks: ⌘-click and a middle-click on a
@@ -215,7 +215,8 @@
 #     with its history; Window > Pin Tab puts the tab first, marked; a secondary click on a tab
 #     opens Syndeo's menu for it, Unpin Tab for a pinned one, and its
 #     Duplicate Tab duplicates that tab;
-#   - File > Close Other Tabs closes all but the pinned one and this one;
+#   - File > Close Other Tabs closes all but the pinned one, which says no to
+#     closing, and this one;
 #     History > Recently Closed lists them by title; ⇧⌘T opens the last one
 #     closed again, and Recently Closed > Page A that one;
 #   - View > Show All Tabs, and ⇧⌘\, show AppKit's overview, one more window
@@ -2097,15 +2098,13 @@ tab_shortcuts() {
     must "$([ "$(printf '%s' "$have" | tr '[:lower:]' '[:upper:]')" = "$key" ] && echo yes)" "$menu > $item is ⇧⌘${key% *}" "${have:-no such item}"
   done <<'EOF'
 History|Reopen Last Closed Tab|T 1
-View|Show All Tabs|\ 1
 EOF
   for menu in File View History Window; do
     "$APPCTL" menu-items "$PID" "$menu" >"$LOGS/tabs-menu-$menu.txt" 2>&1
   done
   must "$([ "$(grep -cx 'Show All Tabs' "$LOGS/tabs-menu-View.txt")" = 1 ] && [ "$(grep -cx 'Show Tab Bar' "$LOGS/tabs-menu-View.txt")" = 1 ] && echo yes)" \
-    "View has Show Tab Bar and Show All Tabs once each, AppKit adding none of its own" "$(tr '\n' '|' <"$LOGS/tabs-menu-View.txt")"
-  printf '  MEASURE  View > Show Tab Bar: %s\n' "$("$APPCTL" shortcut "$PID" View "Show Tab Bar")"
-  must "$(grep -qx 'Close Other Tabs' "$LOGS/tabs-menu-File.txt" && echo yes)" "File has Close Other Tabs" "$(tr '\n' '|' <"$LOGS/tabs-menu-File.txt")"
+    "View has AppKit's Show Tab Bar and Show All Tabs, once each" "$(tr '\n' '|' <"$LOGS/tabs-menu-View.txt")"
+  printf '  MEASURE  View > Show Tab Bar: %s; Show All Tabs: %s\n' "$("$APPCTL" shortcut "$PID" View "Show Tab Bar")" "$("$APPCTL" shortcut "$PID" View "Show All Tabs")"
   must "$(grep -qx 'Duplicate Tab' "$LOGS/tabs-menu-Window.txt" && grep -qx 'Pin Tab' "$LOGS/tabs-menu-Window.txt" && echo yes)" \
     "Window has Duplicate Tab and Pin Tab" "$(tr '\n' '|' <"$LOGS/tabs-menu-Window.txt")"
   must "$(grep -qx 'Reopen All Windows from Last Session' "$LOGS/tabs-menu-History.txt" && grep -qx 'Recently Closed' "$LOGS/tabs-menu-History.txt" && echo yes)" \
@@ -2208,7 +2207,7 @@ tabbing() {
     "$APPCTL" menu-dump "$PID" "$items" >"$LOGS/tabs-menu-$items-with-tabs.txt" 2>&1
   done
   must "$([ "$(grep -c "^Close Other Tabs$(printf '\t')" "$LOGS/tabs-menu-File-with-tabs.txt")" = 1 ] && echo yes)" \
-    "with tabs showing, File has one Close Other Tabs, Syndeo's, AppKit adding none" "$(tr '\t\n' ' |' <"$LOGS/tabs-menu-File-with-tabs.txt")"
+    "with tabs showing, File has AppKit's Close Other Tabs, once" "$(tr '\t\n' ' |' <"$LOGS/tabs-menu-File-with-tabs.txt")"
   must "$([ "$(grep -c "^Show All Tabs$(printf '\t')" "$LOGS/tabs-menu-View-with-tabs.txt")" = 1 ] && echo yes)" \
     "and View one Show All Tabs" "$(tr '\t\n' ' |' <"$LOGS/tabs-menu-View-with-tabs.txt")"
 
@@ -2271,7 +2270,8 @@ tabbing() {
   choose File "Close Other Tabs"
   opens "$log" 2 "File > Close Other Tabs closes every other tab but the pinned one"
   list="$(tab_list)"
-  must "$([ "$list" = "  Tabs test|* Tabs test|" ] && echo yes)" "leaving the pinned tab first, and this one" "tabs: $list; $(grep 'other tabs closed' "$log" | tail -n 1)"
+  must "$([ "$list" = "  Tabs test|* Tabs test|" ] && echo yes)" "leaving the pinned tab first, and this one" "tabs: $list"
+  must "$(logged "$log" 'a pinned tab kept open' 1 && echo yes)" "the pinned tab said no to closing"
   items="$("$APPCTL" submenu-items "$PID" History "Recently Closed" | tr '\n' '|')"
   printf '%s\n' "$items" >"$LOGS/tabs-recently-closed.txt"
   must "$(for want in 'Page A' 'Page B' 'Page C' 'Slow page'; do printf '%s' "|$items" | grep -qF "|$want|" || exit 1; done && echo yes)" \
