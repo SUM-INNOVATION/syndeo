@@ -246,6 +246,10 @@ pub struct Index {
     db: Database,
     /// Accesses recorded since the last durable commit.
     since_flush: AtomicU64,
+    /// The durability each write transaction began with, so a test can see
+    /// which writes are on disk when they return.
+    #[cfg(test)]
+    began: std::sync::Mutex<Vec<redb::Durability>>,
 }
 
 impl Drop for Index {
@@ -327,7 +331,51 @@ impl Index {
         Ok(Index {
             db,
             since_flush: AtomicU64::new(0),
+            #[cfg(test)]
+            began: Default::default(),
         })
+    }
+
+    /// A write transaction whose commit is atomic and consistent at once, and
+    /// on disk soon after: redb's `Durability::Eventual`.
+    ///
+    /// On macOS an immediate commit flushes with `F_FULLFSYNC`, which waits
+    /// for the drive's own cache too: 3.7 ms a time, measured on an Apple SSD,
+    /// against 0.4 ms for the `F_BARRIERFSYNC` an eventual one uses, which
+    /// keeps every write in order and so the index consistent. Storing one
+    /// response commits four times, one writer at a time, so a page of a
+    /// hundred subresources queued for seconds. What a power cut can cost now
+    /// is the last few entries, which a cache can do without; never a
+    /// half-written one. Elsewhere the two are the same flush.
+    ///
+    /// The writes that promise something about the disk, rather than about
+    /// the cache, are [`writing_now`](Index::writing_now), and
+    /// [`persist`](Index::persist) is immediate too.
+    fn writing(&self) -> Result<redb::WriteTransaction> {
+        self.beginning(redb::Durability::Eventual)
+    }
+
+    /// A write transaction that is on disk when its commit returns: redb's
+    /// `Durability::Immediate`, `F_FULLFSYNC` on macOS.
+    ///
+    /// For [`clear`](Index::clear), which Clear Browsing Data waits for: once
+    /// it returns, the cleared entries, and the URLs in them, are gone from
+    /// the disk too. Eventual would let a power cut just after bring them
+    /// back. Being immediate, it also carries every eventual commit before
+    /// it to the disk.
+    fn writing_now(&self) -> Result<redb::WriteTransaction> {
+        self.beginning(redb::Durability::Immediate)
+    }
+
+    fn beginning(&self, durability: redb::Durability) -> Result<redb::WriteTransaction> {
+        let mut tx = self.db.begin_write()?;
+        tx.set_durability(durability);
+        #[cfg(test)]
+        self.began
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(durability);
+        Ok(tx)
     }
 
     /// The layout this index was written under.
@@ -369,7 +417,7 @@ impl Index {
         let wanted = record.contents();
         let mut orphaned = Vec::new();
 
-        let tx = self.db.begin_write()?;
+        let tx = self.writing()?;
         {
             let mut entries = tx.open_table(ENTRIES)?;
             let mut blobs = tx.open_table(BLOBS)?;
@@ -443,7 +491,7 @@ impl Index {
             &record.vary_key,
         );
         let encoded = bincode::serialize(record)?;
-        let tx = self.db.begin_write()?;
+        let tx = self.writing()?;
         {
             let mut entries = tx.open_table(ENTRIES)?;
             entries.insert(key.as_str(), encoded.as_slice())?;
@@ -477,7 +525,7 @@ impl Index {
     ) -> Result<Vec<ContentId>> {
         let pkey = primary_key(partition, method, url);
         let mut orphaned = Vec::new();
-        let tx = self.db.begin_write()?;
+        let tx = self.writing()?;
         {
             let mut entries = tx.open_table(ENTRIES)?;
             let mut blobs = tx.open_table(BLOBS)?;
@@ -509,7 +557,7 @@ impl Index {
 
     /// Drop one entry. Returns the blobs whose last reference it held.
     pub fn remove_entry(&self, key: &str) -> Result<Vec<ContentId>> {
-        let tx = self.db.begin_write()?;
+        let tx = self.writing()?;
         let orphan = remove_entry_in(&tx, key)?;
         tx.commit()?;
         Ok(orphan)
@@ -550,7 +598,7 @@ impl Index {
         expected: &EntryRecord,
         revoke_sharing: bool,
     ) -> Result<Option<Vec<ContentId>>> {
-        let tx = self.db.begin_write()?;
+        let tx = self.writing()?;
         let current: Option<EntryRecord> = {
             let entries = tx.open_table(ENTRIES)?;
             let found = entries.get(key)?;
@@ -613,14 +661,14 @@ impl Index {
         // the relaxed commit without a flush produced, and what the pre-release
         // check caught.
         //
-        // So every so many accesses one commit pays the fsync and carries
-        // everything before it to disk. What a crash costs is bounded by that
+        // So every so many accesses one commit goes to disk and carries
+        // everything before it there. What a crash costs is bounded by that
         // interval, which for statistics and an eviction stamp is the right
         // trade, and the common case still does no synchronous I/O at all.
         const FLUSH_EVERY: u64 = 32;
 
         let since = self.since_flush.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut tx = self.db.begin_write()?;
+        let mut tx = self.writing()?;
         if !since.is_multiple_of(FLUSH_EVERY) {
             tx.set_durability(redb::Durability::None);
         }
@@ -649,7 +697,7 @@ impl Index {
 
     /// Record a hit against an entry.
     pub fn touch(&self, key: &str, now: u64) -> Result<()> {
-        let tx = self.db.begin_write()?;
+        let tx = self.writing()?;
         {
             let mut entries = tx.open_table(ENTRIES)?;
             let existing: Option<EntryRecord> = match entries.get(key)? {
@@ -718,7 +766,8 @@ impl Index {
     /// The blob files are the caller's to delete: see `Cache::clear`, which
     /// holds the blob gate exclusively across this and that.
     pub fn clear(&self) -> Result<u64> {
-        let tx = self.db.begin_write()?;
+        // On disk when this returns: see `writing_now`.
+        let tx = self.writing_now()?;
         let entries = {
             let mut table = tx.open_table(ENTRIES)?;
             let entries = table.len()?;
@@ -757,7 +806,7 @@ impl Index {
     /// blob that was released and then taken again before this ran — a new
     /// entry storing the same bytes — keeps its record and its file.
     pub fn forget_blob_if_unreferenced(&self, id: ContentId) -> Result<bool> {
-        let tx = self.db.begin_write()?;
+        let tx = self.writing()?;
         let forget = {
             let mut blobs = tx.open_table(BLOBS)?;
             let refcount = match blobs.get(id.0.as_slice())? {
@@ -802,7 +851,7 @@ impl Index {
         if verified.is_empty() {
             return Ok(Vec::new());
         }
-        let tx = self.db.begin_write()?;
+        let tx = self.writing()?;
         let referenced = {
             let blobs = tx.open_table(BLOBS)?;
             let found = blobs.get(id.0.as_slice())?;
@@ -862,7 +911,7 @@ impl Index {
         if digests.is_empty() {
             return Ok(());
         }
-        let tx = self.db.begin_write()?;
+        let tx = self.writing()?;
         {
             let mut table = tx.open_table(SRI)?;
             for (key, content) in digests {
@@ -895,7 +944,7 @@ impl Index {
         if stale.is_empty() {
             return Ok(0);
         }
-        let tx = self.db.begin_write()?;
+        let tx = self.writing()?;
         {
             let mut sri = tx.open_table(SRI)?;
             for key in &stale {
@@ -923,7 +972,7 @@ impl Index {
     // ---- counters ----------------------------------------------------------
 
     pub fn bump(&self, name: &str, by: u64) -> Result<()> {
-        let tx = self.db.begin_write()?;
+        let tx = self.writing()?;
         {
             let mut table = tx.open_table(COUNTERS)?;
             let current = { table.get(name)?.map(|v| v.value()).unwrap_or(0) };
@@ -1042,6 +1091,23 @@ mod tests {
 
     fn index_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
         dir.path().join("index.redb")
+    }
+
+    /// Clear Browsing Data's write is on disk when it returns; the ordinary
+    /// writes of a store or a hit are only on their way there.
+    #[test]
+    fn clearing_is_on_disk_when_it_returns_and_storing_is_on_its_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(index_path(&dir)).unwrap();
+        let last = |index: &Index| *index.began.lock().unwrap().last().unwrap();
+
+        index.bump("requests", 1).unwrap();
+        assert!(matches!(last(&index), redb::Durability::Eventual));
+        index.clear().unwrap();
+        assert!(
+            matches!(last(&index), redb::Durability::Immediate),
+            "clearing the index can be undone by a power cut"
+        );
     }
 
     #[test]

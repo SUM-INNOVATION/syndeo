@@ -429,12 +429,16 @@ fn announce_ready(out: &mut impl std::io::Write, address: SocketAddr) -> std::io
 /// each answer actually came from: the cache is shared by every page that
 /// goes through the proxy, and nothing from this Mac's own services or the
 /// local network belongs in it, even when a public name resolves there.
+///
+/// The browser's own `Accept-Encoding` goes to the origin, and the answer
+/// comes back compressed as it asked, for it to decode.
 fn net_config(root: &std::path::Path, shared: bool, dns: DnsMode) -> NetConfig {
     NetConfig {
         cache_root: root.to_path_buf(),
         shared_cache: shared,
         dns,
         cache_public_addresses_only: true,
+        forward_accept_encoding: true,
         ..NetConfig::default()
     }
 }
@@ -632,6 +636,7 @@ fn connect(proxy: Arc<Proxy>, req: Request<Incoming>, local: SocketAddr) -> Resp
                 return;
             }
         };
+        tracing::debug!(%host, "tunnel opened");
         let mut io = TokioIo::new(upgraded);
 
         // Bounded: a tunnel that says nothing, or closes, costs no certificate
@@ -815,7 +820,7 @@ async fn forward(
         Err(refusal) => return text(StatusCode::BAD_REQUEST, refusal),
     };
 
-    if let Some(response) = stats::intercept(&proxy.net, &url) {
+    if let Some(response) = stats::intercept(&proxy.net, &url).await {
         return response;
     }
     if direct {
@@ -1587,6 +1592,7 @@ mod tests {
             paths, expected,
             "a second request was answered from the cache"
         );
+        running.net.landed().await;
         let stats = running.net.cache().stats().unwrap();
         assert_eq!((stats.entries, stats.blobs), (0, 0), "{stats:?}");
     }
@@ -1848,6 +1854,36 @@ mod tests {
         );
     }
 
+    /// The statistics count every answer already given. An entry is written
+    /// just after its body has gone to the browser, so the page waits for
+    /// the entries still being written before it counts them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_statistics_count_every_answer_already_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|path| {
+            let mut body = path.as_bytes().to_vec();
+            body.resize(64 * 1024, b'.');
+            Response::builder()
+                .header("cache-control", "max-age=600")
+                .body(Full::new(Bytes::from(body)))
+                .unwrap()
+        }))
+        .await;
+        let proxy = start_proxy(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let mut sender = http_over(stream).await;
+        const PAGES: usize = 40;
+        for n in 0..PAGES {
+            let reply = get(&mut sender, &format!("/{n}"), &[("host", &authority)]).await;
+            assert_eq!(reply.status, StatusCode::OK);
+        }
+
+        let page = through(proxy, "http://syndeo.local/stats.json", &[]).await;
+        let stats: serde_json::Value = serde_json::from_slice(&page.body).unwrap();
+        assert_eq!(stats["entries"], PAGES, "{stats}");
+    }
+
     #[tokio::test]
     async fn the_statistics_page_and_connect_still_answer() {
         let dir = tempfile::tempdir().unwrap();
@@ -2066,6 +2102,10 @@ mod tests {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
+        // An HTTP/1 connection takes the next request only once it has
+        // finished with the last one; sent sooner, hyper refuses it as not
+        // ready.
+        within(sender.ready()).await.unwrap();
         let response = within(sender.send_request(request.body(Full::new(Bytes::new())).unwrap()))
             .await
             .unwrap();
@@ -2152,6 +2192,168 @@ mod tests {
             origin.seen().is_empty(),
             "the request went out as plain HTTP"
         );
+    }
+
+    /// TLS to the proxy inside a tunnel, offering `protocols` by ALPN and
+    /// trusting the proxy's own authority, as a Syndeo window does.
+    async fn tls_to_proxy_offering(
+        stream: tokio::net::TcpStream,
+        proxy: &Proxy,
+        protocols: &[&[u8]],
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut proxy.authority.certificate_pem().as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = protocols.iter().map(|p| p.to_vec()).collect();
+        within(tokio_rustls::TlsConnector::from(Arc::new(config)).connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        ))
+        .await
+        .unwrap()
+    }
+
+    /// A client that offers HTTP/2, as WebKit does, gets it inside the tunnel,
+    /// and its requests share that one connection, answered side by side:
+    /// over HTTP/1.1 WebKit opened six tunnels to a host and queued the rest
+    /// of a page's requests behind them. A client that offers only HTTP/1.1,
+    /// as a WebSocket's does, still gets HTTP/1.1, and nothing else.
+    #[tokio::test]
+    async fn tls_in_a_tunnel_speaks_h2_to_a_client_that_offers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| respond(200, &[], b"plain"))).await;
+        let (proxy, handle) = start_proxy_with_count(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let tls = tls_to_proxy_offering(stream, &handle, &[b"h2", b"http/1.1"]).await;
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        let (mut sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(connection);
+        let target = format!("https://{authority}/secure");
+        let ask = |sender: &mut hyper::client::conn::http2::SendRequest<Full<Bytes>>| {
+            sender.send_request(
+                Request::builder()
+                    .uri(target.as_str())
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+        };
+        // Two requests at once on the one connection. The origin speaks
+        // plain HTTP and cannot answer the https the tunnel carries, so each
+        // is the proxy's own 502: answered through the same path as any.
+        let (first, second) = tokio::join!(ask(&mut sender.clone()), ask(&mut sender));
+        for reply in [first, second] {
+            let reply = reply.expect("the proxy should answer over h2");
+            assert_eq!(reply.version(), http::Version::HTTP_2);
+            assert_eq!(reply.status(), StatusCode::BAD_GATEWAY);
+        }
+
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let tls = tls_to_proxy_offering(stream, &handle, &[b"http/1.1"]).await;
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+        let mut sender = http_over(tls).await;
+        let reply = get(&mut sender, "/secure", &[("host", &authority)]).await;
+        assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+
+        assert!(origin.seen().is_empty(), "a request went out as plain HTTP");
+    }
+
+    /// The browser's own `Accept-Encoding` reaches the origin, and the answer
+    /// comes back in the encoding it asked for, untouched, for the browser to
+    /// decode; the next one comes from the cache the same way. Without this
+    /// every page came uncompressed.
+    #[tokio::test]
+    async fn the_browsers_accept_encoding_reaches_the_origin_and_its_encoded_answer_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = Origin::start(Arc::new(|_| {
+            respond(
+                200,
+                &[("content-encoding", "br"), ("cache-control", "max-age=600")],
+                b"\x1b\x03\x00 brotli bytes",
+            )
+        }))
+        .await;
+        let proxy = start_proxy(dir.path()).await;
+        let authority = format!("localhost:{}", origin.address.port());
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let mut sender = http_over(stream).await;
+        let asking = [
+            ("host", authority.as_str()),
+            ("accept-encoding", "gzip, deflate, br"),
+        ];
+
+        for source in ["origin", "cache"] {
+            let reply = get(&mut sender, "/app.js", &asking).await;
+            assert_eq!(reply.status, StatusCode::OK);
+            assert_eq!(reply.headers.get("content-encoding").unwrap(), "br");
+            assert_eq!(&reply.body[..], b"\x1b\x03\x00 brotli bytes");
+            assert_eq!(reply.headers.get("x-syndeo-source").unwrap(), source);
+        }
+        let seen = origin.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].headers.get("accept-encoding").unwrap(),
+            "gzip, deflate, br"
+        );
+    }
+
+    /// The same over HTTP/2, where every request names its origin in
+    /// :authority: a request inside a tunnel to A that names B is refused,
+    /// and B sees nothing.
+    #[tokio::test]
+    async fn an_h2_tunnel_to_one_origin_cannot_be_used_to_reach_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Origin::start(Arc::new(|_| respond(200, &[], b"A"))).await;
+        let second = Origin::start(Arc::new(|_| respond(200, &[], b"B"))).await;
+        let (proxy, handle) = start_proxy_with_count(dir.path()).await;
+        let authority = format!("localhost:{}", first.address.port());
+
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let tls = tls_to_proxy_offering(stream, &handle, &[b"h2"]).await;
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        let (mut sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(connection);
+
+        for elsewhere in [
+            format!("https://127.0.0.1:{}/secret", second.address.port()),
+            format!("https://localhost:{}/secret", second.address.port()),
+            format!("http://localhost:{}/secret", first.address.port()),
+        ] {
+            within(sender.ready()).await.unwrap();
+            let reply = within(
+                sender.send_request(
+                    Request::builder()
+                        .uri(elsewhere.as_str())
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reply.version(), http::Version::HTTP_2);
+            assert_eq!(reply.status(), StatusCode::BAD_REQUEST, "{elsewhere}");
+        }
+
+        assert!(
+            second.seen().is_empty(),
+            "the tunnel reached another origin"
+        );
+        assert!(first.seen().is_empty(), "a refused request went out anyway");
     }
 
     #[tokio::test]
@@ -3080,6 +3282,7 @@ mod tests {
         ws_switched(&ws_open(&mut stream, "/echo", &authority, &[]).await);
         ws_carries(&mut stream).await;
 
+        handle.net.landed().await;
         let stats = handle.net.cache().stats().unwrap();
         assert_eq!(
             (stats.requests, stats.stores, stats.entries),
