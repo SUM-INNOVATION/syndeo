@@ -8,7 +8,9 @@
 //!   window's controls in step with loading; says in the bar how the page on
 //!   screen was reached (`address::route`: Direct, Local or Through Syndeo),
 //!   from its address once it is committed, after any redirect; and shows a
-//!   failure page when a page cannot be opened.
+//!   failure page when a page cannot be opened, saying so when it was macOS
+//!   that refused a connection the window had vouched for
+//!   (`address::refused_after_vouching`).
 //! - **Its UI delegate.** A page that asks for a new window gets a new tab,
 //!   made the way every other is, never a web view WebKit made for it.
 //! - **The window's delegate**, so a window that closes is let go.
@@ -31,7 +33,7 @@ use objc2_app_kit::{
     NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
-    ns_string, NSError, NSNotification, NSNumber, NSPoint, NSRect, NSSize, NSString,
+    ns_string, NSError, NSNotification, NSNumber, NSPoint, NSProcessInfo, NSRect, NSSize, NSString,
     NSURLAuthenticationChallenge, NSURLRequest, NSURL,
 };
 use objc2_web_kit::{
@@ -103,7 +105,16 @@ pub struct Ivars {
     /// Someone has typed in the address field, and has not yet pressed
     /// Return or left it.
     typing: Cell<bool>,
+    /// The hosts this window vouched for since its last navigation started:
+    /// their certificates came from Syndeo's own proxy. At most [`VOUCHED`].
+    vouched: RefCell<Vec<String>>,
 }
+
+/// How many hosts a window remembers vouching for, in one navigation.
+const VOUCHED: usize = 64;
+
+/// `NSURLSessionAuthChallengeUseCredential`: the pinner vouched for it.
+const USE_CREDENTIAL: isize = 0;
 
 /// `NSReturnTextMovement`: the address field was left by pressing Return.
 const RETURN: isize = 0x10;
@@ -145,6 +156,14 @@ define_class!(
                 Some(web) => web.pinner.judge(challenge),
                 None => (2, std::ptr::null_mut()),
             };
+            if disposition == USE_CREDENTIAL {
+                if let Some(host) = host_of(challenge) {
+                    let mut vouched = self.ivars().vouched.borrow_mut();
+                    if !vouched.contains(&host) && vouched.len() < VOUCHED {
+                        vouched.push(host);
+                    }
+                }
+            }
             handler.call((disposition, credential));
         }
 
@@ -175,6 +194,7 @@ define_class!(
         #[unsafe(method(webView:didStartProvisionalNavigation:))]
         fn did_start(&self, _webview: &WKWebView, _navigation: Option<&WKNavigation>) {
             self.ivars().refused.set(false);
+            self.ivars().vouched.borrow_mut().clear();
             self.ivars().loading.set(true);
             self.refresh();
         }
@@ -372,6 +392,13 @@ fn address_of(request: &NSURLRequest) -> String {
         .unwrap_or_default()
 }
 
+/// The host a TLS challenge is for, lowercase.
+fn host_of(challenge: &NSURLAuthenticationChallenge) -> Option<String> {
+    let space: Option<Retained<AnyObject>> = unsafe { msg_send![challenge, protectionSpace] };
+    let host: Option<Retained<NSString>> = unsafe { msg_send![&*space?, host] };
+    host.map(|host| host.to_string().to_ascii_lowercase())
+}
+
 /// The scheme of a request's URL, lowercase, or empty.
 fn scheme_of(request: &NSURLRequest) -> String {
     request
@@ -557,11 +584,34 @@ impl BrowserController {
             .objectForKey(ns_string!("NSErrorFailingURLStringKey"))
             .and_then(|value| value.downcast::<NSString>().ok());
         let address = failing.map(|s| s.to_string()).unwrap_or_default();
+        let host = url::Url::parse(&address)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_default();
+        let vouched = !host.is_empty() && self.ivars().vouched.borrow().contains(&host);
+        let macos = NSProcessInfo::processInfo()
+            .operatingSystemVersion()
+            .majorVersion as u64;
+        let refused = address::refused_after_vouching(
+            &error.domain().to_string(),
+            error.code(),
+            &host,
+            vouched,
+            macos,
+        );
         let why = if address::has_zone(&address) {
             address::ZONED.to_string()
         } else if error.domain().to_string() == "WebKitErrorDomain" && error.code() == INTERRUPTED {
             "Syndeo opens web pages. It does not download files or open other kinds of address."
                 .to_string()
+        } else if let Some(refused) = refused {
+            // Said in the log without the host, as every address is kept
+            // out of it.
+            tracing::warn!(
+                macos,
+                "macOS refused a secure connection this window had vouched for"
+            );
+            refused
         } else {
             error.localizedDescription().to_string()
         };

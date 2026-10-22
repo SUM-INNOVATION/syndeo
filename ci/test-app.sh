@@ -581,6 +581,27 @@ pinned() {
   risen "$before" "and the proxy fetched it over https"
 }
 
+# preloaded: https://github.com, on the HSTS preload list built into macOS.
+# On macOS 15 and earlier, macOS accepts only a publicly trusted certificate
+# for it: it asks the window, which vouches for the proxy's, and then refuses
+# the connection anyway (#58). The page has to say that, never that it was an
+# SSL error, and the bar has to say nothing of a route. From macOS 26 it
+# opens, Through Syndeo. It fails, or not, between WebKit and the proxy, before
+# anything is asked of github.com itself.
+preloaded() {
+  local major
+  major="$(sw_vers -productVersion | cut -d. -f1)"
+  if [ "$major" -le 15 ]; then
+    visit "https://github.com/" "https://github.com/" 'refused the secure connection to github.com.*HSTS preload list' \
+      "on macOS $major, https://github.com, on macOS's HSTS preload list, says that macOS refused it after the window vouched for it, and why"
+    must "$(page_says 'SSL error' && echo no || echo yes)" "and not that it was an SSL error"
+    must "$(bar_empty && echo yes)" "and the bar says nothing of a route" "the bar says \"$(bar)\""
+  else
+    visit "https://github.com/" "https://github.com/" 'GitHub' "on macOS $major, https://github.com opens"
+    must "$([ "$(bar)" = "$SYNDEO_LABEL" ] && echo yes)" "and the bar says $SYNDEO_LABEL" "the bar says \"$(bar)\""
+  fi
+}
+
 # risen BEFORE WHAT: COUNTED, the proxy's count read since, is above BEFORE.
 risen() {
   must "$([ -n "$1" ] && [ -n "$COUNTED" ] && [ "$COUNTED" -gt "$1" ] && echo yes)" \
@@ -859,6 +880,7 @@ browsing() {
 
   private "$log"
   pinned
+  preloaded
   passkeys_unavailable "$log" "$round"
   asked_web "$app" "$log" http
   asked_web "$app" "$log" https

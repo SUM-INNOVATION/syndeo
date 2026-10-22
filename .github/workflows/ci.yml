@@ -319,7 +319,9 @@ jobs:
     # Accessibility; browsed in, by keystrokes and presses as a person would:
     # addresses, Back and Forward, refusals, search as Settings chooses it, a
     # tab opened and closed, no private URL in any log, https pinned through
-    # the proxy, a page's own links to other schemes refused; addresses other
+    # the proxy, a site on macOS's HSTS preload list, which macOS 15 refuses
+    # through the proxy, said so on its page (#58), a page's own links to
+    # other schemes refused; addresses other
     # applications ask it to open, opened through the proxy or refused, and
     # opened by one; passkeys reported unavailable, asking nothing; its last
     # window closed and brought back by opening it again, quit as the Quit
@@ -462,9 +464,11 @@ jobs:
       # paint, load, the protocols WebKit used and the tunnels it opened
       # (ci/test-pageload.sh). The times are measured, not gated. For
       # www.rust-lang.org every load has to finish, and WebKit has to speak
-      # HTTP/2 through the proxy. github.com is measured only: on this
-      # runner's macOS every load of it through the proxy has failed its TLS
-      # handshake before WebKit asked anything of Syndeo (PR #56).
+      # HTTP/2 through the proxy. github.com is measured only: it is on the
+      # HSTS preload list built into macOS, and on this runner's macOS 15
+      # macOS refuses its connection through the proxy after the page's
+      # delegate has vouched for it (#58); the app's own test gates what
+      # Syndeo.app says about that.
       # Kept in pageload/ in the logs.
       - name: Page load, directly and through Syndeo's proxy (times measured, not gated)
         if: always()

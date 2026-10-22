@@ -357,6 +357,51 @@ pub fn allowed_in_main_frame(scheme: &str) -> bool {
     )
 }
 
+/// `NSURLErrorSecureConnectionFailed`.
+pub const SECURE_CONNECTION_FAILED: isize = -1200;
+
+/// Why a page failed, when macOS refused a secure connection that the
+/// window had already vouched for: its certificate had come from Syndeo's
+/// own proxy, and the window had said so.
+///
+/// macOS 15 and earlier do this for the sites on the HSTS preload list
+/// built into macOS, such as github.com, paypal.com, wikipedia.org and every
+/// .dev site: there, macOS accepts only a publicly trusted certificate,
+/// whatever an application answers, and fails the connection after the
+/// answer as "a secure connection to the server cannot be made", which
+/// reads as the site's fault. macOS 26 does not do this. Measured on hosted
+/// macOS 14.8, 15.7 and 26.6 runners, through the same proxy (#58).
+///
+/// `domain` and `code` are the error's; `vouched`, whether the window
+/// vouched for the failing page's host during this navigation; `macos`, the
+/// running macOS's major version. None for any other failure, which keeps
+/// the words macOS gave it.
+pub fn refused_after_vouching(
+    domain: &str,
+    code: isize,
+    host: &str,
+    vouched: bool,
+    macos: u64,
+) -> Option<String> {
+    if domain != "NSURLErrorDomain" || code != SECURE_CONNECTION_FAILED || !vouched {
+        return None;
+    }
+    let refused = format!(
+        "macOS refused the secure connection to {host}, after this window had checked that \
+         its certificate came from Syndeo's own proxy."
+    );
+    if macos >= 26 {
+        return Some(refused);
+    }
+    Some(format!(
+        "{refused} On macOS {macos} and earlier, macOS accepts only a publicly trusted \
+         certificate for the sites on the HSTS preload list built into macOS, such as \
+         github.com, whatever an application says. Syndeo opens every secure page through \
+         its own proxy, with a certificate of its own, so on this version of macOS it cannot \
+         open this site, and it does not open it another way. macOS 26 lets it."
+    ))
+}
+
 /// The page a window shows when `address` could not be opened.
 pub fn failure_page(address: &str, why: &str) -> String {
     format!(
@@ -888,6 +933,59 @@ mod tests {
             escape("<b>\"&\"</b>"),
             "&lt;b&gt;&quot;&amp;&quot;&lt;/b&gt;"
         );
+    }
+
+    /// Only a secure connection that failed after the window vouched for
+    /// its host is explained as macOS's refusal; and on macOS 15 and
+    /// earlier, as the HSTS preload list's.
+    #[test]
+    fn a_refusal_after_vouching_is_said_to_be_macos_and_nothing_else_is() {
+        let said = |macos| {
+            refused_after_vouching("NSURLErrorDomain", -1200, "github.com", true, macos)
+                .unwrap_or_else(|| panic!("macOS {macos}: no explanation"))
+        };
+        for macos in [13, 14, 15] {
+            let why = said(macos);
+            assert!(
+                why.starts_with("macOS refused the secure connection to github.com"),
+                "{why}"
+            );
+            assert!(why.contains("HSTS preload list"), "{why}");
+            assert!(
+                why.contains(&format!("On macOS {macos} and earlier")),
+                "{why}"
+            );
+            assert!(why.contains("does not open it another way"), "{why}");
+            assert!(!why.to_lowercase().contains("ssl"), "{why}");
+        }
+        let why = said(26);
+        assert!(!why.contains("HSTS"), "macOS 26 does not do this: {why}");
+        assert!(
+            why.starts_with("macOS refused the secure connection to github.com"),
+            "{why}"
+        );
+
+        // Not vouched for: a certificate the window refused, or never saw,
+        // keeps macOS's own words.
+        assert_eq!(
+            refused_after_vouching("NSURLErrorDomain", -1200, "github.com", false, 15),
+            None
+        );
+        // Another error, or another domain's -1200.
+        for (domain, code) in [
+            ("NSURLErrorDomain", -1202),
+            ("NSURLErrorDomain", -1201),
+            ("NSURLErrorDomain", -999),
+            ("NSURLErrorDomain", -1004),
+            ("WebKitErrorDomain", -1200),
+            ("NSOSStatusErrorDomain", -1200),
+        ] {
+            assert_eq!(
+                refused_after_vouching(domain, code, "github.com", true, 15),
+                None,
+                "{domain} {code}"
+            );
+        }
     }
 
     #[test]
