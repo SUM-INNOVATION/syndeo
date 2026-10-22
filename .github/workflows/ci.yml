@@ -495,7 +495,8 @@ jobs:
     # directly (#58), macOS 26 lets through: github.com and a page's image
     # from en.wikipedia.org open Through Syndeo, nothing is sent directly,
     # and example.com is Through Syndeo too (ci/test-app.sh preloaded).
-    # Unsigned with a Developer ID, and with no secrets.
+    # Unsigned with a Developer ID, and with no secrets: a pull request never
+    # signs.
     runs-on: macos-26
     timeout-minutes: 45
     env:
