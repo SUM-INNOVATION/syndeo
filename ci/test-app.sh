@@ -197,8 +197,9 @@
 # tabs, which gates tabs, from no kept session and with macOS's own "keep
 # windows" setting as the runner has it, on pages this Mac serves, reached
 # through Syndeo by a public name for 127.0.0.1:
-#   - History > Reopen Last Closed Tab is ⇧⌘T; View has AppKit's Show Tab
-#     Bar and Show All Tabs, once each; with tabs showing, File has AppKit's
+#   - History > Reopen Last Closed Tab is ⇧⌘T and View > Show All Tabs ⇧⌘\;
+#     View has Show Tab Bar and Show All Tabs, once each; with tabs showing,
+#     File has AppKit's
 #     Close Other Tabs, once; Window has Duplicate Tab and Pin Tab, and
 #     History Reopen All Windows from Last Session and Recently Closed;
 #   - the window takes its title from its page, and so does its tab;
@@ -219,8 +220,11 @@
 #     closing, and this one;
 #     History > Recently Closed lists them by title; ⇧⌘T opens the last one
 #     closed again, and Recently Closed > Page A that one;
-#   - View > Show All Tabs, and ⇧⌘\, show AppKit's overview, one more window
-#     to Accessibility, and Escape leaves it;
+#   - ⇧⌘\ and View > Show All Tabs show AppKit's overview, and each, again,
+#     leaves it, as does Escape: gated on AppKit's own state, the tab group's
+#     isOverviewVisible, which the app logs before each request and a second
+#     after, since on the runner the overview is not a window to
+#     Accessibility;
 #   - quit: the session is kept, readable by this user alone, with one tab
 #     pinned; opened again, the pinned tab is first, beside the start page,
 #     and opens its page when shown; History > Reopen All Windows from Last
@@ -2098,13 +2102,13 @@ tab_shortcuts() {
     must "$([ "$(printf '%s' "$have" | tr '[:lower:]' '[:upper:]')" = "$key" ] && echo yes)" "$menu > $item is ⇧⌘${key% *}" "${have:-no such item}"
   done <<'EOF'
 History|Reopen Last Closed Tab|T 1
+View|Show All Tabs|\ 1
 EOF
   for menu in File View History Window; do
     "$APPCTL" menu-items "$PID" "$menu" >"$LOGS/tabs-menu-$menu.txt" 2>&1
   done
   must "$([ "$(grep -cx 'Show All Tabs' "$LOGS/tabs-menu-View.txt")" = 1 ] && [ "$(grep -cx 'Show Tab Bar' "$LOGS/tabs-menu-View.txt")" = 1 ] && echo yes)" \
-    "View has AppKit's Show Tab Bar and Show All Tabs, once each" "$(tr '\n' '|' <"$LOGS/tabs-menu-View.txt")"
-  printf '  MEASURE  View > Show Tab Bar: %s; Show All Tabs: %s\n' "$("$APPCTL" shortcut "$PID" View "Show Tab Bar")" "$("$APPCTL" shortcut "$PID" View "Show All Tabs")"
+    "View has Show Tab Bar and Show All Tabs, once each" "$(tr '\n' '|' <"$LOGS/tabs-menu-View.txt")"
   must "$(grep -qx 'Duplicate Tab' "$LOGS/tabs-menu-Window.txt" && grep -qx 'Pin Tab' "$LOGS/tabs-menu-Window.txt" && echo yes)" \
     "Window has Duplicate Tab and Pin Tab" "$(tr '\n' '|' <"$LOGS/tabs-menu-Window.txt")"
   must "$(grep -qx 'Reopen All Windows from Last Session' "$LOGS/tabs-menu-History.txt" && grep -qx 'Recently Closed' "$LOGS/tabs-menu-History.txt" && echo yes)" \
@@ -2140,9 +2144,26 @@ tabs_cleared() {
     "Clear Browsing Data forgets the session: History > Reopen All Windows from Last Session is not offered"
 }
 
-# ax_windows: how many windows Accessibility has for the app; AppKit's tab
-# overview is one more.
+# ax_windows: how many windows Accessibility has for the app.
 ax_windows() { "$APPCTL" ax-tree "$PID" | grep -c '^AXWindow'; }
+
+# The two ways a person asks for the tab overview.
+overview_by_keys() { press_keys '\' cmd+shift; }
+overview_by_menu() { choose View "Show All Tabs"; }
+
+# overview_shows N ACTION WANT WHAT: run ACTION, the Nth request for the tab
+# overview, and require AppKit's state around it, as the app logs it, to be
+# WANT: "was=X shown=Y", whether it was shown when asked for, and whether it
+# is a second later.
+overview_shows() {
+  local said
+  "$2"
+  wait_for 10 sh -c '[ "$(grep -c "the tab overview, a second later" "$1")" -ge "$2" ]' _ "$log" "$1" || true
+  said="$([ "$(grep -c 'the tab overview, a second later' "$log")" -ge "$1" ] &&
+    printf 'was=%s shown=%s' "$(grep 'the tab overview asked for' "$log" | tail -n 1 | sed -n 's/.*was=\([a-z]*\).*/\1/p')" \
+      "$(grep 'the tab overview, a second later' "$log" | tail -n 1 | sed -n 's/.*shown=\([a-z]*\).*/\1/p')")"
+  must "$([ "$said" = "$3" ] && echo yes)" "$4: AppKit's tab group, $3" "the app said ${said:-nothing for request $1}"
+}
 
 # show_tab N ADDRESS PAGE WHAT: ⌘N, and the tab it shows at ADDRESS saying
 # PAGE. If it does not, that tab is pressed in the tab bar instead, so the
@@ -2291,24 +2312,19 @@ tabbing() {
     arrive "$TP/page-a.html" 'SYNDEO-PAGE-A' "in front, with its page"
   fi
 
-  before="$(ax_windows)"
-  press_keys '\' cmd+shift
-  if wait_for 10 sh -c '[ "$("$1" ax-tree "$2" | grep -c "^AXWindow")" -gt "$3" ]' _ "$APPCTL" "$PID" "$before"; then
-    ok "⇧⌘\\ shows AppKit's overview of the tabs"
-  else
-    bad "⇧⌘\\ shows AppKit's overview of the tabs" "Accessibility has $(ax_windows) windows, as before ($before); the app: $(grep 'the tab overview' "$log" | tail -n 2 | sed 's/^.*INFO //' | tr '\n' ' ')"
-  fi
+  # AppKit's overview is not a window to Accessibility on the runner (CI
+  # 39738260562: none appeared while AppKit said it was shown), so what is
+  # gated is AppKit's own state, NSWindowTabGroup.isOverviewVisible, as the
+  # app logs it before each request and a second after.
+  overview_shows 1 overview_by_keys "was=false shown=true" "⇧⌘\\ shows AppKit's overview of the tabs"
   "$APPCTL" ax-tree "$PID" >"$LOGS/tabs-overview-tree.txt" 2>&1
+  printf '  MEASURE  with the overview shown, Accessibility has %s window(s)\n' "$(ax_windows)"
+  overview_shows 2 overview_by_menu "was=true shown=false" "View > Show All Tabs, with it shown, leaves it"
+  overview_shows 3 overview_by_menu "was=false shown=true" "View > Show All Tabs shows it"
   press_keys escape none
-  if wait_for 10 sh -c '[ "$("$1" ax-tree "$2" | grep -c "^AXWindow")" = "$3" ]' _ "$APPCTL" "$PID" "$before"; then ok "Escape leaves it"; else bad "Escape leaves the overview" "$(ax_windows) windows"; fi
-  choose View "Show All Tabs"
-  if wait_for 10 sh -c '[ "$("$1" ax-tree "$2" | grep -c "^AXWindow")" -gt "$3" ]' _ "$APPCTL" "$PID" "$before"; then
-    ok "View > Show All Tabs shows it again"
-  else
-    bad "View > Show All Tabs shows the overview" "$(ax_windows) windows"
-  fi
-  press_keys escape none
-  if wait_for 10 "$APPCTL" value "$PID" syndeo.address; then ok "and Escape leaves it again, with the window as it was"; else bad "leaving the overview" "no address field in front"; fi
+  overview_shows 4 overview_by_keys "was=false shown=true" "Escape leaves it: asked for again, AppKit had it not shown, and shows it"
+  overview_shows 5 overview_by_menu "was=true shown=false" "View > Show All Tabs again leaves it"
+  if wait_for 10 "$APPCTL" value "$PID" syndeo.address; then ok "and the window is as it was, its address field in front"; else bad "leaving the overview" "no address field in front"; fi
 }
 
 # tabs APP: see the top of this script.
