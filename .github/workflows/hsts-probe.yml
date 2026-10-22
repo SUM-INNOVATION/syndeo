@@ -1,0 +1,48 @@
+# EXPERIMENT (#58), removed before review: how macOS 14, 15 and 26 treat
+# HSTS-preloaded and other hosts through Syndeo's proxy.
+name: hsts-probe
+
+on:
+  push:
+    branches: [fix-hsts-macos15]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      SYNDEO_ALLOW_APP_TEST: "yes"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hsts-probe
+      - name: Build the proxy
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin -p syndeo-proxy
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/syndeo-proxy dist/
+          codesign --force --sign - --options runtime dist/syndeo-proxy
+      - name: Probe
+        run: >-
+          bash ci/hsts-probe.sh "$PWD/dist/syndeo-proxy"
+          github.com paypal.com en.wikipedia.org go.dev www.dropbox.com
+          example.com www.rust-lang.org www.mozilla.org crates.io www.apple.com
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hsts-probe-${{ matrix.os }}
+          path: ${{ runner.temp }}/hsts-probe/
+          if-no-files-found: warn
