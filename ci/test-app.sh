@@ -2322,6 +2322,9 @@ tabbing() {
   overview_shows 2 overview_by_menu "was=true shown=false" "View > Show All Tabs, with it shown, leaves it"
   overview_shows 3 overview_by_menu "was=false shown=true" "View > Show All Tabs shows it"
   press_keys escape none
+  # AppKit's overview closes with an animation; asked for again while it
+  # was still closing, it stayed closed (CI 39858637347).
+  sleep 3
   overview_shows 4 overview_by_keys "was=false shown=true" "Escape leaves it: asked for again, AppKit had it not shown, and shows it"
   overview_shows 5 overview_by_menu "was=true shown=false" "View > Show All Tabs again leaves it"
   if wait_for 10 "$APPCTL" value "$PID" syndeo.address; then ok "and the window is as it was, its address field in front"; else bad "leaving the overview" "no address field in front"; fi
