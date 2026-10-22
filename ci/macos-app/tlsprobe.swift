@@ -1,7 +1,7 @@
 // EXPERIMENT (#58), removed before review: how each of macOS's stacks treats
 // one https host through Syndeo's proxy.
 //
-//   tlsprobe <webkit|session|nw> <host> <proxy host:port> <ca.pem>
+//   tlsprobe <webkit|webkit-twice|webkit-ephemeral|session|nw> <host> <proxy host:port> <ca.pem>
 //
 // webkit: a WKWebView, its proxy set as Syndeo.app sets it; session: a
 // URLSession through the same proxy; nw: a bare Network framework TLS
@@ -110,10 +110,15 @@ final class Web: NSObject, WKNavigationDelegate {
         contentRect: NSRect(x: 0, y: 0, width: 800, height: 600), styleMask: [.titled], backing: .buffered,
         defer: false)
     var view: WKWebView?
+    /// Load the page a second time, in the same web view and data store,
+    /// once the first has finished: what a site's own HSTS header changes.
+    var twice = false
+    var first = true
 
-    func start() {
+    func start(ephemeral: Bool, twice: Bool) {
+        self.twice = twice
         window.makeKeyAndOrderFront(nil)
-        let store = WKWebsiteDataStore.default()
+        let store = ephemeral ? WKWebsiteDataStore.nonPersistent() : WKWebsiteDataStore.default()
         let config = nw_proxy_config_create_http_connect(
             nw_endpoint_create_host(proxyHost, String(proxyPort)), nil)
         store.setValue([config], forKey: "proxyConfigurations")
@@ -129,36 +134,54 @@ final class Web: NSObject, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        finish(true, "title=\(webView.title ?? "")")
+        if twice, first {
+            first = false
+            say("FIRST \(mode) \(host) ok asked=\(asked)")
+            webView.load(URLRequest(url: url))
+            return
+        }
+        finish(true, "\(twice ? "second load " : "")title=\(webView.title ?? "")")
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        finish(false, describe(error))
+        finish(false, "\(twice && !first ? "second load " : "")\(describe(error))")
     }
 
     func webView(
         _ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error
     ) {
-        finish(false, describe(error))
+        finish(false, "\(twice && !first ? "second load " : "")\(describe(error))")
     }
 
-    @objc(webView:didReceiveAuthenticationChallenge:completionHandler:)
-    func webView(
-        _ webView: WKWebView, didReceive challenge: URLAuthenticationChallenge,
-        completionHandler: @escaping @MainActor @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
-    ) {
+    #if compiler(>=6.0)
+        @objc(webView:didReceiveAuthenticationChallenge:completionHandler:)
+        func webView(
+            _ webView: WKWebView, didReceive challenge: URLAuthenticationChallenge,
+            completionHandler: @escaping @MainActor @Sendable (URLSession.AuthChallengeDisposition, URLCredential?)
+                -> Void
+        ) {
+            let (disposition, credential) = decide(challenge)
+            completionHandler(disposition, credential)
+        }
+    #else
+        func webView(_ webView: WKWebView, respondTo challenge: URLAuthenticationChallenge) async
+            -> (URLSession.AuthChallengeDisposition, URLCredential?)
+        {
+            decide(challenge)
+        }
+    #endif
+
+    func decide(_ challenge: URLAuthenticationChallenge) -> (URLSession.AuthChallengeDisposition, URLCredential?) {
         let space = challenge.protectionSpace
         say("CHALLENGE webkit \(host) for=\(space.host):\(space.port) method=\(space.authenticationMethod)")
         guard space.authenticationMethod == NSURLAuthenticationMethodServerTrust, let trust = space.serverTrust
         else {
-            completionHandler(.performDefaultHandling, nil)
-            return
+            return (.performDefaultHandling, nil)
         }
         if pinned(trust, "webkit-delegate") {
-            completionHandler(.useCredential, URLCredential(trust: trust))
-        } else {
-            completionHandler(.cancelAuthenticationChallenge, nil)
+            return (.useCredential, URLCredential(trust: trust))
         }
+        return (.cancelAuthenticationChallenge, nil)
     }
 }
 
@@ -241,7 +264,9 @@ let web = Web()
 let session = Session()
 DispatchQueue.main.async {
     switch mode {
-    case "webkit": web.start()
+    case "webkit": web.start(ephemeral: false, twice: false)
+    case "webkit-twice": web.start(ephemeral: false, twice: true)
+    case "webkit-ephemeral": web.start(ephemeral: true, twice: false)
     case "session": session.start()
     case "nw": bare()
     default:

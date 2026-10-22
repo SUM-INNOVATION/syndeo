@@ -35,10 +35,7 @@ jobs:
           cp target/aarch64-apple-darwin/release/syndeo-proxy dist/
           codesign --force --sign - --options runtime dist/syndeo-proxy
       - name: Probe
-        run: >-
-          bash ci/hsts-probe.sh "$PWD/dist/syndeo-proxy"
-          github.com paypal.com en.wikipedia.org go.dev www.dropbox.com
-          example.com www.rust-lang.org www.mozilla.org crates.io www.apple.com
+        run: bash ci/hsts-probe.sh "$PWD/dist/syndeo-proxy"
       - name: Keep the logs
         if: always()
         uses: actions/upload-artifact@v4
