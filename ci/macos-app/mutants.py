@@ -46,6 +46,14 @@ back.
   measured. A WebSocket through Syndeo must then be seen failing: in the
   page, at the origin, which is sent no Upgrade, and in the proxy's count,
   which the handshake then moves.
+- direct-for-every-host: after a page, Syndeo sends directly every host the
+  window vouched for, not only those the proxy said macOS refused (#58).
+  https://example.com, which macOS never refuses, must then be seen leaving
+  Through Syndeo for Direct, and something sent directly for it.
+- never-retry-direct: a page macOS refused through the proxy is never
+  retried directly. https://github.com, on macOS 15's HSTS preload list,
+  must then be seen not opening, the bar not saying Direct, and the log not
+  saying a host was sent directly.
 """
 import os
 import sys
@@ -151,6 +159,20 @@ MUTANTS = {
             "            return websocket::open(proxy, req, url, key).await\n"
             "        }\n",
             "        websocket::Upgrading::WebSocket { .. } => {}\n",
+        ),
+    ],
+    "direct-for-every-host": [
+        (
+            ADDRESS,
+            ".filter(|host| refused.contains(host))",
+            ".filter(|_| true)",
+        ),
+    ],
+    "never-retry-direct": [
+        (
+            ADDRESS,
+            "Some(refusal) if !retried => AfterFailure::RetryDirect(refusal),",
+            "Some(refusal) if !retried && false => AfterFailure::RetryDirect(refusal),",
         ),
     ],
 }

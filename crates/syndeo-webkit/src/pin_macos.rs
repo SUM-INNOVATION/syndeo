@@ -37,6 +37,23 @@ const DEFAULT_HANDLING: isize = 1;
 /// `NSURLSessionAuthChallengeCancelAuthenticationChallenge`.
 const CANCEL: isize = 2;
 
+/// `errSecInvalidPolicyIdentifiers`: how a certificate fails macOS's own
+/// pinning of Apple's sites, such as www.apple.com, to Apple's certificates
+/// ("certificates do not meet pinning requirements"). Measured on macOS 14,
+/// 15 and 26: the proxy's certificate for www.apple.com fails with it even
+/// with the proxy's authority as the only anchor (#58).
+const PINNED_BY_MACOS: i64 = -67835;
+
+/// What [`Pinner::judge_noting`] decided, and whether it refused because
+/// macOS pins the host itself.
+pub struct Judged {
+    pub disposition: isize,
+    pub credential: *mut AnyObject,
+    /// The certificate failed macOS's own pinning of the host, not only
+    /// Syndeo's: no certificate of Syndeo's could ever pass for it.
+    pub pinned_by_macos: bool,
+}
+
 pub struct PinnerIvars {
     /// The one authority this process will accept, beyond nothing else.
     anchor: SecCertificate,
@@ -87,10 +104,26 @@ impl Pinner {
     /// the default handling for anything else. Public so a delegate that also
     /// follows navigation can answer challenges exactly as this one does.
     pub fn judge(&self, challenge: &NSURLAuthenticationChallenge) -> (isize, *mut AnyObject) {
+        let judged = self.judge_noting(challenge);
+        (judged.disposition, judged.credential)
+    }
+
+    /// [`judge`](Pinner::judge), saying also whether a refusal was macOS's
+    /// own pinning of the host.
+    pub fn judge_noting(&self, challenge: &NSURLAuthenticationChallenge) -> Judged {
+        let (disposition, credential, pinned_by_macos) = self.decide(challenge);
+        Judged {
+            disposition,
+            credential,
+            pinned_by_macos,
+        }
+    }
+
+    fn decide(&self, challenge: &NSURLAuthenticationChallenge) -> (isize, *mut AnyObject, bool) {
         let space: Retained<AnyObject> = unsafe { msg_send![challenge, protectionSpace] };
         let method: Retained<NSString> = unsafe { msg_send![&*space, authenticationMethod] };
         if method.to_string() != "NSURLAuthenticationMethodServerTrust" {
-            return (DEFAULT_HANDLING, std::ptr::null_mut());
+            return (DEFAULT_HANDLING, std::ptr::null_mut(), false);
         }
 
         // `serverTrust` is a `SecTrustRef` — a CoreFoundation type rather than
@@ -99,7 +132,7 @@ impl Pinner {
         // the length of this decision.
         let trust_ptr: *mut std::ffi::c_void = unsafe { msg_send![&*space, serverTrust] };
         let Some(trust_ptr) = NonNull::new(trust_ptr) else {
-            return (CANCEL, std::ptr::null_mut());
+            return (CANCEL, std::ptr::null_mut(), false);
         };
         let mut trust = unsafe {
             use core_foundation::base::TCFType;
@@ -115,7 +148,7 @@ impl Pinner {
             .is_err()
             || trust.set_trust_anchor_certificates_only(true).is_err()
         {
-            return (CANCEL, std::ptr::null_mut());
+            return (CANCEL, std::ptr::null_mut(), false);
         }
 
         match trust.evaluate_with_error() {
@@ -123,14 +156,16 @@ impl Pinner {
                 let credential: Retained<NSURLCredential> = unsafe {
                     msg_send![<NSURLCredential as objc2::ClassType>::class(), credentialForTrust: trust_ptr.as_ptr()]
                 };
-                (USE_CREDENTIAL, Retained::into_raw(credential).cast())
+                (USE_CREDENTIAL, Retained::into_raw(credential).cast(), false)
             }
             Err(err) => {
                 // Refused rather than ignored. A certificate this process
                 // cannot trace to the proxy's authority is one it should not
                 // believe, and saying so beats a blank page with no reason.
                 tracing::warn!(%err, host = %host_of(&space), "refused a certificate");
-                (CANCEL, std::ptr::null_mut())
+                let pinned_by_macos =
+                    err.domain() == "NSOSStatusErrorDomain" && err.code() as i64 == PINNED_BY_MACOS;
+                (CANCEL, std::ptr::null_mut(), pinned_by_macos)
             }
         }
     }

@@ -8,9 +8,11 @@
 //!   window's controls in step with loading; says in the bar how the page on
 //!   screen was reached (`address::route`: Direct, Local or Through Syndeo),
 //!   from its address once it is committed, after any redirect; and shows a
-//!   failure page when a page cannot be opened, saying so when it was macOS
-//!   that refused a connection the window had vouched for
-//!   (`address::refused_after_vouching`).
+//!   failure page when a page cannot be opened. When macOS refused a page,
+//!   or a part of one, through the proxy (`address::Refusal`: macOS 15's
+//!   preloaded HSTS sites, Apple's pinned ones), it sends that host directly
+//!   from then on and loads the page again, once (#58); a host sent directly
+//!   gets macOS's own trust, and the bar says Direct for a page from one.
 //! - **Its UI delegate.** A page that asks for a new window gets a new tab,
 //!   made the way every other is, never a web view WebKit made for it.
 //! - **The window's delegate**, so a window that closes is let go.
@@ -53,6 +55,9 @@ const ROUTE_WIDTH: f64 = 190.0;
 /// Open a tab beside a window: a page's request, or the start page.
 pub type OpenTab = Box<dyn Fn(&NSWindow, Option<Retained<NSURLRequest>>)>;
 
+/// Send hosts around the proxy, directly; whether that took effect.
+pub type SendDirect = Box<dyn Fn(&[String]) -> bool>;
+
 /// What a controller asks of the application.
 pub struct Hooks {
     /// Open a tab beside `window`: `request`, or the start page.
@@ -63,6 +68,15 @@ pub struct Hooks {
     pub start_page: Box<dyn Fn() -> String>,
     /// The search engine chosen in Settings, as it is now.
     pub search: Box<dyn Fn() -> Search>,
+    /// The domains every window sends around the proxy, directly, this
+    /// session: each, and the names under it (`address::covered`).
+    pub direct: Box<dyn Fn() -> Vec<String>>,
+    /// Send these hosts directly, from now on, for every window; whether
+    /// that took effect.
+    pub send_direct: SendDirect,
+    /// The hosts the proxy has said this session were refused, as macOS 15
+    /// refuses its preloaded HSTS sites (`syndeo-proxy`'s `refusals`).
+    pub refused: Box<dyn Fn() -> Vec<String>>,
 }
 
 /// The web view a window browses in, and the delegate that pins it.
@@ -108,6 +122,13 @@ pub struct Ivars {
     /// The hosts this window vouched for since its last navigation started:
     /// their certificates came from Syndeo's own proxy. At most [`VOUCHED`].
     vouched: RefCell<Vec<String>>,
+    /// The hosts whose certificates this window refused, since its last
+    /// navigation started, because macOS pins them itself. At most
+    /// [`VOUCHED`].
+    pinned: RefCell<Vec<String>>,
+    /// The page this window last loaded again with hosts sent directly. It
+    /// is not loaded again for that, ever, until another page starts.
+    retried: RefCell<Option<String>>,
 }
 
 /// How many hosts a window remembers vouching for, in one navigation.
@@ -115,6 +136,13 @@ const VOUCHED: usize = 64;
 
 /// `NSURLSessionAuthChallengeUseCredential`: the pinner vouched for it.
 const USE_CREDENTIAL: isize = 0;
+
+/// `NSURLSessionAuthChallengePerformDefaultHandling`: macOS's own trust.
+const DEFAULT_HANDLING: isize = 1;
+
+/// How long after a page has loaded to look once more for parts of it the
+/// proxy says macOS refused: the proxy's word can come just after the page.
+const LOOK_AGAIN: f64 = 1.0;
 
 /// `NSReturnTextMovement`: the address field was left by pressing Return.
 const RETURN: isize = 0x10;
@@ -151,20 +179,31 @@ define_class!(
             challenge: &NSURLAuthenticationChallenge,
             handler: &block2::DynBlock<dyn Fn(isize, *mut AnyObject)>,
         ) {
+            let host = host_of(challenge);
+            // A host sent around the proxy, directly, is not Syndeo's to
+            // vouch for: macOS's own trust decides, as for any application.
+            let direct = self.hooks().map(|hooks| (hooks.direct)()).unwrap_or_default();
+            if host.as_deref().is_some_and(|host| address::sent_direct(host, &direct)) {
+                handler.call((DEFAULT_HANDLING, std::ptr::null_mut()));
+                return;
+            }
             // Only ever made with a pinner; without one, refuse.
-            let (disposition, credential) = match &*self.ivars().web.borrow() {
-                Some(web) => web.pinner.judge(challenge),
-                None => (2, std::ptr::null_mut()),
+            let judged = match &*self.ivars().web.borrow() {
+                Some(web) => web.pinner.judge_noting(challenge),
+                None => pin::Judged {
+                    disposition: 2,
+                    credential: std::ptr::null_mut(),
+                    pinned_by_macos: false,
+                },
             };
-            if disposition == USE_CREDENTIAL {
-                if let Some(host) = host_of(challenge) {
-                    let mut vouched = self.ivars().vouched.borrow_mut();
-                    if !vouched.contains(&host) && vouched.len() < VOUCHED {
-                        vouched.push(host);
-                    }
+            if let Some(host) = host {
+                if judged.disposition == USE_CREDENTIAL {
+                    remember(&self.ivars().vouched, host);
+                } else if judged.pinned_by_macos {
+                    remember(&self.ivars().pinned, host);
                 }
             }
-            handler.call((disposition, credential));
+            handler.call((judged.disposition, judged.credential));
         }
 
         #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
@@ -195,6 +234,14 @@ define_class!(
         fn did_start(&self, _webview: &WKWebView, _navigation: Option<&WKNavigation>) {
             self.ivars().refused.set(false);
             self.ivars().vouched.borrow_mut().clear();
+            self.ivars().pinned.borrow_mut().clear();
+            // Another page than the one last loaded again may be, once.
+            let now = self.page_address();
+            let mut retried = self.ivars().retried.borrow_mut();
+            if retried.as_deref() != Some(now.as_str()) {
+                *retried = None;
+            }
+            drop(retried);
             self.ivars().loading.set(true);
             self.refresh();
         }
@@ -212,12 +259,17 @@ define_class!(
             // may not be committed anew.
             self.refresh_address();
             self.refresh();
+            self.send_refused_parts_direct(false);
         }
 
         #[unsafe(method(webView:didFailProvisionalNavigation:withError:))]
         fn did_fail_provisional(&self, _webview: &WKWebView, _navigation: Option<&WKNavigation>, error: &NSError) {
             self.ivars().loading.set(false);
             let refused = error.code() == INTERRUPTED && self.ivars().refused.replace(false);
+            if !refused && self.retry_direct(error) {
+                self.refresh();
+                return;
+            }
             if error.code() != CANCELLED && !refused {
                 self.show_failure(error);
             }
@@ -306,6 +358,15 @@ define_class!(
     }
 
     impl BrowserController {
+        /// A moment after a page loaded: once more, the parts of it macOS
+        /// refused through the proxy, unless another page has started.
+        #[unsafe(method(lookAgainForRefusedParts))]
+        fn look_again_for_refused_parts(&self) {
+            if !self.ivars().loading.get() {
+                self.send_refused_parts_direct(true);
+            }
+        }
+
         #[unsafe(method(syndeoBack:))]
         fn back(&self, _sender: Option<&AnyObject>) {
             if let Some(web) = &*self.ivars().web.borrow() {
@@ -390,6 +451,33 @@ fn address_of(request: &NSURLRequest) -> String {
         .and_then(|url| url.absoluteString())
         .map(|text| text.to_string())
         .unwrap_or_default()
+}
+
+/// Add `host` to `list`, once, up to [`VOUCHED`] hosts.
+fn remember(list: &RefCell<Vec<String>>, host: String) {
+    let mut list = list.borrow_mut();
+    if !list.contains(&host) && list.len() < VOUCHED {
+        list.push(host);
+    }
+}
+
+/// The address an error says failed, or nothing.
+fn failing_address(error: &NSError) -> String {
+    error
+        .userInfo()
+        .objectForKey(ns_string!("NSErrorFailingURLStringKey"))
+        .and_then(|value| value.downcast::<NSString>().ok())
+        .map(|text| text.to_string())
+        .unwrap_or_default()
+}
+
+/// The host of `address`, lowercase.
+fn host_in(address: &str) -> Option<String> {
+    url::Url::parse(address)
+        .ok()?
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 /// The host a TLS challenge is for, lowercase.
@@ -584,38 +672,110 @@ impl BrowserController {
             .objectForKey(ns_string!("NSErrorFailingURLStringKey"))
             .and_then(|value| value.downcast::<NSString>().ok());
         let address = failing.map(|s| s.to_string()).unwrap_or_default();
-        let host = url::Url::parse(&address)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_string))
-            .unwrap_or_default();
-        let vouched = !host.is_empty() && self.ivars().vouched.borrow().contains(&host);
-        let macos = NSProcessInfo::processInfo()
-            .operatingSystemVersion()
-            .majorVersion as u64;
-        let refused = address::refused_after_vouching(
-            &error.domain().to_string(),
-            error.code(),
-            &host,
-            vouched,
-            macos,
-        );
         let why = if address::has_zone(&address) {
             address::ZONED.to_string()
         } else if error.domain().to_string() == "WebKitErrorDomain" && error.code() == INTERRUPTED {
             "Syndeo opens web pages. It does not download files or open other kinds of address."
                 .to_string()
-        } else if let Some(refused) = refused {
-            // Said in the log without the host, as every address is kept
-            // out of it.
-            tracing::warn!(
-                macos,
-                "macOS refused a secure connection this window had vouched for"
-            );
-            refused
         } else {
             error.localizedDescription().to_string()
         };
         self.show_page(&address, &why);
+    }
+
+    /// When macOS refused this page's main document through the proxy
+    /// (`address::refusal`), send its host directly from now on and load the
+    /// page again: once, never for a page already loaded again, which shows
+    /// what WebKit says instead. Whether it did. If the host could not be
+    /// sent directly, the page says what macOS did, and why.
+    fn retry_direct(&self, error: &NSError) -> bool {
+        let address = failing_address(error);
+        let Some(host) = host_in(&address) else {
+            return false;
+        };
+        let refusal = address::refusal(
+            &error.domain().to_string(),
+            error.code(),
+            self.ivars().vouched.borrow().contains(&host),
+            self.ivars().pinned.borrow().contains(&host),
+        );
+        let retried = self.ivars().retried.borrow().as_deref() == Some(address.as_str());
+        let address::AfterFailure::RetryDirect(refusal) = address::after_failure(refusal, retried)
+        else {
+            return false;
+        };
+        if !self
+            .hooks()
+            .is_some_and(|hooks| (hooks.send_direct)(std::slice::from_ref(&host)))
+        {
+            let macos = NSProcessInfo::processInfo()
+                .operatingSystemVersion()
+                .majorVersion as u64;
+            self.show_page(&address, &address::explain(refusal, &host, macos));
+            return true;
+        }
+        // Said in the log without the host, as every address is kept out of it.
+        tracing::info!(
+            ?refusal,
+            "sent a host directly: macOS refused it through Syndeo's proxy"
+        );
+        self.load_again(address);
+        true
+    }
+
+    /// After a page has loaded: send directly the hosts it loaded from that
+    /// macOS refused through the proxy (`address::to_send_direct`), and load
+    /// it again, once. If there are none yet, look once more a moment later,
+    /// `again`: the proxy's word may come just after the page.
+    fn send_refused_parts_direct(&self, again: bool) {
+        let Some(hooks) = self.hooks() else { return };
+        let address = self.page_address();
+        if address.is_empty() || self.ivars().retried.borrow().as_deref() == Some(address.as_str())
+        {
+            return;
+        }
+        let hosts = address::to_send_direct(
+            &self.ivars().vouched.borrow(),
+            &(hooks.refused)(),
+            &self.ivars().pinned.borrow(),
+            &(hooks.direct)(),
+        );
+        if hosts.is_empty() {
+            if !again {
+                let _: () = unsafe {
+                    msg_send![self, performSelector: sel!(lookAgainForRefusedParts), withObject: std::ptr::null::<AnyObject>(), afterDelay: LOOK_AGAIN]
+                };
+            }
+            return;
+        }
+        if !(hooks.send_direct)(&hosts) {
+            return;
+        }
+        tracing::info!(
+            hosts = hosts.len(),
+            "sent hosts a page loaded from directly: macOS refused them through Syndeo's proxy"
+        );
+        self.load_again(address);
+    }
+
+    /// Load `address` again, as the page last loaded again for hosts sent
+    /// directly.
+    fn load_again(&self, address: String) {
+        let Some(url) = NSURL::URLWithString(&NSString::from_str(&address)) else {
+            return;
+        };
+        *self.ivars().retried.borrow_mut() = Some(address);
+        self.load(&NSURLRequest::requestWithURL(&url));
+    }
+
+    /// The address of the page in the web view, or nothing.
+    fn page_address(&self) -> String {
+        let web = self.ivars().web.borrow();
+        web.as_ref()
+            .and_then(|web| unsafe { web.view.URL() })
+            .and_then(|url| url.absoluteString())
+            .map(|text| text.to_string())
+            .unwrap_or_default()
     }
 
     /// Show the failure page for `address`, keeping it in the field. The bar
@@ -684,7 +844,11 @@ impl BrowserController {
             *self.ivars().failed.borrow_mut() = None;
             self.set_shown(&text);
             // From the committed address, which is where any redirect led.
-            self.show_route(address::route_of(&text));
+            let direct = self
+                .hooks()
+                .map(|hooks| (hooks.direct)())
+                .unwrap_or_default();
+            self.show_route(address::route_with(&text, &direct));
         } else {
             // A page that is not the web's, which is reached no way at all.
             self.show_route(None);

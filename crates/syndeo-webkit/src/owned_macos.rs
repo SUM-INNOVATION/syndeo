@@ -84,8 +84,24 @@ impl OwnedProxy {
 /// --control-stdin`. Only this program holds that pipe, so nothing else — no
 /// page, no other process — can ask. Cloned, to ask from another thread; one
 /// question at a time.
+///
+/// Besides its answers, the proxy says on its own which hosts' browsers
+/// refused its certificate the way macOS 15 and earlier do for their
+/// preloaded HSTS sites (`syndeo-proxy`'s `refusals`); those lines are kept
+/// apart, for [`ProxyControl::refused`], and never taken for an answer.
 #[derive(Clone)]
-pub struct ProxyControl(std::sync::Arc<std::sync::Mutex<Control>>);
+pub struct ProxyControl {
+    control: std::sync::Arc<std::sync::Mutex<Control>>,
+    refused: Refused,
+}
+
+/// Hosts the proxy said were refused, not yet taken: at most [`REFUSED_KEPT`].
+type Refused = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
+/// How the proxy starts a line saying a host was refused.
+const REFUSED: &str = "SYNDEO-PROXY-REFUSED 1 ";
+/// How many refused hosts are kept until taken; the oldest go first.
+const REFUSED_KEPT: usize = 256;
 
 struct Control {
     /// None once closed, by the owner's quitting.
@@ -108,7 +124,7 @@ impl ProxyControl {
     pub fn clear_cache(&self, within: std::time::Duration) -> Result<u64> {
         use std::io::Write;
         let mut control = self
-            .0
+            .control
             .lock()
             .map_err(|_| anyhow::anyhow!("an earlier question to the proxy failed part way"))?;
         if control.out_of_step {
@@ -140,10 +156,17 @@ impl ProxyControl {
 }
 
 impl ProxyControl {
+    /// The hosts the proxy has said were refused since this was last asked,
+    /// each once, oldest first. Never waits for the proxy.
+    pub fn refused(&self) -> Vec<String> {
+        let mut refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
+        refused.drain(..).collect()
+    }
+
     /// Close the pipe, for every clone: the proxy reads its end closing as
     /// its owner quitting.
     fn close(&self) {
-        let mut control = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
         drop(control.stdin.take());
     }
 }
@@ -191,18 +214,21 @@ fn parse_announcement(line: &[u8]) -> Result<std::net::SocketAddr> {
     Ok(address)
 }
 
-/// The longest answer worth reading after the announcement. A longer line is
-/// none, and is read past.
-const MAX_ANSWER: usize = 96;
+/// The longest line worth reading after the announcement: an answer, or a
+/// refused host, whose name may be 253 bytes. A longer line is none, and is
+/// read past.
+const MAX_ANSWER: usize = 288;
 
 /// On the child's stdout, on a thread of its own: the one announcement line,
 /// bounded, and then everything after it read until the child goes, so a
 /// child that writes more can never block on a full pipe. Each line after the
-/// announcement that is short enough to be an answer is sent to `answers`.
+/// announcement that is short enough to be an answer is sent to `answers`,
+/// except one saying a host was refused, whose host is kept in `refused`.
 fn read_announcement(
     mut stdout: std::process::ChildStdout,
     found: std::sync::mpsc::Sender<Result<std::net::SocketAddr>>,
     answers: std::sync::mpsc::Sender<String>,
+    refused: Refused,
 ) {
     use std::io::Read;
     let mut line = Vec::with_capacity(MAX_ANNOUNCEMENT);
@@ -244,6 +270,9 @@ fn read_announcement(
         for &byte in &chunk[..n] {
             if byte == b'\n' {
                 match (too_long, String::from_utf8(std::mem::take(&mut answer))) {
+                    (false, Ok(text)) if text.starts_with(REFUSED) => {
+                        keep_refused(&refused, &text[REFUSED.len()..]);
+                    }
                     (false, Ok(text)) => {
                         let _ = answers.send(text);
                     }
@@ -257,6 +286,15 @@ fn read_announcement(
             }
         }
     }
+}
+
+/// Keep `host`, one the proxy said was refused, for [`ProxyControl::refused`].
+fn keep_refused(refused: &Refused, host: &str) {
+    let mut refused = refused.lock().unwrap_or_else(|e| e.into_inner());
+    if refused.len() >= REFUSED_KEPT {
+        refused.pop_front();
+    }
+    refused.push_back(host.to_string());
 }
 
 /// Start `command` as this browser's proxy and wait until it says where it
@@ -291,15 +329,20 @@ pub fn start_owned(
     let stdout = owned.0.stdout.take().context("the proxy's stdout")?;
     let (found, announced) = std::sync::mpsc::channel();
     let (answered, answers) = std::sync::mpsc::channel();
+    let refused = Refused::default();
+    let heard = refused.clone();
     std::thread::Builder::new()
         .name("proxy-stdout".into())
-        .spawn(move || read_announcement(stdout, found, answered))
+        .spawn(move || read_announcement(stdout, found, answered, heard))
         .context("reading the proxy's output")?;
-    let control = ProxyControl(std::sync::Arc::new(std::sync::Mutex::new(Control {
-        stdin: Some(stdin),
-        answers,
-        out_of_step: false,
-    })));
+    let control = ProxyControl {
+        control: std::sync::Arc::new(std::sync::Mutex::new(Control {
+            stdin: Some(stdin),
+            answers,
+            out_of_step: false,
+        })),
+        refused,
+    };
 
     let deadline = std::time::Instant::now() + within;
     loop {
@@ -818,6 +861,28 @@ mod tests {
         assert_eq!(control.clear_cache(Duration::from_secs(5)).unwrap(), 42);
         // And again: each answer is the one to its own question.
         assert_eq!(control.clear_cache(Duration::from_secs(5)).unwrap(), 42);
+    }
+
+    /// A refused host the proxy says, even between a question and its
+    /// answer, is kept for `refused`, each once, and never taken for the
+    /// answer; a line too long to be one is read past.
+    #[test]
+    fn a_refused_host_is_kept_apart_from_the_answers() {
+        let long = "x".repeat(400);
+        let owned = start_owned(
+            sh(&format!(
+                "printf 'SYNDEO-PROXY-READY 1 127.0.0.1:4567\\nSYNDEO-PROXY-REFUSED 1 github.com\\n'; \
+                 read line; printf 'SYNDEO-PROXY-REFUSED 1 {long}.example\\nSYNDEO-PROXY-REFUSED 1 www.dropbox.com\\nSYNDEO-PROXY-CLEARED 1 42\\n'; \
+                 exec /bin/sleep 60"
+            )),
+            Duration::from_secs(10),
+            None,
+        )
+        .unwrap();
+        let control = owned.control();
+        assert_eq!(control.clear_cache(Duration::from_secs(5)).unwrap(), 42);
+        assert_eq!(control.refused(), ["github.com", "www.dropbox.com"]);
+        assert!(control.refused().is_empty(), "each is taken once");
     }
 
     /// A line the proxy wrote before the question is not its answer.

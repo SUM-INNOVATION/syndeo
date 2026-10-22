@@ -319,8 +319,9 @@ jobs:
     # Accessibility; browsed in, by keystrokes and presses as a person would:
     # addresses, Back and Forward, refusals, search as Settings chooses it, a
     # tab opened and closed, no private URL in any log, https pinned through
-    # the proxy, a site on macOS's HSTS preload list, which macOS 15 refuses
-    # through the proxy, said so on its page (#58), a page's own links to
+    # the proxy, sites on macOS's HSTS preload list, which macOS 15 refuses
+    # through the proxy, sent directly and shown, a page and a page's image,
+    # with example.com still through Syndeo (#58), a page's own links to
     # other schemes refused; addresses other
     # applications ask it to open, opened through the proxy or refused, and
     # opened by one; passkeys reported unavailable, asking nothing; its last
@@ -467,8 +468,8 @@ jobs:
       # HTTP/2 through the proxy. github.com is measured only: it is on the
       # HSTS preload list built into macOS, and on this runner's macOS 15
       # macOS refuses its connection through the proxy after the page's
-      # delegate has vouched for it (#58); the app's own test gates what
-      # Syndeo.app says about that.
+      # delegate has vouched for it (#58). This harness does not retry it
+      # directly as Syndeo.app does; the app's own test gates that.
       # Kept in pageload/ in the logs.
       - name: Page load, directly and through Syndeo's proxy (times measured, not gated)
         if: always()
@@ -485,6 +486,51 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-app-logs
+          path: ${{ runner.temp }}/syndeo-app-test/
+          if-no-files-found: warn
+
+  macos-26-app:
+    name: Syndeo.app on macOS 26, where macOS lets its preloaded sites through Syndeo
+    # What macOS 15 refuses through Syndeo's proxy, and Syndeo.app then sends
+    # directly (#58), macOS 26 lets through: github.com and a page's image
+    # from en.wikipedia.org open Through Syndeo, nothing is sent directly,
+    # and example.com is Through Syndeo too (ci/test-app.sh preloaded).
+    # Unsigned with a Developer ID, and with no secrets.
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      SYNDEO_ALLOW_APP_TEST: "yes"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-26-app
+
+      - name: Build the app and its helper
+        run: cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app -p syndeo-proxy
+
+      - name: Assemble Syndeo.app, then sign it ad hoc, the helper first
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          mkdir -p dist
+          bash ci/package-macos-app.sh "$version" target/aarch64-apple-darwin/release dist
+          codesign --force --sign - --options runtime dist/Syndeo.app/Contents/Helpers/syndeo-proxy
+          codesign --force --sign - --options runtime dist/Syndeo.app
+          codesign --verify --strict --verbose=2 dist/Syndeo.app
+
+      - name: Open github.com, a page's image from en.wikipedia.org, and example.com, all Through Syndeo
+        run: bash ci/test-app.sh preloaded "$PWD/dist/Syndeo.app"
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-26-app-logs
           path: ${{ runner.temp }}/syndeo-app-test/
           if-no-files-found: warn
 
