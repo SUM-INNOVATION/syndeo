@@ -2307,6 +2307,55 @@ mod tests {
         );
     }
 
+    /// The same over HTTP/2, where every request names its origin in
+    /// :authority: a request inside a tunnel to A that names B is refused,
+    /// and B sees nothing.
+    #[tokio::test]
+    async fn an_h2_tunnel_to_one_origin_cannot_be_used_to_reach_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Origin::start(Arc::new(|_| respond(200, &[], b"A"))).await;
+        let second = Origin::start(Arc::new(|_| respond(200, &[], b"B"))).await;
+        let (proxy, handle) = start_proxy_with_count(dir.path()).await;
+        let authority = format!("localhost:{}", first.address.port());
+
+        let (stream, _) = open_tunnel(proxy, &authority).await;
+        let tls = tls_to_proxy_offering(stream, &handle, &[b"h2"]).await;
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        let (mut sender, connection) = hyper::client::conn::http2::handshake::<_, _, Full<Bytes>>(
+            TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(connection);
+
+        for elsewhere in [
+            format!("https://127.0.0.1:{}/secret", second.address.port()),
+            format!("https://localhost:{}/secret", second.address.port()),
+            format!("http://localhost:{}/secret", first.address.port()),
+        ] {
+            within(sender.ready()).await.unwrap();
+            let reply = within(
+                sender.send_request(
+                    Request::builder()
+                        .uri(elsewhere.as_str())
+                        .body(Full::new(Bytes::new()))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reply.version(), http::Version::HTTP_2);
+            assert_eq!(reply.status(), StatusCode::BAD_REQUEST, "{elsewhere}");
+        }
+
+        assert!(
+            second.seen().is_empty(),
+            "the tunnel reached another origin"
+        );
+        assert!(first.seen().is_empty(), "a refused request went out anyway");
+    }
+
     #[tokio::test]
     async fn a_tunnel_to_one_origin_cannot_be_used_to_reach_another() {
         let dir = tempfile::tempdir().unwrap();
