@@ -433,6 +433,20 @@ define_class!(
             }
         }
 
+        /// View > Show All Tabs, and a tab's own menu: AppKit's overview of
+        /// the front browser window's tabs, through its tab group, or, shown,
+        /// left again. AppKit adds no item of its own for an action an item
+        /// already has, so this one is the only Show All Tabs.
+        #[unsafe(method(toggleTabOverview:))]
+        fn toggle_tab_overview(&self, _sender: Option<&AnyObject>) {
+            let Some(group) = self.front_browser().and_then(|w| w.tabGroup()) else {
+                return;
+            };
+            let was = group.isOverviewVisible();
+            group.setOverviewVisible(!was);
+            tracing::info!(was, "the tab overview toggled");
+        }
+
         /// History > Reopen All Windows from Last Session.
         #[unsafe(method(syndeoReopenSession:))]
         fn reopen_session(&self, _sender: Option<&AnyObject>) {
@@ -895,6 +909,7 @@ impl AppDelegate {
         let controller = controller_of(window)?;
         let to_tab: &AnyObject = controller.as_ref();
         let to_window: &AnyObject = window.as_ref();
+        let to_app: &AnyObject = self.as_ref();
         let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Tab"));
         let pin = if controller.is_pinned() {
             "Unpin Tab"
@@ -924,12 +939,7 @@ impl AppDelegate {
                 Some(to_window),
             ),
             NSMenuItem::separatorItem(mtm),
-            tabs_macos::item(
-                mtm,
-                "Show All Tabs",
-                sel!(toggleTabOverview:),
-                Some(to_window),
-            ),
+            tabs_macos::item(mtm, "Show All Tabs", sel!(toggleTabOverview:), Some(to_app)),
         ] {
             menu.addItem(&entry);
         }
@@ -1101,8 +1111,32 @@ fn submenu(
 /// in front through the responder chain, and are disabled where there is no
 /// browsing to do. With it, History > Recently Closed's menu, which changes
 /// as tabs close.
-fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> (Retained<NSMenu>, Retained<NSMenu>) {
+fn main_menu(
+    mtm: MainThreadMarker,
+    app: &NSApplication,
+    delegate: &AnyObject,
+) -> (Retained<NSMenu>, Retained<NSMenu>) {
     let command = NSEventModifierFlags::Command;
+    // Close's alternate, shown with ⌥ held, as Safari has it; given here, so
+    // that AppKit adds none of its own, whose Close Other Tabs would close
+    // pinned tabs too.
+    let close_others = item_with(
+        mtm,
+        "Close Other Tabs",
+        sel!(syndeoCloseOtherTabs:),
+        "w",
+        NSEventModifierFlags::Option | command,
+    );
+    close_others.setAlternate(true);
+    // Sent to the application, which shows the front window's tabs.
+    let show_all_tabs = item_with(
+        mtm,
+        "Show All Tabs",
+        sel!(toggleTabOverview:),
+        "\\",
+        NSEventModifierFlags::Shift | command,
+    );
+    unsafe { show_all_tabs.setTarget(Some(delegate)) };
     let bar = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
     let hide_others = item(mtm, "Hide Others", sel!(hideOtherApplications:), "h");
     hide_others
@@ -1133,8 +1167,7 @@ fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> (Retained<NSMenu>, R
             item(mtm, "Open Location…", sel!(openLocation:), "l"),
             NSMenuItem::separatorItem(mtm),
             item(mtm, "Close", sel!(performClose:), "w"),
-            // No shortcut: ⌥⌘W is AppKit's own Close All, which it adds.
-            item(mtm, "Close Other Tabs", sel!(syndeoCloseOtherTabs:), ""),
+            close_others,
         ],
     );
     submenu(
@@ -1159,13 +1192,7 @@ fn main_menu(mtm: MainThreadMarker, app: &NSApplication) -> (Retained<NSMenu>, R
             // AppKit's own tab items, which it would add itself, first, as it
             // would put them: here, so that Show All Tabs has its shortcut.
             item(mtm, "Show Tab Bar", sel!(toggleTabBar:), ""),
-            item_with(
-                mtm,
-                "Show All Tabs",
-                sel!(toggleTabOverview:),
-                "\\",
-                NSEventModifierFlags::Shift | command,
-            ),
+            show_all_tabs,
             NSMenuItem::separatorItem(mtm),
             item(mtm, "Reload Page", sel!(reloadPage:), "r"),
             item(mtm, "Stop Loading", sel!(stopPage:), "."),
@@ -1273,7 +1300,7 @@ pub fn run(install: InstallDir) -> Result<()> {
         },
     );
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    let (bar, recent) = main_menu(mtm, &app);
+    let (bar, recent) = main_menu(mtm, &app, delegate.as_ref());
     *delegate.ivars().recent.borrow_mut() = Some(recent);
     app.setMainMenu(Some(&bar));
     app.run();

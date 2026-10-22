@@ -140,16 +140,27 @@ try {
   return null;
 }
 if (blob.size > 262144) return null;
+const canvas = document.createElement("canvas");
+canvas.width = 32;
+canvas.height = 32;
+const draw = (picture) => {
+  canvas.getContext("2d").drawImage(picture, 0, 0, 32, 32);
+  return canvas.toDataURL("image/png");
+};
+// Decoded off the page, which works in a tab behind as in front; an SVG,
+// which that cannot decode, through an image instead.
+try {
+  return draw(await createImageBitmap(blob));
+} catch (e) {}
 const url = URL.createObjectURL(blob);
 try {
   const image = new Image();
-  image.src = url;
-  await image.decode();
-  const canvas = document.createElement("canvas");
-  canvas.width = 32;
-  canvas.height = 32;
-  canvas.getContext("2d").drawImage(image, 0, 0, 32, 32);
-  return canvas.toDataURL("image/png");
+  await new Promise((done, failed) => {
+    image.onload = done;
+    image.onerror = failed;
+    image.src = url;
+  });
+  return draw(image);
 } catch (e) {
   return null;
 } finally {

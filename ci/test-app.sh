@@ -2202,6 +2202,15 @@ tabbing() {
   else
     bad "a tab opened in front goes right after its page" "tabs: $(tab_list)"
   fi
+  # The menus as AppKit has them with tabs showing, which is when it adds
+  # its own items.
+  for items in File View Window History; do
+    "$APPCTL" menu-dump "$PID" "$items" >"$LOGS/tabs-menu-$items-with-tabs.txt" 2>&1
+  done
+  must "$([ "$(grep -c "^Close Other Tabs$(printf '\t')" "$LOGS/tabs-menu-File-with-tabs.txt")" = 1 ] && echo yes)" \
+    "with tabs showing, File has one Close Other Tabs, Syndeo's, AppKit adding none" "$(tr '\t\n' ' |' <"$LOGS/tabs-menu-File-with-tabs.txt")"
+  must "$([ "$(grep -c "^Show All Tabs$(printf '\t')" "$LOGS/tabs-menu-View-with-tabs.txt")" = 1 ] && echo yes)" \
+    "and View one Show All Tabs" "$(tr '\t\n' ' |' <"$LOGS/tabs-menu-View-with-tabs.txt")"
 
   show_tab 1 "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "⌘1 shows the first tab"
   "$APPCTL" click-web "$PID" "File link" cmd left || bad "⌘-click on a file: link" "no File link to click"
@@ -2226,6 +2235,7 @@ tabbing() {
   "$APPCTL" click-web "$PID" "Slow link" cmd+shift left || bad "⇧⌘-click on Slow link" "no Slow link to click"
   opens "$log" 5 "⇧⌘-click on a slow page opens a tab in front"
   if wait_for 6 "$APPCTL" ids "$PID" syndeo.tab-loading; then ok "its tab shows it loading"; else bad "its tab shows it loading" "no syndeo.tab-loading"; fi
+  "$APPCTL" id-tree "$PID" >"$LOGS/tabs-loading-ids.txt" 2>&1
   arrive "$TP/slow.html" 'SYNDEO-SLOW-PAGE' "the slow page arrives"
   if wait_for 10 sh -c '! "$1" ids "$2" syndeo.tab-loading' _ "$APPCTL" "$PID"; then ok "and its tab stops showing it loading"; else bad "its tab stops showing it loading" "still loading"; fi
 

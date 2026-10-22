@@ -61,6 +61,10 @@
 //                                option joined by +), with <button> (left or middle)
 //   appctl keys <pid> <key> <keys>    bring pid to the front and press <key> (a digit,
 //                                a letter, [, ], \ or escape) holding <keys>, as above
+//   appctl menu-dump <pid> <menu>    each item of that menu, one a line:
+//                                "title<TAB>key<TAB>modifiers<TAB>enabled"
+//   appctl id-tree <pid>         each element outside the page in pid's front window
+//                                that has an accessibility identifier: "role<TAB>identifier"
 //   appctl tab-press <pid> <index>    press the front window's tab <index>, counted from 1,
 //                                as a click on it would; exits 1 if there is no such tab
 //   appctl menu-enabled <pid> <menu> <item>   "enabled" or "disabled", for that menu
@@ -538,6 +542,18 @@ case "menu-enabled" where args.count == 5:
     }
     guard let enabled else { exit(1) }
     print(enabled ? "enabled" : "disabled")
+case "menu-dump" where args.count == 4:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    for item in menuItems(pid, args[3]) {
+        let modifiers = (attribute(item, kAXMenuItemCmdModifiersAttribute) as? Int).map(String.init) ?? "?"
+        let enabled = (attribute(item, kAXEnabledAttribute) as? Bool) == true ? "enabled" : "disabled"
+        print("\(oneLine(attribute(item, kAXTitleAttribute)))\t\(oneLine(attribute(item, kAXMenuItemCmdCharAttribute)))\t\(modifiers)\t\(enabled)")
+    }
+case "id-tree" where args.count == 3:
+    guard let pid = Int32(args[2]), let window = frontWindow(of: pid) else { exit(1) }
+    for element in all(window, depth: 24, { attribute($0, "AXIdentifier") != nil }) {
+        print("\(attribute(element, kAXRoleAttribute) as? String ?? "?")\t\(oneLine(attribute(element, "AXIdentifier")))")
+    }
 case "tab-press" where args.count == 4:
     guard let pid = Int32(args[2]), let index = Int(args[3]) else { exit(2) }
     let tabs = tabButtons(pid)
