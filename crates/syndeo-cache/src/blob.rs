@@ -106,7 +106,7 @@ impl BlobStore {
                 .open(&tmp)?;
             f.write_all(&[compression_tag(compression)])?;
             f.write_all(payload)?;
-            f.sync_all()?;
+            in_order(&f)?;
             self.pause_point("write:before-rename");
             fs::rename(&tmp, path)?;
             Ok(())
@@ -395,6 +395,26 @@ impl BlobStore {
     }
 }
 
+/// Put a file's bytes on the disk before anything written after them: what
+/// makes renaming it into place safe, so a crash can leave a body missing but
+/// never part of one under its address (and `get` checks the hash anyway).
+///
+/// On macOS that is `F_BARRIERFSYNC`. `sync_all` is `F_FULLFSYNC` there, which
+/// waits for the drive's own cache as well: 3.7 ms against 0.4 ms, measured on
+/// an Apple SSD, for every body a page stores. Where the call is refused, as a
+/// file system may, it falls back to `sync_all`. Elsewhere it is `sync_all`.
+fn in_order(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: an fcntl on a descriptor this File owns, with no argument.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
+            return Ok(());
+        }
+    }
+    file.sync_all()
+}
+
 /// A body being written as it arrives.
 ///
 /// Dropping one without committing removes the partial file: an interrupted
@@ -442,9 +462,11 @@ impl BlobWriter {
     }
 
     fn finish(mut self) -> Result<FinishedWrite> {
+        // Not flushed to the disk: `adopt` reads it back and writes what it
+        // keeps through `write_in_place`, which is, and a crash leaves the
+        // staging directory to be emptied at the next open.
         if let Some(mut file) = self.file.take() {
             file.flush()?;
-            file.sync_all()?;
         }
         let id = ContentId(*self.hasher.finalize().as_bytes());
         let digests = self.digests.take().map(|d| d.finish()).unwrap_or_default();

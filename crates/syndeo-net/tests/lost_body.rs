@@ -45,6 +45,8 @@ async fn a_body_deleted_from_disk_is_fetched_and_stored_again() {
     let url = origin.url("/asset");
 
     assert_eq!(fetch(&net, &url).await.unwrap().0, Source::Origin);
+    // Its entry is written just after the body ends.
+    net.landed().await;
     std::fs::remove_file(blob_file(dir.path(), b"the body")).unwrap();
 
     let (source, body) = fetch(&net, &url).await.unwrap();

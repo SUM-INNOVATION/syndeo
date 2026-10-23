@@ -519,7 +519,7 @@ impl Cache {
                 continue;
             };
             let computed = vary::vary_key(&record.vary_fields, request_headers);
-            if computed == record.vary_key {
+            if computed == record.vary_key && coding_accepted(&record, request_headers) {
                 return Ok(Some((key, record)));
             }
         }
@@ -1462,6 +1462,32 @@ impl Cache {
         }
         Ok(stats)
     }
+}
+
+/// Whether the request accepts the content coding a stored response is in
+/// (`headers::coding_acceptable`). `Vary: Accept-Encoding` decides it when
+/// the origin sent one; this decides it when the origin left it out, so a
+/// body stored compressed for one client is never handed to another that
+/// cannot decode it.
+fn coding_accepted(record: &EntryRecord, request_headers: &HeaderMap) -> bool {
+    let joined = |values: Vec<&str>| (!values.is_empty()).then(|| values.join(","));
+    let content = joined(
+        record
+            .headers
+            .pairs()
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+            .map(|(_, value)| value.as_str())
+            .collect(),
+    );
+    let accept = joined(
+        request_headers
+            .get_all(http::header::ACCEPT_ENCODING)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect(),
+    );
+    crate::headers::coding_acceptable(content.as_deref(), accept.as_deref())
 }
 
 /// How a peer names the body it wants.

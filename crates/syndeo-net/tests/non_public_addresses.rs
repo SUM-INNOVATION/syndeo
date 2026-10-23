@@ -28,7 +28,10 @@ async fn fetch(net: &Net, request: FetchRequest) -> (Source, Vec<u8>) {
     (source, body.to_vec())
 }
 
-fn entries(net: &Net) -> u64 {
+/// The entries the cache holds once every write already begun has landed: a
+/// streamed body's entry is written just after its end goes to the caller.
+async fn entries(net: &Net) -> u64 {
+    net.landed().await;
     net.cache().stats().unwrap().entries
 }
 
@@ -82,7 +85,7 @@ async fn an_answer_from_loopback_is_not_stored_by_address_or_by_name() {
             assert_eq!(origin.hits(), hits, "{url} was answered from the cache");
         }
     }
-    assert_eq!(entries(&net), 0, "an entry was written");
+    assert_eq!(entries(&net).await, 0, "an entry was written");
     assert_eq!(
         on_disk(dir.path()),
         0,
@@ -110,7 +113,7 @@ async fn an_answer_from_ipv6_loopback_is_not_stored() {
         let (source, _) = fetch(&net, FetchRequest::get(&url)).await;
         assert_eq!((source, origin.hits()), (Source::Origin, n));
     }
-    assert_eq!(entries(&net), 0);
+    assert_eq!(entries(&net).await, 0);
 }
 
 /// The same origin, with the rule off: the second fetch is a hit. Without
@@ -123,7 +126,7 @@ async fn without_the_rule_the_same_answer_is_stored() {
     let url = origin.url("/kept");
     assert_eq!(fetch(&net, FetchRequest::get(&url)).await.0, Source::Origin);
     assert_eq!(fetch(&net, FetchRequest::get(&url)).await.0, Source::Cache);
-    assert_eq!((origin.hits(), entries(&net)), (1, 1));
+    assert_eq!((origin.hits(), entries(&net).await), (1, 1));
 }
 
 #[tokio::test]
@@ -146,7 +149,7 @@ async fn a_body_checked_against_its_declared_integrity_is_not_stored_either() {
         assert_eq!(&body[..], b"checked");
         assert_eq!((source, origin.hits()), (Source::PassThrough, n));
     }
-    assert_eq!(entries(&net), 0);
+    assert_eq!(entries(&net).await, 0);
 }
 
 /// An entry stored when the rule was off (as a public answer would be), then
@@ -174,7 +177,7 @@ async fn a_revalidation_from_loopback_is_not_recorded() {
     {
         let net = net(dir.path(), false);
         assert_eq!(fetch(&net, FetchRequest::get(&url)).await.0, Source::Origin);
-        assert_eq!(entries(&net), 1);
+        assert_eq!(entries(&net).await, 1);
     }
     let net = net(dir.path(), true);
     let (source, body) = fetch(&net, FetchRequest::get(&url)).await;
@@ -213,6 +216,9 @@ async fn a_background_refresh_from_loopback_is_not_recorded() {
     {
         let net = net(dir.path(), false);
         fetch(&net, FetchRequest::get(&url)).await;
+        // Its entry, written just after the body ends, before the cache is
+        // opened again.
+        net.landed().await;
     }
     let net = net(dir.path(), true);
     for round in 1..=2 {
@@ -260,7 +266,7 @@ async fn clearing_keeps_out_a_body_that_was_still_arriving() {
     let net = net(dir.path(), false);
     let earlier = Origin::start(Arc::new(|_, _| respond(200, CACHEABLE, b"earlier"))).await;
     fetch(&net, FetchRequest::get(earlier.url("/earlier"))).await;
-    assert_eq!(entries(&net), 1);
+    assert_eq!(entries(&net).await, 1);
 
     let response = net
         .fetch(FetchRequest::get(origin.url("/arriving")))
@@ -277,12 +283,16 @@ async fn clearing_keeps_out_a_body_that_was_still_arriving() {
     }
     assert_eq!(&rest[..], b" second", "the body is passed on whole");
     assert_eq!(
-        entries(&net),
+        entries(&net).await,
         0,
         "a body asked for before the clear was stored"
     );
     assert_eq!(on_disk(dir.path()), 0);
 
     fetch(&net, FetchRequest::get(earlier.url("/after"))).await;
-    assert_eq!(entries(&net), 1, "the cache stores again after a clear");
+    assert_eq!(
+        entries(&net).await,
+        1,
+        "the cache stores again after a clear"
+    );
 }

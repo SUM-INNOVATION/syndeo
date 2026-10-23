@@ -53,6 +53,36 @@
 //                                a person would; exits 1 if there is no such item
 //   appctl popup-items <pid> <id>     open that pop-up, print each item's title, one a
 //                                line, and close it again choosing nothing
+//   appctl tabs <pid>            the front window's tabs, as its tab bar has them, in
+//                                order, one title a line, the one in front marked "* "
+//                                and the others "  "; nothing for a window with no
+//                                tab bar showing
+//   appctl ids <pid> <id>        each element outside the page, in pid's front window,
+//                                with that accessibility identifier: "role<TAB>description"
+//                                a line; exits 1 if there is none
+//   appctl click-web <pid> <text> <keys> <button>   click the first link in the front
+//                                window's page whose text contains <text>, with the mouse,
+//                                at its middle, holding <keys> (none, or cmd, shift and
+//                                option joined by +), with <button> (left or middle)
+//   appctl keys <pid> <key> <keys>    bring pid to the front and press <key> (a digit,
+//                                a letter, [, ], \ or escape) holding <keys>, as above
+//   appctl menu-dump <pid> <menu>    each item of that menu, one a line:
+//                                "title<TAB>key<TAB>modifiers<TAB>enabled"
+//   appctl id-tree <pid>         each element outside the page in pid's front window
+//                                that has an accessibility identifier: "role<TAB>identifier"
+//   appctl tab-press <pid> <index>    press the front window's tab <index>, counted from 1,
+//                                as a click on it would; exits 1 if there is no such tab
+//   appctl menu-enabled <pid> <menu> <item>   "enabled" or "disabled", for that menu
+//                                item, read with its menu open, as a person sees it;
+//                                exits 1 if there is no such item
+//   appctl submenu-items <pid> <menu> <item>   the title of each item in that item's
+//                                menu, one a line
+//   appctl submenu <pid> <menu> <item> <title>   press that item's menu's item <title>
+//   appctl tab-menu <pid> <index> [<title>]   a secondary click on the front window's
+//                                tab <index>, counted from 1, as a person makes it; print
+//                                each item of the menu it opens, one a line, then press
+//                                <title>, or close it choosing nothing; exits 1 if no menu
+//                                opened, or there is no such item
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -151,6 +181,112 @@ func key(_ pid: Int32, _ code: CGKeyCode, _ text: String) {
         usleep(30_000)
     }
 }
+
+/// The element's frame on screen, top-left origin, as CGEvent has the screen.
+func frame(of element: AXUIElement) -> CGRect? {
+    guard let position = attribute(element, kAXPositionAttribute), let size = attribute(element, kAXSizeAttribute),
+          CFGetTypeID(position) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID() else { return nil }
+    var origin = CGPoint.zero, extent = CGSize.zero
+    guard AXValueGetValue(position as! AXValue, .cgPoint, &origin), AXValueGetValue(size as! AXValue, .cgSize, &extent) else { return nil }
+    return CGRect(origin: origin, size: extent)
+}
+
+/// Keys held, from "none" or "cmd+shift+option" in any order.
+func flags(_ words: String) -> CGEventFlags {
+    var held: CGEventFlags = []
+    for word in words.split(separator: "+") {
+        switch word {
+        case "cmd": held.insert(.maskCommand)
+        case "shift": held.insert(.maskShift)
+        case "option": held.insert(.maskAlternate)
+        case "ctrl": held.insert(.maskControl)
+        default: break
+        }
+    }
+    return held
+}
+
+/// The modifier keys in `held`, each with its virtual key code.
+func modifierKeys(_ held: CGEventFlags) -> [(CGKeyCode, CGEventFlags)] {
+    [(55, .maskCommand), (56, .maskShift), (58, .maskAlternate), (59, .maskControl)].filter { held.contains($0.1) }
+}
+
+/// A click at `point`, as a person makes it: the pointer moved there, the
+/// keys in `held` pressed, the button down and up, and the keys let go.
+func click(_ point: CGPoint, _ button: CGMouseButton, _ held: CGEventFlags) {
+    let source = CGEventSource(stateID: .hidSystemState)
+    CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?
+        .post(tap: .cghidEventTap)
+    usleep(150_000)
+    var down: CGEventFlags = []
+    for (code, flag) in modifierKeys(held) {
+        down.insert(flag)
+        let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true)
+        event?.flags = down
+        event?.post(tap: .cghidEventTap)
+        usleep(50_000)
+    }
+    defer {
+        for (code, flag) in modifierKeys(held).reversed() {
+            down.remove(flag)
+            let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)
+            event?.flags = down
+            event?.post(tap: .cghidEventTap)
+            usleep(50_000)
+        }
+    }
+    let (pressed, released): (CGEventType, CGEventType) = switch button {
+    case .left: (.leftMouseDown, .leftMouseUp)
+    case .right: (.rightMouseDown, .rightMouseUp)
+    default: (.otherMouseDown, .otherMouseUp)
+    }
+    for type in [pressed, released] {
+        guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else { continue }
+        event.flags = held
+        event.setIntegerValueField(.mouseEventClickState, value: 1)
+        event.post(tap: .cghidEventTap)
+        usleep(80_000)
+    }
+}
+
+/// Each element under `element` matching, not looking inside pages.
+func all(_ element: AXUIElement, depth: Int, _ matches: (AXUIElement) -> Bool) -> [AXUIElement] {
+    var found = matches(element) ? [element] : []
+    guard depth > 0, (attribute(element, kAXRoleAttribute) as? String) != "AXWebArea" else { return found }
+    for child in children(element) {
+        found += all(child, depth: depth - 1, matches)
+    }
+    return found
+}
+
+/// The front window's tab bar's tabs, in order.
+func tabButtons(_ pid: Int32) -> [AXUIElement] {
+    guard let window = frontWindow(of: pid),
+          let bar = all(window, depth: 6, { (attribute($0, kAXRoleAttribute) as? String) == "AXTabGroup" }).first else { return [] }
+    return children(bar).filter { (attribute($0, kAXRoleAttribute) as? String) == "AXRadioButton" }
+}
+
+/// The menu open in pid now, if one is: a context menu, under the application.
+func openMenu(_ pid: Int32) -> (AXUIElement, [AXUIElement])? {
+    let app = AXUIElementCreateApplication(pid)
+    for _ in 0..<30 {
+        for menu in all(app, depth: 3, { (attribute($0, kAXRoleAttribute) as? String) == "AXMenu" }) {
+            // Not one of the menu bar's.
+            if let parent = asElement(attribute(menu, kAXParentAttribute)),
+               (attribute(parent, kAXRoleAttribute) as? String) == "AXMenuBarItem" { continue }
+            let items = children(menu).filter { (attribute($0, kAXRoleAttribute) as? String) == "AXMenuItem" }
+            if !items.isEmpty { return (menu, items) }
+        }
+        usleep(100_000)
+    }
+    return nil
+}
+
+/// The virtual key code of `key` on a US keyboard, as the runner has.
+let keyCodes: [String: CGKeyCode] = [
+    "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25, "0": 29,
+    "t": 17, "w": 13, "d": 2, "l": 37, "[": 33, "]": 30, "\\": 42, "escape": 53,
+]
 
 /// The items of the menu bar item `menu`.
 func menuItems(_ pid: Int32, _ menu: String) -> [AXUIElement] {
@@ -377,6 +513,123 @@ case "popup-items" where args.count == 4:
         print(oneLine(attribute(item, kAXTitleAttribute)))
     }
     // Closed by Cancel, or by Escape if the menu does not take Cancel.
+    if AXUIElementPerformAction(menu, kAXCancelAction as CFString) != .success {
+        key(pid, 53, "\u{1b}")
+    }
+case "tabs" where args.count == 3:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    for tab in tabButtons(pid) {
+        let front = (attribute(tab, kAXValueAttribute) as? Int) == 1
+        print("\(front ? "* " : "  ")\(oneLine(attribute(tab, kAXTitleAttribute)))")
+    }
+case "ids" where args.count == 4:
+    guard let pid = Int32(args[2]), let window = frontWindow(of: pid) else { exit(2) }
+    let found = all(window, depth: 24) { (attribute($0, "AXIdentifier") as? String) == args[3] }
+    for element in found {
+        print("\(attribute(element, kAXRoleAttribute) as? String ?? "?")\t\(oneLine(attribute(element, kAXDescriptionAttribute)))")
+    }
+    exit(found.isEmpty ? 1 : 0)
+case "click-web" where args.count == 6:
+    guard let pid = Int32(args[2]), activate(pid), let window = frontWindow(of: pid),
+          let page = find(window, depth: 12, { (attribute($0, kAXRoleAttribute) as? String) == "AXWebArea" }) else { exit(1) }
+    let link = find(page, depth: 24) {
+        (attribute($0, kAXRoleAttribute) as? String) == "AXLink" && text(of: $0).contains(args[3])
+    }
+    guard let link, let box = frame(of: link) else { exit(1) }
+    let button: CGMouseButton = args[5] == "middle" ? .center : .left
+    click(CGPoint(x: box.midX, y: box.midY), button, flags(args[4]))
+case "keys" where args.count == 5:
+    // As a person presses them, through the system's own event stream: the
+    // keys held pressed first and let go last, so the application sees a
+    // shortcut, not a character.
+    guard let pid = Int32(args[2]), let code = keyCodes[args[3]] else { exit(2) }
+    guard activate(pid) else { print("not frontmost"); exit(1) }
+    let source = CGEventSource(stateID: .hidSystemState)
+    let held = flags(args[4])
+    var down: CGEventFlags = []
+    for (modifier, flag) in modifierKeys(held) {
+        down.insert(flag)
+        let event = CGEvent(keyboardEventSource: source, virtualKey: modifier, keyDown: true)
+        event?.flags = down
+        event?.post(tap: .cghidEventTap)
+        usleep(50_000)
+    }
+    for pressed in [true, false] {
+        let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: pressed)
+        event?.flags = held
+        event?.post(tap: .cghidEventTap)
+        usleep(50_000)
+    }
+    for (modifier, flag) in modifierKeys(held).reversed() {
+        down.remove(flag)
+        let event = CGEvent(keyboardEventSource: source, virtualKey: modifier, keyDown: false)
+        event?.flags = down
+        event?.post(tap: .cghidEventTap)
+        usleep(50_000)
+    }
+case "menu-enabled" where args.count == 5:
+    // Opened first, as a person opens it, so AppKit asks the application
+    // which of its items it offers now; then closed again.
+    guard let pid = Int32(args[2]), activate(pid),
+          let bar = asElement(attribute(AXUIElementCreateApplication(pid), kAXMenuBarAttribute)),
+          let top = children(bar).first(where: { oneLine(attribute($0, kAXTitleAttribute)) == args[3] }) else { exit(1) }
+    _ = AXUIElementPerformAction(top, kAXPressAction as CFString)
+    usleep(400_000)
+    let item = menuItem(pid, args[3], args[4])
+    let enabled = item.map { (attribute($0, kAXEnabledAttribute) as? Bool) == true }
+    let closed = children(top).first.map { AXUIElementPerformAction($0, kAXCancelAction as CFString) == .success } ?? false
+    if !closed {
+        key(pid, 53, "\u{1b}")
+    }
+    guard let enabled else { exit(1) }
+    print(enabled ? "enabled" : "disabled")
+case "menu-dump" where args.count == 4:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    for item in menuItems(pid, args[3]) {
+        let modifiers = (attribute(item, kAXMenuItemCmdModifiersAttribute) as? Int).map(String.init) ?? "?"
+        let enabled = (attribute(item, kAXEnabledAttribute) as? Bool) == true ? "enabled" : "disabled"
+        print("\(oneLine(attribute(item, kAXTitleAttribute)))\t\(oneLine(attribute(item, kAXMenuItemCmdCharAttribute)))\t\(modifiers)\t\(enabled)")
+    }
+case "id-tree" where args.count == 3:
+    guard let pid = Int32(args[2]), let window = frontWindow(of: pid) else { exit(1) }
+    for element in all(window, depth: 24, { attribute($0, "AXIdentifier") != nil }) {
+        print("\(attribute(element, kAXRoleAttribute) as? String ?? "?")\t\(oneLine(attribute(element, "AXIdentifier")))")
+    }
+case "tab-press" where args.count == 4:
+    guard let pid = Int32(args[2]), let index = Int(args[3]) else { exit(2) }
+    let tabs = tabButtons(pid)
+    guard index >= 1, index <= tabs.count else { print("no tab \(args[3]) of \(tabs.count)"); exit(1) }
+    exit(AXUIElementPerformAction(tabs[index - 1], kAXPressAction as CFString) == .success ? 0 : 1)
+case "submenu-items" where args.count == 5:
+    guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
+    for entry in children(item).flatMap({ children($0) }) {
+        print(oneLine(attribute(entry, kAXTitleAttribute)))
+    }
+case "submenu" where args.count == 6:
+    guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
+    guard let entry = children(item).flatMap({ children($0) })
+        .first(where: { oneLine(attribute($0, kAXTitleAttribute)) == args[5] }) else { exit(1) }
+    exit(AXUIElementPerformAction(entry, kAXPressAction as CFString) == .success ? 0 : 1)
+case "tab-menu" where args.count == 4 || args.count == 5:
+    guard let pid = Int32(args[2]), let index = Int(args[3]), activate(pid) else { exit(1) }
+    let tabs = tabButtons(pid)
+    guard index >= 1, index <= tabs.count, let box = frame(of: tabs[index - 1]) else {
+        print("no tab \(args[3]) of \(tabs.count)")
+        exit(1)
+    }
+    // Left of the middle, away from the tab's close button and its badge.
+    click(CGPoint(x: box.minX + box.width * 0.4, y: box.midY), .right, [])
+    guard let (menu, items) = openMenu(pid) else { print("no menu opened"); exit(1) }
+    for item in items {
+        print(oneLine(attribute(item, kAXTitleAttribute)))
+    }
+    if args.count == 5 {
+        guard let item = items.first(where: { oneLine(attribute($0, kAXTitleAttribute)) == args[4] }) else {
+            _ = AXUIElementPerformAction(menu, kAXCancelAction as CFString)
+            exit(1)
+        }
+        exit(AXUIElementPerformAction(item, kAXPressAction as CFString) == .success ? 0 : 1)
+    }
     if AXUIElementPerformAction(menu, kAXCancelAction as CFString) != .success {
         key(pid, 53, "\u{1b}")
     }

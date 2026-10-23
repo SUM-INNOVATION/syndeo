@@ -73,9 +73,45 @@ Type in the address field and press Return:
 
 The menus are a Mac application's. File has New Tab (⌘T), New Window (⌘N),
 Open Location… (⌘L) and Close (⌘W); View has Reload Page (⌘R) and Stop
-Loading (⌘.); History has Back (⌘[) and Forward (⌘]). Tabs are the ones
-macOS draws. Closing the last window leaves Syndeo running, as Mac
-applications do, until you quit it (⌘Q).
+Loading (⌘.); History has Back (⌘[) and Forward (⌘]). Closing the last
+window leaves Syndeo running, as Mac applications do, until you quit it (⌘Q).
+
+### Tabs
+
+Tabs are the ones macOS draws, with what a browser adds to them:
+
+- **Opening links in tabs.** ⌘-click a link, or click it with the middle
+  button, to open it in a new tab behind the one you are on; add ⇧ to open
+  it in front. ⌘⌥-click opens it in a new window. A link to an address no
+  window may show (`file:` and the rest) opens nothing, as clicking it does.
+- **Choosing a tab.** ⌘1 to ⌘8 show that tab, and ⌘9 the last. Window >
+  Show Next Tab and Show Previous Tab, and the tab bar itself, work as in
+  any Mac application.
+- **The tab bar** shows each tab's page title, an hourglass while its page
+  loads, and the icon the page names. Syndeo fetches that icon through the
+  page itself, so through its proxy like everything else on the page; it does
+  not ask a site for `/favicon.ico` when the page names no icon.
+- **A tab's own menu.** Control-click or right-click a tab for Duplicate Tab,
+  Pin Tab, Close Tab, Close Other Tabs, Move Tab to New Window and Show All
+  Tabs. Duplicate Tab and Pin Tab are in the Window menu too, and Close Other
+  Tabs in File (⌥⌘W, with ⌥ held).
+- **Pinned tabs** stay first in their window and come back every time Syndeo
+  opens. A pinned tab closes only when it is the tab in front (⌘W), or from
+  its own menu's Close Tab: Close Other Tabs, and closing its window, leave it
+  open.
+- **Closed tabs.** History > Reopen Last Closed Tab (⇧⌘T) opens the last tab
+  you closed again, with its back and forward history; History > Recently
+  Closed lists the last 25 by title. They are kept in memory only, until
+  Syndeo quits.
+- **Show All Tabs** (View, `⇧⌘\`) is macOS's overview of a window's tabs.
+- **Tabs after a relaunch.** When Syndeo quits, it keeps the address and
+  title of each open tab, and which are pinned, in
+  `~/Library/Application Support/Syndeo/session.txt`, readable by you alone.
+  If macOS is set to keep windows when an application quits (System
+  Settings > Desktop & Dock > "Close windows when quitting an application"
+  off), every tab comes back when Syndeo opens again; otherwise pinned tabs
+  come back, and History > Reopen All Windows from Last Session brings back
+  the rest. A tab opens its page when you first show it.
 
 Syndeo is a web browser to macOS: it can be chosen as the default web
 browser (System Settings > Desktop & Dock), and another application can ask
@@ -122,8 +158,9 @@ loading first, so a page still arriving cannot put back what was cleared.
 Settings says when both are done; if Syndeo's cache could not be emptied, it
 says so, and how to try again.
 
-It leaves the search engine chosen, and Syndeo's certificate authority
-(below), as they are.
+It also forgets recently closed tabs and the tabs kept from when Syndeo last
+quit (above). It leaves the search engine chosen, and Syndeo's certificate
+authority (below), as they are.
 
 ### WebSockets and WebRTC
 
@@ -857,6 +894,18 @@ Same page, same interval, both sides sampled rather than snapshotted:
 | rust-lang.org | Syndeo | Safari |
 | --- | --- | --- |
 | WebContent | 43.6 MB | 46.2 MB |
+
+**Per tab, in Syndeo.app.** Each tab is a web view of its own, with a
+WebContent process of its own. With the same small page through Syndeo in
+one tab and then in five, sampled four times over the same interval on a CI
+runner (`ci/test-app.sh tabs`, run 39695773041):
+
+| Syndeo.app | one tab | five tabs | each tab past the first |
+| --- | --- | --- | --- |
+| the app's own process | 68 MB | 77 MB | +2.2 MB |
+| WebContent | 35 MB, 1 process | 180 MB, 5 processes | +36.5 MB, 1 process |
+
+A heavier page costs its WebContent process what it costs Safari (above).
 
 The engine costs what Safari's engine costs, because it *is* Safari's engine;
 the difference is the host process, where ours is smaller. Safari's fixed

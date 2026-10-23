@@ -14,11 +14,15 @@ mod browser_macos;
 mod chrome_macos;
 #[cfg(target_os = "macos")]
 mod settings_macos;
+#[cfg(target_os = "macos")]
+mod tabs_macos;
 // Plain Rust, and used only by the macOS application; tested everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod address;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod passkeys;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod tabs;
 
 #[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
