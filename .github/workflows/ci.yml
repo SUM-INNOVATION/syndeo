@@ -441,15 +441,6 @@ jobs:
           printf '  %s\n' "${results[@]}"
           [ "$wrong" = 0 ]
 
-      # Tabs: links opened in tabs by ⌘ and the middle button, ⌘1 to ⌘9,
-      # icons and loading in the tab bar, Duplicate, Pin, a tab's own menu,
-      # Close Other Tabs, closed tabs opened again, Show All Tabs, the session
-      # kept at quit and opened again, and Clear Browsing Data forgetting it;
-      # memory per tab measured, not gated.
-      - name: Tabs, and the session kept between launches
-        if: always()
-        run: bash ci/test-app.sh tabs "$PWD/dist/Syndeo.app"
-
       # The route bar, gated against what WebKit actually does: each address
       # typed, from a fresh WebKit state and with a fresh token. For Direct
       # and Through Syndeo, the way WebKit went (by which process the origin
@@ -471,14 +462,6 @@ jobs:
       - name: WebSockets through Syndeo, and WebRTC around it, as the start page says
         if: always()
         run: bash ci/test-app.sh realtime "$PWD/dist/Syndeo.app"
-
-      # Its controls in the toolbar and browsing, in light appearance and in
-      # dark, the runner's own, put back as it was; pictures of the start
-      # page, a page through Syndeo, a Direct page, Syndeo's own page and
-      # Settings in each, kept with the logs as looks-*.png.
-      - name: Its look, light and dark, with pictures kept with the logs
-        if: always()
-        run: bash ci/test-app.sh looks "$PWD/dist/Syndeo.app"
 
       # Pages in WebKit by itself and through this tree's proxy, as Syndeo.app
       # runs it, cold and warm, interleaved run by run: first contentful
@@ -564,7 +547,8 @@ jobs:
     # person gives it; the agent's pages in tabs of its own, through Syndeo's
     # proxy and pinned, saying who controls them; reading, acting, a
     # screenshot, JavaScript only with its own leave; Stop and Revoke All;
-    # MCP; and root refused. ci/test-app.sh agents says each check.
+    # MCP; and root refused. ci/test-app.sh agents says each check. Then the
+    # agents' mutants, and tabs and its look, light and dark.
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -646,6 +630,26 @@ jobs:
           printf '\nmutants:\n'
           printf '  %s\n' "${results[@]}"
           [ "$wrong" = 0 ]
+
+      # Moved here from macos-app, whose time neared its 60 minutes (CI
+      # 39909638505: 51m31s), as its agents' mutants were: they need only
+      # the Syndeo.app this job assembles as macos-app does.
+      # Tabs: links opened in tabs by ⌘ and the middle button, ⌘1 to ⌘9,
+      # icons and loading in the tab bar, Duplicate, Pin, a tab's own menu,
+      # Close Other Tabs, closed tabs opened again, Show All Tabs, the session
+      # kept at quit and opened again, and Clear Browsing Data forgetting it;
+      # memory per tab measured, not gated.
+      - name: Tabs, and the session kept between launches
+        if: always()
+        run: bash ci/test-app.sh tabs "$PWD/dist/Syndeo.app"
+
+      # Its controls in the toolbar and browsing, in light appearance and in
+      # dark, the runner's own, put back as it was; pictures of the start
+      # page, a page through Syndeo, a Direct page, Syndeo's own page and
+      # Settings in each, kept with the logs as looks-*.png.
+      - name: Its look, light and dark, with pictures kept with the logs
+        if: always()
+        run: bash ci/test-app.sh looks "$PWD/dist/Syndeo.app"
 
       - name: Keep the logs
         if: always()
