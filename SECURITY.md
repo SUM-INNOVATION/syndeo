@@ -123,6 +123,14 @@ welcome as a second opinion; they are not treated as new.
   configuration, not by a sandbox.** Their web views are configured to send
   their traffic through the proxy, with the proxy's certificate pinned.
   Anything WebKit does not send through that setting is not covered by it.
+  Syndeo.app takes out of that setting, for the rest of the session, each
+  host macOS refuses through the proxy
+  ([#58](https://github.com/SUM-INNOVATION/syndeo/issues/58)): on macOS 15
+  and earlier the sites on its built-in HSTS preload list, such as
+  github.com, and on every macOS Apple's own, such as www.apple.com. Those
+  go directly, with macOS's own certificate checks rather than the pin, and
+  nothing from them is cached; the address field says Direct for a page
+  from one.
   WebKit was seen to send requests for localhost and loopback addresses
   directly, never to the proxy, so a page in it can reach local services
   without the proxy seeing the request. WebRTC was measured connecting
