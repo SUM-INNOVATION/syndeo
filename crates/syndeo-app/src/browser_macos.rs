@@ -14,8 +14,16 @@
 //!   from then on and loads the page again, once (#58); a host sent directly
 //!   gets macOS's own trust, and the bar says Direct for a page from one.
 //! - **Its UI delegate.** A page that asks for a new window gets a new tab,
-//!   made the way every other is, never a web view WebKit made for it.
-//! - **The window's delegate**, so a window that closes is let go.
+//!   made the way every other is, never a web view WebKit made for it. A
+//!   link followed with ⌘ or the middle button opens in a tab the same way,
+//!   behind this one, or in front with ⇧, and with ⌘⌥ in a new window
+//!   (`tabs::opening`), but only to an address a window may show.
+//! - **The window's delegate**, so a window that closes is let go, and kept
+//!   as a closed tab (`Snapshot`) to open again; and a tab from the last
+//!   session opens its page when it is first shown.
+//!
+//! It also keeps its tab's badge (`tabs_macos::Badge`) in step: pinned, a
+//! page loading, and the page's icon.
 //!
 //! Menu items with no target reach it through the responder chain, so Back,
 //! Forward, Reload, Stop and Open Location work on the window in front, and
@@ -23,6 +31,8 @@
 //! so they are disabled there.
 
 use crate::address::{self, Route, Search, Typed};
+use crate::tabs;
+use crate::tabs_macos::{self, Badge};
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{
@@ -30,17 +40,18 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAccessibility, NSAutoresizingMaskOptions, NSButton, NSColor, NSControlSize,
-    NSControlTextEditingDelegate, NSFont, NSImage, NSMenuItem, NSMenuItemValidation,
-    NSProgressIndicator, NSProgressIndicatorStyle, NSTextAlignment, NSTextField,
-    NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate,
+    NSControlTextEditingDelegate, NSEventModifierFlags, NSFont, NSImage, NSMenuItem,
+    NSMenuItemValidation, NSProgressIndicator, NSProgressIndicatorStyle, NSTextAlignment,
+    NSTextField, NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
-    ns_string, NSError, NSNotification, NSNumber, NSPoint, NSProcessInfo, NSRect, NSSize, NSString,
+    ns_string, NSError, NSKeyValueObservingOptions, NSNotification, NSNumber,
+    NSObjectNSKeyValueObserverRegistration, NSPoint, NSProcessInfo, NSRect, NSSize, NSString,
     NSURLAuthenticationChallenge, NSURLRequest, NSURL,
 };
 use objc2_web_kit::{
-    WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKUIDelegate,
-    WKWebView, WKWebViewConfiguration, WKWindowFeatures,
+    WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
+    WKNavigationType, WKUIDelegate, WKWebView, WKWebViewConfiguration, WKWindowFeatures,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -52,18 +63,71 @@ pub const BAR: f64 = 36.0;
 /// The width of the bar's route, at its right, before the spinner.
 const ROUTE_WIDTH: f64 = 190.0;
 
-/// Open a tab beside a window: a page's request, or the start page.
-pub type OpenTab = Box<dyn Fn(&NSWindow, Option<Retained<NSURLRequest>>)>;
+/// How a new tab starts.
+pub enum Start {
+    /// With the start page.
+    Page,
+    /// With a page's request.
+    Request(Retained<NSURLRequest>),
+    /// As a tab that was closed, or is being duplicated, was.
+    Again(Snapshot),
+    /// A tab from the last session: its address and title, its page opened
+    /// when the tab is first shown.
+    Later { address: String, title: String },
+}
+
+/// Where a new tab goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// After the tab it is opened from, and in front.
+    Front,
+    /// After the tab it is opened from, and any it opened behind it since,
+    /// with that tab kept in front.
+    Behind,
+    /// A window of its own.
+    Window,
+}
+
+impl Place {
+    fn of(opening: tabs::Opening) -> Option<Place> {
+        match opening {
+            tabs::Opening::Here => None,
+            tabs::Opening::Tab { front: true } => Some(Place::Front),
+            tabs::Opening::Tab { front: false } => Some(Place::Behind),
+            tabs::Opening::Window => Some(Place::Window),
+        }
+    }
+}
+
+/// A tab, as it was when it was closed or duplicated.
+pub struct Snapshot {
+    /// Its page's address, the address that failed to open, or nothing for
+    /// the start page.
+    pub address: String,
+    pub title: String,
+    pub pinned: bool,
+    /// WebKit's own record of its history, for a web page, kept in memory
+    /// and never written anywhere.
+    state: Option<Retained<AnyObject>>,
+}
+
+/// Open a tab: from `parent`, after `after`, starting as `Start` says and
+/// placed as `Place` says. The new tab's window, if one was made.
+pub type OpenTab = Box<dyn Fn(&NSWindow, &NSWindow, Start, Place) -> Option<Retained<NSWindow>>>;
+
+/// A window is closing, as the tab in the snapshot, if it browsed.
+pub type OnClosed = Box<dyn Fn(&NSWindow, Option<Snapshot>)>;
 
 /// Send hosts around the proxy, directly; whether that took effect.
 pub type SendDirect = Box<dyn Fn(&[String]) -> bool>;
 
 /// What a controller asks of the application.
 pub struct Hooks {
-    /// Open a tab beside `window`: `request`, or the start page.
+    /// Open a tab beside a window.
     pub open_tab: OpenTab,
-    /// `window` is closing; let it go.
-    pub closed: Box<dyn Fn(&NSWindow)>,
+    /// `window` is closing, as the tab in the snapshot, if it browsed; let
+    /// it go.
+    pub closed: OnClosed,
     /// The start page's HTML.
     pub start_page: Box<dyn Fn() -> String>,
     /// The search engine chosen in Settings, as it is now.
@@ -119,6 +183,20 @@ pub struct Ivars {
     /// Someone has typed in the address field, and has not yet pressed
     /// Return or left it.
     typing: Cell<bool>,
+    /// The tab is pinned.
+    pinned: Cell<bool>,
+    /// A tab from the last session not yet shown: its address and title.
+    later: RefCell<Option<(String, String)>>,
+    /// The tab's badge.
+    badge: RefCell<Option<Badge>>,
+    /// The page's icon was looked for and not found: found again when the
+    /// tab is shown.
+    icon_missed: Cell<bool>,
+    /// Which page is on screen, counted, so that an icon found for one page
+    /// is never shown for the next.
+    page: Cell<u64>,
+    /// The last tab this one opened behind itself, after which the next goes.
+    behind: RefCell<Option<Weak<NSWindow>>>,
     /// The hosts this window vouched for most recently, the latest last:
     /// their certificates came from Syndeo's own proxy. At most [`VOUCHED`].
     /// Not emptied when a navigation starts: WebKit's networking can ask
@@ -127,7 +205,7 @@ pub struct Ivars {
     vouched: RefCell<Vec<String>>,
     /// The hosts whose certificates this window refused most recently
     /// because macOS pins them itself, the latest last. At most [`VOUCHED`].
-    pinned: RefCell<Vec<String>>,
+    macos_pinned: RefCell<Vec<String>>,
     /// The page this window last loaded again with hosts sent directly. It
     /// is not loaded again for that, ever, until another page starts.
     retried: RefCell<Option<String>>,
@@ -202,7 +280,7 @@ define_class!(
                 if judged.disposition == USE_CREDENTIAL {
                     remember(&self.ivars().vouched, host);
                 } else if judged.pinned_by_macos {
-                    remember(&self.ivars().pinned, host);
+                    remember(&self.ivars().macos_pinned, host);
                 }
             }
             handler.call((judged.disposition, judged.credential));
@@ -221,6 +299,16 @@ define_class!(
             let target = address_of(&request);
             // Refused wherever it would load, as typing it is.
             let zoned = address::has_zone(&target);
+            // A link followed with ⌘ or the middle button: elsewhere, as a
+            // new tab is made, or, for an address no tab may show, here,
+            // where it is refused as any other.
+            if let Some(place) = Place::of(tabs::opening(click_of(action))) {
+                if !zoned && self.open_beside(request.clone(), place) {
+                    self.ivars().refused.set(main_frame);
+                    handler.call((WKNavigationActionPolicy::Cancel,));
+                    return;
+                }
+            }
             let allowed = (!main_frame || address::allowed_in_main_frame(&scheme)) && !zoned;
             if !allowed && main_frame {
                 self.ivars().refused.set(true);
@@ -243,11 +331,18 @@ define_class!(
             }
             drop(retried);
             self.ivars().loading.set(true);
+            // Tabs this one opens behind it from the next page go after it.
+            self.ivars().behind.borrow_mut().take();
             self.refresh();
         }
 
         #[unsafe(method(webView:didCommitNavigation:))]
         fn did_commit(&self, _webview: &WKWebView, _navigation: Option<&WKNavigation>) {
+            // Another page: the last one's icon goes, and any still coming.
+            self.ivars().page.set(self.ivars().page.get() + 1);
+            if let Some(badge) = &*self.ivars().badge.borrow() {
+                badge.set_icon(None);
+            }
             self.refresh_address();
             self.refresh();
         }
@@ -259,6 +354,7 @@ define_class!(
             // may not be committed anew.
             self.refresh_address();
             self.refresh();
+            self.find_icon();
             self.send_refused_parts_direct(false);
         }
 
@@ -295,11 +391,7 @@ define_class!(
             _features: &WKWindowFeatures,
         ) -> *mut WKWebView {
             let request = unsafe { action.request() };
-            if address::allowed_in_main_frame(&scheme_of(&request)) {
-                if let (Some(window), Some(hooks)) = (self.window(), self.hooks()) {
-                    (hooks.open_tab)(&window, Some(request));
-                }
-            }
+            self.open_beside(request, Place::Front);
             std::ptr::null_mut()
         }
     }
@@ -307,20 +399,51 @@ define_class!(
     unsafe impl NSWindowDelegate for BrowserController {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, notification: &NSNotification) {
+            // As it was, to open again, before anything of it goes.
+            let snapshot = self.snapshot();
             // Taken out first: stopping may call back into this controller,
             // which then finds no web view and leaves it alone.
             let web = self.ivars().web.borrow_mut().take();
             if let Some(web) = web {
                 unsafe {
+                    web.view.removeObserver_forKeyPath(self, ns_string!("title"));
                     web.view.stopLoading();
                     web.view.setNavigationDelegate(None);
                     web.view.setUIDelegate(None);
                 }
             }
             let window = notification.object().and_then(|object| object.downcast::<NSWindow>().ok());
-            if let (Some(window), Some(hooks)) = (window, self.hooks()) {
-                (hooks.closed)(&window);
+            if let (Some(window), Some(badge)) = (&window, self.ivars().badge.borrow_mut().take()) {
+                badge.detach(window);
             }
+            if let (Some(window), Some(hooks)) = (window, self.hooks()) {
+                (hooks.closed)(&window, snapshot);
+            }
+        }
+
+        /// A tab is shown: one from the last session opens its page now;
+        /// one opened behind finds its page's icon, which WebKit does not
+        /// draw for a page never shown.
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn window_did_become_key(&self, _notification: &NSNotification) {
+            let later = self.ivars().later.borrow_mut().take();
+            if let Some((address, _)) = later {
+                self.go(&address);
+            } else if self.ivars().icon_missed.get() && !self.ivars().loading.get() {
+                self.find_icon();
+            }
+        }
+
+        /// A pinned tab closes only from itself, in front: not with Close
+        /// Other Tabs, AppKit's or this one's, nor with the rest of its
+        /// window, which AppKit closes by asking each tab in turn.
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, sender: &NSWindow) -> bool {
+            let keep = self.ivars().pinned.get() && !sender.isKeyWindow();
+            if keep {
+                tracing::info!("a pinned tab kept open");
+            }
+            !keep
         }
     }
 
@@ -353,7 +476,7 @@ define_class!(
     unsafe impl NSMenuItemValidation for BrowserController {
         #[unsafe(method(validateMenuItem:))]
         fn validate_menu_item(&self, item: &NSMenuItem) -> bool {
-            self.offers(item.action())
+            self.validate(item)
         }
     }
 
@@ -423,11 +546,105 @@ define_class!(
         #[unsafe(method(newWindowForTab:))]
         fn new_window_for_tab(&self, _sender: Option<&AnyObject>) {
             if let (Some(window), Some(hooks)) = (self.window(), self.hooks()) {
-                (hooks.open_tab)(&window, None);
+                (hooks.open_tab)(&window, &window, Start::Page, Place::Front);
+            }
+        }
+
+        /// Window > Duplicate Tab: a tab after this one, as this one is,
+        /// history and all, and not pinned.
+        #[unsafe(method(syndeoDuplicateTab:))]
+        fn duplicate_tab(&self, _sender: Option<&AnyObject>) {
+            if let (Some(window), Some(hooks), Some(snapshot)) = (self.window(), self.hooks(), self.snapshot()) {
+                let copy = Snapshot { pinned: false, ..snapshot };
+                (hooks.open_tab)(&window, &window, Start::Again(copy), Place::Front);
+                tracing::info!("a tab duplicated");
+            }
+        }
+
+        /// Window > Pin Tab, or Unpin Tab.
+        #[unsafe(method(syndeoTogglePin:))]
+        fn toggle_pin(&self, _sender: Option<&AnyObject>) {
+            self.set_pinned(!self.ivars().pinned.get());
+        }
+
+        /// A tab's own menu > Close Tab: that tab, pinned or not.
+        #[unsafe(method(syndeoCloseTab:))]
+        fn close_tab(&self, _sender: Option<&AnyObject>) {
+            if let Some(window) = self.window() {
+                window.close();
+            }
+        }
+
+        /// A tab's own menu > Close Other Tabs: every other tab of this
+        /// window that is not pinned.
+        #[unsafe(method(syndeoCloseOtherTabs:))]
+        fn close_other_tabs(&self, _sender: Option<&AnyObject>) {
+            let closing = self.others_to_close();
+            let tabs = self.window().map(|w| tabs_macos::tabs_of(&w).len()).unwrap_or(0);
+            tracing::info!(tabs, closing = closing.len(), "other tabs closed");
+            for window in closing {
+                window.close();
+            }
+        }
+
+        /// The page's title changed, which it may do at any time: the
+        /// window's, and so its tab's, follows it.
+        #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
+        fn observe_value(
+            &self,
+            _key_path: Option<&NSString>,
+            _object: Option<&AnyObject>,
+            _change: Option<&AnyObject>,
+            _context: *mut std::ffi::c_void,
+        ) {
+            self.refresh();
+        }
+
+        /// ⌘1 to ⌘8 show that tab, and ⌘9 the last: the item's tag is the
+        /// digit.
+        #[unsafe(method(syndeoSelectTab:))]
+        fn select_tab(&self, sender: Option<&AnyObject>) {
+            let digit = sender
+                .and_then(|s| s.downcast_ref::<NSMenuItem>())
+                .and_then(|item| usize::try_from(item.tag()).ok());
+            let (Some(window), Some(digit)) = (self.window(), digit) else {
+                return;
+            };
+            let tabs = tabs_macos::tabs_of(&window);
+            if let Some(index) = tabs::chosen_tab(digit, tabs.len()) {
+                tabs[index].makeKeyAndOrderFront(None);
             }
         }
     }
 );
+
+/// What WebKit says of a navigation, for `tabs::opening`.
+fn click_of(action: &WKNavigationAction) -> tabs::Click {
+    let kind = unsafe { action.navigationType() };
+    let keys = unsafe { action.modifierFlags() };
+    tabs::Click {
+        followed: kind == WKNavigationType::LinkActivated
+            || kind == WKNavigationType::FormSubmitted,
+        command: keys.contains(NSEventModifierFlags::Command),
+        shift: keys.contains(NSEventModifierFlags::Shift),
+        option: keys.contains(NSEventModifierFlags::Option),
+        buttons: unsafe { action.buttonNumber() },
+    }
+}
+
+/// The controller of `window`, if it is a browser window.
+pub fn controller_of(window: &NSWindow) -> Option<Retained<BrowserController>> {
+    let delegate = window.delegate()?;
+    let object: &AnyObject = (*delegate).as_ref();
+    object
+        .downcast_ref::<BrowserController>()
+        .map(|c| c.retain())
+}
+
+/// Whether `window`'s tab is pinned.
+fn pinned(window: &NSWindow) -> bool {
+    controller_of(window).is_some_and(|c| c.ivars().pinned.get())
+}
 
 /// Whether `action` is one of the window's browsing actions, which a window
 /// that cannot browse does not offer.
@@ -439,6 +656,8 @@ fn browsing_action(action: Option<Sel>) -> bool {
             sel!(reloadPage:),
             sel!(stopPage:),
             sel!(openLocation:),
+            sel!(syndeoDuplicateTab:),
+            sel!(syndeoTogglePin:),
         ]
         .contains(&a)
     })
@@ -546,7 +765,213 @@ impl BrowserController {
         *self.ivars().window.borrow_mut() = Some(Weak::from_retained(&window.retain()));
         *self.ivars().ui.borrow_mut() = Some(ui);
         *self.ivars().hooks.borrow_mut() = Some(hooks);
+        *self.ivars().badge.borrow_mut() = Some(Badge::new(self.mtm(), window));
+        if let Some(web) = &*self.ivars().web.borrow() {
+            // Removed again when the window closes.
+            unsafe {
+                web.view.addObserver_forKeyPath_options_context(
+                    self,
+                    ns_string!("title"),
+                    NSKeyValueObservingOptions::New,
+                    std::ptr::null_mut(),
+                )
+            };
+        }
         self.refresh();
+    }
+
+    /// Open `request` in a new tab, or window, beside this one, where
+    /// `place` says, made as every tab is; but only an address a window may
+    /// show. Whether it was opened.
+    fn open_beside(&self, request: Retained<NSURLRequest>, place: Place) -> bool {
+        if address::allowed_in_main_frame(&scheme_of(&request)) {
+            if let (Some(window), Some(hooks)) = (self.window(), self.hooks()) {
+                // Behind this tab, after the last it opened behind itself
+                // that is still beside it.
+                let last = self.ivars().behind.borrow().as_ref().and_then(Weak::load);
+                let after = match (place, last) {
+                    (Place::Behind, Some(last))
+                        if tabs_macos::tabs_of(&window)
+                            .iter()
+                            .any(|w| std::ptr::eq(&**w, &*last)) =>
+                    {
+                        last
+                    }
+                    _ => window.clone(),
+                };
+                let opened = (hooks.open_tab)(&window, &after, Start::Request(request), place);
+                if place == Place::Behind {
+                    *self.ivars().behind.borrow_mut() =
+                        opened.as_deref().map(|w| Weak::from_retained(&w.retain()));
+                }
+                return opened.is_some();
+            }
+        }
+        false
+    }
+
+    /// The tabs Close Other Tabs closes: every other of this window's that
+    /// is not pinned.
+    fn others_to_close(&self) -> Vec<Retained<NSWindow>> {
+        let Some(window) = self.window() else {
+            return Vec::new();
+        };
+        tabs_macos::tabs_of(&window)
+            .into_iter()
+            .filter(|w| !std::ptr::eq(&**w, &*window) && !pinned(w))
+            .collect()
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        self.ivars().pinned.get()
+    }
+
+    /// Pin the tab, or unpin it: pinned tabs come first in their window, in
+    /// the order they were pinned; one unpinned goes first after them.
+    pub fn set_pinned(&self, pin: bool) {
+        self.ivars().pinned.set(pin);
+        if let Some(badge) = &*self.ivars().badge.borrow() {
+            badge.set_pinned(pin);
+        }
+        let Some(window) = self.window() else { return };
+        let others: Vec<Retained<NSWindow>> = tabs_macos::tabs_of(&window)
+            .into_iter()
+            .filter(|w| !std::ptr::eq(&**w, &*window))
+            .collect();
+        let pinned_others = others.iter().filter(|w| pinned(w)).count();
+        if let Some(beside) = others.first() {
+            if tabs_macos::index_of(&window) != tabs::pinned_place(pinned_others) {
+                tabs_macos::place(beside, &window, tabs::pinned_place(pinned_others));
+                window.makeKeyAndOrderFront(None);
+            }
+        }
+        tracing::info!(pinned = pin, "a tab pinned or unpinned");
+    }
+
+    /// The tab as it is: what to open it again with.
+    pub fn snapshot(&self) -> Option<Snapshot> {
+        let web = self.ivars().web.borrow();
+        let web = web.as_ref()?;
+        let pinned = self.ivars().pinned.get();
+        if let Some((address, title)) = self.ivars().later.borrow().clone() {
+            return Some(Snapshot {
+                address,
+                title,
+                pinned,
+                state: None,
+            });
+        }
+        let title = unsafe { web.view.title() }
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        if let Some(address) = self.ivars().failed.borrow().clone() {
+            return Some(Snapshot {
+                address,
+                title,
+                pinned,
+                state: None,
+            });
+        }
+        let page = unsafe { web.view.URL() }
+            .and_then(|url| url.absoluteString())
+            .map(|text| text.to_string())
+            .filter(|text| tabs::savable(text));
+        Some(match page {
+            Some(address) => Snapshot {
+                address,
+                title,
+                pinned,
+                state: unsafe { web.view.interactionState() },
+            },
+            // The start page, or one of Syndeo's own.
+            None => Snapshot {
+                address: String::new(),
+                title: String::new(),
+                pinned,
+                state: None,
+            },
+        })
+    }
+
+    /// Open the tab as `snapshot` has it: its history, through the same
+    /// navigation policy as any page, or its address, as if typed, or the
+    /// start page. Pinning it again is for whoever places it.
+    pub fn restore(&self, snapshot: Snapshot) {
+        match (&*self.ivars().web.borrow(), snapshot.state) {
+            (Some(web), Some(state)) if !snapshot.address.is_empty() => {
+                unsafe { web.view.setInteractionState(Some(&state)) };
+            }
+            _ if !snapshot.address.is_empty() => self.go(&snapshot.address),
+            _ => self.show_start_page(),
+        }
+        if !snapshot.address.is_empty() {
+            self.set_shown(&snapshot.address);
+        }
+    }
+
+    /// A tab from the last session: it shows `address` and `title`, and
+    /// opens the page when it is first shown.
+    pub fn open_later(&self, address: String, title: String) {
+        self.set_shown(&address);
+        *self.ivars().later.borrow_mut() = Some((address, title));
+        self.refresh();
+    }
+
+    /// The page's icon, in the tab's badge, if the page names one.
+    fn find_icon(&self) {
+        let web = self.ivars().web.borrow();
+        let Some(web) = web.as_ref() else { return };
+        let is_web = unsafe { web.view.URL() }
+            .and_then(|url| url.scheme())
+            .is_some_and(|scheme| {
+                matches!(
+                    scheme.to_string().to_ascii_lowercase().as_str(),
+                    "http" | "https"
+                )
+            });
+        if !is_web {
+            return;
+        }
+        let page = self.ivars().page.get();
+        let me = Weak::from_retained(&self.retain());
+        tabs_macos::fetch_icon(self.mtm(), &web.view, move |icon| {
+            let Some(me) = me.load() else { return };
+            // Still the page it was found for.
+            if me.ivars().page.get() == page {
+                me.ivars().icon_missed.set(icon.is_none());
+                if let Some(badge) = &*me.ivars().badge.borrow() {
+                    badge.set_icon(icon.as_deref());
+                    tracing::info!(found = icon.is_some(), "a page's icon, for its tab");
+                }
+            }
+        });
+    }
+
+    /// Whether the window offers `item`, and its title: Pin Tab or Unpin
+    /// Tab as the tab is; ⌘1 to ⌘9 where there is such a tab; Close Other
+    /// Tabs where there is one to close; and the rest as [`Self::offers`].
+    fn validate(&self, item: &NSMenuItem) -> bool {
+        let action = item.action();
+        if action == Some(sel!(syndeoTogglePin:)) {
+            let title = if self.ivars().pinned.get() {
+                "Unpin Tab"
+            } else {
+                "Pin Tab"
+            };
+            item.setTitle(&NSString::from_str(title));
+        }
+        if action == Some(sel!(syndeoSelectTab:)) {
+            let count = self
+                .window()
+                .map(|w| tabs_macos::tabs_of(&w).len())
+                .unwrap_or(0);
+            return usize::try_from(item.tag())
+                .is_ok_and(|digit| tabs::chosen_tab(digit, count).is_some());
+        }
+        if action == Some(sel!(syndeoCloseOtherTabs:)) {
+            return !self.others_to_close().is_empty();
+        }
+        self.offers(action)
     }
 
     /// Whether the window offers the menu item that sends `action`: no
@@ -699,7 +1124,7 @@ impl BrowserController {
             &error.domain().to_string(),
             error.code(),
             self.ivars().vouched.borrow().contains(&host),
-            self.ivars().pinned.borrow().contains(&host),
+            self.ivars().macos_pinned.borrow().contains(&host),
         );
         let retried = self.ivars().retried.borrow().as_deref() == Some(address.as_str());
         let address::AfterFailure::RetryDirect(refusal) = address::after_failure(refusal, retried)
@@ -739,7 +1164,7 @@ impl BrowserController {
         let hosts = address::to_send_direct(
             &self.ivars().vouched.borrow(),
             &(hooks.refused)(),
-            &self.ivars().pinned.borrow(),
+            &self.ivars().macos_pinned.borrow(),
             &(hooks.direct)(),
         );
         if hosts.is_empty() {
@@ -866,6 +1291,9 @@ impl BrowserController {
             return;
         };
         let loading = self.ivars().loading.get();
+        if let Some(badge) = &*self.ivars().badge.borrow() {
+            badge.set_loading(loading);
+        }
         ui.back.setEnabled(unsafe { web.view.canGoBack() });
         ui.forward.setEnabled(unsafe { web.view.canGoForward() });
         let (symbol, label) = if loading {
@@ -885,8 +1313,15 @@ impl BrowserController {
             }
         }
         if let Some(window) = self.window() {
-            let title = unsafe { web.view.title() }
-                .map(|t| t.to_string())
+            // A tab from the last session has its title until it opens.
+            let later = self
+                .ivars()
+                .later
+                .borrow()
+                .as_ref()
+                .map(|(_, title)| title.clone());
+            let title = later
+                .or_else(|| unsafe { web.view.title() }.map(|t| t.to_string()))
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_else(|| "Syndeo".to_string());
             window.setTitle(&NSString::from_str(&title));

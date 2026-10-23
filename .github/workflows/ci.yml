@@ -326,8 +326,9 @@ jobs:
     # applications ask it to open, opened through the proxy or refused, and
     # opened by one; passkeys reported unavailable, asking nothing; its last
     # window closed and brought back by opening it again, quit as the Quit
-    # menu item would, and opened again; seven mutants, each of which the test has to
-    # catch; a copy whose proxy cannot start, which has to refuse to browse;
+    # menu item would, and opened again; tabs, and the session kept between
+    # launches; ten mutants, each of which the test has to catch; a copy
+    # whose proxy cannot start, which has to refuse to browse;
     # and the route bar against what WebKit does, the proxy's cache keeping
     # nothing from this Mac, and Clear Browsing Data. Unsigned with a
     # Developer ID, and with no secrets: a pull request never signs. Then,
@@ -387,8 +388,9 @@ jobs:
       # the schemes a new tab may open, the schemes another application may
       # ask Syndeo to open, the address field's guard for typing,
       # the bar's rule for names, the refusal of a link to an IPv6 address
-      # with a zone, Reload asking the origin, and, in the proxy, a WebSocket
-      # carried rather than stripped of its Upgrade. Each is built from this
+      # with a zone, Reload asking the origin, Clear Browsing Data forgetting
+      # closed tabs and the session, and, in the proxy, a WebSocket carried
+      # rather than stripped of its Upgrade. Each is built from this
       # tree, the app and its helper, which is then put back, and the test has
       # to catch each by the checks meant to, with every other check passing.
       # All of them are run whatever any one does, each recorded on its own
@@ -437,6 +439,15 @@ jobs:
           printf '\nmutants:\n'
           printf '  %s\n' "${results[@]}"
           [ "$wrong" = 0 ]
+
+      # Tabs: links opened in tabs by ⌘ and the middle button, ⌘1 to ⌘9,
+      # icons and loading in the tab bar, Duplicate, Pin, a tab's own menu,
+      # Close Other Tabs, closed tabs opened again, Show All Tabs, the session
+      # kept at quit and opened again, and Clear Browsing Data forgetting it;
+      # memory per tab measured, not gated.
+      - name: Tabs, and the session kept between launches
+        if: always()
+        run: bash ci/test-app.sh tabs "$PWD/dist/Syndeo.app"
 
       # The route bar, gated against what WebKit actually does: each address
       # typed, from a fresh WebKit state and with a fresh token. For Direct

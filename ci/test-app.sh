@@ -7,6 +7,7 @@
 #   ci/test-app.sh routes <Syndeo.app>
 #   ci/test-app.sh customer <installed Syndeo.app> [again]
 #   ci/test-app.sh realtime <Syndeo.app>
+#   ci/test-app.sh tabs <Syndeo.app>
 #   ci/test-app.sh measure
 #
 # launch, which gates: open the app with `open`, never by running its
@@ -122,7 +123,9 @@
 # asks Syndeo to open refused for asked-any-scheme, typing kept through a
 # page's arrival for no-editing-guard, the bar for a name for direct-for-every-name, a link to
 # an IPv6 address with a zone for zoned-links-followed, Reload consulting
-# the origin for reload-from-cache, and a WebSocket through Syndeo for
+# the origin for reload-from-cache, Clear Browsing Data forgetting the
+# closed tabs and a session kept from a last quit (which it writes first)
+# for tabs-kept-after-clear, and a WebSocket through Syndeo for
 # websocket-headers-stripped. Any other failure is a failure.
 #
 # routes, which gates: the bar's route against what WebKit actually does,
@@ -190,6 +193,51 @@
 # Measured, not gated, because what they do is theirs: a WebSocket to a
 # public echo server by ws:// and wss://, what a public STUN server answered,
 # and whether two connections in one page join.
+#
+# tabs, which gates tabs, from no kept session and with macOS's own "keep
+# windows" setting as the runner has it, on pages this Mac serves, reached
+# through Syndeo by a public name for 127.0.0.1:
+#   - History > Reopen Last Closed Tab is ⇧⌘T and View > Show All Tabs ⇧⌘\;
+#     View has Show Tab Bar and Show All Tabs, once each; with tabs showing,
+#     File has AppKit's
+#     Close Other Tabs, once; Window has Duplicate Tab and Pin Tab, and
+#     History Reopen All Windows from Last Session and Recently Closed;
+#   - the window takes its title from its page, and so does its tab;
+#   - with the mouse, as a person clicks: ⌘-click and a middle-click on a
+#     link each open it in a tab behind the page, which stays in front, the
+#     tabs after it in the order they were opened, with their pages' titles;
+#     ⇧⌘-click opens one in front, right after the page; each tab's page came
+#     through Syndeo; ⌘-click on a file: link opens no tab, leaves the page
+#     and shows nothing of the file;
+#   - ⌘1, ⌘2 and ⌘3 show those tabs, and ⌘9 the last;
+#   - a tab shows the icon its page names, and that it is loading, until its
+#     page has arrived;
+#   - Window > Duplicate Tab opens the page again in front, right after it,
+#     with its history; Window > Pin Tab puts the tab first, marked; a secondary click on a tab
+#     opens Syndeo's menu for it, Unpin Tab for a pinned one, and its
+#     Duplicate Tab duplicates that tab;
+#   - File > Close Other Tabs closes all but the pinned one, which says no to
+#     closing, and this one;
+#     History > Recently Closed lists them by title; ⇧⌘T opens the last one
+#     closed again, and Recently Closed > Page A that one;
+#   - ⇧⌘\ and View > Show All Tabs show AppKit's overview, and each, again,
+#     leaves it, as does Escape: gated on AppKit's own state, the tab group's
+#     isOverviewVisible, which the app logs before each request and a second
+#     after, since on the runner the overview is not a window to
+#     Accessibility;
+#   - quit: the session is kept, readable by this user alone, with one tab
+#     pinned; opened again, the pinned tab is first, beside the start page,
+#     and opens its page when shown; History > Reopen All Windows from Last
+#     Session opens the rest, in a window of their own;
+#   - quit with macOS set to keep windows (NSQuitAlwaysKeepsWindows, for
+#     this application only): opened again, every window's tabs are back;
+#   - Clear Browsing Data forgets the closed tabs and the session: History >
+#     Reopen Last Closed Tab and Reopen All Windows from Last Session are not
+#     offered, Recently Closed is empty, and the session file is gone.
+# It measures, without gating, memory per tab, as README's Memory section
+# measures memory: the same page in one tab and in five, sampled over the
+# same interval; kept in tabs-memory.txt. It removes the setting it made and
+# the session.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -295,7 +343,15 @@ started() {
     return 1
   fi
   ok "one running application is $ID ($round, pid $PID)"
-  must "$([ "$("$APPCTL" bundle "$PID")" = "$ID" ] && echo yes)" "Launch Services has pid $PID as $ID ($round)" "$("$APPCTL" bundle "$PID")"
+  # Asked of Launch Services for that pid, which it may answer only once the
+  # application has checked in: CI 39872069798 listed the pid 0.1 s after
+  # open, and asked 0.04 s later, before the application had logged anything,
+  # it had no identifier for it yet; 0.5 s later it had com.sum.syndeo.
+  if wait_for 10 sh -c '[ "$("$1" bundle "$2")" = "$3" ]' _ "$APPCTL" "$PID" "$ID"; then
+    ok "Launch Services has pid $PID as $ID ($round)"
+  else
+    bad "Launch Services has pid $PID as $ID ($round)" "it has '$("$APPCTL" bundle "$PID")' 10 s after listing the pid"
+  fi
   image="$(image_of "$PID")"
   must "$([ "$image" = "$app/Contents/MacOS/Syndeo" ] && echo yes)" "it runs $app/Contents/MacOS/Syndeo ($round)" "$image"
   if wait_for 30 "$APPCTL" windows "$PID"; then
@@ -1181,7 +1237,7 @@ refuse() {
 # failure here too. For no-pinning-delegate that includes http through the
 # proxy, rendered and counted, so it is the pinning that failed.
 mutant() {
-  local name="${1:-}" app intended log caught unrelated
+  local name="${1:-}" app intended log caught unrelated session="$HOME/Library/Application Support/Syndeo/session.txt"
   [ -n "$name" ] && [ -d "${2:-}" ] || { say "usage: $0 mutant <name> <Syndeo.app>"; exit 2; }
   app="$(cd "$2" && pwd -P)"
   no_app || { say "refusing: $ID is already running"; exit 2; }
@@ -1195,11 +1251,17 @@ mutant() {
     direct-for-every-name) intended='^the bar for a name' ;;
     zoned-links-followed) intended='^a link to an IPv6 address with a zone' ;;
     reload-from-cache) intended="^the reload consulted the origin through Syndeo's proxy" ;;
+    tabs-kept-after-clear) intended='^Clear Browsing Data forgets' ;;
     websocket-headers-stripped) intended='^a WebSocket through Syndeo' ;;
     direct-for-every-host) intended='^(https://example\.com stays Through Syndeo|and nothing was sent directly for it)$' ;;
     never-retry-direct) intended='^(on macOS [0-9]+, https://github\.com, on macOS.s HSTS preload list, opens|and the bar says Direct — not cached by Syndeo|and the log says it sent a host directly)' ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
+  if [ "$name" = tabs-kept-after-clear ]; then
+    # A session kept from a last quit, as the app writes it, to be cleared.
+    mkdir -p "$(dirname "$session")"
+    printf 'syndeo-session 1\nwindow\t0\ntab\t-\thttps://example.com/\tExample Domain\n' >"$session"
+  fi
   if started "$app" "mutant-$name"; then
     helper_of "$app" "mutant-$name"
     browses "mutant-$name"
@@ -1210,6 +1272,7 @@ mutant() {
       no-editing-guard) editing ;;
       direct-for-every-name | zoned-links-followed) routes_lite ;;
       reload-from-cache) reload_gate ;;
+      tabs-kept-after-clear) tabs_cleared "$session" ;;
       websocket-headers-stripped) realtime_origin && rt_through_syndeo ;;
       direct-for-every-host | never-retry-direct) preloaded "$log" ;;
       *) policy "$log" ;;
@@ -1219,6 +1282,8 @@ mutant() {
   route_origin_stop
   realtime_origin_stop
   stopped "mutant-$name"
+  # What it kept, which a clear would have forgotten.
+  [ "$name" = tabs-kept-after-clear ] && rm -f "$session"
   printf '\n'
   caught="$(printf '%s' "$FAILED" | grep -E "$intended")"
   unrelated="$(printf '%s' "$FAILED" | grep -vE "$intended")"
@@ -2013,6 +2078,423 @@ realtime() {
   [ "$fails" = 0 ]
 }
 
+# The pages tabs opens, served by the loopback origin and reached through
+# Syndeo by a public name for 127.0.0.1: a page of links, three pages to
+# open from it, Page A naming an icon, a PNG this writes, and the origin's
+# slow page. Sets TP, the address they are under.
+TP=''
+tab_pages() {
+  local dir="$LOGS/origin"
+  origin || return 1
+  TP="http://127.0.0.1.nip.io:$ORIGIN_PORT"
+  cat >"$dir/tabs.html" <<'EOF'
+<!doctype html><meta charset="utf-8"><title>Tabs test</title>
+<h1>SYNDEO-TABS-PAGE</h1>
+<p><a href="/page-a.html">Page A link</a></p>
+<p><a href="/page-b.html">Page B link</a></p>
+<p><a href="/page-c.html">Page C link</a></p>
+<p><a href="/slow.html">Slow link</a></p>
+<p><a href="file:///etc/passwd">File link</a></p>
+EOF
+  printf '<!doctype html><meta charset="utf-8"><title>Page A</title><link rel="icon" href="/icon.png"><h1>SYNDEO-PAGE-A</h1>\n' >"$dir/page-a.html"
+  printf '<!doctype html><meta charset="utf-8"><title>Page B</title><h1>SYNDEO-PAGE-B</h1>\n' >"$dir/page-b.html"
+  printf '<!doctype html><meta charset="utf-8"><title>Page C</title><h1>SYNDEO-PAGE-C</h1>\n' >"$dir/page-c.html"
+  python3 -I -c '
+import struct, sys, zlib
+side = 16
+rows = b"".join(b"\x00" + b"\x2a\x6f\xdb\xff" * side for _ in range(side))
+def chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 6, 0, 0, 0)) \
+    + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+open(sys.argv[1], "wb").write(png)' "$dir/icon.png"
+}
+
+# open_now LOG: how many windows, each tab one, the app last said it has.
+open_now() { grep -oE 'a window (opened|closed) open=[0-9]+' "$1" | tail -n 1 | grep -oE '[0-9]+$'; }
+# opens LOG N WHAT: within 15 s, the app says it has N.
+opens() {
+  if wait_for 15 sh -c '[ "$(grep -oE "a window (opened|closed) open=[0-9]+" "$1" | tail -n 1 | grep -oE "[0-9]+\$")" = "$2" ]' _ "$1" "$2"; then
+    ok "$3"
+  else
+    bad "$3" "the app says it has $(open_now "$1") open, not $2"
+  fi
+}
+# The front window's tabs, as tabs prints them, on one line: "* Title|  Title|".
+tab_list() { "$APPCTL" tabs "$PID" | tr '\n' '|'; }
+route_is() { [ "$("$APPCTL" value "$PID" syndeo.route)" = "$1" ]; }
+# press_keys KEY KEYS: KEY pressed holding KEYS, as appctl keys does.
+press_keys() { "$APPCTL" keys "$PID" "$1" "$2" || bad "$2+$1" "pid $PID could not be brought to the front"; }
+# logged LOG TEXT N: within 15 s, LOG has at least N lines with TEXT.
+logged() { wait_for 15 sh -c '[ "$(grep -cF "$2" "$1")" -ge "$3" ]' _ "$1" "$2" "$3"; }
+
+# WebKit's WebContent processes, and memory.
+webcontent() { pgrep -f 'com.apple.WebKit.WebContent' | sort -n; }
+# rss_of PID...: their resident memory together, in MB.
+rss_of() {
+  local kb=0 p v
+  for p in "$@"; do
+    v="$(ps -o rss= -p "$p" 2>/dev/null | tr -d ' ')"
+    kb=$((kb + ${v:-0}))
+  done
+  echo $((kb / 1024))
+}
+# ours BEFORE: the WebContent processes that were not there before Syndeo opened.
+ours() {
+  local p
+  for p in $(webcontent); do
+    case " $1 " in *" $p "*) ;; *) printf '%s ' "$p" ;; esac
+  done
+}
+# memory_now BEFORE OUT: four samples, 3 s apart, of the app's own memory and
+# its WebContent processes', each kept in OUT; prints the last, "host H web W
+# processes N".
+memory_now() {
+  local web line i
+  for i in 1 2 3 4; do
+    web="$(ours "$1")"
+    # shellcheck disable=SC2086 # pids, split on purpose
+    line="host $(rss_of "$PID") web $(rss_of $web) processes $(printf '%s' "$web" | wc -w | tr -d ' ')"
+    printf '    sample %s: %s\n' "$i" "$line" >>"$2"
+    [ "$i" = 4 ] || sleep 3
+  done
+  printf '%s\n' "$line"
+}
+
+# tab_memory LOG BEFORE: memory per tab, as README's Memory section measures
+# memory: the same page in one tab, then in five, both sampled over the same
+# interval; the cost of each tab past the first is reported, not gated.
+tab_memory() {
+  local log="$1" before="$2" one five n out="$LOGS/tabs-memory.txt"
+  : >"$out"
+  visit "$TP/page-c.html" "$TP/page-c.html" 'SYNDEO-PAGE-C' "a page to measure memory with opens, in one tab"
+  sleep 5
+  printf 'Page C (%s), in one tab\n' "$TP/page-c.html" >>"$out"
+  one="$(memory_now "$before" "$out")"
+  for n in 2 3 4 5; do
+    choose File "New Tab"
+    arrive "" 'Welcome to Syndeo' "tab $n, to measure memory with, shows the start page"
+    visit "$TP/page-c.html" "$TP/page-c.html" 'SYNDEO-PAGE-C' "the same page opens in tab $n"
+  done
+  sleep 5
+  printf 'the same page, in five tabs\n' >>"$out"
+  five="$(memory_now "$before" "$out")"
+  printf 'each tab past the first: %s\n' "$(awk -v a="$one" -v b="$five" 'BEGIN {
+    split(a, x, " "); split(b, y, " ")
+    printf "host %+.1f MB, WebContent %+.1f MB, %+.1f WebContent processes", (y[2] - x[2]) / 4, (y[4] - x[4]) / 4, (y[6] - x[6]) / 4 }')" >>"$out"
+  sed 's/^/  MEASURE  memory: /' "$out"
+  for n in 5 4 3 2; do close_tab "tab $n, measured"; done
+  opens "$log" 1 "the tabs measured are closed, and the app lets them go"
+}
+
+# tab_shortcuts: the new tab items' shortcuts, as AppKit has them.
+tab_shortcuts() {
+  local menu item key have
+  while IFS='|' read -r menu item key; do
+    have="$("$APPCTL" shortcut "$PID" "$menu" "$item")"
+    must "$([ "$(printf '%s' "$have" | tr '[:lower:]' '[:upper:]')" = "$key" ] && echo yes)" "$menu > $item is ⇧⌘${key% *}" "${have:-no such item}"
+  done <<'EOF'
+History|Reopen Last Closed Tab|T 1
+View|Show All Tabs|\ 1
+EOF
+  for menu in File View History Window; do
+    "$APPCTL" menu-items "$PID" "$menu" >"$LOGS/tabs-menu-$menu.txt" 2>&1
+  done
+  must "$([ "$(grep -cx 'Show All Tabs' "$LOGS/tabs-menu-View.txt")" = 1 ] && [ "$(grep -cx 'Show Tab Bar' "$LOGS/tabs-menu-View.txt")" = 1 ] && echo yes)" \
+    "View has Show Tab Bar and Show All Tabs, once each" "$(tr '\n' '|' <"$LOGS/tabs-menu-View.txt")"
+  must "$(grep -qx 'Duplicate Tab' "$LOGS/tabs-menu-Window.txt" && grep -qx 'Pin Tab' "$LOGS/tabs-menu-Window.txt" && echo yes)" \
+    "Window has Duplicate Tab and Pin Tab" "$(tr '\n' '|' <"$LOGS/tabs-menu-Window.txt")"
+  must "$(grep -qx 'Reopen All Windows from Last Session' "$LOGS/tabs-menu-History.txt" && grep -qx 'Recently Closed' "$LOGS/tabs-menu-History.txt" && echo yes)" \
+    "History has Reopen All Windows from Last Session and Recently Closed" "$(tr '\n' '|' <"$LOGS/tabs-menu-History.txt")"
+}
+
+# tabs_cleared SESSION: Clear Browsing Data forgets the tabs closed and the
+# session kept on disk at SESSION; both are there before.
+tabs_cleared() {
+  local session="$1"
+  choose File "New Tab"
+  arrive "" 'Welcome to Syndeo' "a tab to close before clearing"
+  close_tab "a tab closed before clearing"
+  must "$([ "$("$APPCTL" menu-enabled "$PID" History "Reopen Last Closed Tab")" = enabled ] && echo yes)" \
+    "before clearing, History > Reopen Last Closed Tab is offered"
+  must "$([ -f "$session" ] && echo yes)" "before clearing, a session is kept on disk" "$(ls -l "$session" 2>&1)"
+  settings_open "clearing tabs"
+  if "$APPCTL" press "$PID" syndeo.clear; then ok "Settings > Clear Browsing Data… is pressed (tabs)"; else bad "Clear Browsing Data… (tabs)" "no button to press"; fi
+  if wait_for 10 "$APPCTL" press "$PID" syndeo.clear-confirm; then ok "and asks first; Clear is pressed (tabs)"; else bad "Clear Browsing Data (tabs)" "no Clear in a sheet to press"; fi
+  if wait_for 40 sh -c '"$1" value "$2" syndeo.clear-status | grep -q "^Browsing data cleared"' _ "$APPCTL" "$PID"; then
+    ok "Settings says the browsing data is cleared (tabs)"
+  else
+    bad "Clear Browsing Data (tabs)" "Settings says: $("$APPCTL" value "$PID" syndeo.clear-status)"
+  fi
+  settings_close "after clearing tabs"
+  must "$([ ! -e "$session" ] && echo yes)" "Clear Browsing Data forgets the session kept on disk" "$(ls -l "$session" 2>&1)"
+  must "$([ "$("$APPCTL" menu-enabled "$PID" History "Reopen Last Closed Tab")" = disabled ] && echo yes)" \
+    "Clear Browsing Data forgets the closed tabs: History > Reopen Last Closed Tab is not offered"
+  must "$([ -z "$("$APPCTL" submenu-items "$PID" History "Recently Closed")" ] && echo yes)" \
+    "Clear Browsing Data forgets the closed tabs: History > Recently Closed is empty" \
+    "$("$APPCTL" submenu-items "$PID" History "Recently Closed" | tr '\n' '|')"
+  must "$([ "$("$APPCTL" menu-enabled "$PID" History "Reopen All Windows from Last Session")" = disabled ] && echo yes)" \
+    "Clear Browsing Data forgets the session: History > Reopen All Windows from Last Session is not offered"
+}
+
+# ax_windows: how many windows Accessibility has for the app.
+ax_windows() { "$APPCTL" ax-tree "$PID" | grep -c '^AXWindow'; }
+
+# The two ways a person asks for the tab overview.
+overview_by_keys() { press_keys '\' cmd+shift; }
+overview_by_menu() { choose View "Show All Tabs"; }
+
+# overview_shows N ACTION WANT WHAT: run ACTION, the Nth request for the tab
+# overview, and require AppKit's state around it, as the app logs it, to be
+# WANT: "was=X shown=Y", whether it was shown when asked for, and whether it
+# is a second later.
+overview_shows() {
+  local said
+  "$2"
+  wait_for 10 sh -c '[ "$(grep -c "the tab overview, a second later" "$1")" -ge "$2" ]' _ "$log" "$1" || true
+  said="$([ "$(grep -c 'the tab overview, a second later' "$log")" -ge "$1" ] &&
+    printf 'was=%s shown=%s' "$(grep 'the tab overview asked for' "$log" | tail -n 1 | sed -n 's/.*was=\([a-z]*\).*/\1/p')" \
+      "$(grep 'the tab overview, a second later' "$log" | tail -n 1 | sed -n 's/.*shown=\([a-z]*\).*/\1/p')")"
+  must "$([ "$said" = "$3" ] && echo yes)" "$4: AppKit's tab group, $3" "the app said ${said:-nothing for request $1}"
+}
+
+# show_tab N ADDRESS PAGE WHAT: ⌘N, and the tab it shows at ADDRESS saying
+# PAGE. If it does not, that tab is pressed in the tab bar instead, so the
+# checks after this one still start where they should.
+show_tab() {
+  press_keys "$1" cmd
+  if wait_for 15 at "$2" "$3"; then
+    ok "$4"
+  else
+    bad "$4" "address field: '$(address)'; tabs: $(tab_list)"
+    if [ "$1" = 9 ]; then "$APPCTL" tab-press "$PID" "$("$APPCTL" tabs "$PID" | wc -l | tr -d ' ')"; else "$APPCTL" tab-press "$PID" "$1"; fi
+    wait_for 15 at "$2" "$3" || true
+  fi
+}
+
+# tabbing LOG: links opened in tabs by ⌘ and the middle button, ⌘ digits,
+# a refused address, icons and loading in the tab bar, Duplicate, Pin, the
+# tab's own menu, Close Other Tabs, Reopen Last Closed Tab and Recently
+# Closed, and Show All Tabs.
+tabbing() {
+  local log="$1" list last_closed items before
+  visit "$TP/tabs.html" "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "a page with links opens, by a public name"
+  must "$(route_is 'Through Syndeo' && echo yes)" "and came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
+  if wait_for 10 sh -c '[ "$("$1" titles "$2" | head -n 1)" = "Tabs test" ]' _ "$APPCTL" "$PID"; then
+    ok "the window takes its title from the page"
+  else
+    bad "the window takes its title from the page" "titles: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+
+  "$APPCTL" click-web "$PID" "Page A link" cmd left || bad "⌘-click" "no Page A link to click"
+  opens "$log" 2 "⌘-click on a link opens it in a new tab"
+  sleep 2
+  arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "behind: the page clicked on stays in front, as it was"
+  if wait_for 15 sh -c '[ "$("$1" tabs "$2" | tr "\n" "|")" = "* Tabs test|  Page A|" ]' _ "$APPCTL" "$PID"; then
+    ok "and the tab behind it is after it, with its page's title, Page A"
+  else
+    bad "⌘-click's tab" "tabs: $(tab_list)"
+  fi
+
+  "$APPCTL" click-web "$PID" "Page B link" none middle || bad "middle-click" "no Page B link to click"
+  opens "$log" 3 "a middle-click on a link opens it in a new tab"
+  sleep 2
+  arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "behind, too"
+  if wait_for 15 sh -c '[ "$("$1" tabs "$2" | tr "\n" "|")" = "* Tabs test|  Page A|  Page B|" ]' _ "$APPCTL" "$PID"; then
+    ok "tabs opened behind a page are in the order they were opened, after it"
+  else
+    bad "tabs opened behind" "tabs: $(tab_list)"
+  fi
+
+  "$APPCTL" click-web "$PID" "Page C link" cmd+shift left || bad "⇧⌘-click" "no Page C link to click"
+  opens "$log" 4 "⇧⌘-click on a link opens it in a new tab"
+  arrive "$TP/page-c.html" 'SYNDEO-PAGE-C' "in front"
+  must "$(route_is 'Through Syndeo' && echo yes)" "and the tab came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
+  if wait_for 10 sh -c '[ "$("$1" tabs "$2" | tr "\n" "|")" = "  Tabs test|* Page C|  Page A|  Page B|" ]' _ "$APPCTL" "$PID"; then
+    ok "right after the page it was opened from"
+  else
+    bad "a tab opened in front goes right after its page" "tabs: $(tab_list)"
+  fi
+  # The menus as AppKit has them with tabs showing, which is when it adds
+  # its own items.
+  for items in File View Window History; do
+    "$APPCTL" menu-dump "$PID" "$items" >"$LOGS/tabs-menu-$items-with-tabs.txt" 2>&1
+  done
+  must "$([ "$(grep -c "^Close Other Tabs$(printf '\t')" "$LOGS/tabs-menu-File-with-tabs.txt")" = 1 ] && echo yes)" \
+    "with tabs showing, File has AppKit's Close Other Tabs, once" "$(tr '\t\n' ' |' <"$LOGS/tabs-menu-File-with-tabs.txt")"
+  must "$([ "$(grep -c "^Show All Tabs$(printf '\t')" "$LOGS/tabs-menu-View-with-tabs.txt")" = 1 ] && echo yes)" \
+    "and View one Show All Tabs" "$(tr '\t\n' ' |' <"$LOGS/tabs-menu-View-with-tabs.txt")"
+
+  show_tab 1 "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "⌘1 shows the first tab"
+  "$APPCTL" click-web "$PID" "File link" cmd left || bad "⌘-click on a file: link" "no File link to click"
+  sleep 3
+  must "$([ "$(open_now "$log")" = 4 ] && echo yes)" "⌘-click on a file: link opens no tab" "the app says $(open_now "$log") open"
+  must "$(at "$TP/tabs.html" 'SYNDEO-TABS-PAGE' && echo yes)" "and leaves the page as it was" "address '$(address)'"
+  must "$("$APPCTL" ax-tree "$PID" | grep -q 'root:' && echo no || echo yes)" "and shows nothing of that file"
+
+  show_tab 9 "$TP/page-b.html" 'SYNDEO-PAGE-B' "⌘9 shows the last tab, the middle-click's"
+  must "$(route_is 'Through Syndeo' && echo yes)" "which came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
+  show_tab 2 "$TP/page-c.html" 'SYNDEO-PAGE-C' "⌘2 shows the second tab"
+  show_tab 3 "$TP/page-a.html" 'SYNDEO-PAGE-A' "⌘3 shows the third, the ⌘-click's"
+  must "$(route_is 'Through Syndeo' && echo yes)" "which came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
+  if wait_for 15 "$APPCTL" ids "$PID" syndeo.tab-icon; then
+    ok "its tab shows the icon Page A names: $("$APPCTL" ids "$PID" syndeo.tab-icon | head -n 1 | tr '\t' ' ')"
+  else
+    bad "its tab shows the icon Page A names" "no syndeo.tab-icon; the app: $(grep "a page's icon" "$log" | tail -n 2 | tr '\n' ' ')"
+  fi
+  "$APPCTL" front-tree "$PID" >"$LOGS/tabs-bar-tree.txt" 2>&1
+
+  show_tab 1 "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "⌘1 shows the first tab again"
+  "$APPCTL" click-web "$PID" "Slow link" cmd+shift left || bad "⇧⌘-click on Slow link" "no Slow link to click"
+  opens "$log" 5 "⇧⌘-click on a slow page opens a tab in front"
+  if wait_for 6 "$APPCTL" ids "$PID" syndeo.tab-loading; then ok "its tab shows it loading"; else bad "its tab shows it loading" "no syndeo.tab-loading"; fi
+  "$APPCTL" id-tree "$PID" >"$LOGS/tabs-loading-ids.txt" 2>&1
+  arrive "$TP/slow.html" 'SYNDEO-SLOW-PAGE' "the slow page arrives"
+  if wait_for 10 sh -c '! "$1" ids "$2" syndeo.tab-loading' _ "$APPCTL" "$PID"; then ok "and its tab stops showing it loading"; else bad "its tab stops showing it loading" "still loading"; fi
+
+  show_tab 1 "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "⌘1 shows the first tab, to duplicate"
+  choose Window "Duplicate Tab"
+  opens "$log" 6 "Window > Duplicate Tab opens a tab"
+  arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "with the same page, in front"
+  must "$(logged "$log" 'a tab duplicated' 1 && echo yes)" "the app says a tab was duplicated"
+  must "$([ "$("$APPCTL" enabled "$PID" syndeo.back)" = enabled ] && echo yes)" "with its history: Back is offered" "$(controls)"
+  list="$(tab_list)"
+  must "$([ "$list" = "  Tabs test|* Tabs test|  Slow page|  Page C|  Page A|  Page B|" ] && echo yes)" "right after the tab it duplicates" "tabs: $list"
+
+  choose Window "Pin Tab"
+  must "$(logged "$log" 'a tab pinned or unpinned pinned=true' 1 && echo yes)" "Window > Pin Tab pins it"
+  if wait_for 10 sh -c '[ "$("$1" tabs "$2" | tr "\n" "|")" = "* Tabs test|  Tabs test|  Slow page|  Page C|  Page A|  Page B|" ]' _ "$APPCTL" "$PID"; then
+    ok "and puts it first"
+  else
+    bad "a pinned tab goes first" "tabs: $(tab_list)"
+  fi
+  if wait_for 5 "$APPCTL" ids "$PID" syndeo.tab-pinned; then ok "marked pinned in the tab bar"; else bad "a pinned tab is marked" "no syndeo.tab-pinned"; fi
+
+  items="$("$APPCTL" tab-menu "$PID" 1 | tr '\n' '|')"
+  must "$(printf '%s' "|$items" | grep -qF '|Unpin Tab|' && echo yes)" "a pinned tab's own menu offers Unpin Tab" "$items"
+  items="$("$APPCTL" tab-menu "$PID" 2 | tr '\n' '|')"
+  printf '%s\n' "$items" >"$LOGS/tabs-tab-menu.txt"
+  must "$(for want in 'Duplicate Tab' 'Pin Tab' 'Close Tab' 'Close Other Tabs' 'Move Tab to New Window' 'Show All Tabs'; do
+      printf '%s' "|$items" | grep -qF "|$want|" || exit 1; done && echo yes)" \
+    "a secondary click on a tab opens its own menu: Duplicate, Pin, Close, Close Other Tabs, Move to New Window, Show All" "$items"
+  "$APPCTL" tab-menu "$PID" 2 "Duplicate Tab" >/dev/null || bad "the tab's menu > Duplicate Tab" "it could not be pressed"
+  opens "$log" 7 "its Duplicate Tab duplicates that tab"
+  arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "in front"
+
+  choose File "Close Other Tabs"
+  opens "$log" 2 "File > Close Other Tabs closes every other tab but the pinned one"
+  list="$(tab_list)"
+  must "$([ "$list" = "  Tabs test|* Tabs test|" ] && echo yes)" "leaving the pinned tab first, and this one" "tabs: $list"
+  must "$(logged "$log" 'a pinned tab kept open' 1 && echo yes)" "the pinned tab said no to closing"
+  items="$("$APPCTL" submenu-items "$PID" History "Recently Closed" | tr '\n' '|')"
+  printf '%s\n' "$items" >"$LOGS/tabs-recently-closed.txt"
+  must "$(for want in 'Page A' 'Page B' 'Page C' 'Slow page'; do printf '%s' "|$items" | grep -qF "|$want|" || exit 1; done && echo yes)" \
+    "History > Recently Closed lists the tabs closed, by title" "$items"
+
+  last_closed="$(printf '%s' "$items" | cut -d'|' -f1)"
+  press_keys t cmd+shift
+  opens "$log" 3 "⇧⌘T opens a closed tab again"
+  if wait_for 30 sh -c '"$1" tabs "$2" | grep -qxF "* $3"' _ "$APPCTL" "$PID" "$last_closed"; then
+    ok "the last one closed, $last_closed, in front"
+  else
+    bad "⇧⌘T opens the last tab closed" "it was '$last_closed'; tabs: $(tab_list)"
+  fi
+  if [ "$last_closed" != 'Page A' ]; then
+    "$APPCTL" submenu "$PID" History "Recently Closed" "Page A" || bad "History > Recently Closed > Page A" "no such item"
+    opens "$log" 4 "History > Recently Closed > Page A opens it again"
+    arrive "$TP/page-a.html" 'SYNDEO-PAGE-A' "in front, with its page"
+  fi
+
+  # AppKit's overview is not a window to Accessibility on the runner (CI
+  # 39738260562: none appeared while AppKit said it was shown), so what is
+  # gated is AppKit's own state, NSWindowTabGroup.isOverviewVisible, as the
+  # app logs it before each request and a second after.
+  overview_shows 1 overview_by_keys "was=false shown=true" "⇧⌘\\ shows AppKit's overview of the tabs"
+  "$APPCTL" ax-tree "$PID" >"$LOGS/tabs-overview-tree.txt" 2>&1
+  printf '  MEASURE  with the overview shown, Accessibility has %s window(s)\n' "$(ax_windows)"
+  overview_shows 2 overview_by_menu "was=true shown=false" "View > Show All Tabs, with it shown, leaves it"
+  overview_shows 3 overview_by_menu "was=false shown=true" "View > Show All Tabs shows it"
+  press_keys escape none
+  # AppKit's overview closes with an animation; asked for again while it
+  # was still closing, it stayed closed (CI 39858637347).
+  sleep 3
+  overview_shows 4 overview_by_keys "was=false shown=true" "Escape leaves it: asked for again, AppKit had it not shown, and shows it"
+  overview_shows 5 overview_by_menu "was=true shown=false" "View > Show All Tabs again leaves it"
+  if wait_for 10 "$APPCTL" value "$PID" syndeo.address; then ok "and the window is as it was, its address field in front"; else bad "leaving the overview" "no address field in front"; fi
+}
+
+# tabs APP: see the top of this script.
+tabs_test() {
+  local app home session log before on_screen
+  [ -d "${1:-}" ] || { say "usage: $0 tabs <Syndeo.app>"; exit 2; }
+  app="$(cd "$1" && pwd -P)"
+  home="$HOME/Library/Application Support/Syndeo"
+  session="$home/session.txt"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  printf '\nSyndeo.app, its tabs: %s\n' "$app"
+  # From no session, and macOS's own setting: whatever an earlier test left.
+  rm -f "$session"
+  defaults delete "$ID" NSQuitAlwaysKeepsWindows >/dev/null 2>&1 || true
+  tab_pages || { printf '\n%d failed\n' "$fails"; return 1; }
+  before="$(webcontent | tr '\n' ' ')"
+  if started "$app" tabs; then
+    helper_of "$app" tabs
+    browses tabs
+    log="$LOGS/app-tabs.stderr"
+    arrive "" 'Welcome to Syndeo' "a new window shows the start page (tabs)"
+    tab_shortcuts
+    tab_memory "$log" "$before"
+    tabbing "$log"
+    must "$([ "$(pgrep -P "$PID" | tr -d '\n')" = "$HELPER" ] && echo yes)" "with all those tabs opened and closed, the proxy is still the one helper" \
+      "children: $(pgrep -P "$PID" | tr '\n' ' ')"
+  fi
+  stopped tabs
+
+  printf '\nquit, with a pinned tab: kept, and opened again\n'
+  must "$([ -f "$session" ] && [ "$(stat -f %Lp "$session")" = 600 ] && echo yes)" "quitting kept the session, readable by this user alone" "$(ls -l "$session" 2>&1)"
+  must "$([ "$(grep -c "$(printf '^tab\tpinned\t')" "$session" 2>/dev/null)" = 1 ] && echo yes)" "with one tab pinned"
+  if started "$app" tabs-pinned; then
+    helper_of "$app" tabs-pinned
+    log="$LOGS/app-tabs-pinned.stderr"
+    arrive "" 'Welcome to Syndeo' "opened again, the window shows the start page"
+    if wait_for 15 sh -c '"$1" tabs "$2" | head -n 1 | grep -qx "  Tabs test"' _ "$APPCTL" "$PID"; then
+      ok "with the pinned tab before it, as it was"
+    else
+      bad "the pinned tab, opened again" "tabs: $(tab_list)"
+    fi
+    must "$(wait_for 5 "$APPCTL" ids "$PID" syndeo.tab-pinned && echo yes)" "marked pinned"
+    press_keys 1 cmd
+    arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "the pinned tab opens its page when it is shown"
+    choose History "Reopen All Windows from Last Session"
+    must "$(logged "$log" 'tabs from the last session opened windows=1' 1 && echo yes)" "History > Reopen All Windows from Last Session opens the rest"
+    arrive "$TP/page-a.html" 'SYNDEO-PAGE-A' "in a window of their own, with the tab that was in front, in front"
+    "$APPCTL" tabs "$PID" >"$LOGS/tabs-session-window.txt" 2>&1
+    must "$(grep -qx '  Tabs test' "$LOGS/tabs-session-window.txt" && grep -qx '\* Page A' "$LOGS/tabs-session-window.txt" && echo yes)" \
+      "and the other tabs it had, by their titles, not yet opened" "tabs: $(tab_list)"
+  fi
+  stopped tabs-pinned
+
+  printf '\nquit, with macOS set to keep windows: every tab opened again\n'
+  defaults write "$ID" NSQuitAlwaysKeepsWindows -bool true
+  if started "$app" tabs-kept; then
+    helper_of "$app" tabs-kept
+    log="$LOGS/app-tabs-kept.stderr"
+    must "$(logged "$log" 'tabs from the last session opened windows=2' 1 && echo yes)" "opened again, every window's tabs open again" \
+      "$(grep 'session' "$log" | tail -n 2 | tr '\n' ' ')"
+    arrive "$TP/page-a.html" 'SYNDEO-PAGE-A' "the tab that was in front is in front, with its page"
+    on_screen="$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')"
+    must "$([ "$on_screen" = 2 ] && echo yes)" "in two windows, as they were" "$on_screen on screen"
+    tabs_cleared "$session"
+  fi
+  stopped tabs-kept
+  defaults delete "$ID" NSQuitAlwaysKeepsWindows >/dev/null 2>&1 || true
+  rm -f "$session"
+  origin_stop
+  must "$(defaults read "$ID" NSQuitAlwaysKeepsWindows >/dev/null 2>&1 && echo no || echo yes)" "the setting this test made is removed again"
+  printf '\n%d failed\n' "$fails"
+  [ "$fails" = 0 ]
+}
+
 measure() {
   local probe out status started
   printf '\nwhat this runner allows (measured; not a gate)\n'
@@ -2058,7 +2540,8 @@ case "${1:-}" in
   routes) shift; routes "$@" ;;
   customer) shift; customer "$@" ;;
   realtime) shift; realtime "$@" ;;
+  tabs) shift; tabs_test "$@" ;;
   preloaded) shift; preloaded_only "$@" ;;
   measure) measure ;;
-  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | preloaded <Syndeo.app> | measure"; exit 2 ;;
+  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | tabs <Syndeo.app> | preloaded <Syndeo.app> | measure"; exit 2 ;;
 esac
