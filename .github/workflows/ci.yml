@@ -326,14 +326,13 @@ jobs:
     # applications ask it to open, opened through the proxy or refused, and
     # opened by one; passkeys reported unavailable, asking nothing; its last
     # window closed and brought back by opening it again, quit as the Quit
-    # menu item would, and opened again; tabs, and the session kept between
-    # launches; ten mutants, each of which the test has to catch; a copy
-    # whose proxy cannot start, which has to refuse to browse;
-    # and the route bar against what WebKit does, the proxy's cache keeping
-    # nothing from this Mac, and Clear Browsing Data. Unsigned with a
-    # Developer ID, and with no secrets: a pull request never signs. Its
-    # controls in its toolbar, in light and dark appearance, with pictures of
-    # each kept with the logs. Then, reported and not gated, how long
+    # menu item would, and opened again; twelve mutants, each of which the
+    # test has to catch; a copy whose proxy cannot start, which has to refuse
+    # to browse; and the route bar against what WebKit does, the proxy's
+    # cache keeping nothing from this Mac, and Clear Browsing Data. Unsigned
+    # with a Developer ID, and with no secrets: a pull request never signs.
+    # (Tabs, and its look in light and dark, run in macos-agents.) Then,
+    # reported and not gated, how long
     # github.com takes to show in WebKit by itself and through the proxy, and
     # what this runner allows an onboarding test to do.
     runs-on: macos-15
