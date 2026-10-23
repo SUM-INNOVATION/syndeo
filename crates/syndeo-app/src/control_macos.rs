@@ -28,7 +28,9 @@
 use crate::address;
 use crate::agent::{self, Command, Failure, Proc, Request, Scope, Scopes, Step};
 use crate::browser_macos::BrowserController;
+use crate::chrome_macos;
 use crate::peer_macos::{self, Peer};
+use crate::settings_macos;
 use base64::Engine as _;
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
@@ -37,9 +39,10 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAccessibility, NSAlert, NSAlertSecondButtonReturn, NSAlertStyle, NSAlertThirdButtonReturn,
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBitmapImageFileType,
-    NSBitmapImageRep, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont,
-    NSImage, NSLayoutAttribute, NSPopUpButton, NSTextField, NSTitlebarAccessoryViewController,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezelStyle,
+    NSBitmapImageFileType, NSBitmapImageRep, NSButton, NSColor, NSControlSize,
+    NSControlStateValueOff, NSControlStateValueOn, NSFont, NSFontWeightSemibold, NSImage,
+    NSImageView, NSLayoutAttribute, NSPopUpButton, NSTextField, NSTitlebarAccessoryViewController,
     NSView, NSWindow, NSWindowOrderingMode, NSWindowStyleMask,
 };
 use objc2_foundation::{
@@ -1647,7 +1650,11 @@ fn screenshot(tab: u64, view: &WKWebView, reply: Reply) {
 
 // ------------------------------------------------------------- what the person sees
 
-/// The bar below an agent's tab's title bar: who is in control, and Stop.
+/// The strip below an agent's tab's toolbar, above its page, across the
+/// window: who is in control, and Stop. Part of the window's own chrome, as
+/// a title bar accessory under the unified toolbar, so the page, laid out
+/// below the toolbar and anything under it, is never under it either; its
+/// colours are AppKit's own, light or dark.
 fn indicator(
     mtm: MainThreadMarker,
     name: &str,
@@ -1656,26 +1663,48 @@ fn indicator(
     Retained<NSTitlebarAccessoryViewController>,
     Retained<StopTarget>,
 ) {
-    let width = 600.0;
+    let (width, height) = (600.0, 30.0);
     let view = NSView::initWithFrame(
         NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, 30.0)),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
     );
-    let label = NSTextField::labelWithString(
-        &NSString::from_str(&format!(
-            "Controlled by “{name}”. It works only in its own tabs, and its pages go through \
-             Syndeo as yours do."
-        )),
-        mtm,
-    );
-    label.setFrame(NSRect::new(
-        NSPoint::new(12.0, 7.0),
-        NSSize::new(width - 110.0, 16.0),
-    ));
-    label.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
-    label.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
+    let mut x = 12.0;
+    let symbol = chrome_macos::symbol_image("cursorarrow.rays", "An agent is in control")
+        .or_else(|| chrome_macos::symbol_image("person.crop.circle", "An agent is in control"));
+    if let Some(symbol) = symbol {
+        let icon = NSImageView::imageViewWithImage(&symbol, mtm);
+        icon.setContentTintColor(Some(&NSColor::systemPurpleColor()));
+        icon.setFrame(NSRect::new(
+            NSPoint::new(x, (height - 16.0) / 2.0),
+            NSSize::new(16.0, 16.0),
+        ));
+        view.addSubview(&icon);
+        x += 22.0;
+    }
+    let label =
+        NSTextField::labelWithString(&NSString::from_str(&format!("Controlled by “{name}”")), mtm);
+    label.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, unsafe {
+        NSFontWeightSemibold
+    })));
     label.setTextColor(Some(&NSColor::systemPurpleColor()));
     label.setAccessibilityIdentifier(Some(ns_string!("syndeo.agent-indicator")));
+    label.sizeToFit();
+    let named = label.frame().size.width.min(width / 2.0);
+    label.setFrame(NSRect::new(
+        NSPoint::new(x, (height - 16.0) / 2.0),
+        NSSize::new(named, 16.0),
+    ));
+    let about = NSTextField::labelWithString(
+        ns_string!("It works only in its own tabs, and its pages go through Syndeo as yours do."),
+        mtm,
+    );
+    about.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+    about.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    about.setFrame(NSRect::new(
+        NSPoint::new(x + named + 6.0, (height - 16.0) / 2.0),
+        NSSize::new(width - (x + named + 6.0) - 84.0, 16.0),
+    ));
+    about.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
     let target = StopTarget::new(mtm, number);
     let stop = unsafe {
         NSButton::buttonWithTitle_target_action(
@@ -1685,9 +1714,12 @@ fn indicator(
             mtm,
         )
     };
+    stop.setBezelStyle(NSBezelStyle::Push);
+    stop.setControlSize(NSControlSize::Small);
+    stop.setFont(Some(&NSFont::systemFontOfSize(11.0)));
     stop.setFrame(NSRect::new(
-        NSPoint::new(width - 88.0, 2.0),
-        NSSize::new(80.0, 26.0),
+        NSPoint::new(width - 72.0, (height - 22.0) / 2.0),
+        NSSize::new(62.0, 22.0),
     ));
     stop.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
     stop.setToolTip(Some(ns_string!(
@@ -1695,6 +1727,7 @@ fn indicator(
     )));
     stop.setAccessibilityIdentifier(Some(ns_string!("syndeo.agent-stop")));
     view.addSubview(&label);
+    view.addSubview(&about);
     view.addSubview(&stop);
     let accessory = NSTitlebarAccessoryViewController::new(mtm);
     accessory.setView(&view);
@@ -1802,7 +1835,9 @@ impl AccessController {
     fn make_window(&self, own: &str) {
         let mtm = self.mtm();
         let target: &AnyObject = self.as_ref();
-        let (width, height) = (560.0, 380.0);
+        // In sections, as Settings is laid out: a heading, a rounded group,
+        // and a note below it.
+        let (width, height, pad) = (560.0, 516.0, 14.0);
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
@@ -1818,6 +1853,12 @@ impl AccessController {
             NSView::alloc(mtm),
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
         );
+        let mut layout = settings_macos::Layout::new(mtm, &content, width, height);
+        let inner = layout.group_width();
+
+        // Agents: on or off, and what that means now.
+        layout.header("Agents");
+        let row = layout.group(46.0);
         let switch = unsafe {
             NSButton::checkboxWithTitle_target_action(
                 ns_string!("Allow agents to control Syndeo"),
@@ -1827,10 +1868,17 @@ impl AccessController {
             )
         };
         switch.setFrame(NSRect::new(
-            NSPoint::new(18.0, height - 44.0),
-            NSSize::new(400.0, 24.0),
+            NSPoint::new(pad, 12.0),
+            NSSize::new(inner - 2.0 * pad, 22.0),
         ));
         switch.setAccessibilityIdentifier(Some(ns_string!("syndeo.agent-switch")));
+        row.addSubview(&switch);
+        let status = layout.note("", 18.0);
+        status.setAccessibilityIdentifier(Some(ns_string!("syndeo.agent-status")));
+
+        // How programs ask: the command, and the person's leave.
+        layout.header("How Programs Connect");
+        let how = layout.group(118.0);
         let program = if own.is_empty() {
             "Syndeo's own command"
         } else {
@@ -1838,35 +1886,37 @@ impl AccessController {
         };
         let about = NSTextField::wrappingLabelWithString(
             &NSString::from_str(&format!(
-                "Programs on this Mac — command-line agents, scripts and tests — can then ask to \
-                 drive Syndeo, through Syndeo's own command:\n{program} mcp   (an MCP server)\n\
-                 {program} control   (one request, or a session)\n\nEach program is asked about \
-                 first, and works only in tabs of its own, which say so and offer Stop. Your tabs \
-                 stay hidden from it. What you allow lasts until Syndeo quits, or until you take \
-                 it back here or with Stop."
+                "Command-line agents, scripts and tests on this Mac can ask to drive Syndeo \
+                 through Syndeo's own command:\n{program} mcp   (an MCP server)\n{program} \
+                 control   (one request, or a session)"
             )),
             mtm,
         );
         about.setFrame(NSRect::new(
-            NSPoint::new(20.0, height - 190.0),
-            NSSize::new(width - 40.0, 140.0),
+            NSPoint::new(pad, 8.0),
+            NSSize::new(inner - 2.0 * pad, 102.0),
         ));
         about.setSelectable(true);
-        let status = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
-        status.setFrame(NSRect::new(
-            NSPoint::new(20.0, height - 222.0),
-            NSSize::new(width - 40.0, 22.0),
-        ));
-        status.setAccessibilityIdentifier(Some(ns_string!("syndeo.agent-status")));
+        how.addSubview(&about);
+        layout.note(
+            "Each program is asked about first, and works only in tabs of its own, which say \
+             so and offer Stop. Your tabs stay hidden from it. What you allow lasts until \
+             Syndeo quits, or until you take it back here or with Stop.",
+            46.0,
+        );
+
+        // Allowed now: each program, and taking it back.
+        layout.header("Allowed Now");
+        let allowed = layout.group(132.0);
         let grants = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
         grants.setFrame(NSRect::new(
-            NSPoint::new(20.0, 64.0),
-            NSSize::new(width - 40.0, height - 222.0 - 64.0 - 8.0),
+            NSPoint::new(pad, 52.0),
+            NSSize::new(inner - 2.0 * pad, 72.0),
         ));
         grants.setAccessibilityIdentifier(Some(ns_string!("syndeo.agent-grants")));
         let list = NSPopUpButton::initWithFrame_pullsDown(
             NSPopUpButton::alloc(mtm),
-            NSRect::new(NSPoint::new(16.0, 18.0), NSSize::new(250.0, 28.0)),
+            NSRect::new(NSPoint::new(pad - 2.0, 12.0), NSSize::new(230.0, 28.0)),
             false,
         );
         list.setAccessibilityIdentifier(Some(ns_string!("syndeo.agent-list")));
@@ -1879,8 +1929,8 @@ impl AccessController {
             )
         };
         revoke.setFrame(NSRect::new(
-            NSPoint::new(272.0, 16.0),
-            NSSize::new(110.0, 32.0),
+            NSPoint::new(pad + 236.0, 10.0),
+            NSSize::new(100.0, 32.0),
         ));
         revoke.setAccessibilityIdentifier(Some(ns_string!("syndeo.agent-revoke")));
         let revoke_all = unsafe {
@@ -1892,20 +1942,12 @@ impl AccessController {
             )
         };
         revoke_all.setFrame(NSRect::new(
-            NSPoint::new(388.0, 16.0),
-            NSSize::new(150.0, 32.0),
+            NSPoint::new(inner - pad - 120.0, 10.0),
+            NSSize::new(120.0, 32.0),
         ));
         revoke_all.setAccessibilityIdentifier(Some(ns_string!("syndeo.agent-revoke-all")));
-        for view in [
-            &*switch as &NSView,
-            &*about,
-            &*status,
-            &*grants,
-            &*list,
-            &*revoke,
-            &*revoke_all,
-        ] {
-            content.addSubview(view);
+        for view in [&*grants as &NSView, &*list, &*revoke, &*revoke_all] {
+            allowed.addSubview(view);
         }
         window.setContentView(Some(&content));
         window.center();

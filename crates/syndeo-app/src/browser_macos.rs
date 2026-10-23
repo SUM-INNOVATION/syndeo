@@ -5,14 +5,15 @@
 //!   only anchor; lets a window's main frame show only the web's own pages
 //!   and Syndeo's (`address::allowed_in_main_frame`), and no IPv6 address
 //!   with a zone, which it refuses as the address field does; keeps the
-//!   window's controls in step with loading; says in the bar how the page on
-//!   screen was reached (`address::route`: Direct, Local or Through Syndeo),
-//!   from its address once it is committed, after any redirect; and shows a
-//!   failure page when a page cannot be opened. When macOS refused a page,
-//!   or a part of one, through the proxy (`address::Refusal`: macOS 15's
-//!   preloaded HSTS sites, Apple's pinned ones), it sends that host directly
-//!   from then on and loads the page again, once (#58); a host sent directly
-//!   gets macOS's own trust, and the bar says Direct for a page from one.
+//!   window's controls in step with loading; says in the address field how
+//!   the page on screen was reached (`address::route`: Direct, Local or
+//!   Through Syndeo), from its address once it is committed, after any
+//!   redirect; and shows a failure page when a page cannot be opened. When
+//!   macOS refused a page, or a part of one, through the proxy
+//!   (`address::Refusal`: macOS 15's preloaded HSTS sites, Apple's pinned
+//!   ones), it sends that host directly from then on and loads the page
+//!   again, once (#58); a host sent directly gets macOS's own trust, and the
+//!   address field says Direct for a page from one.
 //! - **Its UI delegate.** A page that asks for a new window gets a new tab,
 //!   made the way every other is, never a web view WebKit made for it. A
 //!   link followed with ⌘ or the middle button opens in a tab the same way,
@@ -29,8 +30,11 @@
 //! Forward, Reload, Stop and Open Location work on the window in front, and
 //! a window that cannot browse has no controller with a web view to do them,
 //! so they are disabled there.
+//!
+//! The controls themselves, the window's toolbar, are `chrome_macos`'s.
 
 use crate::address::{self, Route, Search, Typed};
+use crate::chrome_macos::Ui;
 use crate::tabs;
 use crate::tabs_macos::{self, Badge};
 use objc2::rc::{Retained, Weak};
@@ -39,14 +43,12 @@ use objc2::{
     define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly, Message,
 };
 use objc2_app_kit::{
-    NSAccessibility, NSAutoresizingMaskOptions, NSButton, NSColor, NSControlSize,
-    NSControlTextEditingDelegate, NSEventModifierFlags, NSFont, NSImage, NSMenuItem,
-    NSMenuItemValidation, NSProgressIndicator, NSProgressIndicatorStyle, NSTextAlignment,
-    NSTextField, NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate,
+    NSControlTextEditingDelegate, NSEventModifierFlags, NSMenuItem, NSMenuItemValidation,
+    NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
     ns_string, NSError, NSKeyValueObservingOptions, NSNotification, NSNumber,
-    NSObjectNSKeyValueObserverRegistration, NSPoint, NSProcessInfo, NSRect, NSSize, NSString,
+    NSObjectNSKeyValueObserverRegistration, NSProcessInfo, NSRect, NSString,
     NSURLAuthenticationChallenge, NSURLRequest, NSURL,
 };
 use objc2_web_kit::{
@@ -56,12 +58,6 @@ use objc2_web_kit::{
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use syndeo_webkit::pin;
-
-/// The height of the bar above the page.
-pub const BAR: f64 = 36.0;
-
-/// The width of the bar's route, at its right, before the spinner.
-const ROUTE_WIDTH: f64 = 190.0;
 
 /// How a new tab starts.
 pub enum Start {
@@ -149,17 +145,6 @@ struct Web {
     pinner: Retained<pin::Pinner>,
 }
 
-/// The controls above the page.
-pub struct Ui {
-    address: Retained<NSTextField>,
-    back: Retained<NSButton>,
-    forward: Retained<NSButton>,
-    reload: Retained<NSButton>,
-    spinner: Retained<NSProgressIndicator>,
-    /// How the page on screen was reached: see [`Route`].
-    route: Retained<NSTextField>,
-}
-
 #[derive(Default)]
 pub struct Ivars {
     /// The window this controller is the delegate of.
@@ -236,14 +221,6 @@ const CANCELLED: isize = -999;
 /// `WebKitErrorFrameLoadInterruptedByPolicyChange`: WebKit stopped a load
 /// itself, for a file it does not show or an address a window may not open.
 const INTERRUPTED: isize = 102;
-
-/// What the bar's route says when someone points at it.
-const ROUTE_HELP: &str = "How this page was reached. Through Syndeo: through Syndeo's proxy, \
-    which may cache it. Direct: this Mac's own loopback, which WebKit opens without the proxy, \
-    so Syndeo does not cache it. Local: a local-network address, which WebKit may open \
-    directly or through the proxy; either way Syndeo does not cache it. Each image, script \
-    and other part of the page is classified by its own address, so parts of it can be \
-    reached another way.";
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -508,7 +485,7 @@ define_class!(
             }
         }
 
-        /// The bar's one button: Stop while loading, Reload otherwise.
+        /// The address field's button: Stop while loading, Reload otherwise.
         #[unsafe(method(syndeoReloadOrStop:))]
         fn reload_or_stop(&self, _sender: Option<&AnyObject>) {
             if self.ivars().loading.get() {
@@ -1227,7 +1204,7 @@ impl BrowserController {
             .unwrap_or_default()
     }
 
-    /// Show the failure page for `address`, keeping it in the field. The bar
+    /// Show the failure page for `address`, keeping it in the field, which
     /// says nothing of a route: no page came from there, either way.
     fn show_page(&self, address: &str, why: &str) {
         *self.ivars().failed.borrow_mut() = (!address.is_empty()).then(|| address.to_string());
@@ -1242,13 +1219,11 @@ impl BrowserController {
         self.show_route(None);
     }
 
-    /// Say in the bar how the page on screen was reached, or nothing for one
-    /// of Syndeo's own pages.
+    /// Say in the address field how the page on screen was reached, or
+    /// nothing for one of Syndeo's own pages.
     fn show_route(&self, route: Option<Route>) {
         if let Some(ui) = &*self.ivars().ui.borrow() {
-            let label = route.map(Route::label).unwrap_or_default();
-            ui.route.setStringValue(&NSString::from_str(label));
-            ui.route.setHidden(route.is_none());
+            ui.show_route(route);
         }
     }
 
@@ -1272,7 +1247,7 @@ impl BrowserController {
     }
 
     /// The page's address, for the web's own pages, kept as the field's and
-    /// shown unless someone is typing there, with its route in the bar;
+    /// shown unless someone is typing there, with its route beside it;
     /// Syndeo's own pages leave the kept address as it is (empty, or the
     /// address that failed).
     fn refresh_address(&self) {
@@ -1305,7 +1280,7 @@ impl BrowserController {
     }
 
     /// The controls, as the page is now: Back and Forward, Reload or Stop,
-    /// the spinner, and the window's title.
+    /// the loading progress, and the window's title, which its tab shows.
     fn refresh(&self) {
         let web = self.ivars().web.borrow();
         let ui = self.ivars().ui.borrow();
@@ -1318,22 +1293,7 @@ impl BrowserController {
         }
         ui.back.setEnabled(unsafe { web.view.canGoBack() });
         ui.forward.setEnabled(unsafe { web.view.canGoForward() });
-        let (symbol, label) = if loading {
-            ("xmark", "Stop")
-        } else {
-            ("arrow.clockwise", "Reload")
-        };
-        if let Some(image) = symbol_image(symbol, label) {
-            ui.reload.setImage(Some(&image));
-        }
-        ui.reload.setToolTip(Some(&NSString::from_str(label)));
-        unsafe {
-            if loading {
-                ui.spinner.startAnimation(None);
-            } else {
-                ui.spinner.stopAnimation(None);
-            }
-        }
+        ui.show_loading(loading, &web.view);
         if let Some(window) = self.window() {
             // A tab from the last session has its title until it opens.
             let later = self
@@ -1351,147 +1311,19 @@ impl BrowserController {
     }
 }
 
-/// An SF Symbol, described for VoiceOver and Accessibility by `label`.
-fn symbol_image(name: &str, label: &str) -> Option<Retained<NSImage>> {
-    NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str(name),
-        Some(&NSString::from_str(label)),
-    )
-}
-
-/// A bar button: a symbol, described by `label`, sending `action` to `target`.
-fn button(
-    mtm: MainThreadMarker,
-    symbol: &str,
-    label: &str,
-    target: &AnyObject,
-    action: Sel,
-    x: f64,
-) -> Retained<NSButton> {
-    let image = symbol_image(symbol, label).unwrap_or_default();
-    let button =
-        unsafe { NSButton::buttonWithImage_target_action(&image, Some(target), Some(action), mtm) };
-    button.setFrame(NSRect::new(NSPoint::new(x, 6.0), NSSize::new(28.0, 24.0)));
-    button.setToolTip(Some(&NSString::from_str(label)));
-    button
-}
-
-/// The window's content: the bar of controls above `webview`, sized to
-/// `frame`, with the controls sending to `controller`.
+/// The window's content, `webview` under the toolbar's controls, which send
+/// to `controller`: see `chrome_macos`.
 pub fn browser_content(
     mtm: MainThreadMarker,
     frame: NSRect,
     webview: &WKWebView,
     controller: &BrowserController,
 ) -> (Retained<NSView>, Ui) {
-    let width = frame.size.width;
-    let height = frame.size.height;
-    let target: &AnyObject = controller.as_ref();
-
-    let container = NSView::initWithFrame(NSView::alloc(mtm), frame);
-    let bar = NSView::initWithFrame(
-        NSView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, height - BAR), NSSize::new(width, BAR)),
-    );
-    bar.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
-    );
-
-    let back = button(mtm, "chevron.left", "Back", target, sel!(syndeoBack:), 8.0);
-    let forward = button(
+    crate::chrome_macos::browser_content(
         mtm,
-        "chevron.right",
-        "Forward",
-        target,
-        sel!(syndeoForward:),
-        38.0,
-    );
-    let reload = button(
-        mtm,
-        "arrow.clockwise",
-        "Reload",
-        target,
-        sel!(syndeoReloadOrStop:),
-        68.0,
-    );
-
-    let address = NSTextField::textFieldWithString(ns_string!(""), mtm);
-    address.setFrame(NSRect::new(
-        NSPoint::new(104.0, 6.0),
-        NSSize::new(width - 104.0 - 40.0 - ROUTE_WIDTH - 8.0, 24.0),
-    ));
-    address.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
-    address.setPlaceholderString(Some(ns_string!("Enter a web address")));
-    // Only Return opens what was typed; leaving the field does not.
-    if let Some(cell) = address.cell() {
-        cell.setSendsActionOnEndEditing(false);
-    }
-    unsafe {
-        // Told when someone types there, and when they leave.
-        address.setDelegate(Some(ProtocolObject::from_ref(controller)));
-        address.setTarget(Some(target));
-        address.setAction(Some(sel!(navigateTo:)));
-    }
-
-    let route = NSTextField::labelWithString(ns_string!(""), mtm);
-    route.setFrame(NSRect::new(
-        NSPoint::new(width - 40.0 - ROUTE_WIDTH, 10.0),
-        NSSize::new(ROUTE_WIDTH, 16.0),
-    ));
-    route.setAlignment(NSTextAlignment::Right);
-    route.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-    route.setTextColor(Some(&NSColor::secondaryLabelColor()));
-    route.setToolTip(Some(&NSString::from_str(ROUTE_HELP)));
-    route.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
-    route.setHidden(true);
-
-    let spinner = NSProgressIndicator::initWithFrame(
-        NSProgressIndicator::alloc(mtm),
-        NSRect::new(NSPoint::new(width - 30.0, 10.0), NSSize::new(16.0, 16.0)),
-    );
-    spinner.setStyle(NSProgressIndicatorStyle::Spinning);
-    spinner.setControlSize(NSControlSize::Small);
-    spinner.setDisplayedWhenStopped(false);
-    spinner.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
-
-    // What Accessibility, and the UI test, find them by.
-    for (control, name) in [
-        (&*back as &NSView, "syndeo.back"),
-        (&*forward, "syndeo.forward"),
-        (&*reload, "syndeo.reload"),
-        (&*address, "syndeo.address"),
-        (&*route, "syndeo.route"),
-    ] {
-        control.setAccessibilityIdentifier(Some(&NSString::from_str(name)));
-    }
-    for control in [
-        &*back as &NSView,
-        &*forward,
-        &*reload,
-        &*address,
-        &*route,
-        &*spinner,
-    ] {
-        bar.addSubview(control);
-    }
-
-    webview.setFrame(NSRect::new(
-        NSPoint::new(0.0, 0.0),
-        NSSize::new(width, height - BAR),
-    ));
-    webview.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
-    );
-    container.addSubview(webview);
-    container.addSubview(&bar);
-
-    let ui = Ui {
-        address,
-        back,
-        forward,
-        reload,
-        spinner,
-        route,
-    };
-    (container, ui)
+        frame,
+        webview,
+        controller.as_ref(),
+        ProtocolObject::from_ref(controller),
+    )
 }

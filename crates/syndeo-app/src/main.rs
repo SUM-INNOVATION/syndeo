@@ -16,6 +16,8 @@ mod app_macos;
 #[cfg(target_os = "macos")]
 mod browser_macos;
 #[cfg(target_os = "macos")]
+mod chrome_macos;
+#[cfg(target_os = "macos")]
 mod control_macos;
 #[cfg(target_os = "macos")]
 mod peer_macos;

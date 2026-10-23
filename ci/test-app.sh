@@ -8,6 +8,7 @@
 #   ci/test-app.sh customer <installed Syndeo.app> [again]
 #   ci/test-app.sh realtime <Syndeo.app>
 #   ci/test-app.sh agents <Syndeo.app>
+#   ci/test-app.sh looks <Syndeo.app>
 #   ci/test-app.sh tabs <Syndeo.app>
 #   ci/test-app.sh measure
 #
@@ -18,6 +19,10 @@
 #   - its one child is the proxy, from this bundle's Contents/Helpers, and no
 #     keystore process exists;
 #   - its window holds a web view and no error;
+#   - its controls are its toolbar's, in the title bar: Back, Forward, the
+#     address field and its Reload, each by the identifier it always had;
+#     and the address field's route, there, says Through Syndeo for a page
+#     that came through the proxy, with its help tag those words first;
 #   - its menus have the usual shortcuts, read from the menu items;
 #   - in it, as a person uses it — File > Open Location…, then the address
 #     typed as keystrokes and Return: an address opens and shows the page's
@@ -54,7 +59,8 @@
 #     in a new tab opens one;
 #   - an address typed while a page loads is not overwritten when it arrives,
 #     leaving the field shows the page's address again, and the field then
-#     follows navigation as before;
+#     follows navigation as before; and while that page loads, the address
+#     field shows its loading progress, which is gone once it has loaded;
 #   - it says in its log that passkeys are not available in this copy, which
 #     holds no entitlement, and asked nothing of anyone: no sheet, and its
 #     one window its own;
@@ -203,6 +209,15 @@
 # Measured, not gated, because what they do is theirs: a WebSocket to a
 # public echo server by ws:// and wss://, what a public STUN server answered,
 # and whether two connections in one page join.
+#
+# looks, which gates the window's controls and browsing in light and in dark
+# appearance, the runner's own, set through System Events for each opening
+# and put back as it was at the end, which is gated too; and keeps pictures
+# of what it looks like: in each, the start page, a page that came through
+# Syndeo, a page on this Mac's loopback (Direct), Syndeo's own page for an
+# address it refuses, and Settings, each a looks-*.png in the logs, with how
+# light its top and the content below it are (ci/macos-app/luma.py),
+# measured and not gated.
 #
 # tabs, which gates tabs, from no kept session and with macOS's own "keep
 # windows" setting as the runner has it, on pages this Mac serves, reached
@@ -425,6 +440,46 @@ at() {
 }
 page_text() { front | grep -E '^AX(StaticText|Heading)' | cut -f2,3 | tr '\t\n' '  ' | head -c 300; }
 controls() { printf 'Back %s, Forward %s' "$("$APPCTL" enabled "$PID" syndeo.back)" "$("$APPCTL" enabled "$PID" syndeo.forward)"; }
+
+# chrome WHEN: the front window's controls are its toolbar's, in the title
+# bar: Back, Forward, the address field and its Reload, each found by the
+# identifier it always had, and Reload saying Reload.
+chrome() {
+  local id where
+  for id in syndeo.back syndeo.forward syndeo.address syndeo.reload; do
+    where="$("$APPCTL" in-toolbar "$PID" "$id" 2>&1)"
+    must "$([ "$where" = "in the toolbar" ] && echo yes)" "$id is in the window's toolbar ($1)" "${where:-no such control in the front window}"
+  done
+  must "$("$APPCTL" describe "$PID" syndeo.reload | grep -q 'Reload' && echo yes)" "the address field's Reload says Reload ($1)" \
+    "it says '$("$APPCTL" describe "$PID" syndeo.reload)'"
+}
+
+# route_words WHEN: the front window's page came through Syndeo, and the
+# address field's route, in the toolbar, says so: Through Syndeo, with its
+# help tag those words first, then what each route means.
+route_words() {
+  local help
+  must "$([ "$(bar)" = "$SYNDEO_LABEL" ] && echo yes)" "the address field's route says '$SYNDEO_LABEL' ($1)" "it says '$(bar)'"
+  must "$("$APPCTL" in-toolbar "$PID" syndeo.route >/dev/null 2>&1 && echo yes)" "and it is in the address field, in the toolbar ($1)"
+  help="$("$APPCTL" describe "$PID" syndeo.route | cut -f2)"
+  must "$([[ "$help" == "$SYNDEO_LABEL. How this page was reached."* ]] && echo yes)" \
+    "and its help tag is its words, then what each route means ($1)" "help: '${help:-none}'"
+}
+
+# look NAME: a picture of PID's front window, the one Accessibility has in
+# front, which the checks before it used, kept as looks-NAME.png in the
+# logs, and how light its top and the content below it are; measured, never
+# gated, since what a runner lets a picture show is the runner's.
+look() {
+  local id file="$LOGS/looks-$1.png"
+  id="$("$APPCTL" front-window-id "$PID")"
+  rm -f "$file"
+  if [ -n "$id" ] && screencapture -x -o -l "$id" "$file" 2>/dev/null && [ -s "$file" ]; then
+    printf '  MEASURE  %s: looks-%s.png, %s\n' "$1" "$1" "$(python3 -I "$here/macos-app/luma.py" "$file" 2>&1 | head -c 160)"
+  else
+    printf '  MEASURE  %s: no picture of the window could be taken (window %s)\n' "$1" "${id:-not found}"
+  fi
+}
 
 # arrive ADDRESS PAGE WHAT: within 30 s the front window's address field says
 # ADDRESS and its page says PAGE, an extended regular expression.
@@ -863,6 +918,11 @@ editing() {
   visit "$first" "$first" 'Policy test' "a page to start from opens"
   choose File "Open Location…"
   "$APPCTL" type "$PID" "$slow" >/dev/null || bad "typing $slow" "pid $PID could not be brought to the front"
+  if wait_for 5 "$APPCTL" value "$PID" syndeo.progress; then
+    ok "while a page loads, the address field shows its loading progress"
+  else
+    bad "loading progress" "no progress in the address field while $slow loads"
+  fi
   choose File "Open Location…"
   "$APPCTL" type-only "$PID" "$typed" >/dev/null || bad "typing while it loads" "pid $PID could not be brought to the front"
   if wait_for 30 page_says 'SYNDEO-SLOW-PAGE'; then
@@ -875,6 +935,7 @@ editing() {
   said="$("$APPCTL" value "$PID" syndeo.address)"
   must "$([ "$said" = "$typed" ] && echo yes)" \
     "typing in the address field while a page loads: the page's arrival leaves what was typed" "the field says '$said'"
+  must "$("$APPCTL" value "$PID" syndeo.progress >/dev/null 2>&1 && echo no || echo yes)" "once that page has loaded, its progress is gone"
   "$APPCTL" tab "$PID" >/dev/null || bad "Tab" "pid $PID could not be brought to the front"
   arrive "$slow" 'SYNDEO-SLOW-PAGE' "leaving the field with Tab shows the page's address again"
   "$APPCTL" press "$PID" syndeo.back || bad "Back" "no Back button to press in the front window"
@@ -994,7 +1055,9 @@ browsing() {
   log="$LOGS/app-$round.stderr"
   shortcuts
   arrive "" 'Welcome to Syndeo' "a new window shows the start page, with an empty address field ($round)"
+  chrome "$round"
   plain_http
+  route_words "$round"
   "$APPCTL" press "$PID" syndeo.back || bad "Back" "no Back button to press in the front window"
   arrive "http://example.com/?$FRESH" "$EXAMPLE_BODY" "the bar's Back button goes back"
   choose History Forward
@@ -2143,6 +2206,9 @@ realtime() {
 #            authority in no trust settings;
 #   visible: its tabs say who controls them, with Stop, in a window of their
 #            own on screen;
+#   placed:  that bar below the toolbar and the tab bar, above the page, and
+#            the route the agent reads what the address field says
+#            (agents_placed);
 #   act:     on a page this test serves, the agent types into a field, clicks
 #            a button, submits a form, scrolls, follows a link and waits for
 #            the page, and goes back; a reference from another page is refused;
@@ -2566,6 +2632,58 @@ agents_off_again() {
   must "$([ "$st" = 3 ] && [ "$(code_of "$out")" = off ] && echo yes)" "off: and a client cannot reach Syndeo" "exit $st: $(head -c 200 "$out")"
 }
 
+# agents_placed: in the agent's window, chosen, with two tabs of its own.
+#   placed:  the bar saying who controls its tabs is below the toolbar and
+#            its address field, above the page, and overlaps none of its tabs
+#            in the tab bar, as Accessibility has them;
+#   placed:  the route the agent reads for its tab is what the address field
+#            says: its words, which for Through Syndeo are in its help tag
+#            alone, beside the symbol.
+agents_placed() {
+  local frames verdict out
+  out="$LOGS/agent-placed.json"
+  agent "$out" "{\"cmd\":\"select\",\"tab\":${AGENT_T1:-1}}"
+  "$APPCTL" activate "$PID" >/dev/null || true
+  sleep 1
+  frames="$("$APPCTL" frames "$PID" 'Controlled by “ci-agent”' 2>&1)"
+  printf '%s\n' "$frames" >"$LOGS/agent-frames.txt"
+  verdict="$(printf '%s\n' "$frames" | python3 -I -c '
+import sys
+parts = {}
+tabs = []
+for line in sys.stdin:
+    name, *box = line.split()
+    if len(box) != 4:
+        continue
+    box = [int(v) for v in box]
+    if name == "tab":
+        tabs.append(box)
+    else:
+        parts[name] = box
+missing = [p for p in ("indicator", "address", "page") if p not in parts]
+if missing:
+    sys.exit("missing: " + " ".join(missing))
+ind, addr, page = parts["indicator"], parts["address"], parts["page"]
+top, bottom = ind[1], ind[1] + ind[3]
+if top < addr[1] + addr[3]:
+    sys.exit("the bar is not below the address field: %r, %r" % (ind, addr))
+if bottom > page[1] + 1:
+    sys.exit("the bar is over the page: %r, %r" % (ind, page))
+for tab in tabs:
+    if tab[1] < bottom and tab[1] + tab[3] > top:
+        sys.exit("the bar overlaps a tab: %r, %r" % (ind, tab))
+print("placed, with %d tabs in the bar" % len(tabs))
+' 2>&1)"
+  must "$(printf '%s' "$verdict" | grep -q '^placed, with [2-9]' && echo yes)" \
+    "placed: the bar saying who controls an agent's tab is below the toolbar and the tab bar, above the page, and covered by neither" \
+    "$verdict; $(tr '\n' ';' <"$LOGS/agent-frames.txt")"
+  agent "$out" "{\"cmd\":\"read\",\"tab\":${AGENT_T1:-1}}"
+  must "$([ "$(answered "$out" result.route)" = "$(bar)" ] &&
+    "$APPCTL" describe "$PID" syndeo.route | cut -f2 | grep -qF "$(answered "$out" result.route). " && echo yes)" \
+    "placed: the route the agent reads is what the address field says, in its words and its help tag" \
+    "the agent read '$(answered "$out" result.route)'; the field says '$(bar)', with help '$("$APPCTL" describe "$PID" syndeo.route | cut -f2 | head -c 60)'"
+}
+
 # agents_direct LOG: an agent's tab routes as the person's do (#58). On
 # macOS 15 and earlier, https://github.com, on macOS's HSTS preload list, is
 # refused through the proxy, sent directly for the session and its page
@@ -2738,6 +2856,7 @@ agents() {
     agents_peer
     agents_approval
     agents_traffic
+    agents_placed
     agents_act
     agents_direct "$log"
     agents_read
@@ -2768,6 +2887,58 @@ agents() {
   must "$(cmp -s "$LOGS/trust-before-agents.txt" "$LOGS/trust-after-agents.txt" && echo yes)" "the user's trust settings are as they were" \
     "$(diff "$LOGS/trust-before-agents.txt" "$LOGS/trust-after-agents.txt" | head -5)"
   defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
+  printf '\n%d failed\n' "$fails"
+  [ "$fails" = 0 ]
+}
+
+# The runner's appearance, dark or light, as System Events has it; and
+# setting it. Each gives up after 20 s.
+appearance_now() {
+  perl -e 'alarm 20; exec @ARGV' osascript -e 'tell application "System Events" to tell appearance preferences to get dark mode' 2>/dev/null |
+    sed 's/^true$/dark/; s/^false$/light/'
+}
+appearance_set() {
+  perl -e 'alarm 20; exec @ARGV' osascript -e "tell application \"System Events\" to tell appearance preferences to set dark mode to $([ "$1" = dark ] && echo true || echo false)" >/dev/null 2>&1
+}
+
+# looks APP: see the top of this script.
+looks() {
+  local app appearance round was page
+  [ -d "${1:-}" ] || { say "usage: $0 looks <Syndeo.app>"; exit 2; }
+  app="$(cd "$1" && pwd -P)"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  was="$(appearance_now)"
+  printf '\nthe runner'"'"'s appearance before: %s\n' "${was:-unknown}"
+  for appearance in light dark; do
+    round="looks-$appearance"
+    printf '\nSyndeo.app, in %s appearance: %s\n' "$appearance" "$app"
+    appearance_set "$appearance"
+    must "$([ "$(appearance_now)" = "$appearance" ] && echo yes)" "the runner is in $appearance appearance" "System Events says '$(appearance_now)'"
+    started "$app" "$round" || continue
+    helper_of "$app" "$round"
+    browses "$round"
+    arrive "" 'Welcome to Syndeo' "the window shows the start page ($appearance)"
+    chrome "$appearance"
+    look "$appearance-start"
+    plain_http
+    route_words "$appearance"
+    look "$appearance-page"
+    if origin; then
+      page="http://127.0.0.1:$ORIGIN_PORT/policy.html"
+      visit "$page" "$page" 'Policy test' "a page on this Mac's loopback opens ($appearance)"
+      must "$([ "$(bar)" = "$DIRECT_LABEL" ] && echo yes)" "and the address field's route says '$DIRECT_LABEL' ($appearance)" "it says '$(bar)'"
+      look "$appearance-direct"
+    fi
+    visit "file:///etc/passwd" "file:///etc/passwd" 'not file: ones' "Syndeo's own page for an address it refuses ($appearance)"
+    look "$appearance-refused"
+    settings_open "$appearance"
+    look "$appearance-settings"
+    settings_close "$appearance"
+    stopped "$round"
+  done
+  origin_stop
+  [ -z "$was" ] || appearance_set "$was"
+  must "$([ -n "$was" ] && [ "$(appearance_now)" = "$was" ] && echo yes)" "the runner's appearance is put back as it was: ${was:-unknown}" "System Events says '$(appearance_now)'"
   printf '\n%d failed\n' "$fails"
   [ "$fails" = 0 ]
 }
@@ -3235,8 +3406,9 @@ case "${1:-}" in
   customer) shift; customer "$@" ;;
   realtime) shift; realtime "$@" ;;
   agents) shift; agents "$@" ;;
+  looks) shift; looks "$@" ;;
   tabs) shift; tabs_test "$@" ;;
   preloaded) shift; preloaded_only "$@" ;;
   measure) measure ;;
-  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | agents <Syndeo.app> | tabs <Syndeo.app> | preloaded <Syndeo.app> | measure"; exit 2 ;;
+  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | looks <Syndeo.app> | agents <Syndeo.app> | tabs <Syndeo.app> | preloaded <Syndeo.app> | measure"; exit 2 ;;
 esac

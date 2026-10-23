@@ -1,4 +1,5 @@
-//! Settings: the search engine, and Clear Browsing Data.
+//! Settings: the search engine, and Clear Browsing Data, each in a section
+//! of its own, as a Mac application's Settings window has them.
 //!
 //! The search engine is stored in the application's user defaults, under
 //! [`SEARCH_KEY`], and read each time something is typed in an address
@@ -18,8 +19,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAccessibility, NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSBackingStoreType, NSButton,
-    NSModalResponse, NSPopUpButton, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSAccessibility, NSAlert, NSAlertFirstButtonReturn, NSAlertStyle, NSBackingStoreType, NSBox,
+    NSBoxType, NSButton, NSColor, NSFont, NSModalResponse, NSPopUpButton, NSTextField,
+    NSTitlePosition, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{
     ns_string, NSDate, NSPoint, NSRect, NSSize, NSString, NSTimer, NSUserDefaults,
@@ -43,6 +45,98 @@ pub fn search() -> Search {
 
 /// How long the proxy has to say it cleared its cache.
 const PROXY_CLEAR: Duration = Duration::from_secs(30);
+
+/// The Settings window's size, its margin, and each section's width and
+/// inner margin.
+const WIDTH: f64 = 520.0;
+const HEIGHT: f64 = 302.0;
+const MARGIN: f64 = 20.0;
+const GROUP_WIDTH: f64 = WIDTH - 2.0 * MARGIN;
+const PAD: f64 = 14.0;
+
+/// Settings in sections, as macOS lays them out: a heading, then a rounded
+/// group of rows, then a note below it in smaller, quieter text. Laid out
+/// from the top of `content`, a window's content `width` by `height`; Agent
+/// Access is laid out the same way.
+pub struct Layout<'a> {
+    mtm: MainThreadMarker,
+    content: &'a NSView,
+    /// How far down from the top the next piece goes.
+    top: f64,
+    width: f64,
+    height: f64,
+}
+
+impl<'a> Layout<'a> {
+    pub fn new(mtm: MainThreadMarker, content: &'a NSView, width: f64, height: f64) -> Self {
+        Self {
+            mtm,
+            content,
+            top: MARGIN,
+            width,
+            height,
+        }
+    }
+
+    /// The width of a group, and of what goes across it.
+    pub fn group_width(&self) -> f64 {
+        self.width - 2.0 * MARGIN
+    }
+
+    /// The frame of the next piece, `height` tall and `inset` in from the
+    /// margin, then `after` below it.
+    fn next(&mut self, inset: f64, height: f64, after: f64) -> NSRect {
+        let frame = NSRect::new(
+            NSPoint::new(MARGIN + inset, self.height - self.top - height),
+            NSSize::new(self.group_width() - 2.0 * inset, height),
+        );
+        self.top += height + after;
+        frame
+    }
+
+    pub fn header(&mut self, title: &str) {
+        let label = NSTextField::labelWithString(&NSString::from_str(title), self.mtm);
+        label.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+        label.setFrame(self.next(2.0, 17.0, 6.0));
+        self.content.addSubview(&label);
+    }
+
+    /// A rounded group, `height` tall, to put rows in.
+    pub fn group(&mut self, height: f64) -> Retained<NSView> {
+        let group = NSBox::initWithFrame(NSBox::alloc(self.mtm), self.next(0.0, height, 6.0));
+        group.setBoxType(NSBoxType::Custom);
+        group.setTitlePosition(NSTitlePosition::NoTitle);
+        group.setCornerRadius(10.0);
+        group.setBorderWidth(1.0);
+        group.setBorderColor(&NSColor::separatorColor());
+        group.setFillColor(&NSColor::controlBackgroundColor());
+        group.setContentViewMargins(NSSize::new(0.0, 0.0));
+        self.content.addSubview(&group);
+        group
+            .contentView()
+            .unwrap_or_else(|| Retained::into_super(group.clone()))
+    }
+
+    /// A note below a group, in smaller, secondary text.
+    pub fn note(&mut self, text: &str, height: f64) -> Retained<NSTextField> {
+        let note = NSTextField::wrappingLabelWithString(&NSString::from_str(text), self.mtm);
+        note.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        note.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        note.setFrame(self.next(4.0, height, 16.0));
+        self.content.addSubview(&note);
+        note
+    }
+}
+
+/// A row's label, at the leading end of a group `height` tall.
+pub fn row_label(label: &NSTextField, group: &NSView, height: f64) {
+    let size = label.fittingSize();
+    label.setFrame(NSRect::new(
+        NSPoint::new(PAD, (height - size.height) / 2.0),
+        size,
+    ));
+    group.addSubview(label);
+}
 
 /// What clearing needs from the application.
 pub struct Clearing {
@@ -161,7 +255,7 @@ impl SettingsController {
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
                 NSWindow::alloc(mtm),
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(480.0, 280.0)),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, HEIGHT)),
                 NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
                 NSBackingStoreType::Buffered,
                 false,
@@ -171,17 +265,21 @@ impl SettingsController {
         window.setTitle(ns_string!("Settings"));
         let content = NSView::initWithFrame(
             NSView::alloc(mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(480.0, 280.0)),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIDTH, HEIGHT)),
         );
+        let mut layout = Layout::new(mtm, &content, WIDTH, HEIGHT);
 
-        let label = NSTextField::labelWithString(ns_string!("Search engine:"), mtm);
-        label.setFrame(NSRect::new(
-            NSPoint::new(20.0, 234.0),
-            NSSize::new(110.0, 20.0),
-        ));
+        // Search: which engine, and what is sent to it.
+        layout.header("Search");
+        let search = layout.group(46.0);
+        let label = NSTextField::labelWithString(ns_string!("Search engine"), mtm);
+        row_label(&label, &search, 46.0);
         let popup = NSPopUpButton::initWithFrame_pullsDown(
             NSPopUpButton::alloc(mtm),
-            NSRect::new(NSPoint::new(134.0, 228.0), NSSize::new(320.0, 28.0)),
+            NSRect::new(
+                NSPoint::new(GROUP_WIDTH - PAD - 240.0, 9.0),
+                NSSize::new(240.0, 28.0),
+            ),
             false,
         );
         for search in Search::ALL {
@@ -192,19 +290,28 @@ impl SettingsController {
             popup.setAction(Some(sel!(searchChosen:)));
         }
         popup.setAccessibilityIdentifier(Some(ns_string!("syndeo.search")));
-        let about_search = NSTextField::wrappingLabelWithString(
+        search.addSubview(&popup);
+        layout.note(
+            "Words typed in the address field are sent to the search engine when you \
+             press Return, and only then. Syndeo makes no suggestions, so nothing is \
+             sent while you type.",
+            32.0,
+        );
+
+        // Browsing data: what clearing removes, and how it went.
+        layout.header("Browsing Data");
+        let data = layout.group(76.0);
+        let about_clear = NSTextField::wrappingLabelWithString(
             ns_string!(
-                "Words typed in the address field are sent to the search engine when you \
-                 press Return, and only then. Syndeo makes no suggestions, so nothing is \
-                 sent while you type."
+                "Removes cookies, website storage and cached pages from every Syndeo window, \
+                 and empties Syndeo's own cache."
             ),
             mtm,
         );
-        about_search.setFrame(NSRect::new(
-            NSPoint::new(20.0, 168.0),
-            NSSize::new(440.0, 50.0),
+        about_clear.setFrame(NSRect::new(
+            NSPoint::new(PAD, 8.0),
+            NSSize::new(GROUP_WIDTH - 3.0 * PAD - 170.0, 58.0),
         ));
-
         let clear = unsafe {
             NSButton::buttonWithTitle_target_action(
                 ns_string!("Clear Browsing Data…"),
@@ -214,38 +321,15 @@ impl SettingsController {
             )
         };
         clear.setFrame(NSRect::new(
-            NSPoint::new(16.0, 124.0),
-            NSSize::new(200.0, 32.0),
+            NSPoint::new(GROUP_WIDTH - PAD - 170.0, 22.0),
+            NSSize::new(170.0, 32.0),
         ));
         clear.setAccessibilityIdentifier(Some(ns_string!("syndeo.clear")));
-        let about_clear = NSTextField::wrappingLabelWithString(
-            ns_string!(
-                "Removes cookies, website storage and cached pages from every Syndeo window, \
-                 and empties Syndeo's own cache."
-            ),
-            mtm,
-        );
-        about_clear.setFrame(NSRect::new(
-            NSPoint::new(20.0, 72.0),
-            NSSize::new(440.0, 44.0),
-        ));
-        let status = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
-        status.setFrame(NSRect::new(
-            NSPoint::new(20.0, 20.0),
-            NSSize::new(440.0, 44.0),
-        ));
+        data.addSubview(&about_clear);
+        data.addSubview(&clear);
+        let status = layout.note("", 34.0);
         status.setAccessibilityIdentifier(Some(ns_string!("syndeo.clear-status")));
 
-        for view in [
-            &*label as &NSView,
-            &*popup,
-            &*about_search,
-            &*clear,
-            &*about_clear,
-            &*status,
-        ] {
-            content.addSubview(view);
-        }
         window.setContentView(Some(&content));
         window.center();
         *self.ivars().window.borrow_mut() = Some(window.clone());
