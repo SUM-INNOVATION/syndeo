@@ -29,15 +29,24 @@
 //! and no other was built. Each window then gets its own configuration,
 //! routed through the proxy, and its web view's delegate is the window's
 //! controller, which answers every TLS challenge with that authority as the
-//! only anchor, checked after it is set. If any of it fails, the window holds
-//! a native label saying so instead — no web view at all, so nothing in it
-//! can reach the network. There is no unproxied configuration and no unpinned
-//! web view anywhere in this application, and a page asking for a new window
-//! gets a tab made the same way. WebKit itself opens `localhost` and loopback
-//! addresses directly rather than through the proxy, as measured on CI, and
-//! may open local-network addresses either way; Syndeo caches neither. Each
-//! window's address field says which applies to its page (`address::route`), and
-//! nothing here claims that every request goes through Syndeo.
+//! only anchor, checked after it is set, but one for a host this session
+//! sends directly (below). If any of it fails, the window holds a native
+//! label saying so instead — no web view at all, so nothing in it can reach
+//! the network. Every configuration is routed through the proxy, and every
+//! web view pinned to its authority, apart from those hosts; a page asking
+//! for a new window gets a tab made the same way.
+//!
+//! A host macOS refuses through the proxy (#58) — on macOS 15 and earlier the
+//! sites on its built-in HSTS preload list, such as github.com, and on every
+//! macOS Apple's own, such as www.apple.com — is excluded from every
+//! window's proxy configuration for the rest of the session, in memory only
+//! (`State::direct`), and a challenge for it gets macOS's default handling,
+//! not the pin. WebKit itself opens `localhost` and loopback addresses
+//! directly rather than through the proxy, as measured on CI, and may open
+//! local-network addresses either way; Syndeo caches none of these. Each
+//! window's address field says which applies to its page
+//! (`address::route_with`), and nothing here claims that every request goes
+//! through Syndeo.
 //!
 //! Nothing here asks for, reads or changes the keychain's trust settings:
 //! each window accepts the proxy's authority, and no other, itself, so
@@ -1787,6 +1796,11 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
         assert!(page.contains("Local — not cached by Syndeo"), "{page}");
         assert!(page.contains("may connect directly or through"), "{page}");
         assert!(page.contains("classified by its own address"), "{page}");
+        // And that a site macOS refuses through the proxy goes directly (#58).
+        assert!(
+            page.contains("will not let Syndeo open through its proxy"),
+            "{page}"
+        );
         for claim in [
             "not in your login keychain",
             "trust Syndeo",

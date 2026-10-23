@@ -114,8 +114,9 @@ impl Search {
 pub enum Route {
     /// Through Syndeo's proxy, which may cache it.
     Syndeo,
-    /// This Mac's own loopback: WebKit opens it directly, never through the
-    /// proxy, so Syndeo does not cache it.
+    /// Not through the proxy, so Syndeo does not cache it: this Mac's own
+    /// loopback, which WebKit opens directly, or a host macOS refuses through
+    /// the proxy, which Syndeo then sends directly (#58).
     Direct,
     /// A local-network address: WebKit may open it directly or through the
     /// proxy, and either way Syndeo does not cache it, because the proxy
@@ -160,8 +161,9 @@ impl Route {
 
 /// What every route means, in the route's help tag.
 pub const ROUTE_HELP: &str = "How this page was reached. Through Syndeo: through Syndeo's proxy, \
-    which may cache it. Direct: this Mac's own loopback, which WebKit opens without the proxy, \
-    so Syndeo does not cache it. Local: a local-network address, which WebKit may open \
+    which may cache it. Direct: without the proxy, so Syndeo does not cache it: this Mac's \
+    own loopback, which WebKit opens itself, or a site macOS will not let Syndeo open through \
+    its proxy, which Syndeo opens directly for the rest of the session. Local: a local-network address, which WebKit may open \
     directly or through the proxy; either way Syndeo does not cache it. Each image, script \
     and other part of the page is classified by its own address, so parts of it can be \
     reached another way.";
@@ -1212,6 +1214,23 @@ mod tests {
         assert!(!Route::Syndeo.words_shown());
         assert!(Route::Direct.words_shown());
         assert!(Route::Local.words_shown());
+    }
+
+    /// What the help tag says Direct is: both of the ways a page comes
+    /// without the proxy, never loopback alone.
+    #[test]
+    fn the_help_tag_says_both_reasons_a_page_is_direct() {
+        let direct = ROUTE_HELP
+            .split_once("Direct: ")
+            .and_then(|(_, rest)| rest.split_once(" Local: "))
+            .map(|(direct, _)| direct)
+            .expect("the help tag says what Direct is, before Local");
+        assert!(direct.contains("this Mac's own loopback"), "{direct}");
+        assert!(
+            direct.contains("a site macOS will not let Syndeo open through its proxy"),
+            "{direct}"
+        );
+        assert!(direct.contains("does not cache it"), "{direct}");
     }
 
     #[test]

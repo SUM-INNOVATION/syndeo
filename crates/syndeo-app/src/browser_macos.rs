@@ -1,8 +1,9 @@
 //! A browser window's controller: one per window, and three things at once.
 //!
 //! - **The web view's navigation delegate.** It answers every TLS challenge
-//!   exactly as `syndeo_webkit::pin` does, with the proxy's authority as the
-//!   only anchor; lets a window's main frame show only the web's own pages
+//!   but one for a host sent directly (below) exactly as
+//!   `syndeo_webkit::pin` does, with the proxy's authority as the only
+//!   anchor; lets a window's main frame show only the web's own pages
 //!   and Syndeo's (`address::allowed_in_main_frame`), and no IPv6 address
 //!   with a zone, which it refuses as the address field does; keeps the
 //!   window's controls in step with loading; says in the address field how
