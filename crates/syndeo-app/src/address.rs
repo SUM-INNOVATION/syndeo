@@ -384,8 +384,8 @@ pub enum Refusal {
 
 /// Whether a main frame's failure, `domain` and `code`, was macOS refusing
 /// it through the proxy: `vouched`, the window vouched for its host's
-/// certificate during this navigation; `pinned`, the window's check of it
-/// failed on macOS's own pinning. None for every other failure.
+/// certificate recently; `pinned`, the window's check of it failed on
+/// macOS's own pinning. None for every other failure.
 pub fn refusal(domain: &str, code: isize, vouched: bool, pinned: bool) -> Option<Refusal> {
     if domain != "NSURLErrorDomain" {
         return None;
@@ -462,9 +462,9 @@ pub fn sent_direct(host: &str, direct: &[String]) -> bool {
 }
 
 /// The hosts a page's window sends directly once the page has loaded: those
-/// it vouched for during this navigation that the proxy then said were
-/// refused, as macOS refuses its preloaded sites, and those macOS pinned;
-/// none already sent directly, each once.
+/// it vouched for recently that the proxy then said were refused, as macOS
+/// refuses its preloaded sites, and those macOS pinned; none already sent
+/// directly, each once.
 pub fn to_send_direct(
     vouched: &[String],
     refused: &[String],

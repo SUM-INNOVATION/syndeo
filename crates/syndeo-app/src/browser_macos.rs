@@ -119,19 +119,21 @@ pub struct Ivars {
     /// Someone has typed in the address field, and has not yet pressed
     /// Return or left it.
     typing: Cell<bool>,
-    /// The hosts this window vouched for since its last navigation started:
+    /// The hosts this window vouched for most recently, the latest last:
     /// their certificates came from Syndeo's own proxy. At most [`VOUCHED`].
+    /// Not emptied when a navigation starts: WebKit's networking can ask
+    /// about a page's host before WebKit says its navigation started, and
+    /// each use of this list needs its own sign of a refusal besides.
     vouched: RefCell<Vec<String>>,
-    /// The hosts whose certificates this window refused, since its last
-    /// navigation started, because macOS pins them itself. At most
-    /// [`VOUCHED`].
+    /// The hosts whose certificates this window refused most recently
+    /// because macOS pins them itself, the latest last. At most [`VOUCHED`].
     pinned: RefCell<Vec<String>>,
     /// The page this window last loaded again with hosts sent directly. It
     /// is not loaded again for that, ever, until another page starts.
     retried: RefCell<Option<String>>,
 }
 
-/// How many hosts a window remembers vouching for, in one navigation.
+/// How many hosts a window remembers vouching for, or refusing as pinned.
 const VOUCHED: usize = 64;
 
 /// `NSURLSessionAuthChallengeUseCredential`: the pinner vouched for it.
@@ -233,8 +235,6 @@ define_class!(
         #[unsafe(method(webView:didStartProvisionalNavigation:))]
         fn did_start(&self, _webview: &WKWebView, _navigation: Option<&WKNavigation>) {
             self.ivars().refused.set(false);
-            self.ivars().vouched.borrow_mut().clear();
-            self.ivars().pinned.borrow_mut().clear();
             // Another page than the one last loaded again may be, once.
             let now = self.page_address();
             let mut retried = self.ivars().retried.borrow_mut();
@@ -453,11 +453,13 @@ fn address_of(request: &NSURLRequest) -> String {
         .unwrap_or_default()
 }
 
-/// Add `host` to `list`, once, up to [`VOUCHED`] hosts.
+/// Put `host` last in `list`, once, keeping the latest [`VOUCHED`] hosts.
 fn remember(list: &RefCell<Vec<String>>, host: String) {
     let mut list = list.borrow_mut();
-    if !list.contains(&host) && list.len() < VOUCHED {
-        list.push(host);
+    list.retain(|kept| *kept != host);
+    list.push(host);
+    if list.len() > VOUCHED {
+        list.remove(0);
     }
 }
 
