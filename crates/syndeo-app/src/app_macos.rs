@@ -36,7 +36,7 @@
 //! gets a tab made the same way. WebKit itself opens `localhost` and loopback
 //! addresses directly rather than through the proxy, as measured on CI, and
 //! may open local-network addresses either way; Syndeo caches neither. Each
-//! window's bar says which applies to its page (`address::route`), and
+//! window's address field says which applies to its page (`address::route`), and
 //! nothing here claims that every request goes through Syndeo.
 //!
 //! Nothing here asks for, reads or changes the keychain's trust settings:
@@ -251,6 +251,9 @@ fn authority(home: &Path) -> PathBuf {
 struct WebKit {
     mtm: MainThreadMarker,
     frame: NSRect,
+    /// The domains sent around the proxy, directly, as this window is made:
+    /// see [`State::direct`].
+    direct: Vec<String>,
 }
 
 impl Engine for WebKit {
@@ -261,7 +264,9 @@ impl Engine for WebKit {
     type Delegate = Retained<BrowserController>;
 
     fn configure(&self, target: &proxied::ProxyTarget) -> Result<Self::Config> {
-        proxied::configuration(target, self.mtm)
+        // Every window sets the one data store's proxy configuration, so each
+        // carries the hosts sent directly, or making one would undo them.
+        proxied::configuration_sending_direct(target, &self.direct, self.mtm)
     }
 
     fn pinner(&self, pem: &str) -> Result<Self::Pinner> {
@@ -317,7 +322,18 @@ pub struct State {
     launched: Cell<bool>,
     /// Addresses other applications asked this one to open before then.
     asked: RefCell<Vec<String>>,
+    /// The domains every window sends around the proxy, directly, because
+    /// macOS refused them through it (#58): this session's, in memory only,
+    /// never written anywhere. At most [`DIRECT_KEPT`].
+    direct: RefCell<Vec<String>>,
+    /// The hosts the proxy has said were refused this session. At most
+    /// [`DIRECT_KEPT`].
+    heard: RefCell<Vec<String>>,
 }
+
+/// How many domains a session sends directly, and how many refused hosts it
+/// remembers, at most.
+const DIRECT_KEPT: usize = 1024;
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -485,7 +501,49 @@ impl AppDelegate {
         WebKit {
             mtm: self.mtm(),
             frame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1200.0, 800.0)),
+            direct: self.ivars().direct.borrow().clone(),
         }
+    }
+
+    /// Send `hosts` around the proxy, directly, for every window from now
+    /// on; whether that took effect. Only ever for hosts a window saw macOS
+    /// refuse through the proxy: see `BrowserController`.
+    fn send_direct(&self, hosts: &[String]) -> bool {
+        let browsing = self.ivars().browsing.borrow();
+        let Some(browsing) = browsing.as_ref() else {
+            return false;
+        };
+        let mut direct = self.ivars().direct.borrow().clone();
+        for host in hosts {
+            if !address::sent_direct(host, &direct) && direct.len() < DIRECT_KEPT {
+                direct.push(host.clone());
+            }
+        }
+        match proxied::send_direct(&browsing.target, &direct, self.mtm()) {
+            Ok(()) => {
+                *self.ivars().direct.borrow_mut() = direct;
+                true
+            }
+            Err(err) => {
+                tracing::warn!("could not send a host around the proxy: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// The hosts the proxy has said were refused, this session.
+    fn refused(&self) -> Vec<String> {
+        let said = match &*self.ivars().proxy.borrow() {
+            Some(proxy) => proxy.control().refused(),
+            None => Vec::new(),
+        };
+        let mut heard = self.ivars().heard.borrow_mut();
+        for host in said {
+            if !heard.contains(&host) && heard.len() < DIRECT_KEPT {
+                heard.push(host);
+            }
+        }
+        heard.clone()
     }
 
     /// What every controller may ask of the application, made once.
@@ -494,7 +552,8 @@ impl AppDelegate {
             return hooks;
         }
         let me = Weak::from_retained(&self.retain());
-        let (tab, closed, start) = (me.clone(), me.clone(), me);
+        let (tab, closed, start) = (me.clone(), me.clone(), me.clone());
+        let (direct, send, refused) = (me.clone(), me.clone(), me);
         let search: Box<dyn Fn() -> Search> = Box::new(settings_macos::search);
         let hooks = Rc::new(Hooks {
             open_tab: Box::new(move |parent, after, start, place| {
@@ -513,6 +572,16 @@ impl AppDelegate {
                     .unwrap_or_default()
             }),
             search,
+            direct: Box::new(move || {
+                direct
+                    .load()
+                    .map(|app| app.ivars().direct.borrow().clone())
+                    .unwrap_or_default()
+            }),
+            send_direct: Box::new(move |hosts| {
+                send.load().is_some_and(|app| app.send_direct(hosts))
+            }),
+            refused: Box::new(move || refused.load().map(|app| app.refused()).unwrap_or_default()),
         });
         *self.ivars().hooks.borrow_mut() = Some(hooks.clone());
         hooks
@@ -1298,6 +1367,8 @@ pub fn run(install: InstallDir) -> Result<()> {
             tab_clicks: RefCell::new(None),
             launched: Cell::new(false),
             asked: RefCell::new(Vec::new()),
+            direct: RefCell::new(Vec::new()),
+            heard: RefCell::new(Vec::new()),
         },
     );
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));

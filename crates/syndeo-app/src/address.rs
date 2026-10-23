@@ -109,7 +109,7 @@ impl Search {
     }
 }
 
-/// How the page a window shows is reached, as its bar says.
+/// How the page a window shows is reached, as its address field says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     /// Through Syndeo's proxy, which may cache it.
@@ -387,6 +387,143 @@ pub fn allowed_in_main_frame(scheme: &str) -> bool {
         scheme.to_ascii_lowercase().as_str(),
         "http" | "https" | "about"
     )
+}
+
+/// `NSURLErrorSecureConnectionFailed`.
+pub const SECURE_CONNECTION_FAILED: isize = -1200;
+
+/// `NSURLErrorCancelled`: what a load is when the window refused its
+/// certificate.
+pub const CANCELLED: isize = -999;
+
+/// How macOS refused a page through Syndeo's proxy, in the two ways Syndeo
+/// answers by sending its host directly (#58). Measured on hosted macOS
+/// 14.8, 15.7 and 26.6 runners, through the same proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// macOS 15 and earlier, for a site on the HSTS preload list built into
+    /// macOS, such as github.com: macOS accepts only a publicly trusted
+    /// certificate there, whatever an application answers. It asks the
+    /// window, which vouches for the proxy's certificate, and then fails the
+    /// connection anyway (NSURLErrorDomain -1200). macOS 26 does not do this.
+    Preloaded,
+    /// Every macOS, for Apple's own sites, such as www.apple.com: macOS pins
+    /// them to Apple's certificates, so the window's own check of the
+    /// proxy's fails ("certificates do not meet pinning requirements") and
+    /// the load is cancelled (-999).
+    Pinned,
+}
+
+/// Whether a main frame's failure, `domain` and `code`, was macOS refusing
+/// it through the proxy: `vouched`, the window vouched for its host's
+/// certificate recently; `pinned`, the window's check of it failed on
+/// macOS's own pinning. None for every other failure.
+pub fn refusal(domain: &str, code: isize, vouched: bool, pinned: bool) -> Option<Refusal> {
+    if domain != "NSURLErrorDomain" {
+        return None;
+    }
+    match code {
+        SECURE_CONNECTION_FAILED if vouched => Some(Refusal::Preloaded),
+        CANCELLED if pinned => Some(Refusal::Pinned),
+        _ => None,
+    }
+}
+
+/// What a window does after a main frame's failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterFailure {
+    /// Send its host directly, from now on, and load the page again.
+    RetryDirect(Refusal),
+    /// What WebKit says: it was no refusal, or it was a page this window
+    /// already retried directly, which is never retried again.
+    AsWebKitSays,
+}
+
+/// What to do after a main frame's failure: `refusal`, from [`refusal`];
+/// `retried`, this window already retried this page directly.
+pub fn after_failure(refusal: Option<Refusal>, retried: bool) -> AfterFailure {
+    match refusal {
+        Some(refusal) if !retried => AfterFailure::RetryDirect(refusal),
+        _ => AfterFailure::AsWebKitSays,
+    }
+}
+
+/// Why a refused page is not shown, when its host could not be sent
+/// directly: what macOS did, and why, for `macos`, its major version. The
+/// page says this in place of WebKit's words, which read as the site's fault.
+pub fn explain(refusal: Refusal, host: &str, macos: u64) -> String {
+    let around = "Syndeo opens every secure page through its own proxy, with a certificate \
+                  of its own, and could not send this site around it, so it cannot open it.";
+    match refusal {
+        Refusal::Preloaded if macos >= 26 => format!(
+            "macOS refused the secure connection to {host}, after this window had checked \
+             that its certificate came from Syndeo's own proxy. {around}"
+        ),
+        Refusal::Preloaded => format!(
+            "macOS refused the secure connection to {host}, after this window had checked \
+             that its certificate came from Syndeo's own proxy. On macOS {macos} and earlier, \
+             macOS accepts only a publicly trusted certificate for the sites on the HSTS \
+             preload list built into macOS, such as github.com, whatever an application \
+             says. {around}"
+        ),
+        Refusal::Pinned => format!(
+            "macOS pins {host} to Apple's own certificates, so it accepts no other for it, \
+             Syndeo's included. {around}"
+        ),
+    }
+}
+
+/// Whether `host` goes around the proxy when `domain` is sent directly: the
+/// domain itself, or a name under it. That is how the Network framework
+/// matches a domain excluded from a proxy configuration: measured on macOS
+/// 15 and 26, excluding `d` sent `d` and `x.d` directly and `xd` through the
+/// proxy (#58).
+pub fn covered(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    !domain.is_empty()
+        && (host == domain
+            || host
+                .strip_suffix(domain.as_str())
+                .is_some_and(|rest| rest.ends_with('.')))
+}
+
+/// Whether `host` goes around the proxy, given the domains sent directly.
+pub fn sent_direct(host: &str, direct: &[String]) -> bool {
+    direct.iter().any(|domain| covered(host, domain))
+}
+
+/// The hosts a page's window sends directly once the page has loaded: those
+/// it vouched for recently that the proxy then said were refused, as macOS
+/// refuses its preloaded sites, and those macOS pinned; none already sent
+/// directly, each once.
+pub fn to_send_direct(
+    vouched: &[String],
+    refused: &[String],
+    pinned: &[String],
+    direct: &[String],
+) -> Vec<String> {
+    let mut hosts: Vec<String> = vouched
+        .iter()
+        .filter(|host| refused.contains(host))
+        .chain(pinned)
+        .filter(|host| !sent_direct(host, direct))
+        .cloned()
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// [`route_of`], except that a page whose host is sent directly is Direct.
+pub fn route_with(address: &str, direct: &[String]) -> Option<Route> {
+    let route = route_of(address)?;
+    let host = Url::parse(address).ok()?.host_str()?.to_string();
+    Some(if sent_direct(&host, direct) {
+        Route::Direct
+    } else {
+        route
+    })
 }
 
 /// The page a window shows when `address` could not be opened.
@@ -924,6 +1061,141 @@ mod tests {
             escape("<b>\"&\"</b>"),
             "&lt;b&gt;&quot;&amp;&quot;&lt;/b&gt;"
         );
+    }
+
+    /// Only the two refusals measured are refusals: a secure connection
+    /// that failed after the window vouched for its host, and a load the
+    /// window cancelled because macOS pinned its host.
+    #[test]
+    fn only_the_measured_refusals_are_refusals() {
+        let url = "NSURLErrorDomain";
+        assert_eq!(refusal(url, -1200, true, false), Some(Refusal::Preloaded));
+        assert_eq!(refusal(url, -999, false, true), Some(Refusal::Pinned));
+        // Not vouched for: a certificate the window refused, or never saw.
+        assert_eq!(refusal(url, -1200, false, false), None);
+        // A cancelled load the window did not refuse on macOS's pinning:
+        // Stop, or another page.
+        assert_eq!(refusal(url, -999, true, false), None);
+        for (domain, code) in [
+            (url, -1202),
+            (url, -1201),
+            (url, -1004),
+            (url, -1001),
+            ("WebKitErrorDomain", -1200),
+            ("WebKitErrorDomain", -999),
+            ("NSOSStatusErrorDomain", -1200),
+        ] {
+            assert_eq!(refusal(domain, code, true, true), None, "{domain} {code}");
+        }
+    }
+
+    /// A refusal is retried directly once; a page already retried is never
+    /// retried again, and shows what WebKit says.
+    #[test]
+    fn a_refusal_is_retried_directly_once_and_never_again() {
+        for refused in [Refusal::Preloaded, Refusal::Pinned] {
+            assert_eq!(
+                after_failure(Some(refused), false),
+                AfterFailure::RetryDirect(refused)
+            );
+            assert_eq!(
+                after_failure(Some(refused), true),
+                AfterFailure::AsWebKitSays
+            );
+        }
+        assert_eq!(after_failure(None, false), AfterFailure::AsWebKitSays);
+    }
+
+    #[test]
+    fn a_refusal_that_cannot_be_retried_says_what_macos_did_and_why() {
+        for macos in [14, 15] {
+            let why = explain(Refusal::Preloaded, "github.com", macos);
+            assert!(
+                why.starts_with("macOS refused the secure connection to github.com"),
+                "{why}"
+            );
+            assert!(why.contains("HSTS preload list"), "{why}");
+            assert!(
+                why.contains(&format!("On macOS {macos} and earlier")),
+                "{why}"
+            );
+            assert!(!why.to_lowercase().contains("ssl"), "{why}");
+        }
+        assert!(!explain(Refusal::Preloaded, "github.com", 26).contains("HSTS"));
+        let why = explain(Refusal::Pinned, "www.apple.com", 26);
+        assert!(
+            why.starts_with("macOS pins www.apple.com to Apple's own certificates"),
+            "{why}"
+        );
+    }
+
+    /// As the Network framework matches an excluded domain, measured: the
+    /// domain and the names under it, never a name that only ends the same.
+    #[test]
+    fn a_domain_sent_directly_covers_itself_and_its_subdomains_only() {
+        assert!(covered("github.com", "github.com"));
+        assert!(covered("GitHub.com.", "github.com"));
+        assert!(covered("gist.github.com", "github.com"));
+        assert!(covered("a.b.github.com", "github.com"));
+        assert!(!covered("notgithub.com", "github.com"));
+        assert!(!covered("github.com.evil.example", "github.com"));
+        assert!(!covered("com", "github.com"));
+        assert!(!covered("github.com", ""));
+        let direct = vec!["github.com".to_string(), "www.apple.com".to_string()];
+        assert!(sent_direct("www.apple.com", &direct));
+        assert!(!sent_direct("apple.com", &direct));
+        assert!(!sent_direct("example.com", &direct));
+    }
+
+    /// Only hosts the window vouched for that the proxy said were refused,
+    /// and hosts macOS pinned, are sent directly; never one the window did
+    /// not vouch for, nor one already sent.
+    #[test]
+    fn only_refused_hosts_this_window_vouched_for_are_sent_directly() {
+        let s = |list: &[&str]| list.iter().map(|h| h.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            to_send_direct(
+                &s(&[
+                    "example.com",
+                    "www.google-analytics.com",
+                    "github.githubassets.com"
+                ]),
+                &s(&["www.google-analytics.com", "paypal.com"]),
+                &s(&[]),
+                &s(&[]),
+            ),
+            s(&["www.google-analytics.com"]),
+            "paypal.com was refused for another window, and is not this one's"
+        );
+        assert_eq!(
+            to_send_direct(
+                &s(&["github.com"]),
+                &s(&["github.com"]),
+                &s(&["www.apple.com"]),
+                &s(&["github.com"])
+            ),
+            s(&["www.apple.com"])
+        );
+        assert!(to_send_direct(&s(&["example.com"]), &s(&[]), &s(&[]), &s(&[])).is_empty());
+    }
+
+    #[test]
+    fn a_page_whose_host_is_sent_directly_is_direct_in_the_bar() {
+        let direct = vec!["github.com".to_string()];
+        assert_eq!(
+            route_with("https://github.com/", &direct),
+            Some(Route::Direct)
+        );
+        assert_eq!(
+            route_with("https://gist.github.com/x", &direct),
+            Some(Route::Direct)
+        );
+        assert_eq!(
+            route_with("https://example.com/", &direct),
+            Some(Route::Syndeo)
+        );
+        assert_eq!(route_with("http://127.0.0.1/", &[]), Some(Route::Direct));
+        assert_eq!(route_with("about:blank", &direct), None);
     }
 
     #[test]

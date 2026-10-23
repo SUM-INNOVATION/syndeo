@@ -692,6 +692,85 @@ pinned() {
   risen "$before" "and the proxy fetched it over https"
 }
 
+# preloaded LOG: sites macOS refuses through Syndeo's proxy, and one it does
+# not (#58). On macOS 15 and earlier, macOS accepts only a publicly trusted
+# certificate for the sites on its built-in HSTS preload list: it asks the
+# window, which vouches for the proxy's, and fails the connection anyway.
+# Syndeo then sends that host directly, for the rest of the session, and
+# loads the page again, once. From macOS 26 macOS lets them through Syndeo.
+# In order, each with this instance's query, so nothing WebKit kept answers:
+# - a page on this runner's loopback whose image comes from
+#   en.wikipedia.org, which is on the list: the image loads, on 15 once the
+#   proxy has said macOS refused it;
+# - https://github.com, on the list: its own page shows, and the bar says
+#   Direct on 15, Through Syndeo from 26;
+# - https://example.com, not on it: Through Syndeo, fetched by the proxy,
+#   and nothing sent directly for it, even after the look Syndeo takes again
+#   a second after a page.
+# LOG is the app's log, which says that hosts were sent directly but never
+# which.
+preloaded() {
+  local log="$1" major part sent before
+  major="$(sw_vers -productVersion | cut -d. -f1)"
+  origin || return 0
+  part="preloaded-part-$FRESH.html"
+  cat >"$LOGS/origin/$part" <<EOF
+<!doctype html><meta charset="utf-8"><title>Preloaded part</title>
+<p id="said">SYNDEO-PART-WAITING</p>
+<img alt="" src="https://en.wikipedia.org/static/favicon/wikipedia.ico?$FRESH"
+ onload="document.getElementById('said').textContent = 'SYNDEO-PART-LOADED'"
+ onerror="document.getElementById('said').textContent = 'SYNDEO-PART-FAILED'">
+EOF
+  if [ "$major" -le 15 ]; then
+    visit "http://127.0.0.1:$ORIGIN_PORT/$part" "http://127.0.0.1:$ORIGIN_PORT/$part" 'SYNDEO-PART-LOADED' \
+      "on macOS $major, a page's image from en.wikipedia.org, on macOS's HSTS preload list, loads, sent directly once the proxy said macOS refused it"
+    must "$(grep -q 'sent hosts a page loaded from directly' "$log" && echo yes)" "and the log says hosts a page loaded from were sent directly"
+    visit "https://github.com/" "https://github.com/" 'Sign in' \
+      "on macOS $major, https://github.com, on macOS's HSTS preload list, opens and shows its own page, sent directly once macOS refused it"
+    must "$(wait_for 5 bar_is "$DIRECT_LABEL" && echo yes)" "and the bar says $DIRECT_LABEL" "the bar says \"$(bar)\""
+    must "$(grep -q 'sent a host directly' "$log" && echo yes)" "and the log says it sent a host directly"
+  else
+    visit "http://127.0.0.1:$ORIGIN_PORT/$part" "http://127.0.0.1:$ORIGIN_PORT/$part" 'SYNDEO-PART-LOADED' \
+      "on macOS $major, a page's image from en.wikipedia.org, on macOS's HSTS preload list, loads"
+    visit "https://github.com/" "https://github.com/" 'Sign in' "on macOS $major, https://github.com opens and shows its own page"
+    must "$(wait_for 5 bar_is "$SYNDEO_LABEL" && echo yes)" "and the bar says $SYNDEO_LABEL" "the bar says \"$(bar)\""
+    must "$(grep -qE 'sent (a host|hosts a page loaded from) directly' "$log" && echo no || echo yes)" "and nothing was sent directly"
+  fi
+  must "$(grep -E 'sent (a host|hosts a page loaded from) directly' "$log" | grep -qiE 'github|wikipedia' && echo no || echo yes)" \
+    "the log names no host it sent directly"
+  counted "before https://example.com, again"
+  before="$COUNTED"
+  sent="$(grep -cE 'sent (a host|hosts a page loaded from) directly' "$log")"
+  visit "https://example.com/?$FRESH-again" "https://example.com/?$FRESH-again" "$EXAMPLE_BODY" \
+    "https://example.com, not on macOS's HSTS preload list, opens"
+  # Past the look Syndeo takes again a second after a page.
+  sleep 3
+  must "$(bar_is "$SYNDEO_LABEL" && echo yes)" "https://example.com stays $SYNDEO_LABEL" "the bar says \"$(bar)\""
+  must "$([ "$(grep -cE 'sent (a host|hosts a page loaded from) directly' "$log")" = "$sent" ] && echo yes)" \
+    "and nothing was sent directly for it"
+  counted "after https://example.com, again"
+  risen "$before" "and the proxy fetched it"
+}
+
+# preloaded_only APP: `preloaded` on its own, for a runner of another macOS:
+# open APP, check it browses, run it, quit, and require nothing left.
+preloaded_only() {
+  local app
+  [ -d "${1:-}" ] || { say "usage: $0 preloaded <Syndeo.app>"; exit 2; }
+  app="$(cd "$1" && pwd -P)"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  printf '\nSites macOS refuses through Syndeo, on macOS %s\n' "$(sw_vers -productVersion)"
+  if started "$app" preloaded; then
+    helper_of "$app" preloaded
+    browses preloaded
+    preloaded "$LOGS/app-preloaded.stderr"
+  fi
+  origin_stop
+  stopped preloaded
+  printf '\n%d failed\n' "$fails"
+  [ "$fails" = 0 ]
+}
+
 # risen BEFORE WHAT: COUNTED, the proxy's count read since, is above BEFORE.
 risen() {
   must "$([ -n "$1" ] && [ -n "$COUNTED" ] && [ "$COUNTED" -gt "$1" ] && echo yes)" \
@@ -978,6 +1057,7 @@ browsing() {
 
   private "$log"
   pinned
+  preloaded "$log"
   passkeys_unavailable "$log" "$round"
   asked_web "$app" "$log" http
   asked_web "$app" "$log" https
@@ -1236,6 +1316,8 @@ mutant() {
     reload-from-cache) intended="^the reload consulted the origin through Syndeo's proxy" ;;
     tabs-kept-after-clear) intended='^Clear Browsing Data forgets' ;;
     websocket-headers-stripped) intended='^a WebSocket through Syndeo' ;;
+    direct-for-every-host) intended='^(https://example\.com stays Through Syndeo|and nothing was sent directly for it)$' ;;
+    never-retry-direct) intended='^(on macOS [0-9]+, https://github\.com, on macOS.s HSTS preload list, opens|and the bar says Direct — not cached by Syndeo|and the log says it sent a host directly)' ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
   if [ "$name" = tabs-kept-after-clear ]; then
@@ -1255,6 +1337,7 @@ mutant() {
       reload-from-cache) reload_gate ;;
       tabs-kept-after-clear) tabs_cleared "$session" ;;
       websocket-headers-stripped) realtime_origin && rt_through_syndeo ;;
+      direct-for-every-host | never-retry-direct) preloaded "$log" ;;
       *) policy "$log" ;;
     esac
   fi
@@ -1385,6 +1468,8 @@ bar() {
 }
 # The bar says nothing: hidden, or empty.
 bar_empty() { [ "$(bar)" = '(nothing)' ]; }
+# bar_is LABEL: the bar says exactly LABEL.
+bar_is() { [ "$(bar)" = "$1" ]; }
 # The bar says something.
 bar_said() { [ "$(bar)" != '(nothing)' ]; }
 
@@ -2572,6 +2657,7 @@ case "${1:-}" in
   realtime) shift; realtime "$@" ;;
   looks) shift; looks "$@" ;;
   tabs) shift; tabs_test "$@" ;;
+  preloaded) shift; preloaded_only "$@" ;;
   measure) measure ;;
-  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | looks <Syndeo.app> | tabs <Syndeo.app> | measure"; exit 2 ;;
+  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | looks <Syndeo.app> | tabs <Syndeo.app> | preloaded <Syndeo.app> | measure"; exit 2 ;;
 esac
