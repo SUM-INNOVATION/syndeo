@@ -456,6 +456,10 @@ separate, and removing the application touches neither.
   - the application opened by its path, as Finder opens it: its bundle
     identifier, its executable, and its helper running from inside the
     bundle, byte for byte the one the package carried;
+  - the published 0.2.0 package installed, and this one installed over it,
+    as every 0.2.0 customer upgrades: the receipt, the bundle, its signature
+    and its uninstaller the new package's, and the user's files and
+    preferences kept byte for byte;
   - the published v0.1.6 and v0.1.7 packages removed, every kind of change to
     them refused, and an interrupted removal finished;
   - the commands `install.sh` put in `/usr/local/bin`, left alone;
