@@ -28,7 +28,18 @@
 #    is its uninstaller; quit, nothing of it left running. Reinstalled.
 #    Installed on another volume: refused. Removed with its uninstaller,
 #    Syndeo's user data kept.
-# 2. The published v0.1.6 and v0.1.7 command-line packages, downloaded and
+# 2. The published Syndeo-0.2.0.pkg, downloaded and checked against its
+#    release's SHA256SUMS, installed: its receipt 0.2.0, and Syndeo.app 0.2.0
+#    byte for byte the bundle it carries, stapled ticket and all. A file of
+#    the person's planted in ~/Library/Application Support/Syndeo, and a
+#    search engine in Syndeo's preferences. <pkg> over it, as every 0.2.0
+#    customer upgrades (a pull request's <pkg>, until it raises the version,
+#    is 0.2.0 itself, and reinstalls it): its receipt, and its bundle byte
+#    for byte the one <pkg> carries, its signature and its uninstaller with
+#    it, nothing of 0.2.0's left; the person's file, the preferences and all
+#    Syndeo's user data byte for byte as they were, install.sh's commands
+#    untouched. Removed with its uninstaller, the user's data kept.
+# 3. The published v0.1.6 and v0.1.7 command-line packages, downloaded and
 #    checked against their releases' SHA256SUMS. Over 0.1.6, every kind of
 #    change to its installation is refused, nothing changed; then <pkg>
 #    removes it, exactly, /usr/local/libexec with it, and nothing else. Over
@@ -37,11 +48,11 @@
 #    through its command link; then its removal is interrupted by a faulty
 #    stand-in after the seven links, which leaves what the runner has to
 #    refuse from any other package, and the same stand-in again finishes it.
-# 3. Stand-ins (0.0.1 to 0.0.3, made from <pkg>'s own bundle): an upgrade; an
+# 4. Stand-ins (0.0.1 to 0.0.3, made from <pkg>'s own bundle): an upgrade; an
 #    upgrade whose postinstall fails, what it leaves, the packages refused
 #    over it, and its repair; a downgrade refused; a reinstall; a changed
 #    bundle refused; <pkg> over all of that.
-# 4. Moved to the Trash as Finder moves it: the receipt stays, the trashed
+# 5. Moved to the Trash as Finder moves it: the receipt stays, the trashed
 #    copy's uninstaller refuses, saying how to forget it; an older package is
 #    refused; <pkg> installs into /Applications again, the trashed copy
 #    untouched. With both copies registered with the runner's LaunchServices
@@ -49,7 +60,7 @@
 #    /Applications. Moved to the
 #    Trash again, the receipt forgotten as the refusal says, an older package
 #    installs, and <pkg> upgrades it.
-# 5. Removal: a receipt that cannot be forgotten (exit 2, and the command to
+# 6. Removal: a receipt that cannot be forgotten (exit 2, and the command to
 #    forget it), then forgotten as it says; a foreign application where
 #    Syndeo.app goes, refused; a last install, and its uninstaller, with the
 #    user's data kept throughout.
@@ -185,6 +196,27 @@ unplant() {
 forget_plant() {
   awk -F'\t' -v p="$1" '$1 != p' "$(ST)/planted" >"$(ST)/planted.new"
   mv -f "$(ST)/planted.new" "$(ST)/planted"
+}
+
+# still_planted PATH: PATH is exactly what was planted, the same file with
+# the same bytes.
+still_planted() { [ -n "$(planted_meta "$1")" ] && [ "$(meta "$1")" = "$(planted_meta "$1")" ]; }
+
+# plant_default KEY VALUE: a string in Syndeo's preferences, as the person's
+# own, through cfprefsd as Syndeo writes them, and written down first, as
+# plant writes down a path. unplant_default KEY VALUE removes it, only if it
+# is still VALUE; cleanup does the same with what is left.
+plant_default() {
+  defaults read "$BUNDLE_ID" "$1" >/dev/null 2>&1 && fail "planting the preference $1: it is set already"
+  printf '%s\t%s\n' "$1" "$2" >>"$(ST)/planted-defaults"
+  defaults write "$BUNDLE_ID" "$1" -string "$2" || fail "planting the preference $1"
+}
+
+unplant_default() {
+  [ "$(defaults read "$BUNDLE_ID" "$1" 2>/dev/null)" = "$2" ] || fail "unplanting the preference $1: it is no longer what was planted"
+  defaults delete "$BUNDLE_ID" "$1" || fail "unplanting the preference $1"
+  awk -F'\t' -v k="$1" '$1 != k' "$(ST)/planted-defaults" >"$(ST)/planted-defaults.new"
+  mv -f "$(ST)/planted-defaults.new" "$(ST)/planted-defaults"
 }
 
 # alter KIND PATH VALUE: change a path's mode, or move it aside to VALUE,
@@ -512,9 +544,9 @@ failed_install() {
   pass "$label: the install failed, as its fault makes it"
 }
 
-# legacy_install LABEL PKG: one of the published v0.1.x packages, installed;
-# what it decides is its own.
-legacy_install() {
+# published_install LABEL PKG: one of the published packages, v0.1.x or
+# 0.2.0, installed; what its scripts decide is their own, as published.
+published_install() {
   install "$1" "$2" || { sed 's/^/      | /' "$last_log.installer"; fail "$1: the published package did not install"; }
   pass "$1: installed"
 }
@@ -547,6 +579,30 @@ payload_app() {
   pkgutil --expand-full "$1" "$2" >/dev/null || fail "expanding $1"
   [ -d "$2/Syndeo.pkg/Payload/Syndeo.app" ] || fail "no Syndeo.app in $1's payload"
 }
+
+# bundle_bytes DIR: every path in the bundle DIR, relative to it, with its
+# type, and every file's SHA-256, as text.
+bundle_bytes() {
+  (
+    cd "$1" || exit 1
+    as_root find . -exec stat -f '%N|%HT' {} + | LC_ALL=C sort
+    as_root find . -type f -exec shasum -a 256 {} + | LC_ALL=C sort
+  )
+}
+
+# same_bundle BUNDLE PAYLOAD: BUNDLE holds exactly the paths of PAYLOAD, a
+# package's bundle, each file byte for byte, its code signature and stapled
+# ticket among them, and nothing else; says how they differ if not.
+same_bundle() {
+  local a b
+  a="$(bundle_bytes "$1")" && b="$(bundle_bytes "$2")" || return 1
+  [ "$a" = "$b" ] && return 0
+  diff <(printf '%s\n' "$b") <(printf '%s\n' "$a") | sed 's/^/      | /'
+  return 1
+}
+
+# cdhash BUNDLE: its code signature's CDHash, as codesign reads it.
+cdhash() { codesign -dvvv "$1" 2>&1 | sed -n 's/^CDHash=//p'; }
 
 # standin V: a package of Syndeo.app V, made from the real package's own
 # bundle: its versions changed, its uninstaller rendered for V, the stapled
@@ -581,11 +637,11 @@ fault_pkg() {
   printf '%s' "$dir/$(basename "$pkg")"
 }
 
-# old_release V: the published v0.1.x package V, downloaded with its
-# release's SHA256SUMS, and checked against it.
+# old_release V [NAME]: the package NAME published with vV, by default its
+# v0.1.x command-line package, downloaded with that release's SHA256SUMS,
+# and checked against it. Sets OLD_PKG.
 old_release() {
-  local v="$1" name dir
-  name="syndeo-$v-aarch64-apple-darwin.pkg"
+  local v="$1" name="${2:-syndeo-$1-aarch64-apple-darwin.pkg}" dir
   dir="$(ST)/releases/$v"
   mkdir -p "$dir"
   curl -fsSL --retry 3 -o "$dir/$name" "$REPO_URL/v$v/$name" || fail "downloading $name"
@@ -822,6 +878,17 @@ user_data_kept() {
   return 1
 }
 
+# prefs: Syndeo's preferences, the whole domain, as cfprefsd exports it.
+prefs() { defaults export "$BUNDLE_ID" - 2>/dev/null; }
+
+# prefs_kept BEFORE: Syndeo's preferences are byte for byte BEFORE; says how
+# they differ if not.
+prefs_kept() {
+  [ "$(prefs)" = "$1" ] && return 0
+  diff <(printf '%s\n' "$1") <(prefs) | sed 's/^/      | /'
+  return 1
+}
+
 # gatekeeper SLUG WHAT PATH TYPE: Gatekeeper's verdict on PATH, kept in
 # logs/spctl-SLUG, and what it has to be: accepted as Notarized Developer ID
 # for a signed release, rejected otherwise.
@@ -848,16 +915,18 @@ run() {
   present "$HOME/.Trash/Syndeo.app" && refuse "there is a Syndeo.app in the Trash already"
   mount | grep -q " on $ALT " && refuse "$ALT is already mounted"
   [ "$(syndeo_cmp "$version" 0.0.3)" = gt ] || refuse "$version is not newer than the stand-ins, 0.0.1 to 0.0.3"
+  [ "$(syndeo_cmp "$version" 0.2.0)" != lt ] || refuse "$version is older than the published 0.2.0, which it has to upgrade"
   REAL_VERSION="$version"
   mkdir -p "$st/logs"
   : >"$st/planted"
+  : >"$st/planted-defaults"
   : >"$st/altered"
   snapshot "$st/before"
   cp -R "$st/before" "$st/logs/before"
 
   say "Installing $pkg ($version) on this runner, again and again. It writes only:"
   pkgutil --payload-files "$pkg" | sed 's|^\.|  /Applications|'
-  say "The test also installs the published v0.1.6 and v0.1.7 packages, install.sh's commands in $BIN,"
+  say "The test also installs the published v0.1.6, v0.1.7 and 0.2.0 packages, install.sh's commands in $BIN,"
   say "stand-in packages 0.0.1 to 0.0.3, and a disk image mounted at $ALT; cleanup removes all of it."
   payload_app "$pkg" "$st/real-payload"
   s1="$(standin 0.0.1)" || fail "building the stand-in 0.0.1"
@@ -908,13 +977,57 @@ run() {
   section "removed with its uninstaller"
   uninstalled "$version"
 
-  section "2. the published v0.1.x command-line packages"
+  section "2. the published Syndeo-0.2.0.pkg, upgraded, as every 0.2.0 customer's is"
+  old_release 0.2.0 Syndeo-0.2.0.pkg
+  local p020="$OLD_PKG" asd="$HOME/Library/Application Support/Syndeo" kept from data saved was now
+  payload_app "$p020" "$st/published-0.2.0"
+  published_install published-0.2.0 "$p020"
+  note_said "installing 0.2.0" >/dev/null
+  must "  ... its receipt, $APP_ID 0.2.0, and Syndeo.app 0.2.0" eval "receipt_is $APP_ID 0.2.0 && app_is 0.2.0"
+  was="$(cdhash "$APP")"
+  must "  ... byte for byte the bundle the published package carries, its stapled ticket among it (CDHash $was)" eval \
+    "[ -f '$APP/Contents/CodeResources' ] && same_bundle '$APP' '$st/published-0.2.0/Syndeo.pkg/Payload/Syndeo.app'"
+  # What a person who has used 0.2.0 has: a file of theirs where Syndeo
+  # keeps its data, and a search engine chosen in its Settings.
+  present "$asd" || plant dir "$asd" "$(id -un):$(id -gn)" 700
+  kept="$asd/kept-across-the-upgrade-from-0.2.0"
+  plant file "$kept" "a person's file, which no upgrade may touch
+" "$(id -un):$(id -gn)" 600
+  plant_default SearchEngine startpage
+  must "a file of the person's planted in $asd" still_planted "$kept"
+  must "  ... and SearchEngine startpage in Syndeo's preferences, $BUNDLE_ID" test "$(defaults read "$BUNDLE_ID" SearchEngine 2>/dev/null)" = startpage
+  data="$(settled_user_data)"
+  saved="$(prefs)"
+  # A release's <pkg> upgrades 0.2.0. A pull request's is 0.2.0 itself until
+  # it raises the version, and the preinstall decides on reinstalling it.
+  if [ "$(syndeo_cmp "$version" 0.2.0)" = gt ]; then from="upgrading from 0.2.0 to $version"; else from="reinstalling 0.2.0"; fi
+  installed upgrade-from-0.2.0 "$pkg" "$from" "$version"
+  note_said "Syndeo.app $version is installed in /Applications" >/dev/null
+  now="$(cdhash "$st/real-payload/Syndeo.pkg/Payload/Syndeo.app")"
+  must "  ... its receipt, $APP_ID $version" receipt_is "$APP_ID" "$version"
+  must "  ... Syndeo.app byte for byte the bundle $(basename "$pkg") carries: nothing of 0.2.0's left" \
+    same_bundle "$APP" "$st/real-payload/Syndeo.pkg/Payload/Syndeo.app"
+  must "  ... its code signature the package's (CDHash $now), not 0.2.0's ($was)" eval \
+    "[ -n '$now' ] && [ '$now' != '$was' ] && [ \"\$(cdhash '$APP')\" = '$now' ]"
+  must "  ... its uninstaller $version's" grep -qxF "EMBEDDED='$version'" "$APP/Contents/Resources/uninstall.sh"
+  must "  ... the person's file byte for byte, the very file planted" still_planted "$kept"
+  must "  ... Syndeo's preferences byte for byte as they were" prefs_kept "$saved"
+  must "  ... and all of Syndeo's user data byte for byte as it was" user_data_kept "$data"
+  must "  ... install.sh's commands in $BIN untouched" cli_untouched "$BIN"
+  uninstalled "$version"
+  unplant "$kept"
+  if [ -n "$(planted_meta "$asd")" ]; then unplant "$asd"; fi
+  unplant_default SearchEngine startpage
+  must "the person's file and preference, the test's own, removed again" eval \
+    "! present '$kept' && ! defaults read $BUNDLE_ID SearchEngine >/dev/null 2>&1"
+
+  section "3. the published v0.1.x command-line packages"
   cli_remove "$BIN"
   old_release 0.1.6
   local p016="$OLD_PKG"
   old_release 0.1.7
   local p017="$OLD_PKG"
-  legacy_install v0.1.6 "$p016"
+  published_install v0.1.6 "$p016"
   must "v0.1.6, exactly as its package leaves it" legacy_exact 0.1.6
   plant file "$D/0.1.6/notes.txt" "notes
 "
@@ -947,13 +1060,13 @@ run() {
   uninstalled "$version"
 
   section "v0.1.7, with install.sh's commands put over its links"
-  legacy_install v0.1.7 "$p017"
+  published_install v0.1.7 "$p017"
   must "v0.1.7, exactly as its package leaves it" legacy_exact 0.1.7
   cli_install "$BIN"
   refused legacy-install-sh-over-links "$pkg" "$BIN/syndeo: is not what the v0.1.x 0.1.7 package put there"
   must "  ... install.sh's commands untouched" cli_untouched "$BIN"
   cli_remove "$BIN"
-  legacy_install v0.1.7-repaired "$p017"
+  published_install v0.1.7-repaired "$p017"
   must "v0.1.7, repaired by its own package, exactly as it leaves it" legacy_exact 0.1.7
   legacy_hold 0.1.7 syndeo-net
   refused legacy-running "$pkg" "the v0.1.x command-line package 0.1.7 is running from $D/0.1.7 (process $HELD): quit it first"
@@ -974,7 +1087,7 @@ run() {
   must "  ... nothing of v0.1.7 left, its receipt forgotten, /usr/local as the runner had it" eval \
     "[ \"\$(legacy_left 0.1.7)\" = 0 ] && no_receipt $OLD_ID && usr_local_as_before"
 
-  section "3. upgrades, a failed one, a downgrade, a reinstall"
+  section "4. upgrades, a failed one, a downgrade, a reinstall"
   installed upgrade-0.0.2 "$s2" "upgrading from 0.0.1 to 0.0.2" 0.0.2
   failed_upgrade fault "$f3" 0.0.2 0.0.3 "$s2" "$pkg"
   refused downgrade "$s2" "Syndeo.app 0.0.3 is installed, and this package is the older 0.0.2"
@@ -985,7 +1098,7 @@ run() {
   unplant "$APP/Contents/Resources/extra"
   installed upgrade-real "$pkg" "upgrading from 0.0.3 to $version" "$version"
 
-  section "4. moved to the Trash, as Finder moves it"
+  section "5. moved to the Trash, as Finder moves it"
   trashed="$HOME/.Trash/Syndeo.app"
   mkdir -p "$HOME/.Trash"
   as_root mv "$APP" "$trashed" || fail "moving Syndeo.app to the Trash"
@@ -1021,7 +1134,7 @@ run() {
   as_root rm -rf "$trashed"
   must "the trashed copy emptied from the Trash" test ! -e "$trashed"
 
-  section "5. removal"
+  section "6. removal"
   forget_fails "$version"
   plant dir "$APP"
   plant dir "$APP/Contents"
@@ -1113,7 +1226,7 @@ is_syndeo_bundle() {
 # cleanup: undo everything recorded, whatever happened, then check the runner
 # is as it was. Safe to run any number of times.
 cleanup() {
-  local st problems="" kind p undo want id n t f
+  local st problems="" kind p undo want id n t f k
   guard
   st="$(ST)"
   [ -d "$st/before" ] || { say "cleanup: nothing was recorded"; return 0; }
@@ -1144,6 +1257,17 @@ cleanup() {
         forget_plant "$p"
       fi
     done
+  fi
+  # Preferences planted, each only if it is still what was planted.
+  if [ -s "$st/planted-defaults" ]; then
+    while IFS='	' read -r k want; do
+      if [ "$(defaults read "$BUNDLE_ID" "$k" 2>/dev/null)" = "$want" ]; then
+        defaults delete "$BUNDLE_ID" "$k" >/dev/null 2>&1 || problems="$problems; could not remove the preference $k"
+      elif defaults read "$BUNDLE_ID" "$k" >/dev/null 2>&1; then
+        problems="$problems; the preference $k is no longer as planted"
+      fi
+    done <"$st/planted-defaults"
+    : >"$st/planted-defaults"
   fi
   # The bundles, in /Applications and in the Trash, and their receipt; the
   # runner's LaunchServices records of both paths, whether or not a bundle

@@ -2017,6 +2017,16 @@ st_decisions() {
   st_new; st_app_installed 0.1.7
   decision_case "reinstall" preinstall 0.1.7 0 "syndeo preinstall: reinstalling 0.1.7"
 
+  # The published 0.2.0, stapled, under its receipt, and the real package
+  # over it. Here V is 0.2.1, as a release's is; a pull request's package,
+  # until it raises the version, is 0.2.0 itself, and reinstalls it.
+  st_new; st_app_installed 0.2.0 yes
+  decision_case "upgrade-from-0.2.0" preinstall 0.2.1 0 "syndeo preinstall: upgrading from 0.2.0 to 0.2.1"
+  st_new; st_app_installed 0.2.0 yes
+  decision_case "upgrade-from-0.2.0-as-0.2.0" preinstall 0.2.0 0 "syndeo preinstall: reinstalling 0.2.0"
+  st_new; st_app 0.2.1; st_app_receipt 0.2.0 yes
+  decision_case "upgrade-from-0.2.0-postinstall" postinstall 0.2.1 0 "syndeo postinstall: Syndeo.app 0.2.1 is installed in $R/Applications"
+
   # The v0.1.x command-line package: 0.1.6, then 0.1.7.
   st_new; st_legacy 0.1.6; echo x >"$D/0.1.6/notes.txt"
   decision_case "legacy-extra-file" preinstall 0.1.7 1 "$p $D/0.1.6/notes.txt: is not part of Syndeo 0.1.6"
