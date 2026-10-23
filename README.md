@@ -132,14 +132,15 @@ For the two routes Syndeo does not cache, the words are beside the symbol:
 | The address field says | For | What happens |
 | --- | --- | --- |
 | **Through Syndeo** | every name, whatever it resolves to, and every public address | WebKit sends it through Syndeo's proxy, which may cache it |
-| **Direct — not cached by Syndeo** | `localhost`, and loopback addresses (127.0.0.0/8 and ::1) | WebKit opens it itself, never through the proxy |
+| **Direct — not cached by Syndeo** | `localhost`, and loopback addresses (127.0.0.0/8 and ::1); and a site macOS refuses through Syndeo's proxy, such as github.com on macOS 15 and earlier, or www.apple.com ([#58](https://github.com/SUM-INNOVATION/syndeo/issues/58)) | WebKit opens it itself, never through the proxy; a site macOS refused is opened that way for the rest of the session, with macOS's own certificate checks, not Syndeo's |
 | **Local — not cached by Syndeo** | a local-network address typed as numbers, such as 192.168.1.10: private, link-local and shared (carrier-grade NAT) ranges | WebKit may open it directly or through the proxy; either way, the proxy stores nothing from it |
 
 The route is that of the page's own address. Each image, script, frame and other
 part of a page is reached by its own address, by the same rule, and a
 redirect by the address it leads to. WebRTC takes none of these routes
 (below). The rule is what WebKit was measured doing on CI, not a promise
-WebKit makes; see [Known gaps](#known-gaps).
+WebKit makes; which sites macOS refuses through the proxy, and why, is in
+[Known gaps](#known-gaps).
 
 ### Searching
 
