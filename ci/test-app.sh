@@ -2269,10 +2269,18 @@ access_open() {
   choose Syndeo "Agent Access…"
   wait_for 10 "$APPCTL" value "$PID" syndeo.agent-status || bad "Agent Access" "Syndeo > Agent Access… shows no Agent Access window: $("$APPCTL" titles "$PID" | tr '\n' '|')"
 }
+# access_close: close Agent Access as File's ⌘W would, and wait until it is
+# gone and a browser window has the keys again, so that what is typed next
+# goes to it (CI 39901559891: typed the moment it closed, it went nowhere).
 access_close() {
   "$APPCTL" activate "$PID" >/dev/null || true
   "$APPCTL" menu-key "$PID" File W >/dev/null || true
+  wait_for 10 sh -c '! "$1" titles "$2" | grep -qx "Agent Access"' _ "$APPCTL" "$PID" ||
+    bad "Agent Access closes" "it is still open: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  "$APPCTL" activate "$PID" >/dev/null || true
   wait_for 10 "$APPCTL" value "$PID" syndeo.address || true
+  sleep 1
+  "$APPCTL" titles "$PID" >"$LOGS/agent-access-closed.txt" 2>&1
 }
 access_says() { "$APPCTL" value "$PID" "$1" | grep -qF "$2"; }
 mode_of() { stat -f '%Lp' "$1" 2>/dev/null; }
@@ -2736,6 +2744,7 @@ agents_tabs() {
   person="http://example.com/?person$FRESH"
   kept="http://example.com/?kept$FRESH"
   agents_on
+  arrive "" 'Welcome to Syndeo' "tabs: the person's window is in front again, at the start page"
   visit "$person" "$person" "$EXAMPLE_BODY" "tabs: the person's own page opens in their window"
   out="$LOGS/agent-tabs-first.json"
   agent_bg "$out" '{"cmd":"status"}'
