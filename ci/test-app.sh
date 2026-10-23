@@ -343,7 +343,15 @@ started() {
     return 1
   fi
   ok "one running application is $ID ($round, pid $PID)"
-  must "$([ "$("$APPCTL" bundle "$PID")" = "$ID" ] && echo yes)" "Launch Services has pid $PID as $ID ($round)" "$("$APPCTL" bundle "$PID")"
+  # Asked of Launch Services for that pid, which it may answer only once the
+  # application has checked in: CI 39872069798 listed the pid 0.1 s after
+  # open, and asked 0.04 s later, before the application had logged anything,
+  # it had no identifier for it yet; 0.5 s later it had com.sum.syndeo.
+  if wait_for 10 sh -c '[ "$("$1" bundle "$2")" = "$3" ]' _ "$APPCTL" "$PID" "$ID"; then
+    ok "Launch Services has pid $PID as $ID ($round)"
+  else
+    bad "Launch Services has pid $PID as $ID ($round)" "it has '$("$APPCTL" bundle "$PID")' 10 s after listing the pid"
+  fi
   image="$(image_of "$PID")"
   must "$([ "$image" = "$app/Contents/MacOS/Syndeo" ] && echo yes)" "it runs $app/Contents/MacOS/Syndeo ($round)" "$image"
   if wait_for 30 "$APPCTL" windows "$PID"; then
