@@ -52,6 +52,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSGraphics",
     "NSImage",
     "NSImageRep",
+    "NSImageView",
     "NSLayoutConstraint",
     "NSMenu",
     "NSMenuItem",
@@ -62,9 +63,14 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSTextField",
     "NSTitlebarAccessoryViewController",
     "NSRunningApplication",
+    "NSStackView",
+    "NSUserInterfaceLayout",
     "NSView",
     "NSViewController",
     "NSWindow",
+    "NSWindowRestoration",
+    "NSWindowTab",
+    "NSWindowTabGroup",
 ] }
 objc2-web-kit = "0.3"
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Syndeo.app with one safeguard taken out, which ci/test-app.sh must catch.
 
-  mutants.py names                 each mutant's name, one a line
+  mutants.py names [app|agents]    each mutant's name, one a line: all of
+                                   them, or the application's or the
+                                   agents' (agent-*) alone
   mutants.py --check <repo>        each mutant's text is in <repo>'s source
                                    exactly once, so none has quietly stopped
                                    applying
@@ -19,9 +21,10 @@ back.
 - no-navigation-policy: the handler that keeps a window's main frame to the
   web's own pages and Syndeo's is gone. A page's links and scripts to other
   schemes must then be seen leaving the page.
-- any-scheme-in-a-new-tab: a page asking for a new window gets a tab
-  whatever the scheme. A page's links and scripts to other schemes in a new
-  tab must then be seen opening one.
+- any-scheme-in-a-new-tab: a page asking for a new window, or a link
+  followed with ⌘ or the middle button, gets a tab whatever the scheme. A
+  page's links and scripts to other schemes in a new tab must then be seen
+  opening one.
 - asked-any-scheme: an address another application asks Syndeo to open is
   opened whatever its scheme, as long as it has a host. An ftp address and a
   file asked for that way must then be seen not refused with the words
@@ -40,6 +43,10 @@ back.
   let Syndeo's proxy answer from its own fresh copy without asking the
   origin. The reload must then be seen not consulting the origin: neither
   the proxy's revalidations nor its misses rise.
+- tabs-kept-after-clear: Clear Browsing Data leaves the tabs closed, to
+  open again, and the session kept from the last quit. Both must then be
+  seen still there after a clear: History > Reopen Last Closed Tab still
+  offered, and the session file still on disk.
 - websocket-headers-stripped: in the proxy, a WebSocket handshake goes the
   ordinary way, which drops Upgrade and Connection with the other
   hop-by-hop headers, as it did before; that is what CI 39198465745
@@ -61,14 +68,25 @@ back.
   by Syndeo's proxy, since nothing answers the proxy's certificate with
   that authority. (Its http page may still come through the proxy, which
   CI 39690228430 saw: the proxy is set on WebKit's data store.)
+- agent-tabs-in-session: the session kept at quit holds an agent's tabs as
+  well as the person's. The agent's tab must then be seen in the session
+  file, and opened again at the next launch.
+- agent-tabs-recently-closed: a tab an agent closes goes in History >
+  Recently Closed like the person's. It must then be seen offered there, and
+  Reopen Last Closed Tab offered for it.
+
+The agent-* mutants run in the macos-agents job, beside its gate; the others
+in macos-app's.
 """
 import os
 import sys
 
 BROWSER = "crates/syndeo-app/src/browser_macos.rs"
 ADDRESS = "crates/syndeo-app/src/address.rs"
+SETTINGS = "crates/syndeo-app/src/settings_macos.rs"
 PROXY = "crates/syndeo-proxy/src/main.rs"
 CONTROL = "crates/syndeo-app/src/control_macos.rs"
+APP = "crates/syndeo-app/src/app_macos.rs"
 
 MUTANTS = {
     "no-pinning-delegate": [
@@ -99,6 +117,16 @@ MUTANTS = {
             "            let target = address_of(&request);\n"
             "            // Refused wherever it would load, as typing it is.\n"
             "            let zoned = address::has_zone(&target);\n"
+            "            // A link followed with ⌘ or the middle button: elsewhere, as a\n"
+            "            // new tab is made, or, for an address no tab may show, here,\n"
+            "            // where it is refused as any other.\n"
+            "            if let Some(place) = Place::of(tabs::opening(click_of(action))) {\n"
+            "                if !zoned && self.open_beside(request.clone(), place) {\n"
+            "                    self.ivars().refused.set(main_frame);\n"
+            "                    handler.call((WKNavigationActionPolicy::Cancel,));\n"
+            "                    return;\n"
+            "                }\n"
+            "            }\n"
             "            let allowed = (!main_frame || address::allowed_in_main_frame(&scheme)) && !zoned;\n"
             "            if !allowed && main_frame {\n"
             "                self.ivars().refused.set(true);\n"
@@ -116,8 +144,8 @@ MUTANTS = {
     "any-scheme-in-a-new-tab": [
         (
             BROWSER,
-            "            if address::allowed_in_main_frame(&scheme_of(&request)) {\n",
-            "            if true {\n",
+            "        if address::allowed_in_main_frame(&scheme_of(&request)) {\n",
+            "        if true {\n",
         ),
     ],
     "asked-any-scheme": [
@@ -158,6 +186,13 @@ MUTANTS = {
             BROWSER,
             "                    unsafe { web.view.reloadFromOrigin() };\n",
             "                    unsafe { web.view.reload() };\n",
+        ),
+    ],
+    "tabs-kept-after-clear": [
+        (
+            SETTINGS,
+            "                (clearing.forget_tabs)();\n",
+            "",
         ),
     ],
     "websocket-headers-stripped": [
@@ -222,6 +257,20 @@ MUTANTS = {
             "        tracing::info!(tab = id, \"an agent opened a tab\");\n",
         ),
     ],
+    "agent-tabs-in-session": [
+        (
+            APP,
+            "                .filter(|tab| !control_macos::is_agents(tab))\n",
+            "                .filter(|tab| tab.isVisible() || !tab.isVisible())\n",
+        ),
+    ],
+    "agent-tabs-recently-closed": [
+        (
+            APP,
+            "        if let Some(snapshot) = snapshot.filter(|_| !agents) {\n",
+            "        if let Some(snapshot) = snapshot.filter(|_| agents || !agents) {\n",
+        ),
+    ],
 }
 
 
@@ -261,14 +310,22 @@ def apply(name, repo):
 
 
 def main(argv):
-    if argv == ["names"]:
-        print("\n".join(MUTANTS))
+    if argv[:1] == ["names"] and len(argv) <= 2:
+        group = argv[1] if len(argv) == 2 else None
+        if group not in (None, "app", "agents"):
+            sys.exit("mutants.py: names takes app or agents")
+        agents = {name for name in MUTANTS if name.startswith("agent-")}
+        chosen = [
+            name for name in MUTANTS
+            if group is None or (name in agents) == (group == "agents")
+        ]
+        print("\n".join(chosen))
         return 0
     if len(argv) == 2 and argv[0] == "--check":
         return check(argv[1])
     if len(argv) == 3 and argv[0] == "apply":
         return apply(argv[1], argv[2])
-    sys.exit("usage: mutants.py names | --check <repo> | apply <name> <repo>")
+    sys.exit("usage: mutants.py names [app|agents] | --check <repo> | apply <name> <repo>")
 
 
 if __name__ == "__main__":

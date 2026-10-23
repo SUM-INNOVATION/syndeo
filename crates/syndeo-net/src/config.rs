@@ -53,6 +53,18 @@ pub struct NetConfig {
     /// page shares holds nothing from this Mac's own services, the local
     /// network, or anything else not publicly reachable.
     pub cache_public_addresses_only: bool,
+    /// Pass a request's own `Accept-Encoding` on to the origin, and the
+    /// answer back as it came, with its `Content-Encoding`, for the caller to
+    /// decode. The cache keeps it that way too, and serves it only to a
+    /// request that accepts that encoding.
+    ///
+    /// Off by default: Syndeo's own fetches ask for bytes they can hash as
+    /// they are, and a declared integrity is over the decoded body, so the
+    /// origin is never invited to encode. `syndeo-proxy` turns it on, because
+    /// its client is a browser that asked for an encoding and decodes it
+    /// itself. Without it every page came uncompressed: github.com's page and
+    /// its 123 scripts and stylesheets, 10.8 MB where 2.3 MB would do.
+    pub forward_accept_encoding: bool,
 }
 
 impl Default for NetConfig {
@@ -68,6 +80,7 @@ impl Default for NetConfig {
             max_redirects: 10,
             peers: None,
             cache_public_addresses_only: false,
+            forward_accept_encoding: false,
         }
     }
 }

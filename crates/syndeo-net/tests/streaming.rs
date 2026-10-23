@@ -130,6 +130,7 @@ async fn a_transfer_that_stops_early_stores_nothing() {
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    net.landed().await;
     let stats = net.cache().stats().unwrap();
     assert_eq!(
         stats.entries, 0,
@@ -155,6 +156,7 @@ async fn a_body_past_the_cache_budget_still_arrives_in_full() {
     );
 
     tokio::time::sleep(Duration::from_millis(50)).await;
+    net.landed().await;
     let stats = net.cache().stats().unwrap();
     assert_eq!(stats.entries, 0, "a body over the budget was cached anyway");
 

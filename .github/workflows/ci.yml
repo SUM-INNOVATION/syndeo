@@ -323,12 +323,15 @@ jobs:
     # applications ask it to open, opened through the proxy or refused, and
     # opened by one; passkeys reported unavailable, asking nothing; its last
     # window closed and brought back by opening it again, quit as the Quit
-    # menu item would, and opened again; seven mutants, each of which the test has to
-    # catch; a copy whose proxy cannot start, which has to refuse to browse;
+    # menu item would, and opened again; tabs, and the session kept between
+    # launches; ten mutants, each of which the test has to catch; a copy
+    # whose proxy cannot start, which has to refuse to browse;
     # and the route bar against what WebKit does, the proxy's cache keeping
     # nothing from this Mac, and Clear Browsing Data. Unsigned with a
     # Developer ID, and with no secrets: a pull request never signs. Then,
-    # reported and not gated, what this runner allows an onboarding test to do.
+    # reported and not gated, how long github.com takes to show in WebKit by
+    # itself and through the proxy, and what this runner allows an onboarding
+    # test to do.
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -382,10 +385,10 @@ jobs:
       # the schemes a new tab may open, the schemes another application may
       # ask Syndeo to open, the address field's guard for typing,
       # the bar's rule for names, the refusal of a link to an IPv6 address
-      # with a zone, Reload asking the origin, and, in the proxy, a WebSocket
-      # carried rather than stripped of its Upgrade; and, for agents, the
-      # person's prompt, what a grant allows, the socket's peer being this
-      # user, and an agent's tab being its window's own. Each is built from this
+      # with a zone, Reload asking the origin, Clear Browsing Data forgetting
+      # closed tabs and the session, and, in the proxy, a WebSocket carried
+      # rather than stripped of its Upgrade. (The agents' are macos-agents'.)
+      # Each is built from this
       # tree, the app and its helper, which is then put back, and the test has
       # to catch each by the checks meant to, with every other check passing.
       # All of them are run whatever any one does, each recorded on its own
@@ -398,7 +401,7 @@ jobs:
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           results=()
           wrong=0
-          for name in $(python3 -I ci/macos-app/mutants.py names); do
+          for name in $(python3 -I ci/macos-app/mutants.py names app); do
             echo "::group::mutant $name"
             built=no
             if python3 -I ci/macos-app/mutants.py apply "$name" . &&
@@ -435,6 +438,15 @@ jobs:
           printf '  %s\n' "${results[@]}"
           [ "$wrong" = 0 ]
 
+      # Tabs: links opened in tabs by ⌘ and the middle button, ⌘1 to ⌘9,
+      # icons and loading in the tab bar, Duplicate, Pin, a tab's own menu,
+      # Close Other Tabs, closed tabs opened again, Show All Tabs, the session
+      # kept at quit and opened again, and Clear Browsing Data forgetting it;
+      # memory per tab measured, not gated.
+      - name: Tabs, and the session kept between launches
+        if: always()
+        run: bash ci/test-app.sh tabs "$PWD/dist/Syndeo.app"
+
       # The route bar, gated against what WebKit actually does: each address
       # typed, from a fresh WebKit state and with a fresh token. For Direct
       # and Through Syndeo, the way WebKit went (by which process the origin
@@ -456,6 +468,21 @@ jobs:
       - name: WebSockets through Syndeo, and WebRTC around it, as the start page says
         if: always()
         run: bash ci/test-app.sh realtime "$PWD/dist/Syndeo.app"
+
+      # Pages in WebKit by itself and through this tree's proxy, as Syndeo.app
+      # runs it, cold and warm, interleaved run by run: first contentful
+      # paint, load, the protocols WebKit used and the tunnels it opened
+      # (ci/test-pageload.sh). The times are measured, not gated. For
+      # www.rust-lang.org every load has to finish, and WebKit has to speak
+      # HTTP/2 through the proxy. github.com is measured only: on this
+      # runner's macOS every load of it through the proxy has failed its TLS
+      # handshake before WebKit asked anything of Syndeo (PR #56).
+      # Kept in pageload/ in the logs.
+      - name: Page load, directly and through Syndeo's proxy (times measured, not gated)
+        if: always()
+        run: >-
+          bash ci/test-pageload.sh "$PWD/dist/Syndeo.app/Contents/Helpers/syndeo-proxy" 5
+          https://www.rust-lang.org/ measure-only:https://github.com/
 
       - name: What this runner allows (measured, not a gate)
         if: always()
@@ -480,7 +507,7 @@ jobs:
     # screenshot, JavaScript only with its own leave; Stop and Revoke All;
     # MCP; and root refused. ci/test-app.sh agents says each check.
     runs-on: macos-15
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       SYNDEO_ALLOW_APP_TEST: "yes"
     steps:
@@ -510,6 +537,56 @@ jobs:
 
       - name: Agents drive it, with the person's leave, in the open, through Syndeo
         run: bash ci/test-app.sh agents "$PWD/dist/Syndeo.app"
+
+      # Syndeo.app with one of the agents' safeguards taken out at a time
+      # (ci/macos-app/mutants.py, agent-*): the person's prompt, what a grant
+      # allows, the socket's peer being this user, an agent's tab being its
+      # window's own, and an agent's tabs kept out of the session and of
+      # Recently Closed. Built, run and judged as macos-app's mutants are.
+      - name: Build each agents mutant, and require the test to catch it
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          results=()
+          wrong=0
+          for name in $(python3 -I ci/macos-app/mutants.py names agents); do
+            echo "::group::mutant $name"
+            built=no
+            if python3 -I ci/macos-app/mutants.py apply "$name" . &&
+              cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app -p syndeo-proxy; then
+              built=yes
+            fi
+            # Put back whatever happened, and exactly.
+            git checkout -- crates/syndeo-app crates/syndeo-proxy
+            if ! git diff --quiet; then
+              echo "::error::the tree was not put back after mutant $name"
+              exit 1
+            fi
+            verdict="caught as intended"
+            if [ "$built" != yes ]; then
+              verdict="NOT BUILT"
+            elif ! { mkdir -p "mutant-bins/$name" "dist-mutant/$name" &&
+              cp target/aarch64-apple-darwin/release/syndeo-app target/aarch64-apple-darwin/release/syndeo-proxy "mutant-bins/$name/" &&
+              bash ci/package-macos-app.sh "$version" "mutant-bins/$name" "dist-mutant/$name" &&
+              codesign --force --sign - --options runtime "dist-mutant/$name/Syndeo.app/Contents/Helpers/syndeo-proxy" &&
+              codesign --force --sign - --options runtime "dist-mutant/$name/Syndeo.app"; }; then
+              verdict="NOT ASSEMBLED"
+            elif ! bash ci/test-app.sh mutant "$name" "$PWD/dist-mutant/$name/Syndeo.app"; then
+              verdict="NOT CAUGHT AS INTENDED"
+            fi
+            # Nothing of this mutant left running for the next.
+            pkill -x Syndeo 2>/dev/null || true
+            pkill -x syndeo-proxy 2>/dev/null || true
+            sleep 1
+            [ "$verdict" = "caught as intended" ] || wrong=1
+            results+=("$name: $verdict")
+            echo "::endgroup::"
+          done
+          printf '\nmutants:\n'
+          printf '  %s\n' "${results[@]}"
+          [ "$wrong" = 0 ]
 
       - name: Keep the logs
         if: always()

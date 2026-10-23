@@ -225,7 +225,11 @@ impl CertificateAuthority {
         let mut config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(chain, key)?;
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // HTTP/2 first, as the browser asks: a page's requests to one host
+        // then share one connection, where HTTP/1.1 left WebKit six to a
+        // host with the rest of a page queued behind them. A client that
+        // offers only HTTP/1.1, as a WebSocket's does, still gets it.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         let config = Arc::new(config);
         self.leaves.lock().unwrap().insert(host, config.clone());

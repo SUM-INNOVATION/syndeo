@@ -256,10 +256,14 @@ pub async fn handle(net: &Net, request: NetRequest) -> NetResponse {
             NetResponse::Error("a fetch is answered in frames; use `respond`".into())
         }
 
-        NetRequest::Stats => match net.cache().stats() {
-            Ok(stats) => NetResponse::Stats(serde_json::to_value(stats).unwrap_or_default()),
-            Err(err) => NetResponse::Error(err.to_string()),
-        },
+        NetRequest::Stats => {
+            // Counting every answer already given, its entry included.
+            net.landed().await;
+            match net.cache().stats() {
+                Ok(stats) => NetResponse::Stats(serde_json::to_value(stats).unwrap_or_default()),
+                Err(err) => NetResponse::Error(err.to_string()),
+            }
+        }
 
         NetRequest::PeerStatus => match net.peer_status().await {
             Some(status) => NetResponse::PeerStatus(serde_json::json!({
