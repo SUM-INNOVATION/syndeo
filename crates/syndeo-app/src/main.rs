@@ -11,6 +11,8 @@ mod app_macos;
 #[cfg(target_os = "macos")]
 mod browser_macos;
 #[cfg(target_os = "macos")]
+mod chrome_macos;
+#[cfg(target_os = "macos")]
 mod settings_macos;
 #[cfg(target_os = "macos")]
 mod tabs_macos;

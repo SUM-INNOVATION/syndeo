@@ -8,7 +8,7 @@ swapped, shared, or fed from a peer without anything above it noticing.
 
 On a Mac, Syndeo is **Syndeo.app**, a desktop browser: WebKit draws the
 pages, and Syndeo's own proxy and cache stand in front of most of what they
-fetch — not all of it, as the bar above each page says. The command-line
+fetch — not all of it, as the address field says for each page. The command-line
 tools — the keystore, the agent, peer fetch and the rest — are a separate
 installation, for macOS and Linux: see
 [The command-line tools](#the-command-line-tools).
@@ -56,7 +56,13 @@ from Launchpad, or with Spotlight. Its first window shows a start page with
 the essentials of what follows: how pages are reached, what WebRTC does,
 secure pages, searching, and clearing browsing data.
 
-Type in the field at the top of the window and press Return:
+The window is a Mac browser's: one toolbar in the title bar, with Back and
+Forward, and the address field at its centre. Inside the address field, at
+its end, are the page's route (below) and Reload, which is Stop while a page
+loads; the page's loading progress runs along its bottom edge. Light and
+dark appearance follow the Mac's.
+
+Type in the address field and press Return:
 
 - an `http://` or `https://` address opens as typed;
 - a name with a dot, `localhost` or an IP address, with or without a port and
@@ -118,16 +124,18 @@ searched for. Its log names each such address by its scheme alone.
 
 ### How each page is reached
 
-**Not every request goes through Syndeo.** The bar above each page says how
-that page was reached:
+**Not every request goes through Syndeo.** The address field says how each
+page was reached, by a symbol at its end. For the usual route, Through
+Syndeo, it is the symbol alone, with its words in its help tag: point at it.
+For the two routes Syndeo does not cache, the words are beside the symbol:
 
-| The bar says | For | What happens |
+| The address field says | For | What happens |
 | --- | --- | --- |
 | **Through Syndeo** | every name, whatever it resolves to, and every public address | WebKit sends it through Syndeo's proxy, which may cache it |
 | **Direct — not cached by Syndeo** | `localhost`, and loopback addresses (127.0.0.0/8 and ::1) | WebKit opens it itself, never through the proxy |
 | **Local — not cached by Syndeo** | a local-network address typed as numbers, such as 192.168.1.10: private, link-local and shared (carrier-grade NAT) ranges | WebKit may open it directly or through the proxy; either way, the proxy stores nothing from it |
 
-The bar is about the page's own address. Each image, script, frame and other
+The route is that of the page's own address. Each image, script, frame and other
 part of a page is reached by its own address, by the same rule, and a
 redirect by the address it leads to. WebRTC takes none of these routes
 (below). The rule is what WebKit was measured doing on CI, not a promise
@@ -405,13 +413,15 @@ separate, and removing the application touches neither.
     quit; its search settings kept; an `https` page opened, pinned to
     Syndeo's authority, with that authority in no trust settings;
   - a Syndeo.app whose proxy cannot start, which has to refuse to browse;
-  - the route bar against what WebKit actually does, what the proxy caches,
-    and Clear Browsing Data;
+  - the address field's route against what WebKit actually does, what the
+    proxy caches, and Clear Browsing Data;
   - a WebSocket through Syndeo, opened, carried both ways and closed cleanly,
     with nothing of it cached, and WebRTC going around Syndeo, as the start
     page says;
   - eight mutants, each the application with one safeguard taken out, every
-    one of which the test has to catch.
+    one of which the test has to catch;
+  - its controls in its toolbar and browsing, in light and in dark
+    appearance, with pictures of each kept with the run's logs.
 - **Checked by hand, for every signed release:** from a fresh standard
   user account, installing by opening the package in Finder, which runs
   Installer's window and asks for a separate administrator's name and
@@ -1211,7 +1221,8 @@ package.
      a separate administrator account; the standard account stays standard.
   5. Open Syndeo.app from `/Applications`, as that standard user.
   6. Complete the customer journey there: the start page; an `http` page and
-     an `https` page, each opened through Syndeo, as the bar says; Reload;
+     an `https` page, each opened through Syndeo, as the address field's
+     route says; Reload;
      quit, then open Syndeo again and browse again.
   7. Check that the trust settings and keychains are exactly as recorded:
      nothing was added to or changed in either, by Syndeo or by hand.
@@ -1287,7 +1298,7 @@ this is a set of honest limits rather than work waiting to be done:
 
   A request that goes directly reaches its service without the proxy, and is
   neither cached nor counted by it, and the proxy caches nothing from a
-  local-network address either. Syndeo.app's bar says Direct for loopback,
+  local-network address either. Syndeo.app's address field says Direct for loopback,
   Local for a local-network address, which may go either way, and Through
   Syndeo for the rest.
 - Some sites go directly, not through Syndeo, because macOS refuses them
@@ -1304,7 +1315,7 @@ this is a set of honest limits rather than work waiting to be done:
 
   When that happens to a page, or to a part of one, Syndeo.app sends that
   host directly for the rest of the session, with macOS's own trust and not
-  Syndeo's, and loads the page again, once. The bar says "Direct — not
+  Syndeo's, and loads the page again, once. The address field says "Direct — not
   cached by Syndeo" for a page that came that way, and nothing from it is
   cached. macOS matches a host sent directly as a domain, so the names under
   it go directly too. Nothing about it is written anywhere, and the log says

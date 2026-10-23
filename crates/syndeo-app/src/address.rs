@@ -109,7 +109,7 @@ impl Search {
     }
 }
 
-/// How the page a window shows is reached, as its bar says.
+/// How the page a window shows is reached, as its address field says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     /// Through Syndeo's proxy, which may cache it.
@@ -124,7 +124,8 @@ pub enum Route {
 }
 
 impl Route {
-    /// What the bar says.
+    /// What the address field says: its route's words, which Accessibility
+    /// reads and its help tag starts with.
     pub fn label(self) -> &'static str {
         match self {
             Route::Syndeo => "Through Syndeo",
@@ -132,7 +133,38 @@ impl Route {
             Route::Local => "Local — not cached by Syndeo",
         }
     }
+
+    /// The SF Symbol the address field shows for it, and the one shown
+    /// should that one be missing. Each route has a shape of its own, so the
+    /// three tell apart without their colours.
+    pub fn symbol(self) -> (&'static str, &'static str) {
+        match self {
+            Route::Syndeo => ("point.3.connected.trianglepath.dotted", "network"),
+            Route::Direct => ("desktopcomputer", "laptopcomputer"),
+            Route::Local => ("wifi.router", "house"),
+        }
+    }
+
+    /// Whether the address field shows the words beside the symbol: for the
+    /// two routes Syndeo does not cache, which are never left to a help tag.
+    /// Through Syndeo, the usual route, is the symbol alone.
+    pub fn words_shown(self) -> bool {
+        self != Route::Syndeo
+    }
+
+    /// The route's help tag: its words, then what each route means.
+    pub fn help(self) -> String {
+        format!("{}. {ROUTE_HELP}", self.label())
+    }
 }
+
+/// What every route means, in the route's help tag.
+pub const ROUTE_HELP: &str = "How this page was reached. Through Syndeo: through Syndeo's proxy, \
+    which may cache it. Direct: this Mac's own loopback, which WebKit opens without the proxy, \
+    so Syndeo does not cache it. Local: a local-network address, which WebKit may open \
+    directly or through the proxy; either way Syndeo does not cache it. Each image, script \
+    and other part of the page is classified by its own address, so parts of it can be \
+    reached another way.";
 
 /// Loopback, which WebKit was measured always opening directly: 127/8, and
 /// ::1. (IPv4's loopback carried in IPv6 is 127/8: see [`route`].)
@@ -498,15 +530,19 @@ pub fn route_with(address: &str, direct: &[String]) -> Option<Route> {
 pub fn failure_page(address: &str, why: &str) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <title>Syndeo couldn't open this page</title>\
-         <style>:root {{ color-scheme: light dark; }} \
-         body {{ font: 15px/1.5 -apple-system, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1.5rem; }} \
-         h1 {{ font-size: 1.5rem; font-weight: 600; }} code {{ word-break: break-all; }}</style></head>\
-         <body><h1>Syndeo couldn't open this page</h1><p><code>{}</code></p><p>{}</p></body></html>",
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>Syndeo couldn't open this page</title><style>{PAGE_STYLE}</style></head>\
+         <body><main class=\"failure\"><div class=\"mark\" aria-hidden=\"true\">!</div>\
+         <h1>Syndeo couldn't open this page</h1><p class=\"address\"><code>{}</code></p>\
+         <p class=\"why\">{}</p></main></body></html>",
         escape(address),
         escape(why)
     )
 }
+
+/// The look of Syndeo's own pages, the start page and the failure page: the
+/// system's font, and its colours in light and dark appearance.
+pub const PAGE_STYLE: &str = include_str!("page.css");
 
 /// Text for an HTML page.
 pub fn escape(text: &str) -> String {
@@ -1160,6 +1196,31 @@ mod tests {
         );
         assert_eq!(route_with("http://127.0.0.1/", &[]), Some(Route::Direct));
         assert_eq!(route_with("about:blank", &direct), None);
+    }
+
+    #[test]
+    fn each_route_has_a_shape_of_its_own_and_its_words_where_syndeo_does_not_cache() {
+        let routes = [Route::Syndeo, Route::Direct, Route::Local];
+        for (i, a) in routes.iter().enumerate() {
+            for b in &routes[i + 1..] {
+                assert_ne!(a.symbol().0, b.symbol().0, "{a:?} and {b:?}");
+                assert_ne!(a.symbol().1, b.symbol().1, "{a:?} and {b:?}");
+            }
+            assert!(a.help().starts_with(&format!("{}. ", a.label())), "{a:?}");
+            assert!(a.help().ends_with(ROUTE_HELP), "{a:?}");
+        }
+        assert!(!Route::Syndeo.words_shown());
+        assert!(Route::Direct.words_shown());
+        assert!(Route::Local.words_shown());
+    }
+
+    #[test]
+    fn the_failure_page_says_so_in_both_appearances() {
+        let page = failure_page("https://x/", "why");
+        assert!(page.contains("<h1>Syndeo couldn't open this page</h1>"));
+        assert!(page.contains("color-scheme: light dark"));
+        assert!(page.contains("prefers-color-scheme: dark"));
+        assert!(!page.contains("{{"), "{page}");
     }
 
     #[test]

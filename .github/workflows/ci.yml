@@ -331,10 +331,11 @@ jobs:
     # whose proxy cannot start, which has to refuse to browse;
     # and the route bar against what WebKit does, the proxy's cache keeping
     # nothing from this Mac, and Clear Browsing Data. Unsigned with a
-    # Developer ID, and with no secrets: a pull request never signs. Then,
-    # reported and not gated, how long github.com takes to show in WebKit by
-    # itself and through the proxy, and what this runner allows an onboarding
-    # test to do.
+    # Developer ID, and with no secrets: a pull request never signs. Its
+    # controls in its toolbar, in light and dark appearance, with pictures of
+    # each kept with the logs. Then, reported and not gated, how long
+    # github.com takes to show in WebKit by itself and through the proxy, and
+    # what this runner allows an onboarding test to do.
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -470,6 +471,14 @@ jobs:
       - name: WebSockets through Syndeo, and WebRTC around it, as the start page says
         if: always()
         run: bash ci/test-app.sh realtime "$PWD/dist/Syndeo.app"
+
+      # Its controls in the toolbar and browsing, in light appearance and in
+      # dark, the runner's own, put back as it was; pictures of the start
+      # page, a page through Syndeo, a Direct page, Syndeo's own page and
+      # Settings in each, kept with the logs as looks-*.png.
+      - name: Its look, light and dark, with pictures kept with the logs
+        if: always()
+        run: bash ci/test-app.sh looks "$PWD/dist/Syndeo.app"
 
       # Pages in WebKit by itself and through this tree's proxy, as Syndeo.app
       # runs it, cold and warm, interleaved run by run: first contentful
