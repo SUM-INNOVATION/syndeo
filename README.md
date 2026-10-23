@@ -285,7 +285,11 @@ A program's tabs are kept apart from yours. They are not part of the
 session Syndeo keeps when it quits, and they are not offered again in
 History > Recently Closed. ⌘1 to ⌘9 and Show All Tabs work within the window
 in front, yours or a program's. A tab you open from a program's window (New
-Tab, Duplicate Tab) is yours, and opens beside your own windows.
+Tab, Duplicate Tab) is yours, and opens beside your own windows. A
+program's tabs are routed exactly as yours are, including the hosts Syndeo
+sends directly for the session. The route it is told is the one its tab's
+bar shows, and when its window loads a page again by itself, the program
+waits for that page.
 
 **Only your own programs, and nothing on the network.** While agents are on,
 Syndeo listens on a Unix socket, `control.sock`, in
@@ -1384,6 +1388,25 @@ this is a set of honest limits rather than work waiting to be done:
   local-network address either. Syndeo.app's bar says Direct for loopback,
   Local for a local-network address, which may go either way, and Through
   Syndeo for the rest.
+- Some sites go directly, not through Syndeo, because macOS refuses them
+  through its proxy ([#58](https://github.com/SUM-INNOVATION/syndeo/issues/58)):
+  - on macOS 15 and earlier, the sites on the HSTS preload list built into
+    macOS, such as github.com, paypal.com, wikipedia.org and every .dev
+    site. For those, macOS accepts only a publicly trusted certificate,
+    whatever an application says: it asks the window, which checks that the
+    certificate came from Syndeo's own proxy, and then refuses the
+    connection anyway. Measured on macOS 14.8 and 15.7; macOS 26 lets them
+    through Syndeo. A site's own HSTS header does not do this;
+  - on every macOS, Apple's own sites, such as www.apple.com, which macOS
+    pins to Apple's certificates.
+
+  When that happens to a page, or to a part of one, Syndeo.app sends that
+  host directly for the rest of the session, with macOS's own trust and not
+  Syndeo's, and loads the page again, once. The bar says "Direct — not
+  cached by Syndeo" for a page that came that way, and nothing from it is
+  cached. macOS matches a host sent directly as a domain, so the names under
+  it go directly too. Nothing about it is written anywhere, and the log says
+  that a host was sent directly, never which.
 - The proxy's cache is not partitioned by site, in Syndeo.app or behind
   `syndeo-webkit`, and Syndeo.app has one browsing profile for every site.
 - Syndeo.app has no keystore: no keys, identities or signing.

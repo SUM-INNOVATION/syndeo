@@ -6,6 +6,7 @@
 mod auth;
 mod ca;
 mod keychain;
+mod refusals;
 mod stats;
 mod websocket;
 
@@ -322,6 +323,9 @@ struct Proxy {
     /// The TLS a `wss://` WebSocket's own connection to its origin speaks;
     /// see [`websocket::client_config`].
     upstream_tls: Arc<rustls::ClientConfig>,
+    /// Hosts whose browser refused this proxy's certificate the way macOS 15
+    /// and earlier do for their preloaded HSTS sites, said to the owner.
+    refusals: refusals::Refusals,
     /// Requests this proxy has been asked to handle, so a test can see that a
     /// loop stopped rather than only that an answer came back.
     #[cfg(test)]
@@ -368,6 +372,19 @@ async fn run(args: RunArgs) -> Result<()> {
         tunnel_first_byte: TUNNEL_FIRST_BYTE,
         dns: resolver,
         upstream_tls: websocket::client_config()?,
+        // Said only to an owner that takes this proxy's answers on its
+        // stdout, each a line written whole, like those answers.
+        refusals: if args.control_stdin {
+            refusals::Refusals::saying(|host| {
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                let _ = out
+                    .write_all(refusals::line(host).as_bytes())
+                    .and_then(|()| out.flush());
+            })
+        } else {
+            refusals::Refusals::silent()
+        },
         #[cfg(test)]
         handled: Default::default(),
     });
@@ -503,7 +520,9 @@ fn answer_commands(
             },
             _ => UNKNOWN.to_string(),
         };
-        writeln!(output, "{answer}")?;
+        // Whole, in one write: a refusal (see `refusals`) may be said on the
+        // same output from another thread.
+        output.write_all(format!("{answer}\n").as_bytes())?;
         output.flush()?;
     }
 }
@@ -681,6 +700,9 @@ fn connect(proxy: Arc<Proxy>, req: Request<Incoming>, local: SocketAddr) -> Resp
                 Ok(s) => s,
                 Err(err) => {
                     tracing::debug!(%host, %err, "tls handshake failed");
+                    if proxy.refusals.handshake_failed(&host, &err) {
+                        tracing::debug!(%host, "refused as macOS refuses its preloaded HSTS sites");
+                    }
                     return;
                 }
             };
@@ -1353,6 +1375,7 @@ mod tests {
             tunnel_first_byte: std::time::Duration::from_millis(300),
             dns: syndeo_net::dns::Dns::new(&DnsMode::System).unwrap(),
             upstream_tls,
+            refusals: refusals::Refusals::silent(),
             handled: Default::default(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2217,6 +2240,80 @@ mod tests {
         .unwrap()
     }
 
+    /// A proxy whose refusals (see `refusals`) are said into `said`.
+    async fn start_proxy_saying(
+        dir: &std::path::Path,
+        said: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> (SocketAddr, Arc<Proxy>) {
+        let net = open_net(net_config(&cache_root(dir, None), true, DnsMode::System)).unwrap();
+        let authority = CertificateAuthority::load_or_create(dir.join("proxy")).unwrap();
+        let proxy = Arc::new(Proxy {
+            net,
+            authority,
+            trace: false,
+            max_request_body: DEFAULT_MAX_REQUEST_BODY,
+            auth: None,
+            tunnel_first_byte: std::time::Duration::from_millis(300),
+            dns: syndeo_net::dns::Dns::new(&DnsMode::System).unwrap(),
+            upstream_tls: websocket::client_config().unwrap(),
+            refusals: refusals::Refusals::saying(move |host| {
+                said.lock().unwrap().push(host.to_string())
+            }),
+            handled: Default::default(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, proxy.clone()));
+        (address, proxy)
+    }
+
+    /// A TLS 1.2 ClientHello with no extensions at all, so no
+    /// `signature_algorithms`: the legacy hello macOS 15 sends last, after
+    /// refusing this proxy's certificate for a preloaded HSTS site.
+    fn legacy_client_hello() -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend([0x11; 32]); // random
+        body.push(0); // no session id
+        body.extend([0x00, 0x02, 0xc0, 0x2b]); // one suite
+        body.extend([0x01, 0x00]); // null compression
+        let mut handshake = vec![0x01, 0, 0, body.len() as u8];
+        handshake.extend(body);
+        let mut record = vec![0x16, 0x03, 0x01, 0, handshake.len() as u8];
+        record.extend(handshake);
+        record
+    }
+
+    /// That hello has its host said to the owner, once however often it
+    /// comes; a tunnel closed at once, or TLS as a browser speaks it, has
+    /// nothing said.
+    #[tokio::test]
+    async fn a_client_that_falls_back_without_signature_algorithms_is_said_once() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let said = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (proxy, handle) = start_proxy_saying(dir.path(), said.clone()).await;
+        for _ in 0..2 {
+            let (mut stream, status) = open_tunnel(proxy, "refused.example:443").await;
+            assert_eq!(status, 200);
+            stream.write_all(&legacy_client_hello()).await.unwrap();
+            let mut answer = Vec::new();
+            within(stream.read_to_end(&mut answer)).await.unwrap();
+            assert_eq!(
+                answer.first(),
+                Some(&0x15),
+                "an alert, then closed: {answer:?}"
+            );
+        }
+        let (stream, _) = open_tunnel(proxy, "closed.example:443").await;
+        drop(stream);
+        let (stream, _) = open_tunnel(proxy, "localhost:443").await;
+        let tls = tls_to_proxy_offering(stream, &handle, &[b"h2", b"http/1.1"]).await;
+        drop(tls);
+        // Whatever the last two would have said has had its time.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(*said.lock().unwrap(), ["refused.example"]);
+    }
+
     /// A client that offers HTTP/2, as WebKit does, gets it inside the tunnel,
     /// and its requests share that one connection, answered side by side:
     /// over HTTP/1.1 WebKit opened six tunnels to a host and queued the rest
@@ -2479,6 +2576,7 @@ mod tests {
             tunnel_first_byte: std::time::Duration::from_millis(300),
             dns: syndeo_net::dns::Dns::new(&DnsMode::System).unwrap(),
             upstream_tls: websocket::client_config().unwrap(),
+            refusals: refusals::Refusals::silent(),
             handled: Default::default(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

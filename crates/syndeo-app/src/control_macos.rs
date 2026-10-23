@@ -85,6 +85,9 @@ pub type ControllerOf = Box<dyn Fn(&NSWindow) -> Option<Retained<BrowserControll
 pub struct AppHooks {
     pub new_window: NewWindow,
     pub controller_of: ControllerOf,
+    /// The hosts this session sends around the proxy, directly, as every
+    /// window's bar takes them into account.
+    pub direct: Box<dyn Fn() -> Vec<String>>,
 }
 
 /// An agent's tab, as a request finds it: its web view, its window's
@@ -485,7 +488,7 @@ fn settle(
     let mut seen = false;
     loop {
         let mut state = probe(conn, tab, needs)?;
-        let loading = state["loading"] == json!(true);
+        let loading = busy(&state);
         seen |= loading;
         let arrived = match &arrival {
             Arrival::Now => true,
@@ -496,7 +499,7 @@ fn settle(
             // A failure page may follow a failed load at once.
             std::thread::sleep(Duration::from_millis(200));
             state = probe(conn, tab, needs)?;
-            if state["loading"] != json!(true) {
+            if !busy(&state) {
                 state["loaded"] = json!(true);
                 return Ok(state);
             }
@@ -508,6 +511,13 @@ fn settle(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Whether a tab's page is loading, or may yet be loaded again by its
+/// window, once, with hosts macOS refused sent directly (#58): a wait for it
+/// is not over until it is neither, so it ends on the page loaded again.
+fn busy(state: &Value) -> bool {
+    state["loading"] == json!(true) || state["settling"] == json!(true)
 }
 
 /// A tab's state, from the main thread.
@@ -1178,8 +1188,8 @@ impl Control {
                 ));
             }
         }
-        let (view, _, _) = self.tab(&key, tab)?;
-        Ok(state(tab, &view))
+        let (view, controller, _) = self.tab(&key, tab)?;
+        Ok(self.state(tab, &view, &controller))
     }
 
     // ------------------------------------------------------------- requests
@@ -1209,24 +1219,29 @@ impl Control {
                 })));
             }
             Command::Tabs => {
-                let mut list: Vec<(u64, Retained<WKWebView>)> = self
+                let mut list: Vec<(u64, Retained<WKWebView>, Retained<BrowserController>)> = self
                     .tabs
                     .borrow()
                     .iter()
                     .filter(|(_, t)| &t.agent == key && t.window.load().is_some())
-                    .map(|(&id, t)| (id, t.view.clone()))
+                    .map(|(&id, t)| (id, t.view.clone(), t.controller.clone()))
                     .collect();
-                list.sort_by_key(|(id, _)| *id);
-                let tabs: Vec<Value> = list.iter().map(|(id, view)| state(*id, view)).collect();
+                list.sort_by_key(|(id, _, _)| *id);
+                let tabs: Vec<Value> = list
+                    .iter()
+                    .map(|(id, view, controller)| self.state(*id, view, controller))
+                    .collect();
                 reply.done(Ok(json!({"tabs": tabs})));
             }
             Command::Open { url, .. } => reply.done(self.open(key, &url)),
             Command::Goto { tab, url, .. } => reply.done(self.goto(key, tab, &url)),
             Command::History { tab, step, .. } => reply.done(self.step(key, tab, step)),
-            Command::Select { tab } => reply.done(self.tab(key, tab).map(|(view, _, window)| {
-                window.makeKeyAndOrderFront(None);
-                state(tab, &view)
-            })),
+            Command::Select { tab } => {
+                reply.done(self.tab(key, tab).map(|(view, controller, window)| {
+                    window.makeKeyAndOrderFront(None);
+                    self.state(tab, &view, &controller)
+                }))
+            }
             Command::Close { tab } => reply.done(self.tab(key, tab).map(|(_, _, window)| {
                 window.performClose(None);
                 json!({"tab": tab, "closed": true})
@@ -1323,7 +1338,7 @@ impl Control {
     fn goto(&self, key: &AgentKey, tab: u64, url: &str) -> Result<Value, Failure> {
         let request = web_request(url)?;
         let (view, tab_controller, _) = self.tab(key, tab)?;
-        let from = state(tab, &view)["url"].clone();
+        let from = self.state(tab, &view, &tab_controller)["url"].clone();
         tab_controller.load(&request);
         Ok(json!({"tab": tab, "url": request_url(&request), "from": from}))
     }
@@ -1369,7 +1384,37 @@ impl Control {
                 }
             }
         }
-        Ok(state(tab, &view))
+        Ok(self.state(tab, &view, &controller))
+    }
+
+    /// How a tab's page was reached, as its bar says it: by its address,
+    /// with the hosts this session sends directly (`address::route_with`).
+    fn route_of(&self, view: &WKWebView) -> Option<&'static str> {
+        let url = unsafe { view.URL() }
+            .and_then(|u| u.absoluteString())?
+            .to_string();
+        address::route_with(&url, &(self.hooks.direct)()).map(address::Route::label)
+    }
+
+    /// How a tab is: its address, title, whether it is loading, whether its
+    /// window may yet load it again by itself (`settling`), and how its page
+    /// was reached, as its bar says.
+    fn state(&self, tab: u64, view: &WKWebView, controller: &BrowserController) -> Value {
+        let url = unsafe { view.URL() }
+            .and_then(|u| u.absoluteString())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let title = unsafe { view.title() }
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        json!({
+            "tab": tab,
+            "url": url,
+            "title": title,
+            "loading": unsafe { view.isLoading() },
+            "settling": controller.may_load_again(),
+            "route": self.route_of(view),
+        })
     }
 
     /// One of Syndeo's own operations, in its own world in the tab's page.
@@ -1380,7 +1425,7 @@ impl Control {
         };
         let world = self.world();
         let args = args.to_string();
-        let route = route_of(&view);
+        let route = self.route_of(&view);
         run(
             &view,
             &world,
@@ -1513,32 +1558,6 @@ fn request_url(request: &NSURLRequest) -> String {
         .and_then(|url| url.absoluteString())
         .map(|s| s.to_string())
         .unwrap_or_default()
-}
-
-fn route_of(view: &WKWebView) -> Option<&'static str> {
-    let url = unsafe { view.URL() }
-        .and_then(|u| u.absoluteString())?
-        .to_string();
-    address::route_of(&url).map(address::Route::label)
-}
-
-/// How a tab is: its address, title, whether it is loading, and how its
-/// page was reached, as its bar says.
-fn state(tab: u64, view: &WKWebView) -> Value {
-    let url = unsafe { view.URL() }
-        .and_then(|u| u.absoluteString())
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-    let title = unsafe { view.title() }
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-    json!({
-        "tab": tab,
-        "url": url,
-        "title": title,
-        "loading": unsafe { view.isLoading() },
-        "route": route_of(view),
-    })
 }
 
 /// Run `body`, a function body, in `world` in the view's main frame, with

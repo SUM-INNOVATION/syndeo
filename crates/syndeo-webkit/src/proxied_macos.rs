@@ -17,7 +17,7 @@ use objc2::runtime::NSObject;
 use objc2::MainThreadMarker;
 use objc2_foundation::{ns_string, NSArray, NSObjectNSKeyValueCoding};
 use objc2_web_kit::{WKWebViewConfiguration, WKWebsiteDataStore};
-use std::ffi::{c_char, CString};
+use std::ffi::{c_char, c_void, CString};
 
 /// The username the proxy expects. Not a secret; the token is.
 pub const USER: &str = "syndeo";
@@ -94,6 +94,35 @@ extern "C" {
     );
 }
 
+extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+
+/// `RTLD_DEFAULT`, on macOS.
+const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+
+/// `nw_proxy_config_add_excluded_domain`.
+type AddExcludedDomain = unsafe extern "C" fn(config: *mut NSObject, domain: *const c_char);
+
+/// The Network framework's `nw_proxy_config_add_excluded_domain`, macOS 14
+/// and later: looked up when it is needed, not linked, so that a macOS
+/// without it can still start this program.
+fn add_excluded_domain() -> Option<AddExcludedDomain> {
+    let symbol = unsafe {
+        dlsym(
+            RTLD_DEFAULT,
+            c"nw_proxy_config_add_excluded_domain".as_ptr(),
+        )
+    };
+    (!symbol.is_null())
+        .then(|| unsafe { std::mem::transmute::<*mut c_void, AddExcludedDomain>(symbol) })
+}
+
+/// Whether this macOS can send some hosts around the proxy.
+pub fn can_send_direct() -> bool {
+    add_excluded_domain().is_some()
+}
+
 /// The data store every web view in this process uses: the one wry would have
 /// chosen itself, so nothing about storage changes but the proxy.
 pub fn data_store(mtm: MainThreadMarker) -> Retained<WKWebsiteDataStore> {
@@ -109,17 +138,51 @@ pub fn configuration(
     target: &ProxyTarget,
     mtm: MainThreadMarker,
 ) -> Result<Retained<WKWebViewConfiguration>> {
-    let proxy = proxy_config(target)?;
-    let store = data_store(mtm);
-    let proxies: Retained<NSArray<NSObject>> = NSArray::from_retained_slice(&[proxy]);
-    unsafe { store.setValue_forKey(Some(&proxies), ns_string!("proxyConfigurations")) };
+    configuration_sending_direct(target, &[], mtm)
+}
+
+/// [`configuration`], with each of `direct` and the names under it sent
+/// around the proxy, directly: see [`send_direct`].
+pub fn configuration_sending_direct(
+    target: &ProxyTarget,
+    direct: &[String],
+    mtm: MainThreadMarker,
+) -> Result<Retained<WKWebViewConfiguration>> {
+    let store = apply(target, direct, mtm)?;
     let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
     unsafe { configuration.setWebsiteDataStore(&store) };
     Ok(configuration)
 }
 
-/// The Network framework's proxy configuration for `target`.
-fn proxy_config(target: &ProxyTarget) -> Result<Retained<NSObject>> {
+/// From now on, every web view of this process opens each of `direct`, and
+/// every name under it, directly, and everything else through `target`, as
+/// before. The data store's proxy configuration is replaced, which applies
+/// to the connections opened after it: measured on macOS 15 and 26, the
+/// next load of a host just excluded went directly, in a web view that had
+/// loaded it through the proxy, while another host still went through it
+/// (#58). The Network framework matches each excluded domain as the domain
+/// and the names under it: see `syndeo-app`'s `address::covered`.
+pub fn send_direct(target: &ProxyTarget, direct: &[String], mtm: MainThreadMarker) -> Result<()> {
+    apply(target, direct, mtm).map(drop)
+}
+
+/// The default data store, its proxy configuration `target`, around which
+/// `direct` goes.
+fn apply(
+    target: &ProxyTarget,
+    direct: &[String],
+    mtm: MainThreadMarker,
+) -> Result<Retained<WKWebsiteDataStore>> {
+    let proxy = proxy_config(target, direct)?;
+    let store = data_store(mtm);
+    let proxies: Retained<NSArray<NSObject>> = NSArray::from_retained_slice(&[proxy]);
+    unsafe { store.setValue_forKey(Some(&proxies), ns_string!("proxyConfigurations")) };
+    Ok(store)
+}
+
+/// The Network framework's proxy configuration for `target`, with `direct`
+/// excluded from it.
+fn proxy_config(target: &ProxyTarget, direct: &[String]) -> Result<Retained<NSObject>> {
     let host = CString::new(target.host.as_str()).context("the proxy's host")?;
     let port = CString::new(target.port.as_str()).context("the proxy's port")?;
     // Both functions return a retained object, as `Retained::from_raw` expects.
@@ -146,12 +209,39 @@ fn proxy_config(target: &ProxyTarget) -> Result<Retained<NSObject>> {
         let mut bytes = password.into_bytes();
         bytes.fill(0);
     }
+    if !direct.is_empty() {
+        let exclude =
+            add_excluded_domain().context("this macOS cannot send a host around the proxy")?;
+        for domain in direct {
+            let domain = CString::new(domain.as_str()).context("a domain to send directly")?;
+            unsafe { exclude(Retained::as_ptr(&proxy) as *mut NSObject, domain.as_ptr()) };
+        }
+    }
     Ok(proxy)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On macOS 14 and later, which every proxy configuration here needs,
+    /// hosts can be sent around the proxy, and a configuration that does
+    /// is made; one without them needs nothing of it.
+    #[test]
+    fn hosts_can_be_sent_around_the_proxy() {
+        let target = ProxyTarget {
+            host: "127.0.0.1".into(),
+            port: "8899".into(),
+            credential: None,
+        };
+        assert!(
+            can_send_direct(),
+            "nw_proxy_config_add_excluded_domain is missing"
+        );
+        assert!(proxy_config(&target, &[]).is_ok());
+        assert!(proxy_config(&target, &["github.com".into(), "www.apple.com".into()]).is_ok());
+        assert!(proxy_config(&target, &["bad\0name".into()]).is_err());
+    }
 
     #[test]
     fn a_credential_is_a_fresh_token_framed_for_the_proxy_and_never_printed() {
