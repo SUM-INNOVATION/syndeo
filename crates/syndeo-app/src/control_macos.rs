@@ -15,7 +15,7 @@
 //!   Running JavaScript is asked for, and allowed, on its own.
 //! - **In the open.** An agent works only in tabs it opened, made as every
 //!   window is (routed through the proxy and pinned to its authority), in
-//!   windows of its own. Each says, below its title bar, who is in control,
+//!   windows of its own. Each says, below its toolbar, who is in control,
 //!   with Stop, which disconnects the agent and takes back everything it was
 //!   allowed; its tabs become the person's. The person's own tabs are never
 //!   shown to an agent.
