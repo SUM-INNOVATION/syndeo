@@ -326,8 +326,8 @@ jobs:
     # applications ask it to open, opened through the proxy or refused, and
     # opened by one; passkeys reported unavailable, asking nothing; its last
     # window closed and brought back by opening it again, quit as the Quit
-    # menu item would, and opened again; twelve mutants, each of which the
-    # test has to catch; a copy whose proxy cannot start, which has to refuse
+    # menu item would, and opened again; four mutants, each of which the
+    # test has to catch (the other fourteen are macos-agents'); a copy whose proxy cannot start, which has to refuse
     # to browse; and the route bar against what WebKit does, the proxy's
     # cache keeping nothing from this Mac, and Clear Browsing Data. Unsigned
     # with a Developer ID, and with no secrets: a pull request never signs.
@@ -384,15 +384,15 @@ jobs:
         run: bash ci/test-app.sh refuse "$PWD/dist-broken/Syndeo.app"
 
       # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
-      # mutants.py): the pinning delegate, the main frame's navigation policy,
-      # the schemes a new tab may open, the schemes another application may
-      # ask Syndeo to open, the address field's guard for typing,
-      # the bar's rule for names, the refusal of a link to an IPv6 address
-      # with a zone, Reload asking the origin, Clear Browsing Data forgetting
-      # closed tabs and the session, and, in the proxy, a WebSocket carried
-      # rather than stripped of its Upgrade. (The agents' are macos-agents'.)
-      # Each is built from this tree, the app and its helper, which is then put back, and the test has
-      # to catch each by the checks meant to, with every other check passing.
+      # mutants.py names macos-app): the schemes a new tab may open, the
+      # address field's guard for typing, Reload asking the origin, and Clear
+      # Browsing Data forgetting closed tabs and the session. The other
+      # fourteen run in macos-agents, by their measured times (mutants.py,
+      # MACOS_AGENTS), so that neither job nears its 60 minutes; each mutant
+      # runs in exactly one, which mutants.py --check requires. Each is built
+      # from this tree, the app and its helper, which is then put back, and
+      # the test has to catch each by the checks meant to, with every other
+      # check passing.
       # All of them are run whatever any one does, each recorded on its own
       # and cleaned up after; the step fails at the end if any was not caught
       # exactly as intended.
@@ -403,7 +403,7 @@ jobs:
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           results=()
           wrong=0
-          for name in $(python3 -I ci/macos-app/mutants.py names app); do
+          for name in $(python3 -I ci/macos-app/mutants.py names macos-app); do
             echo "::group::mutant $name"
             built=no
             if python3 -I ci/macos-app/mutants.py apply "$name" . &&
@@ -546,8 +546,9 @@ jobs:
     # person gives it; the agent's pages in tabs of its own, through Syndeo's
     # proxy and pinned, saying who controls them; reading, acting, a
     # screenshot, JavaScript only with its own leave; Stop and Revoke All;
-    # MCP; and root refused. ci/test-app.sh agents says each check. Then the
-    # agents' mutants, and tabs and its look, light and dark.
+    # MCP; and root refused. ci/test-app.sh agents says each check. Then
+    # fourteen of the mutants (the agents' and eight of the application's),
+    # and tabs and its look, light and dark.
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -580,12 +581,17 @@ jobs:
       - name: Agents drive it, with the person's leave, in the open, through Syndeo
         run: bash ci/test-app.sh agents "$PWD/dist/Syndeo.app"
 
-      # Syndeo.app with one of the agents' safeguards taken out at a time
-      # (ci/macos-app/mutants.py, agent-*): the person's prompt, what a grant
-      # allows, the socket's peer being this user, an agent's tab being its
-      # window's own, and an agent's tabs kept out of the session and of
-      # Recently Closed. Built, run and judged as macos-app's mutants are.
-      - name: Build each agents mutant, and require the test to catch it
+      # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
+      # mutants.py names macos-agents): the agents' — the person's prompt,
+      # what a grant allows, the socket's peer being this user, an agent's
+      # tab being its window's own, and an agent's tabs kept out of the
+      # session and of Recently Closed — and, moved from macos-app by their
+      # measured times, the pinning delegate, the main frame's navigation
+      # policy, the schemes another application may ask Syndeo to open, the
+      # bar's rule for names, the refusal of a link to an IPv6 address with
+      # a zone, a WebSocket carried rather than stripped of its Upgrade, and
+      # the hosts sent directly. Built, run and judged as macos-app's are.
+      - name: Build each of its mutants, and require the test to catch it
         if: always()
         shell: bash
         run: |
@@ -593,7 +599,7 @@ jobs:
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           results=()
           wrong=0
-          for name in $(python3 -I ci/macos-app/mutants.py names agents); do
+          for name in $(python3 -I ci/macos-app/mutants.py names macos-agents); do
             echo "::group::mutant $name"
             built=no
             if python3 -I ci/macos-app/mutants.py apply "$name" . &&

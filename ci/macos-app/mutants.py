@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Syndeo.app with one safeguard taken out, which ci/test-app.sh must catch.
 
-  mutants.py names [app|agents]    each mutant's name, one a line: all of
-                                   them, or the application's or the
-                                   agents' (agent-*) alone
+  mutants.py names [JOB]           each mutant's name, one a line: all of
+                                   them, or those CI job JOB runs
+                                   (macos-app or macos-agents)
   mutants.py --check <repo>        each mutant's text is in <repo>'s source
                                    exactly once, so none has quietly stopped
-                                   applying
+                                   applying; and each runs in exactly one job
   mutants.py apply <name> <repo>   make that mutant in <repo>'s source
 
 CI builds each mutant into a Syndeo.app of its own and runs
@@ -84,8 +84,11 @@ back.
   must then be seen not opening, the bar not saying Direct, and the log not
   saying a host was sent directly.
 
-The agent-* mutants run in the macos-agents job, beside its gate; the others
-in macos-app's.
+Each mutant runs in exactly one CI job: macos-agents runs the agent-*
+mutants, beside its gate, and those in MACOS_AGENTS; macos-app runs the
+rest. Which go where is by their measured times, so that neither job nears
+its 60 minutes: CI 39937222216 took 51m06s for macos-app with its twelve,
+which there took 1061 s between them, and 16m36s for macos-agents.
 """
 import os
 import sys
@@ -297,6 +300,32 @@ MUTANTS = {
 }
 
 
+# The application's mutants macos-agents runs: the eight that took longest in
+# CI 39937222216 (seconds each, its build included): no-pinning-delegate 138,
+# direct-for-every-host 124, websocket-headers-stripped 104,
+# no-navigation-policy 102, zoned-links-followed 98, asked-any-scheme 96,
+# never-retry-direct 94 and direct-for-every-name 87; 843 s of the 1061.
+MACOS_AGENTS = {
+    "no-pinning-delegate",
+    "direct-for-every-host",
+    "websocket-headers-stripped",
+    "no-navigation-policy",
+    "zoned-links-followed",
+    "asked-any-scheme",
+    "never-retry-direct",
+    "direct-for-every-name",
+}
+
+JOBS = ("macos-app", "macos-agents")
+
+
+def job_of(name):
+    """The CI job that runs mutant `name`."""
+    if name.startswith("agent-") or name in MACOS_AGENTS:
+        return "macos-agents"
+    return "macos-app"
+
+
 def read(repo, path):
     with open(os.path.join(repo, path), encoding="utf-8") as f:
         return f.read()
@@ -312,7 +341,19 @@ def check(repo):
             else:
                 print(f"  WRONG {name}: its text is in {path} {found} times, not once")
                 wrong += 1
-    print(f"\n  {len(MUTANTS)} mutants, {wrong} wrong")
+    # Every mutant in exactly one job: none named for macos-agents that is
+    # not a mutant, and the jobs' lists together all of them, once.
+    for name in sorted(MACOS_AGENTS - set(MUTANTS)):
+        print(f"  WRONG MACOS_AGENTS names {name}, which is not a mutant")
+        wrong += 1
+    runs = [name for job in JOBS for name in MUTANTS if job_of(name) == job]
+    if sorted(runs) != sorted(MUTANTS):
+        print(f"  WRONG the jobs run {len(runs)} mutants between them, not each of {len(MUTANTS)} once")
+        wrong += 1
+    counts = ", ".join(
+        f"{sum(1 for name in MUTANTS if job_of(name) == job)} in {job}" for job in JOBS
+    )
+    print(f"\n  {len(MUTANTS)} mutants ({counts}), {wrong} wrong")
     return 1 if wrong else 0
 
 
@@ -334,21 +375,16 @@ def apply(name, repo):
 
 def main(argv):
     if argv[:1] == ["names"] and len(argv) <= 2:
-        group = argv[1] if len(argv) == 2 else None
-        if group not in (None, "app", "agents"):
-            sys.exit("mutants.py: names takes app or agents")
-        agents = {name for name in MUTANTS if name.startswith("agent-")}
-        chosen = [
-            name for name in MUTANTS
-            if group is None or (name in agents) == (group == "agents")
-        ]
-        print("\n".join(chosen))
+        job = argv[1] if len(argv) == 2 else None
+        if job not in (None,) + JOBS:
+            sys.exit("mutants.py: names takes " + " or ".join(JOBS))
+        print("\n".join(name for name in MUTANTS if job is None or job_of(name) == job))
         return 0
     if len(argv) == 2 and argv[0] == "--check":
         return check(argv[1])
     if len(argv) == 3 and argv[0] == "apply":
         return apply(argv[1], argv[2])
-    sys.exit("usage: mutants.py names [app|agents] | --check <repo> | apply <name> <repo>")
+    sys.exit("usage: mutants.py names [macos-app|macos-agents] | --check <repo> | apply <name> <repo>")
 
 
 if __name__ == "__main__":
