@@ -1005,9 +1005,9 @@ run() {
   note_said "Syndeo.app $version is installed in /Applications" >/dev/null
   now="$(cdhash "$st/real-payload/Syndeo.pkg/Payload/Syndeo.app")"
   must "  ... its receipt, $APP_ID $version" receipt_is "$APP_ID" "$version"
-  must "  ... Syndeo.app byte for byte the bundle $(basename "$pkg") carries: nothing of 0.2.0's left" \
+  must "  ... Syndeo.app byte for byte the bundle the package under test carries: nothing of the published 0.2.0's left" \
     same_bundle "$APP" "$st/real-payload/Syndeo.pkg/Payload/Syndeo.app"
-  must "  ... its code signature the package's (CDHash $now), not 0.2.0's ($was)" eval \
+  must "  ... its code signature the package under test's (CDHash $now), not the published 0.2.0's ($was)" eval \
     "[ -n '$now' ] && [ '$now' != '$was' ] && [ \"\$(cdhash '$APP')\" = '$now' ]"
   must "  ... its uninstaller $version's" grep -qxF "EMBEDDED='$version'" "$APP/Contents/Resources/uninstall.sh"
   must "  ... the person's file byte for byte, the very file planted" still_planted "$kept"
