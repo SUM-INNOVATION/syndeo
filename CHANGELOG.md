@@ -3,6 +3,161 @@
 The release workflow reads the section matching the tag and puts it in the
 release notes, so a heading here is `## <version>` and nothing else.
 
+## 0.2.1
+
+Syndeo.app becomes more of a browser: tabs as a browser has them, pages that
+load several times faster, a current macOS look, and a place among macOS's
+web browsers. Sites macOS refuses through Syndeo's proxy now open directly,
+and programs on your Mac can drive Syndeo.app once you allow them. The
+package installs and upgrades Syndeo.app as 0.2.0's did; the command-line
+tools are unchanged.
+
+**Before you upgrade**
+
+- **Quit Syndeo before installing.** The package refuses while Syndeo.app or
+  its helper runs, as before. It upgrades 0.2.0 in place and leaves your
+  data as it is.
+
+**Faster pages** ([#47](https://github.com/SUM-INNOVATION/syndeo/issues/47))
+
+- **The proxy's cache no longer holds an answer back while it writes it to
+  disk.** The answer is passed on as it arrives and stored behind it; the
+  store is written in order, but no longer flushed to the disk after every
+  answer. Clearing the cache still waits until it is on disk.
+- **Compression reaches through the proxy.** WebKit's `Accept-Encoding` is
+  passed on, and a compressed answer is cached and served only to a request
+  that accepts its coding.
+- **WebKit speaks HTTP/2 to the proxy:** one connection to a site instead of
+  about six.
+- **Measured** through the proxy on loopback, against an origin answering
+  with github.com's 123 scripts and stylesheets at their real sizes, slowed
+  by 20 ms: 3.3–3.6 s for the page before, 0.50–0.59 s after. Those parts
+  are 2.2 MB compressed, against 10.3 MB as the proxy used to carry them.
+
+**Tabs** ([#48](https://github.com/SUM-INNOVATION/syndeo/issues/48))
+
+- **Opening links:** ⌘-click or a middle click opens a link in a new tab
+  behind this one; with ⇧ as well, in front.
+- **Choosing a tab:** ⌘1 to ⌘8 choose one, ⌘9 the last. Show All Tabs
+  (⇧⌘\) is macOS's overview.
+- **A tab shows its page's title and icon,** and an hourglass while it
+  loads. Right-click a tab for its menu: Duplicate Tab, Pin Tab and the
+  rest.
+- **Pinned tabs** come first, and stay open through Close Other Tabs and
+  through closing their window.
+- **Closed tabs:** ⇧⌘T and History > Recently Closed reopen the last 25,
+  with their history. They are kept in memory only.
+- **When Syndeo quits it keeps its tabs** (their addresses and titles) in a
+  file only you can read, in its own folder. Pinned tabs come back at every
+  launch. The rest come back when macOS is set to keep windows when an
+  application quits, or from History > Reopen All Windows from Last
+  Session. Clear Browsing Data deletes the file and forgets closed tabs.
+
+**A web browser to macOS** ([#49](https://github.com/SUM-INNOVATION/syndeo/issues/49), in part)
+
+- **Syndeo.app can be chosen as the default web browser,** and links other
+  applications open come to it. Each opens in a new tab, through Syndeo's
+  proxy, as a typed address does.
+- **Only `http` and `https` addresses open this way.** Anything else another
+  application asks for is refused in a tab of its own, and never searched
+  for.
+- **Passkeys and password AutoFill are not in this release.** They need an
+  entitlement from Apple that no build has yet. At launch, Syndeo logs
+  whether this copy could use them.
+
+**Sites macOS refuses through Syndeo** ([#58](https://github.com/SUM-INNOVATION/syndeo/issues/58))
+
+- **On macOS 14 and 15, sites on the HSTS preload list built into macOS,**
+  such as github.com, paypal.com and wikipedia.org, could not be opened
+  through Syndeo: macOS accepts only a publicly trusted certificate for
+  them, whatever Syndeo's window decides. macOS 26 lets them through.
+- **On every macOS, Apple's own sites,** such as www.apple.com, which macOS
+  pins to Apple's certificates, could not be opened either.
+- **Syndeo.app now sends such a host directly** for the rest of the
+  session, with macOS's own trust and not Syndeo's, and loads the page
+  again, once.
+  - The address field says **Direct — not cached by Syndeo**, and nothing
+    from it is cached.
+  - macOS sends the names under that host directly too.
+  - The list is in memory only. The log says that a host was sent directly,
+    never which.
+
+**A current macOS look** ([#50](https://github.com/SUM-INNOVATION/syndeo/issues/50))
+
+- **One toolbar in the title bar:** Back, Forward, and a rounded address
+  field in the middle.
+- **The address field says how the page was reached.** It replaces the bar
+  above the page:
+  - **Through Syndeo:** Syndeo's symbol, with its words when you point at it;
+  - **Direct — not cached by Syndeo** and **Local — not cached by Syndeo:**
+    written out, on an orange capsule.
+
+  It also holds Reload, which becomes Stop while a page loads, and a thin
+  line along its bottom edge showing the page's progress.
+- **Settings** is laid out in two sections, Search and Browsing Data.
+- **The start page and Syndeo's own error pages** share one look, and
+  follow light and dark appearance.
+
+**Agents** ([#51](https://github.com/SUM-INNOVATION/syndeo/issues/51))
+
+- **Programs on your Mac can drive Syndeo.app, once you allow them:** Claude
+  Code, scripts and tests. They connect through Syndeo's own executable, as
+  `Syndeo mcp`, an MCP server, or `Syndeo control`. For example:
+  `claude mcp add syndeo -- /Applications/Syndeo.app/Contents/MacOS/Syndeo mcp`.
+- **Off until you turn it on,** in Syndeo > Agent Access…. That setting is
+  remembered; what you allow is not, after Syndeo quits.
+- **Each program is asked about first.** The prompt names the program and
+  what started it, with its signature. Deny is the default, then Allow Once
+  and Allow for This Session. Reading, navigating, acting and running
+  JavaScript are allowed separately. Agent Access lists what is allowed,
+  with Revoke and Revoke All.
+- **In the open:**
+  - An agent works only in tabs of its own, marked below the toolbar as
+    controlled by it, with Stop.
+  - It never sees your tabs.
+  - Its tabs are routed through Syndeo exactly as yours are, and are kept
+    out of your saved tabs and Recently Closed.
+- **Only your account can connect:** over a socket in Syndeo's folder, which
+  exists only while Agent Access is on. There is no network port.
+- **Known limits:**
+  - an agent's clicks and typing are made in the page, so a page can tell
+    them from yours;
+  - only a page's main frame is covered, not the frames inside it;
+  - an agent's wait takes about a second longer after a page loads.
+
+**Security**
+
+- **tokio 1.53.1 → 1.53.3**, for RUSTSEC-2026-0386: `AsyncFd::new` and the
+  constructors like it violated I/O safety. tokio runs Syndeo.app's proxy
+  and the command-line tools.
+
+**What was and was not tested**
+
+- **Every pull request**, on disposable runners, as for 0.2.0, and now also:
+  - tabs: opening, choosing, pinning, closing and reopening them, the
+    session kept and restored, and Clear Browsing Data forgetting it;
+  - the toolbar and address field, in light and in dark appearance, with
+    pictures kept for review;
+  - on macOS 15, github.com opening directly, its address field saying so,
+    and example.com afterwards still through Syndeo; on macOS 26, the same
+    sites all through Syndeo;
+  - agents: refused until allowed, each grant held to what it allows, their
+    tabs kept apart from yours, and Stop and Revoke;
+  - the published 0.2.0 package installed, and this one installed over it,
+    as every 0.2.0 customer upgrades, with the person's files and
+    preferences kept byte for byte;
+  - www.rust-lang.org loaded in WebKit through Syndeo's proxy, cold and
+    warm, with every load finishing over HTTP/2 to the proxy;
+  - eighteen mutants, each the application with one safeguard taken out,
+    have to be caught.
+- **Measured, not gated:** those loads' times, against WebKit by itself;
+  and github.com's, directly, since macOS 15 refuses it through the proxy
+  (above).
+- **Not tested:**
+  - macOS 13 and 14 in CI. Which sites macOS refuses through the proxy was
+    measured on 14.8, 15.7 and 26.6;
+  - passkeys and password AutoFill, which no build can use yet.
+
 ## 0.2.0
 
 The first release of Syndeo.app, a desktop browser for the Mac, and the
