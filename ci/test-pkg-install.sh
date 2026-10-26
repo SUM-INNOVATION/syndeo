@@ -722,6 +722,9 @@ one_app() {
   APP_PIDS="$(appctl pids "$BUNDLE_ID")"
   [ -n "$APP_PIDS" ] && [ "$(printf '%s\n' "$APP_PIDS" | wc -l | tr -d ' ')" = 1 ]
 }
+
+# bundle_is PID: Launch Services has PID as com.sum.syndeo.
+bundle_is() { [ "$(appctl bundle "$1")" = "$BUNDLE_ID" ]; }
 none_running() {
   [ -z "$(appctl pids "$BUNDLE_ID")" ] && ! pgrep -f '/Syndeo.app/Contents/MacOS/Syndeo' >/dev/null &&
     ! pgrep -f '/Syndeo.app/Contents/Helpers/syndeo-proxy' >/dev/null
@@ -818,7 +821,13 @@ came_up() {
   wait_for 30 one_app ||
     fail "$label: not exactly one application is $BUNDLE_ID 30 seconds after open; LaunchServices' last answer: [$(printf '%s' "$APP_PIDS" | tr '\n' ' ')]"
   pid="$APP_PIDS"
-  must "$label: Syndeo runs, with the bundle identifier $BUNDLE_ID" test "$(appctl bundle "$pid")" = "$BUNDLE_ID"
+  # Asked of Launch Services for that pid, which it may answer only once the
+  # application has checked in: CI 40268728088 listed the pid after the Trash
+  # and, asked at once, had no identifier for it yet. The app test met the
+  # same in CI 39872069798.
+  wait_for 10 bundle_is "$pid" ||
+    fail "$label: Syndeo runs, with the bundle identifier $BUNDLE_ID: Launch Services has '$(appctl bundle "$pid")' for pid $pid 10 seconds after listing it"
+  pass "$label: Syndeo runs, with the bundle identifier $BUNDLE_ID"
   must "  ... its executable $APP/Contents/MacOS/Syndeo" test "$(image_of "$pid")" = "$APP/Contents/MacOS/Syndeo"
   must "  ... a window shows" wait_for 30 appctl windows "$pid"
   wait_for 30 sh -c "pgrep -P $pid >/dev/null" || fail "$label: no helper 30 seconds after open"
