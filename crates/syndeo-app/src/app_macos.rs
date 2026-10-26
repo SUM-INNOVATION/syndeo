@@ -1830,6 +1830,24 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
         );
     }
 
+    /// The start page says what the application leaves out, the keystore,
+    /// in words that cannot be read as the application itself being
+    /// unsigned: a tester read "Identity and signing are not part of it yet"
+    /// that way (#66), though Syndeo.app is signed and notarized.
+    #[test]
+    fn the_start_page_says_the_keystore_is_left_out_not_code_signing() {
+        let page = start_page(Search::DuckDuckGo);
+        assert!(
+            page.contains(
+                "This app does not yet include Syndeo’s identity keystore or tools for signing \
+                 requests with your identity."
+            ),
+            "{page}"
+        );
+        assert!(!page.contains("Identity and signing"), "{page}");
+        assert!(!page.contains("preview"), "{page}");
+    }
+
     /// Nothing in the application asks for, reads or changes the keychain's
     /// trust settings, or runs `security`, which could: each window accepts
     /// the proxy's authority itself.
