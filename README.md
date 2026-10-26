@@ -525,13 +525,16 @@ separate, and removing the application touches neither.
     one of which the test has to catch;
   - its controls in its toolbar and browsing, in light and in dark
     appearance, with pictures of each kept with the run's logs.
-- **Checked by hand, for every signed release:** from a fresh standard
-  user account, installing by opening the package in Finder, which runs
-  Installer's window and asks for a separate administrator's name and
-  password; then opening Syndeo.app from `/Applications` and using it as a
-  customer would, with no trust setting or keychain changed. CI cannot drive
-  Installer's window, so it is a required manual check before the release's
-  tag (see [Releasing](#releasing)), not something a pull request waits on.
+- **Checked by hand, for every signed release:** on an existing Mac and
+  account, an administrator's included, installing by opening the package in
+  Finder, which runs Installer's window and asks for an administrator's
+  password. Where Syndeo is already installed, that is the normal upgrade,
+  and the version it started from is recorded. Syndeo.app is then opened
+  from `/Applications` and used as a customer would, with no trust setting
+  or keychain changed. CI cannot drive Installer's window, so it is a manual
+  check before the release's tag (see [Releasing](#releasing)), not
+  something a pull request waits on. A clean environment is CI's to cover:
+  the first install on a pristine runner and the customer's journey above.
 - **What was not tested:** the refusal of Intel Macs and of macOS before 13,
   which rests on the package's metadata alone, with no such runners to try
   it on.
@@ -1311,28 +1314,29 @@ package.
   rehearses the publication on a draft it deletes, and publishes nothing.
 - **Finder, by hand, before a signed release is tagged.** CI installs the
   package with `installer`, as root; it cannot drive Installer's window or
-  its password prompt, and never browses as a standard user. So for every
-  signed release:
-  1. On a Mac with no Syndeo on it, log in to a fresh standard user account,
-     made for this check: a standard account, not an administrator.
-  2. Record that account's trust settings and keychains, and the Mac's.
-  3. In a browser there, download the signed dry run's
-     `Syndeo-<version>.pkg`: the signed, notarized and stapled package the
-     release would publish.
-  4. Open it in Finder, and install it through Installer's window. When
-     Installer asks for an administrator's name and password, give those of
-     a separate administrator account; the standard account stays standard.
-  5. Open Syndeo.app from `/Applications`, as that standard user.
-  6. Complete the customer journey there: the start page; an `http` page and
-     an `https` page, each opened through Syndeo, as the address field's
-     route says; Reload;
-     quit, then open Syndeo again and browse again.
-  7. Check that the trust settings and keychains are exactly as recorded:
+  its password prompt. So for every signed release, on an existing Mac and
+  account (an administrator's is acceptable):
+  1. Record the account's trust settings and keychains, and which version of
+     Syndeo is installed, if any.
+  2. In a browser, download the signed dry run's `Syndeo-<version>.pkg`: the
+     signed, notarized and stapled package the release would publish.
+  3. Open it in Finder, and install it through Installer's window, giving
+     an administrator's password when it asks. Where Syndeo was installed,
+     this is the normal upgrade.
+  4. Open Syndeo.app from `/Applications`.
+  5. Complete the customer journey: the start page; an `http` page and an
+     `https` page, each opened through Syndeo, as the address field's route
+     says; Reload; quit, then open Syndeo again and browse again.
+  6. Check that the trust settings and keychains are exactly as recorded:
      nothing was added to or changed in either, by Syndeo or by hand.
 
   Gatekeeper has to accept the package and the application without a
-  warning. A tag waits for this, and its result is recorded with the
-  release's evidence.
+  warning. A new Mac or a new user account is not required. A clean
+  environment stays covered on disposable CI runners: the package test's
+  first install, upgrades and removal, and the customer's journey on a
+  pristine runner, for every pull request and every release. A tag waits
+  for this check or for the owner's waiver. Either is recorded with the
+  release's evidence, and a waiver in the tag's message.
 - **Checks on every pull request.** `ci/check-workflows.py` checks that no
   pull request can see a secret, and that release.yml keeps them to that one
   job. It also checks every link of the package's SHA-256 from `package` to
