@@ -30,7 +30,9 @@ use crate::address::Route;
 use crate::sidebar_macos::{self, EdgeSensor, Sidebar};
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject, Sel};
-use objc2::{define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly};
+use objc2::{
+    define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly, Message,
+};
 use objc2_app_kit::{
     NSAccessibility, NSAutoresizingMaskOptions, NSBezierPath, NSButton, NSColor, NSControlSize,
     NSFont, NSFontWeightMedium, NSFontWeightSemibold, NSImage, NSImageScaling,
@@ -58,11 +60,6 @@ const ROUTE_PAD: f64 = 6.0;
 /// and its corner radius.
 const CARD_MARGIN: f64 = 8.0;
 pub(crate) const CARD_RADIUS: f64 = 12.0;
-
-/// With the sidebar hidden: the strip kept along the top for Show Sidebar,
-/// and the gap between the traffic lights and that button.
-const SHOW_STRIP: f64 = 44.0;
-const SHOW_GAP: f64 = 12.0;
 
 /// The loading progress: its thickness, and how often it follows the page.
 const PROGRESS: f64 = 2.0;
@@ -411,10 +408,11 @@ pub struct Ui {
     sidebar_width: RefCell<Option<Retained<NSLayoutConstraint>>>,
     card_leading: RefCell<Option<Retained<NSLayoutConstraint>>>,
     card_top: RefCell<Option<Retained<NSLayoutConstraint>>>,
-    sidebar_top: RefCell<Option<Retained<NSLayoutConstraint>>>,
-    /// Show Sidebar: beside the traffic lights while the sidebar is hidden,
-    /// and gone while it shows.
-    show: Retained<NSButton>,
+    /// The sidebar is hidden: the page has the window, and the traffic
+    /// lights are out of sight until the sidebar peeks.
+    hidden: Cell<bool>,
+    /// The window, whose traffic lights come and go with the sidebar.
+    window: RefCell<Option<Weak<NSWindow>>>,
     /// The window's left edge, which brings a hidden sidebar back over the
     /// page while the pointer is there.
     edge: Retained<EdgeSensor>,
@@ -517,14 +515,14 @@ impl Ui {
             .constraintEqualToAnchor_constant(&content.topAnchor(), 0.0);
         // The traffic lights: the buttons across the sidebar's top line up
         // with their centre, and Show Sidebar sits just past them.
-        let (lights_center, lights_end) = traffic_lights(window).unwrap_or((22.0, 72.0));
+        let lights_center = traffic_lights(window).unwrap_or(22.0);
         self.sidebar.align_nav(lights_center);
+        *self.window.borrow_mut() = Some(Weak::from_retained(&window.retain()));
         let edge: &NSView = &self.edge;
         let shade: &NSView = &self.shade;
         let top = card
             .topAnchor()
             .constraintEqualToAnchor_constant(&content.topAnchor(), CARD_MARGIN);
-        let show: &NSView = &self.show;
         NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
             sidebar_top.clone(),
             sidebar
@@ -535,10 +533,6 @@ impl Ui {
                 .constraintEqualToAnchor(&content.leadingAnchor()),
             width.clone(),
             top.clone(),
-            show.leadingAnchor()
-                .constraintEqualToAnchor_constant(&content.leadingAnchor(), lights_end + SHOW_GAP),
-            show.topAnchor()
-                .constraintEqualToAnchor_constant(&content.topAnchor(), lights_center - 14.0),
             card.bottomAnchor()
                 .constraintEqualToAnchor_constant(&content.bottomAnchor(), -CARD_MARGIN),
             leading.clone(),
@@ -547,7 +541,7 @@ impl Ui {
             edge.leadingAnchor()
                 .constraintEqualToAnchor(&content.leadingAnchor()),
             edge.topAnchor()
-                .constraintEqualToAnchor_constant(&content.topAnchor(), SHOW_STRIP),
+                .constraintEqualToAnchor(&content.topAnchor()),
             edge.bottomAnchor()
                 .constraintEqualToAnchor(&content.bottomAnchor()),
             edge.widthAnchor()
@@ -564,7 +558,6 @@ impl Ui {
                 .constraintEqualToAnchor(&card.trailingAnchor()),
         ]));
         *self.sidebar_width.borrow_mut() = Some(width);
-        *self.sidebar_top.borrow_mut() = Some(sidebar_top);
         *self.card_leading.borrow_mut() = Some(leading);
         *self.card_top.borrow_mut() = Some(top);
     }
@@ -581,55 +574,47 @@ impl Ui {
         window.convertRectToScreen(in_window)
     }
 
-    /// Hide the sidebar, giving the page its width but for a strip along
-    /// the top with Show Sidebar in it, beside the traffic lights; or show
-    /// it again. Hidden, it comes back over the page while the pointer is
-    /// at the window's left edge (`peek_sidebar`).
+    /// Hide the sidebar, giving the page the window, with the traffic lights
+    /// out of sight; or show it again. Hidden, it comes back over the page
+    /// while the pointer is at the window's left edge (`peek_sidebar`), as
+    /// Arc's does.
     pub fn toggle_sidebar(&self) {
-        let (width, leading, top) = (
-            self.sidebar_width.borrow(),
-            self.card_leading.borrow(),
-            self.card_top.borrow(),
-        );
-        let (Some(width), Some(leading), Some(top)) =
-            (width.as_ref(), leading.as_ref(), top.as_ref())
-        else {
+        let (width, leading) = (self.sidebar_width.borrow(), self.card_leading.borrow());
+        let (Some(width), Some(leading)) = (width.as_ref(), leading.as_ref()) else {
             return;
         };
-        let hide = self.show.isHidden();
+        let hide = !self.hidden.get();
         if self.peeking.get() {
             self.unpeek_sidebar();
         }
+        self.hidden.set(hide);
         width.setConstant(if hide { 0.0 } else { sidebar_macos::WIDTH });
         leading.setConstant(if hide {
             CARD_MARGIN
         } else {
             sidebar_macos::WIDTH
         });
-        top.setConstant(if hide { SHOW_STRIP } else { CARD_MARGIN });
         let sidebar: &NSView = &self.sidebar;
         sidebar.setHidden(hide);
-        self.show.setHidden(!hide);
         self.edge.setHidden(!hide);
+        self.set_lights(!hide);
     }
 
     /// The pointer is at the window's left edge with the sidebar hidden:
-    /// show it over the page, as a floating panel below the top strip.
+    /// show it over the page, as a floating panel, traffic lights and all.
     pub fn peek_sidebar(&self) {
-        if self.show.isHidden() || self.peeking.get() {
+        if !self.hidden.get() || self.peeking.get() {
             return;
         }
-        let (width, top) = (self.sidebar_width.borrow(), self.sidebar_top.borrow());
-        let (Some(width), Some(top)) = (width.as_ref(), top.as_ref()) else {
-            return;
-        };
+        let width = self.sidebar_width.borrow();
+        let Some(width) = width.as_ref() else { return };
         self.peeking.set(true);
         self.sidebar.set_floating(true);
-        top.setConstant(SHOW_STRIP - sidebar_macos::NAV_TOP);
         width.setConstant(sidebar_macos::WIDTH);
         let sidebar: &NSView = &self.sidebar;
         sidebar.setHidden(false);
         self.edge.setHidden(true);
+        self.set_lights(true);
     }
 
     /// The pointer left a peeking sidebar: put it away again.
@@ -637,31 +622,42 @@ impl Ui {
         if !self.peeking.get() {
             return;
         }
-        let (width, top) = (self.sidebar_width.borrow(), self.sidebar_top.borrow());
-        let (Some(width), Some(top)) = (width.as_ref(), top.as_ref()) else {
-            return;
-        };
+        let width = self.sidebar_width.borrow();
+        let Some(width) = width.as_ref() else { return };
         self.peeking.set(false);
         self.sidebar.set_floating(false);
-        top.setConstant(0.0);
         width.setConstant(0.0);
         let sidebar: &NSView = &self.sidebar;
         sidebar.setHidden(true);
         self.edge.setHidden(false);
+        self.set_lights(false);
+    }
+
+    /// The window's traffic lights, shown or not: they belong to the
+    /// sidebar's top, and go with it.
+    fn set_lights(&self, shown: bool) {
+        let Some(window) = self.window.borrow().as_ref().and_then(Weak::load) else {
+            return;
+        };
+        for which in [
+            NSWindowButton::CloseButton,
+            NSWindowButton::MiniaturizeButton,
+            NSWindowButton::ZoomButton,
+        ] {
+            if let Some(button) = window.standardWindowButton(which) {
+                button.setHidden(!shown);
+            }
+        }
     }
 }
 
 /// Where `window`'s traffic lights are: the centre of the close button
-/// below the window's top, and the zoom button's right edge from its left.
-fn traffic_lights(window: &NSWindow) -> Option<(f64, f64)> {
+/// below the window's top.
+fn traffic_lights(window: &NSWindow) -> Option<f64> {
     let close = window.standardWindowButton(NSWindowButton::CloseButton)?;
-    let zoom = window.standardWindowButton(NSWindowButton::ZoomButton)?;
-    let close_rect = close.convertRect_toView(close.bounds(), None);
-    let zoom_rect = zoom.convertRect_toView(zoom.bounds(), None);
-    let height = window.frame().size.height;
-    let center = height - (close_rect.origin.y + close_rect.size.height / 2.0);
-    let end = zoom_rect.origin.x + zoom_rect.size.width;
-    (center > 0.0 && end > 0.0).then_some((center, end))
+    let rect = close.convertRect_toView(close.bounds(), None);
+    let center = window.frame().size.height - (rect.origin.y + rect.size.height / 2.0);
+    (center > 0.0).then_some(center)
 }
 
 /// An SF Symbol, described for VoiceOver and Accessibility by `label`.
@@ -719,14 +715,6 @@ pub fn browser_content(
         target,
         sel!(syndeoToggleSidebar:),
     );
-    let show = nav_button(
-        mtm,
-        "sidebar.left",
-        "Show Sidebar",
-        target,
-        sel!(syndeoToggleSidebar:),
-    );
-    show.setHidden(true);
     let back = nav_button(mtm, "chevron.left", "Back", target, sel!(syndeoBack:));
     let forward = nav_button(
         mtm,
@@ -856,7 +844,6 @@ pub fn browser_content(
     container.addSubview(&card);
     container.addSubview(&shade);
     container.addSubview(&sidebar);
-    container.addSubview(&show);
     container.addSubview(&edge);
 
     let ui = Ui {
@@ -875,8 +862,8 @@ pub fn browser_content(
         sidebar_width: RefCell::new(None),
         card_leading: RefCell::new(None),
         card_top: RefCell::new(None),
-        sidebar_top: RefCell::new(None),
-        show,
+        hidden: Cell::new(false),
+        window: RefCell::new(None),
         edge,
         peeking: Cell::new(false),
         following: RefCell::new(None),

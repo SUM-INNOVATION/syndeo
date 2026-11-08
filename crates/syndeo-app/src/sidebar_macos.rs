@@ -72,6 +72,7 @@ const LIST_GAP: f64 = 14.0;
 /// The floating panel, when the sidebar peeks over the page: its margin
 /// from the window's left and bottom, and its corner radius.
 pub const PANEL_MARGIN: f64 = 8.0;
+const PANEL_TOP: f64 = 6.0;
 const PANEL_RADIUS: f64 = 12.0;
 
 /// The edge of the window that brings a hidden sidebar back.
@@ -1032,12 +1033,9 @@ pub struct SidebarIvars {
     hint: Retained<DropHint>,
     /// The spaces, at the foot.
     spaces: Retained<SpaceBar>,
-    /// The buttons across the top, and where they and the field sit: the
-    /// buttons are lined up with the window's traffic lights (`align_nav`),
-    /// and hidden while the sidebar peeks, when the field moves up.
-    nav: Retained<NSStackView>,
+    /// Where the buttons across the top sit: lined up with the window's
+    /// traffic lights (`align_nav`).
     nav_top: RefCell<Option<Retained<NSLayoutConstraint>>>,
-    field_top: RefCell<Option<Retained<NSLayoutConstraint>>>,
 }
 
 define_class!(
@@ -1056,21 +1054,17 @@ define_class!(
             if !self.ivars().floating.get() {
                 return;
             }
+            // The panel, in the space's colour as the sidebar always is, with
+            // a hairline edge; the shadow is the layer's.
             let panel = self.panel_rect();
-            let dark = is_dark(self);
             fill_gradient(self, panel, Some(PANEL_RADIUS));
-            // A wash over the gradient, so the rows read as a panel of
-            // their own over the page, and a hairline edge.
-            let shape =
-                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(panel, PANEL_RADIUS, PANEL_RADIUS);
-            if dark {
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.22).setFill();
-            } else {
-                lit(0.42).setFill();
-            }
-            shape.fill();
+            let shape = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                panel,
+                PANEL_RADIUS,
+                PANEL_RADIUS,
+            );
             shape.setLineWidth(1.0);
-            lit(if dark { 0.14 } else { 0.8 }).setStroke();
+            lit(if is_dark(self) { 0.14 } else { 0.6 }).setStroke();
             shape.stroke();
         }
 
@@ -1139,9 +1133,7 @@ impl Sidebar {
             floating: Cell::new(false),
             hint: hint.clone(),
             spaces: spaces.clone(),
-            nav: row.clone(),
             nav_top: RefCell::new(None),
-            field_top: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -1178,7 +1170,9 @@ impl Sidebar {
             row.trailingAnchor()
                 .constraintEqualToAnchor_constant(&this.trailingAnchor(), -SIDE),
             row.heightAnchor().constraintEqualToConstant(NAV_HEIGHT),
-            this.field_top_constraint(field, ADDRESS_TOP),
+            field
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&this.topAnchor(), ADDRESS_TOP),
             field
                 .leadingAnchor()
                 .constraintEqualToAnchor_constant(&this.leadingAnchor(), SIDE),
@@ -1333,15 +1327,6 @@ impl Sidebar {
         constraint
     }
 
-    /// The field's top constraint, made once and kept, to move it.
-    fn field_top_constraint(&self, field: &NSView, top: f64) -> Retained<NSLayoutConstraint> {
-        let constraint = field
-            .topAnchor()
-            .constraintEqualToAnchor_constant(&self.topAnchor(), top);
-        *self.ivars().field_top.borrow_mut() = Some(constraint.clone());
-        constraint
-    }
-
     /// Line the buttons across the top up with the window's traffic lights,
     /// whose centre is `center` below the window's top.
     pub fn align_nav(&self, center: f64) {
@@ -1358,41 +1343,31 @@ impl Sidebar {
 
     /// Peek over the page as a floating panel, or sit beside it.
     pub fn set_floating(&self, floating: bool) {
-        let ivars = self.ivars();
-        ivars.floating.set(floating);
-        // Peeking, the buttons across the top are the window's strip's: the
-        // field moves up into their place, inside the panel.
-        ivars.nav.setHidden(floating);
-        if let Some(top) = &*ivars.field_top.borrow() {
-            top.setConstant(if floating {
-                PANEL_MARGIN * 2.0 + 6.0
-            } else {
-                ADDRESS_TOP
-            });
-        }
+        self.ivars().floating.set(floating);
+        // A shadow under the panel, while it floats over the page.
         let layer: *mut AnyObject = unsafe { msg_send![self, layer] };
         if !layer.is_null() {
-            let opacity: f32 = if floating { 0.28 } else { 0.0 };
+            let opacity: f32 = if floating { 0.38 } else { 0.0 };
             unsafe {
                 let _: () = msg_send![layer, setMasksToBounds: false];
                 let _: () = msg_send![layer, setShadowOpacity: opacity];
-                let _: () = msg_send![layer, setShadowRadius: 18.0f64];
-                let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -6.0)];
+                let _: () = msg_send![layer, setShadowRadius: 26.0f64];
+                let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -10.0)];
             }
         }
         self.setNeedsDisplay(true);
     }
 
     /// Where the floating panel is drawn: the sidebar's bounds, less a
-    /// margin at the left and the bottom, so that it floats clear of the
-    /// window's edges; the page's card is to its right.
+    /// margin all round, so that it floats clear of the window's edges and
+    /// the page's card to its right.
     fn panel_rect(&self) -> NSRect {
         let bounds = self.bounds();
         NSRect::new(
             NSPoint::new(PANEL_MARGIN, PANEL_MARGIN),
             NSSize::new(
                 (bounds.size.width - 2.0 * PANEL_MARGIN).max(0.0),
-                (bounds.size.height - 2.0 * PANEL_MARGIN).max(0.0),
+                (bounds.size.height - PANEL_MARGIN - PANEL_TOP).max(0.0),
             ),
         )
     }
