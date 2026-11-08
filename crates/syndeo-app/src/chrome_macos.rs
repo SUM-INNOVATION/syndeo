@@ -35,7 +35,7 @@ use objc2_app_kit::{
     NSAccessibility, NSAutoresizingMaskOptions, NSBezierPath, NSButton, NSColor, NSControlSize,
     NSFont, NSFontWeightMedium, NSFontWeightSemibold, NSImage, NSImageScaling,
     NSImageSymbolConfiguration, NSImageView, NSLayoutConstraint, NSLineBreakMode, NSTextField,
-    NSTextFieldBezelStyle, NSTextFieldCell, NSTextFieldDelegate, NSView, NSWindow,
+    NSTextFieldBezelStyle, NSTextFieldCell, NSTextFieldDelegate, NSView, NSWindow, NSWindowButton,
     NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{ns_string, NSArray, NSNumber, NSPoint, NSRect, NSSize, NSString, NSTimer};
@@ -60,9 +60,9 @@ const CARD_MARGIN: f64 = 8.0;
 const CARD_RADIUS: f64 = 12.0;
 
 /// With the sidebar hidden: the strip kept along the top for Show Sidebar,
-/// and where that button sits, clear of the traffic lights.
+/// and the gap between the traffic lights and that button.
 const SHOW_STRIP: f64 = 44.0;
-const SHOW_X: f64 = 84.0;
+const SHOW_GAP: f64 = 12.0;
 
 /// The loading progress: its thickness, and how often it follows the page.
 const PROGRESS: f64 = 2.0;
@@ -513,6 +513,10 @@ impl Ui {
         let sidebar_top = sidebar
             .topAnchor()
             .constraintEqualToAnchor_constant(&content.topAnchor(), 0.0);
+        // The traffic lights: the buttons across the sidebar's top line up
+        // with their centre, and Show Sidebar sits just past them.
+        let (lights_center, lights_end) = traffic_lights(window).unwrap_or((22.0, 72.0));
+        self.sidebar.align_nav(lights_center);
         let edge: &NSView = &self.edge;
         let top = card
             .topAnchor()
@@ -529,9 +533,9 @@ impl Ui {
             width.clone(),
             top.clone(),
             show.leadingAnchor()
-                .constraintEqualToAnchor_constant(&content.leadingAnchor(), SHOW_X),
+                .constraintEqualToAnchor_constant(&content.leadingAnchor(), lights_end + SHOW_GAP),
             show.topAnchor()
-                .constraintEqualToAnchor_constant(&content.topAnchor(), 8.0),
+                .constraintEqualToAnchor_constant(&content.topAnchor(), lights_center - 14.0),
             card.bottomAnchor()
                 .constraintEqualToAnchor_constant(&content.bottomAnchor(), -CARD_MARGIN),
             leading.clone(),
@@ -620,6 +624,19 @@ impl Ui {
         sidebar.setHidden(true);
         self.edge.setHidden(false);
     }
+}
+
+/// Where `window`'s traffic lights are: the centre of the close button
+/// below the window's top, and the zoom button's right edge from its left.
+fn traffic_lights(window: &NSWindow) -> Option<(f64, f64)> {
+    let close = window.standardWindowButton(NSWindowButton::CloseButton)?;
+    let zoom = window.standardWindowButton(NSWindowButton::ZoomButton)?;
+    let close_rect = close.convertRect_toView(close.bounds(), None);
+    let zoom_rect = zoom.convertRect_toView(zoom.bounds(), None);
+    let height = window.frame().size.height;
+    let center = height - (close_rect.origin.y + close_rect.size.height / 2.0);
+    let end = zoom_rect.origin.x + zoom_rect.size.width;
+    (center > 0.0 && end > 0.0).then_some((center, end))
 }
 
 /// An SF Symbol, described for VoiceOver and Accessibility by `label`.

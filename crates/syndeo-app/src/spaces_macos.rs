@@ -26,7 +26,7 @@ use std::cell::{Cell, RefCell};
 const LAYOUT_KEY: &str = "SyndeoSpaces";
 
 /// A dot: its size, the ring's width, and the gap between dots.
-pub const DOT: f64 = 14.0;
+pub const DOT: f64 = 18.0;
 const RING: f64 = 2.0;
 const DOT_GAP: f64 = 8.0;
 
@@ -136,6 +136,8 @@ pub struct DotIvars {
     id: u64,
     hue: usize,
     name: String,
+    /// An emoji in place of the dot, or nothing.
+    icon: String,
     current: Cell<bool>,
 }
 
@@ -157,8 +159,12 @@ define_class!(
                 NSPoint::new(bounds.origin.x + RING + 1.0, bounds.origin.y + RING + 1.0),
                 NSSize::new(bounds.size.width - 2.0 * (RING + 1.0), bounds.size.height - 2.0 * (RING + 1.0)),
             );
-            color(spaces::hue_dot(ivars.hue, dark)).setFill();
-            NSBezierPath::bezierPathWithOvalInRect(inset).fill();
+            // The dot, in the space's colour; a space with an emoji shows
+            // that instead (a label, added when the dot is made).
+            if ivars.icon.is_empty() {
+                color(spaces::hue_dot(ivars.hue, dark)).setFill();
+                NSBezierPath::bezierPathWithOvalInRect(inset).fill();
+            }
             if ivars.current.get() {
                 let ring = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
                     NSPoint::new(bounds.origin.x + RING / 2.0, bounds.origin.y + RING / 2.0),
@@ -244,6 +250,7 @@ impl SpaceDot {
             id: space.id,
             hue: space.hue,
             name: space.name.clone(),
+            icon: space.icon.clone(),
             current: Cell::new(current),
         });
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(DOT, DOT));
@@ -255,6 +262,14 @@ impl SpaceDot {
         ]));
         this.setToolTip(Some(&NSString::from_str(&space.name)));
         this.setAccessibilityIdentifier(Some(ns_string!("syndeo.space")));
+        if !space.icon.is_empty() {
+            let label =
+                objc2_app_kit::NSTextField::labelWithString(&NSString::from_str(&space.icon), mtm);
+            label.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(DOT - 6.0)));
+            label.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+            label.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(DOT, DOT)));
+            this.addSubview(&label);
+        }
         this
     }
 

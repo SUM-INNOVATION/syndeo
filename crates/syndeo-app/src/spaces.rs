@@ -23,6 +23,8 @@ pub struct Space {
     pub name: String,
     /// Which of the [`HUES`].
     pub hue: usize,
+    /// An emoji, or nothing: shown in the switcher in place of its dot.
+    pub icon: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +54,7 @@ impl Default for Layout {
                 id: FIRST_SPACE,
                 name: "Personal".to_string(),
                 hue: 0,
+                icon: String::new(),
             }],
             folders: Vec::new(),
             current: FIRST_SPACE,
@@ -79,6 +82,7 @@ impl Layout {
                             name: item.get("name")?.as_str()?.to_string(),
                             hue: item.get("hue").and_then(Value::as_u64).unwrap_or(0) as usize
                                 % HUES,
+                            icon: icon_of(item.get("icon").and_then(Value::as_str).unwrap_or("")),
                         })
                     })
                     .take(MOST_SPACES)
@@ -137,7 +141,7 @@ impl Layout {
     /// The layout, as JSON for `parse`.
     pub fn render(&self) -> String {
         json!({
-            "spaces": self.spaces.iter().map(|s| json!({"id": s.id, "name": s.name, "hue": s.hue})).collect::<Vec<_>>(),
+            "spaces": self.spaces.iter().map(|s| json!({"id": s.id, "name": s.name, "hue": s.hue, "icon": s.icon})).collect::<Vec<_>>(),
             "folders": self.folders.iter().map(|f| json!({"id": f.id, "name": f.name, "space": f.space, "collapsed": f.collapsed})).collect::<Vec<_>>(),
             "current": self.current,
             "next_id": self.next_id,
@@ -167,7 +171,7 @@ impl Layout {
 
     /// A new space, after the others, in the next colour along, made
     /// current. Its id, or none past [`MOST_SPACES`].
-    pub fn add_space(&mut self, name: &str) -> Option<u64> {
+    pub fn add_space(&mut self, name: &str, icon: &str) -> Option<u64> {
         if self.spaces.len() >= MOST_SPACES {
             return None;
         }
@@ -178,7 +182,12 @@ impl Layout {
         } else {
             name.trim().to_string()
         };
-        self.spaces.push(Space { id, name, hue });
+        self.spaces.push(Space {
+            id,
+            name,
+            hue,
+            icon: icon_of(icon),
+        });
         self.current = id;
         Some(id)
     }
@@ -205,6 +214,17 @@ impl Layout {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// A space's emoji, or none for an empty string.
+    pub fn set_icon(&mut self, id: u64, icon: &str) -> bool {
+        match self.spaces.iter_mut().find(|s| s.id == id) {
+            Some(space) => {
+                space.icon = icon_of(icon);
+                true
+            }
+            None => false,
         }
     }
 
@@ -306,6 +326,18 @@ impl Layout {
     }
 }
 
+/// A space's icon from what was typed: its first character, trimmed, so
+/// that an emoji and nothing else is kept; or nothing.
+pub fn icon_of(typed: &str) -> String {
+    typed
+        .trim()
+        .chars()
+        .next()
+        .filter(|c| !c.is_ascii() && !c.is_control())
+        .map(|c| c.to_string())
+        .unwrap_or_default()
+}
+
 /// A space's colours: the gradient's two ends, in light appearance and in
 /// dark, as sRGB. The first is the lavender into blush the window had
 /// before there were spaces.
@@ -357,7 +389,7 @@ mod tests {
     #[test]
     fn a_round_trip_keeps_everything() {
         let mut layout = Layout::default();
-        let work = layout.add_space("Work").unwrap();
+        let work = layout.add_space("Work", "").unwrap();
         let folder = layout.add_folder(work, "Reading").unwrap();
         assert!(layout.toggle_folder(folder));
         assert!(layout.set_hue(work, 3));
@@ -370,9 +402,9 @@ mod tests {
     #[test]
     fn ids_are_never_given_twice() {
         let mut layout = Layout::default();
-        let a = layout.add_space("A").unwrap();
+        let a = layout.add_space("A", "").unwrap();
         assert!(layout.remove_space(a));
-        let b = layout.add_space("B").unwrap();
+        let b = layout.add_space("B", "").unwrap();
         assert_ne!(a, b);
         let read = Layout::parse(&layout.render());
         let mut again = read.clone();
@@ -384,7 +416,7 @@ mod tests {
     fn the_last_space_stays_and_its_folders_go_with_it() {
         let mut layout = Layout::default();
         assert!(!layout.remove_space(FIRST_SPACE));
-        let work = layout.add_space("Work").unwrap();
+        let work = layout.add_space("Work", "").unwrap();
         layout.add_folder(work, "Reading");
         assert_eq!(layout.folders_of(work).len(), 1);
         assert!(layout.remove_space(work));
@@ -395,8 +427,8 @@ mod tests {
     #[test]
     fn next_and_previous_go_round() {
         let mut layout = Layout::default();
-        let work = layout.add_space("Work").unwrap();
-        let play = layout.add_space("Play").unwrap();
+        let work = layout.add_space("Work", "").unwrap();
+        let play = layout.add_space("Play", "").unwrap();
         assert_eq!(layout.current, play);
         assert_eq!(layout.next_space(), FIRST_SPACE);
         assert_eq!(layout.previous_space(), work);
@@ -408,7 +440,7 @@ mod tests {
     #[test]
     fn names_are_trimmed_and_never_empty() {
         let mut layout = Layout::default();
-        let id = layout.add_space("   ").unwrap();
+        let id = layout.add_space("   ", "").unwrap();
         assert_eq!(layout.space(id).unwrap().name, "Space 2");
         assert!(!layout.rename_space(id, " "));
         assert!(layout.rename_space(id, " Work "));
@@ -425,6 +457,18 @@ mod tests {
         let read = Layout::parse(orphan);
         assert!(read.folders.is_empty());
         assert_eq!(read.current, 1);
+    }
+
+    #[test]
+    fn an_icon_is_one_emoji_or_nothing() {
+        assert_eq!(icon_of(" 🚀 "), "🚀");
+        assert_eq!(icon_of("abc"), "");
+        assert_eq!(icon_of(""), "");
+        let mut layout = Layout::default();
+        let id = layout.add_space("Rockets", "🚀🚀").unwrap();
+        assert_eq!(layout.space(id).unwrap().icon, "🚀");
+        assert!(layout.set_icon(id, ""));
+        assert_eq!(Layout::parse(&layout.render()).space(id).unwrap().icon, "");
     }
 
     #[test]

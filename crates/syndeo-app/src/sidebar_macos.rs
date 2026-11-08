@@ -199,20 +199,33 @@ fn track(view: &NSView) {
 const FAVORITES_KEY: &str = "SyndeoFavorites";
 
 /// The favorites, as kept.
-pub fn favorites_read() -> Vec<Favorite> {
-    NSUserDefaults::standardUserDefaults()
-        .stringForKey(&NSString::from_str(FAVORITES_KEY))
-        .map(|json| favorites::parse(&json.to_string()))
+/// The favorites of `space`: each space has its own. The first space's
+/// are also read from where the favorites were kept before there were
+/// spaces.
+pub fn favorites_read(space: u64) -> Vec<Favorite> {
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let kept = defaults
+        .stringForKey(&NSString::from_str(&favorites_key(space)))
+        .or_else(|| {
+            (space == crate::spaces::FIRST_SPACE)
+                .then(|| defaults.stringForKey(&NSString::from_str(FAVORITES_KEY)))
+                .flatten()
+        });
+    kept.map(|json| favorites::parse(&json.to_string()))
         .unwrap_or_default()
 }
 
+fn favorites_key(space: u64) -> String {
+    format!("{FAVORITES_KEY}.{space}")
+}
+
 /// Keep `favorites`.
-pub fn favorites_write(favorites: &[Favorite]) {
+pub fn favorites_write(space: u64, favorites: &[Favorite]) {
     let json = NSString::from_str(&favorites::render(favorites));
     let value: &AnyObject = json.as_ref();
     unsafe {
         NSUserDefaults::standardUserDefaults()
-            .setObject_forKey(Some(value), &NSString::from_str(FAVORITES_KEY))
+            .setObject_forKey(Some(value), &NSString::from_str(&favorites_key(space)))
     };
 }
 
@@ -1019,6 +1032,12 @@ pub struct SidebarIvars {
     hint: Retained<DropHint>,
     /// The spaces, at the foot.
     spaces: Retained<SpaceBar>,
+    /// The buttons across the top, and where they and the field sit: the
+    /// buttons are lined up with the window's traffic lights (`align_nav`),
+    /// and hidden while the sidebar peeks, when the field moves up.
+    nav: Retained<NSStackView>,
+    nav_top: RefCell<Option<Retained<NSLayoutConstraint>>>,
+    field_top: RefCell<Option<Retained<NSLayoutConstraint>>>,
 }
 
 define_class!(
@@ -1038,12 +1057,21 @@ define_class!(
                 return;
             }
             let panel = self.panel_rect();
+            let dark = is_dark(self);
             fill_gradient(self, panel, Some(PANEL_RADIUS));
-            let edge =
+            // A wash over the gradient, so the rows read as a panel of
+            // their own over the page, and a hairline edge.
+            let shape =
                 NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(panel, PANEL_RADIUS, PANEL_RADIUS);
-            edge.setLineWidth(1.0);
-            lit(if is_dark(self) { 0.12 } else { 0.7 }).setStroke();
-            edge.stroke();
+            if dark {
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.22).setFill();
+            } else {
+                lit(0.42).setFill();
+            }
+            shape.fill();
+            shape.setLineWidth(1.0);
+            lit(if dark { 0.14 } else { 0.8 }).setStroke();
+            shape.stroke();
         }
 
         /// Dragging the sidebar's empty parts moves the window, as dragging
@@ -1097,6 +1125,12 @@ impl Sidebar {
         favorites.setTranslatesAutoresizingMaskIntoConstraints(false);
         let hint = DropHint::new(mtm);
         let spaces = SpaceBar::new(mtm);
+        let buttons: Vec<&NSView> = nav.to_vec();
+        let row = NSStackView::stackViewWithViews(&NSArray::from_slice(&buttons), mtm);
+        row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+        row.setSpacing(2.0);
+        row.setTranslatesAutoresizingMaskIntoConstraints(false);
+        field.setTranslatesAutoresizingMaskIntoConstraints(false);
         let this = Self::alloc(mtm).set_ivars(SidebarIvars {
             list: list.clone(),
             favorites: favorites.clone(),
@@ -1105,20 +1139,18 @@ impl Sidebar {
             floating: Cell::new(false),
             hint: hint.clone(),
             spaces: spaces.clone(),
+            nav: row.clone(),
+            nav_top: RefCell::new(None),
+            field_top: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
+        // Layer-backed, for the shadow it casts while it peeks.
+        this.setWantsLayer(true);
 
         // The buttons across the top, right-aligned, clear of the traffic
         // lights at the left.
-        let buttons: Vec<&NSView> = nav.to_vec();
-        let row = NSStackView::stackViewWithViews(&NSArray::from_slice(&buttons), mtm);
-        row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-        row.setSpacing(2.0);
-        row.setTranslatesAutoresizingMaskIntoConstraints(false);
         this.addSubview(&row);
-
-        field.setTranslatesAutoresizingMaskIntoConstraints(false);
         this.addSubview(field);
         this.addSubview(&favorites);
         this.addSubview(&hint);
@@ -1142,14 +1174,11 @@ impl Sidebar {
         this.addSubview(&scroll);
 
         NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-            row.topAnchor()
-                .constraintEqualToAnchor_constant(&this.topAnchor(), NAV_TOP),
+            this.nav_top_constraint(&row, NAV_TOP),
             row.trailingAnchor()
                 .constraintEqualToAnchor_constant(&this.trailingAnchor(), -SIDE),
             row.heightAnchor().constraintEqualToConstant(NAV_HEIGHT),
-            field
-                .topAnchor()
-                .constraintEqualToAnchor_constant(&this.topAnchor(), ADDRESS_TOP),
+            this.field_top_constraint(field, ADDRESS_TOP),
             field
                 .leadingAnchor()
                 .constraintEqualToAnchor_constant(&this.leadingAnchor(), SIDE),
@@ -1295,6 +1324,32 @@ impl Sidebar {
             && point.y <= frame.origin.y + frame.size.height
     }
 
+    /// The buttons' top constraint, made once and kept, to move them.
+    fn nav_top_constraint(&self, row: &NSView, top: f64) -> Retained<NSLayoutConstraint> {
+        let constraint = row
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&self.topAnchor(), top);
+        *self.ivars().nav_top.borrow_mut() = Some(constraint.clone());
+        constraint
+    }
+
+    /// The field's top constraint, made once and kept, to move it.
+    fn field_top_constraint(&self, field: &NSView, top: f64) -> Retained<NSLayoutConstraint> {
+        let constraint = field
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&self.topAnchor(), top);
+        *self.ivars().field_top.borrow_mut() = Some(constraint.clone());
+        constraint
+    }
+
+    /// Line the buttons across the top up with the window's traffic lights,
+    /// whose centre is `center` below the window's top.
+    pub fn align_nav(&self, center: f64) {
+        if let Some(top) = &*self.ivars().nav_top.borrow() {
+            top.setConstant((center - NAV_HEIGHT / 2.0).max(4.0));
+        }
+    }
+
     /// Answer a secondary click on a row with the application's menu for
     /// its tab.
     pub fn set_menu(&self, menu_for: MenuFor) {
@@ -1303,7 +1358,28 @@ impl Sidebar {
 
     /// Peek over the page as a floating panel, or sit beside it.
     pub fn set_floating(&self, floating: bool) {
-        self.ivars().floating.set(floating);
+        let ivars = self.ivars();
+        ivars.floating.set(floating);
+        // Peeking, the buttons across the top are the window's strip's: the
+        // field moves up into their place, inside the panel.
+        ivars.nav.setHidden(floating);
+        if let Some(top) = &*ivars.field_top.borrow() {
+            top.setConstant(if floating {
+                PANEL_MARGIN * 2.0 + 6.0
+            } else {
+                ADDRESS_TOP
+            });
+        }
+        let layer: *mut AnyObject = unsafe { msg_send![self, layer] };
+        if !layer.is_null() {
+            let opacity: f32 = if floating { 0.28 } else { 0.0 };
+            unsafe {
+                let _: () = msg_send![layer, setMasksToBounds: false];
+                let _: () = msg_send![layer, setShadowOpacity: opacity];
+                let _: () = msg_send![layer, setShadowRadius: 18.0f64];
+                let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -6.0)];
+            }
+        }
         self.setNeedsDisplay(true);
     }
 
@@ -1315,8 +1391,8 @@ impl Sidebar {
         NSRect::new(
             NSPoint::new(PANEL_MARGIN, PANEL_MARGIN),
             NSSize::new(
-                (bounds.size.width - PANEL_MARGIN).max(0.0),
-                (bounds.size.height - PANEL_MARGIN).max(0.0),
+                (bounds.size.width - 2.0 * PANEL_MARGIN).max(0.0),
+                (bounds.size.height - 2.0 * PANEL_MARGIN).max(0.0),
             ),
         )
     }
@@ -1362,7 +1438,12 @@ impl Sidebar {
 
         // The current space's name, over its tabs.
         let space = layout.current_space();
-        let name = NSTextField::labelWithString(&NSString::from_str(&space.name), mtm);
+        let heading = if space.icon.is_empty() {
+            space.name.clone()
+        } else {
+            format!("{}  {}", space.icon, space.name)
+        };
+        let name = NSTextField::labelWithString(&NSString::from_str(&heading), mtm);
         name.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
         name.setTextColor(Some(&NSColor::secondaryLabelColor()));
         name.setTranslatesAutoresizingMaskIntoConstraints(false);

@@ -494,11 +494,10 @@ define_class!(
         fn new_space(&self, _sender: Option<&AnyObject>) {
             let count = spaces_macos::read(|layout| layout.spaces.len());
             let suggested = format!("Space {}", count + 1);
-            let Some(name) = self.ask_name("New Space", "A name for the space.", &suggested)
-            else {
+            let Some((name, icon)) = self.ask_space("New Space", &suggested, "") else {
                 return;
             };
-            match spaces_macos::change(|layout| layout.add_space(&name)) {
+            match spaces_macos::change(|layout| layout.add_space(&name, &icon)) {
                 Some(id) => self.switch_space(id),
                 None => tracing::warn!("no room for another space"),
             }
@@ -508,14 +507,18 @@ define_class!(
         #[unsafe(method(syndeoRenameSpace:))]
         fn rename_space(&self, sender: Option<&AnyObject>) {
             let id = tag_or_current(sender);
-            let Some(was) = spaces_macos::read(|layout| layout.space(id).map(|s| s.name.clone()))
+            let Some((was, icon)) =
+                spaces_macos::read(|layout| layout.space(id).map(|s| (s.name.clone(), s.icon.clone())))
             else {
                 return;
             };
-            let Some(name) = self.ask_name("Rename Space", "", &was) else {
+            let Some((name, icon)) = self.ask_space("Rename Space", &was, &icon) else {
                 return;
             };
-            spaces_macos::change(|layout| layout.rename_space(id, &name));
+            spaces_macos::change(|layout| {
+                layout.rename_space(id, &name);
+                layout.set_icon(id, &icon)
+            });
             self.refresh_spaces();
         }
 
@@ -1442,6 +1445,43 @@ impl AppDelegate {
         for window in windows {
             crate::browser_macos::refresh_sidebars(&window);
         }
+    }
+
+    /// Ask for a space's name and emoji, with `name` and `icon` filled in:
+    /// both, or none for Cancel or no name.
+    fn ask_space(&self, title: &str, name: &str, icon: &str) -> Option<(String, String)> {
+        let mtm = self.mtm();
+        let alert = objc2_app_kit::NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(ns_string!(
+            "A name, and an emoji for the switcher if you like."
+        ));
+        let rect = |x: f64, width: f64| {
+            objc2_foundation::NSRect::new(
+                objc2_foundation::NSPoint::new(x, 0.0),
+                objc2_foundation::NSSize::new(width, 24.0),
+            )
+        };
+        let holder = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 260.0));
+        let emoji = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(0.0, 40.0));
+        emoji.setStringValue(&NSString::from_str(icon));
+        emoji.setPlaceholderString(Some(ns_string!("🙂")));
+        emoji.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+        let field = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(48.0, 212.0));
+        field.setStringValue(&NSString::from_str(name));
+        field.setPlaceholderString(Some(ns_string!("Name")));
+        holder.addSubview(&emoji);
+        holder.addSubview(&field);
+        alert.setAccessoryView(Some(&holder));
+        alert.addButtonWithTitle(ns_string!("OK"));
+        alert.addButtonWithTitle(ns_string!("Cancel"));
+        alert.window().setInitialFirstResponder(Some(&field));
+        if alert.runModal() != objc2_app_kit::NSAlertFirstButtonReturn {
+            return None;
+        }
+        let name = field.stringValue().to_string();
+        let icon = emoji.stringValue().to_string();
+        (!name.trim().is_empty()).then(|| (name.trim().to_string(), icon))
     }
 
     /// Ask for a name, with `suggested` filled in: the name, trimmed, or

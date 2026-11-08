@@ -339,16 +339,22 @@ fn label(mtm: MainThreadMarker, text: &str, size: f64, secondary: bool) -> Retai
     label
 }
 
-/// The list, as a view sized to fit.
+/// The list, as a view sized to fit: a head with the title and the two
+/// buttons for the whole list, then a row for each download — its name,
+/// then what has happened to it with its button at the end, then a bar
+/// while it comes in — with a rule between rows. Every label is held to
+/// the popover's width, so a long name is cut short, not the popover
+/// widened.
 fn build(mtm: MainThreadMarker) -> Retained<NSView> {
     // Make sure the keeper exists, so the buttons have a target.
     KEEPER.with(|slot| {
         slot.borrow_mut().get_or_insert_with(|| Keeper::new(mtm));
     });
+    let inner = WIDTH - 2.0 * INSET;
     let stack = NSStackView::new(mtm);
     stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
     stack.setAlignment(NSLayoutAttribute::Leading);
-    stack.setSpacing(10.0);
+    stack.setSpacing(8.0);
     stack.setEdgeInsets(NSEdgeInsets {
         top: INSET,
         left: INSET,
@@ -357,25 +363,38 @@ fn build(mtm: MainThreadMarker) -> Retained<NSView> {
     });
     stack.setTranslatesAutoresizingMaskIntoConstraints(false);
 
-    // The head: the title, Clear and Open Folder.
+    // A row across the popover: `left` takes the room, `right` sits at the
+    // end.
+    let across = |left: &NSView, right: &[&NSView]| -> Retained<NSStackView> {
+        let line = NSStackView::new(mtm);
+        line.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+        line.setSpacing(8.0);
+        line.setTranslatesAutoresizingMaskIntoConstraints(false);
+        line.addArrangedSubview(left);
+        let spring = NSView::new(mtm);
+        spring.setTranslatesAutoresizingMaskIntoConstraints(false);
+        spring.setContentHuggingPriority_forOrientation(
+            1.0,
+            objc2_app_kit::NSLayoutConstraintOrientation::Horizontal,
+        );
+        line.addArrangedSubview(&spring);
+        for view in right {
+            line.addArrangedSubview(view);
+        }
+        line.widthAnchor()
+            .constraintEqualToConstant(inner)
+            .setActive(true);
+        left.widthAnchor()
+            .constraintLessThanOrEqualToConstant(inner * 0.62)
+            .setActive(true);
+        line
+    };
+
     let title = label(mtm, "Downloads", 13.0, false);
     title.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
     let clear = button(mtm, "Clear", sel!(syndeoClearDownloads:), None);
     let open = button(mtm, "Open Folder", sel!(syndeoOpenDownloadsFolder:), None);
-    let head_views: [&NSView; 3] = [&title, &clear, &open];
-    let head = NSStackView::stackViewWithViews(&NSArray::from_slice(&head_views), mtm);
-    head.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-    head.setSpacing(6.0);
-    head.setTranslatesAutoresizingMaskIntoConstraints(false);
-    stack.addArrangedSubview(&head);
-    head.widthAnchor()
-        .constraintEqualToAnchor(&stack.widthAnchor())
-        .setActive(true);
-    // The title takes what the buttons leave; the buttons sit at the end.
-    title.setContentHuggingPriority_forOrientation(
-        1.0,
-        objc2_app_kit::NSLayoutConstraintOrientation::Horizontal,
-    );
+    stack.addArrangedSubview(&across(&title, &[&clear, &open]));
 
     let items: Vec<downloads::Download> = LIST.with(|list| list.borrow().items().to_vec());
     if items.is_empty() {
@@ -383,41 +402,49 @@ fn build(mtm: MainThreadMarker) -> Retained<NSView> {
         stack.addArrangedSubview(&none);
     }
     for item in &items {
+        let rule = objc2_app_kit::NSBox::new(mtm);
+        rule.setBoxType(objc2_app_kit::NSBoxType::Separator);
+        rule.setTranslatesAutoresizingMaskIntoConstraints(false);
+        rule.widthAnchor()
+            .constraintEqualToConstant(inner)
+            .setActive(true);
+        stack.addArrangedSubview(&rule);
+
         let row = NSStackView::new(mtm);
         row.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
         row.setAlignment(NSLayoutAttribute::Leading);
-        row.setSpacing(3.0);
+        row.setSpacing(4.0);
         row.setTranslatesAutoresizingMaskIntoConstraints(false);
+
         let name = label(mtm, &item.name, 12.0, false);
+        name.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, unsafe {
+            objc2_app_kit::NSFontWeightMedium
+        })));
+        name.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+        name.widthAnchor()
+            .constraintLessThanOrEqualToConstant(inner)
+            .setActive(true);
         row.addArrangedSubview(&name);
-        let line_views: Vec<Retained<NSView>> = {
-            let detail = label(mtm, &downloads::describe(item), 11.0, true);
-            let mut views: Vec<Retained<NSView>> =
-                vec![Retained::into_super(Retained::into_super(detail))];
-            match item.state {
-                State::Receiving => {
-                    let cancel = button(mtm, "Cancel", sel!(syndeoCancelDownload:), Some(item.id));
-                    views.push(Retained::into_super(Retained::into_super(cancel)));
-                }
-                State::Done if item.path.is_some() => {
-                    let reveal = button(
-                        mtm,
-                        "Show in Finder",
-                        sel!(syndeoRevealDownload:),
-                        Some(item.id),
-                    );
-                    views.push(Retained::into_super(Retained::into_super(reveal)));
-                }
-                _ => {}
-            }
-            views
+
+        let detail = label(mtm, &downloads::describe(item), 11.0, true);
+        let action: Option<Retained<NSButton>> = match item.state {
+            State::Receiving => Some(button(
+                mtm,
+                "Cancel",
+                sel!(syndeoCancelDownload:),
+                Some(item.id),
+            )),
+            State::Done if item.path.is_some() => Some(button(
+                mtm,
+                "Show in Finder",
+                sel!(syndeoRevealDownload:),
+                Some(item.id),
+            )),
+            _ => None,
         };
-        let refs: Vec<&NSView> = line_views.iter().map(|v| &**v).collect();
-        let line = NSStackView::stackViewWithViews(&NSArray::from_slice(&refs), mtm);
-        line.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-        line.setSpacing(8.0);
-        line.setTranslatesAutoresizingMaskIntoConstraints(false);
-        row.addArrangedSubview(&line);
+        let right: Vec<&NSView> = action.iter().map(|b| -> &NSView { b }).collect();
+        row.addArrangedSubview(&across(&detail, &right));
+
         if item.state == State::Receiving {
             let bar = NSProgressIndicator::new(mtm);
             bar.setStyle(NSProgressIndicatorStyle::Bar);
@@ -435,15 +462,12 @@ fn build(mtm: MainThreadMarker) -> Retained<NSView> {
                     unsafe { bar.startAnimation(None) };
                 }
             }
-            row.addArrangedSubview(&bar);
             bar.widthAnchor()
-                .constraintEqualToAnchor(&row.widthAnchor())
+                .constraintEqualToConstant(inner)
                 .setActive(true);
+            row.addArrangedSubview(&bar);
         }
         stack.addArrangedSubview(&row);
-        row.widthAnchor()
-            .constraintEqualToAnchor_constant(&stack.widthAnchor(), -2.0 * INSET)
-            .setActive(true);
     }
 
     let container = NSView::new(mtm);

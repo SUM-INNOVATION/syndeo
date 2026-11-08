@@ -643,9 +643,9 @@ define_class!(
             else {
                 return;
             };
-            let mut kept = sidebar_macos::favorites_read();
+            let mut kept = sidebar_macos::favorites_read(crate::spaces_macos::current());
             if favorites::remove(&mut kept, &address) {
-                sidebar_macos::favorites_write(&kept);
+                sidebar_macos::favorites_write(crate::spaces_macos::current(), &kept);
                 tracing::info!("a favorite removed");
             }
             if let Some(window) = self.window() {
@@ -689,9 +689,9 @@ define_class!(
                 .window()
                 .map(|w| w.title().to_string())
                 .unwrap_or_default();
-            let mut kept = sidebar_macos::favorites_read();
+            let mut kept = sidebar_macos::favorites_read(crate::spaces_macos::current());
             if tabs::savable(&address) && favorites::add(&mut kept, &address, &title) {
-                sidebar_macos::favorites_write(&kept);
+                sidebar_macos::favorites_write(crate::spaces_macos::current(), &kept);
                 tracing::info!(favorites = kept.len(), "a tab dragged to the favorites");
             }
             if let Some(window) = self.window() {
@@ -705,14 +705,14 @@ define_class!(
         fn toggle_favorite(&self, _sender: Option<&AnyObject>) {
             let address = self.ivars().shown.borrow().clone();
             let title = self.window().map(|w| w.title().to_string()).unwrap_or_default();
-            let mut kept = sidebar_macos::favorites_read();
+            let mut kept = sidebar_macos::favorites_read(crate::spaces_macos::current());
             let changed = if kept.iter().any(|f| f.address == address) {
                 favorites::remove(&mut kept, &address)
             } else {
                 tabs::savable(&address) && favorites::add(&mut kept, &address, &title)
             };
             if changed {
-                sidebar_macos::favorites_write(&kept);
+                sidebar_macos::favorites_write(crate::spaces_macos::current(), &kept);
                 tracing::info!(favorites = kept.len(), "the favorites changed");
             }
             if let Some(window) = self.window() {
@@ -738,11 +738,16 @@ define_class!(
             }
         }
 
-        /// File > New Tab, and the tab bar's button.
+        /// File > New Tab, ⌘T and the sidebar's New Tab: the command bar over
+        /// this window (`command_bar_macos`), which opens what is typed in a
+        /// new tab; not a tab straight away.
         #[unsafe(method(newWindowForTab:))]
         fn new_window_for_tab(&self, _sender: Option<&AnyObject>) {
-            if let (Some(window), Some(hooks)) = (self.window(), self.hooks()) {
-                (hooks.open_tab)(&window, &window, Start::Page, Place::Front);
+            let mtm = self.mtm();
+            let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+            if let (Some(window), Some(delegate)) = (self.window(), app.delegate()) {
+                let target: &AnyObject = (*delegate).as_ref();
+                crate::command_bar_macos::show(mtm, &window, target);
             }
         }
 
@@ -872,18 +877,19 @@ pub fn refresh_sidebars(window: &NSWindow) {
         })
         .collect();
     // A favorite's icon: an open tab of its site has one, or it has none.
-    let favorites: Vec<FavoriteInfo> = sidebar_macos::favorites_read()
-        .into_iter()
-        .map(|favorite| {
-            let host = favorites::host(&favorite.address);
-            let icon = host.and_then(|host| {
-                tabs.iter()
-                    .find(|t| favorites::host(&t.address).as_deref() == Some(host.as_str()))
-                    .and_then(|t| t.icon.clone())
-            });
-            FavoriteInfo { favorite, icon }
-        })
-        .collect();
+    let favorites: Vec<FavoriteInfo> =
+        sidebar_macos::favorites_read(crate::spaces_macos::current())
+            .into_iter()
+            .map(|favorite| {
+                let host = favorites::host(&favorite.address);
+                let icon = host.and_then(|host| {
+                    tabs.iter()
+                        .find(|t| favorites::host(&t.address).as_deref() == Some(host.as_str()))
+                        .and_then(|t| t.icon.clone())
+                });
+                FavoriteInfo { favorite, icon }
+            })
+            .collect();
     let layout = crate::spaces_macos::read(Clone::clone);
     for w in &windows {
         if let Some(controller) = controller_of(w) {
@@ -1288,7 +1294,7 @@ impl BrowserController {
         }
         if action == Some(sel!(syndeoToggleFavorite:)) {
             let address = self.ivars().shown.borrow().clone();
-            let kept = sidebar_macos::favorites_read()
+            let kept = sidebar_macos::favorites_read(crate::spaces_macos::current())
                 .iter()
                 .any(|f| f.address == address);
             let title = if kept {
