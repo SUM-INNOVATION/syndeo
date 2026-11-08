@@ -17,6 +17,14 @@ pub const MOST_FOLDERS: usize = 50;
 /// The space every tab starts in, when nothing says otherwise.
 pub const FIRST_SPACE: u64 = 1;
 
+/// The emoji a space is given when none is chosen, by its place.
+pub const DEFAULT_ICONS: [&str; 8] = ["🏠", "💼", "🎨", "📚", "🎧", "🧪", "✈️", "🛒"];
+
+/// The default emoji for the space at `index`.
+pub fn default_icon(index: usize) -> &'static str {
+    DEFAULT_ICONS[index % DEFAULT_ICONS.len()]
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Space {
     pub id: u64,
@@ -54,7 +62,7 @@ impl Default for Layout {
                 id: FIRST_SPACE,
                 name: "Personal".to_string(),
                 hue: 0,
-                icon: String::new(),
+                icon: default_icon(0).to_string(),
             }],
             folders: Vec::new(),
             current: FIRST_SPACE,
@@ -76,13 +84,17 @@ impl Layout {
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|item| {
+                    .enumerate()
+                    .filter_map(|(index, item)| {
                         Some(Space {
                             id: item.get("id")?.as_u64()?,
                             name: item.get("name")?.as_str()?.to_string(),
                             hue: item.get("hue").and_then(Value::as_u64).unwrap_or(0) as usize
                                 % HUES,
-                            icon: icon_of(item.get("icon").and_then(Value::as_str).unwrap_or("")),
+                            icon: icon_or_default(
+                                item.get("icon").and_then(Value::as_str).unwrap_or(""),
+                                index,
+                            ),
                         })
                     })
                     .take(MOST_SPACES)
@@ -186,7 +198,7 @@ impl Layout {
             id,
             name,
             hue,
-            icon: icon_of(icon),
+            icon: icon_or_default(icon, self.spaces.len()),
         });
         self.current = id;
         Some(id)
@@ -217,14 +229,15 @@ impl Layout {
         }
     }
 
-    /// A space's emoji, or none for an empty string.
+    /// A space's emoji. Nothing typed changes nothing: every space has one.
     pub fn set_icon(&mut self, id: u64, icon: &str) -> bool {
+        let icon = icon_of(icon);
         match self.spaces.iter_mut().find(|s| s.id == id) {
-            Some(space) => {
-                space.icon = icon_of(icon);
+            Some(space) if !icon.is_empty() => {
+                space.icon = icon;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -338,6 +351,17 @@ pub fn icon_of(typed: &str) -> String {
         .unwrap_or_default()
 }
 
+/// `icon_of`, or the default for the space at `index` when nothing was
+/// typed.
+fn icon_or_default(typed: &str, index: usize) -> String {
+    let icon = icon_of(typed);
+    if icon.is_empty() {
+        default_icon(index).to_string()
+    } else {
+        icon
+    }
+}
+
 /// A space's colours: the gradient's two ends, in light appearance and in
 /// dark, as sRGB. The first is the lavender into blush the window had
 /// before there were spaces.
@@ -364,14 +388,6 @@ pub fn hue_colors(hue: usize, dark: bool) -> ([f64; 3], [f64; 3]) {
         out
     };
     (deepen(from), deepen(to))
-}
-
-/// A space's dot in the switcher: its gradient's first colour, deepened so
-/// that it reads against the backdrop.
-pub fn hue_dot(hue: usize, dark: bool) -> [f64; 3] {
-    let (from, _) = hue_colors(hue, false);
-    let factor = if dark { 0.85 } else { 0.72 };
-    [from[0] * factor, from[1] * factor, from[2] * factor]
 }
 
 #[cfg(test)]
@@ -460,15 +476,25 @@ mod tests {
     }
 
     #[test]
-    fn an_icon_is_one_emoji_or_nothing() {
+    fn every_space_has_one_emoji() {
         assert_eq!(icon_of(" 🚀 "), "🚀");
         assert_eq!(icon_of("abc"), "");
         assert_eq!(icon_of(""), "");
         let mut layout = Layout::default();
+        assert_eq!(layout.current_space().icon, default_icon(0));
         let id = layout.add_space("Rockets", "🚀🚀").unwrap();
         assert_eq!(layout.space(id).unwrap().icon, "🚀");
-        assert!(layout.set_icon(id, ""));
-        assert_eq!(Layout::parse(&layout.render()).space(id).unwrap().icon, "");
+        let plain = layout.add_space("Plain", "").unwrap();
+        assert_eq!(layout.space(plain).unwrap().icon, default_icon(2));
+        assert!(!layout.set_icon(id, ""));
+        assert!(layout.set_icon(id, "🛰"));
+        assert_eq!(Layout::parse(&layout.render()).space(id).unwrap().icon, "🛰");
+        // A layout kept before every space had an emoji gets the defaults.
+        let old =
+            "{\"spaces\":[{\"id\":1,\"name\":\"P\"},{\"id\":2,\"name\":\"W\"}],\"current\":2}";
+        let read = Layout::parse(old);
+        assert_eq!(read.spaces[0].icon, default_icon(0));
+        assert_eq!(read.spaces[1].icon, default_icon(1));
     }
 
     #[test]

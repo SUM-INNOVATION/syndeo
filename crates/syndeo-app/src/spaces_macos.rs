@@ -13,6 +13,7 @@
 use crate::spaces::{self, Layout};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
+use objc2::Message;
 use objc2::{define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAccessibility, NSApplication, NSBezierPath, NSButton, NSColor, NSEvent, NSFontWeightMedium,
@@ -25,9 +26,8 @@ use std::cell::{Cell, RefCell};
 /// The defaults key the layout is kept under, as `Layout::render`.
 const LAYOUT_KEY: &str = "SyndeoSpaces";
 
-/// A dot: its size, the ring's width, and the gap between dots.
-pub const DOT: f64 = 18.0;
-const RING: f64 = 2.0;
+/// A space's tile in the switcher: its size, and the gap between tiles.
+pub const DOT: f64 = 26.0;
 const DOT_GAP: f64 = 8.0;
 
 /// The switcher's height.
@@ -136,8 +136,6 @@ pub struct DotIvars {
     id: u64,
     hue: usize,
     name: String,
-    /// An emoji in place of the dot, or nothing.
-    icon: String,
     current: Cell<bool>,
 }
 
@@ -152,28 +150,15 @@ define_class!(
     impl SpaceDot {
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
-            let ivars = self.ivars();
+            // The current space's emoji sits on a lit, rounded square; the
+            // others on nothing.
+            if !self.ivars().current.get() {
+                return;
+            }
             let dark = crate::sidebar_macos::is_dark(self);
-            let bounds = self.bounds();
-            let inset = NSRect::new(
-                NSPoint::new(bounds.origin.x + RING + 1.0, bounds.origin.y + RING + 1.0),
-                NSSize::new(bounds.size.width - 2.0 * (RING + 1.0), bounds.size.height - 2.0 * (RING + 1.0)),
-            );
-            // The dot, in the space's colour; a space with an emoji shows
-            // that instead (a label, added when the dot is made).
-            if ivars.icon.is_empty() {
-                color(spaces::hue_dot(ivars.hue, dark)).setFill();
-                NSBezierPath::bezierPathWithOvalInRect(inset).fill();
-            }
-            if ivars.current.get() {
-                let ring = NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-                    NSPoint::new(bounds.origin.x + RING / 2.0, bounds.origin.y + RING / 2.0),
-                    NSSize::new(bounds.size.width - RING, bounds.size.height - RING),
-                ));
-                ring.setLineWidth(RING);
-                NSColor::labelColor().setStroke();
-                ring.stroke();
-            }
+            let alpha = if dark { 0.18 } else { 0.62 };
+            NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, alpha).setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(self.bounds(), 7.0, 7.0).fill();
         }
 
         #[unsafe(method(acceptsFirstMouse:))]
@@ -192,7 +177,12 @@ define_class!(
             let mtm = self.mtm();
             let id = self.ivars().id as isize;
             let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Space"));
-            menu.addItem(&tagged_item(mtm, "Rename Space…", sel!(syndeoRenameSpace:), id));
+            menu.addItem(&tagged_item(
+                mtm,
+                "Rename or Change Emoji…",
+                sel!(syndeoRenameSpace:),
+                id,
+            ));
             let colours = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Colour"));
             for (hue, name) in COLOUR_NAMES.iter().enumerate() {
                 let item = tagged_item(
@@ -239,6 +229,41 @@ define_class!(
     }
 );
 
+pub struct PickerIvars {
+    field: Retained<objc2_app_kit::NSTextField>,
+}
+
+define_class!(
+    /// Pick…, beside the emoji field in the space dialog: the system's
+    /// emoji palette, typing into that field.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SyndeoEmojiPicker"]
+    #[ivars = PickerIvars]
+    pub struct EmojiPicker;
+
+    impl EmojiPicker {
+        #[unsafe(method(syndeoPickEmoji:))]
+        fn pick(&self, _sender: Option<&AnyObject>) {
+            let field = &self.ivars().field;
+            if let Some(window) = field.window() {
+                let view: &NSView = field;
+                window.makeFirstResponder(Some(view));
+            }
+            NSApplication::sharedApplication(self.mtm()).orderFrontCharacterPalette(None);
+        }
+    }
+);
+
+impl EmojiPicker {
+    pub fn new(mtm: MainThreadMarker, field: &objc2_app_kit::NSTextField) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(PickerIvars {
+            field: field.retain(),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
 /// The colours' names, in `spaces::hue_colors`' order.
 const COLOUR_NAMES: [&str; spaces::HUES] = [
     "Lavender", "Sky", "Mint", "Peach", "Rose", "Sand", "Slate", "Lilac",
@@ -250,7 +275,6 @@ impl SpaceDot {
             id: space.id,
             hue: space.hue,
             name: space.name.clone(),
-            icon: space.icon.clone(),
             current: Cell::new(current),
         });
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(DOT, DOT));
@@ -262,14 +286,17 @@ impl SpaceDot {
         ]));
         this.setToolTip(Some(&NSString::from_str(&space.name)));
         this.setAccessibilityIdentifier(Some(ns_string!("syndeo.space")));
-        if !space.icon.is_empty() {
-            let label =
-                objc2_app_kit::NSTextField::labelWithString(&NSString::from_str(&space.icon), mtm);
-            label.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(DOT - 6.0)));
-            label.setAlignment(objc2_app_kit::NSTextAlignment::Center);
-            label.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(DOT, DOT)));
-            this.addSubview(&label);
-        }
+        // The emoji, dimmed a little when the space is not the current one.
+        let label =
+            objc2_app_kit::NSTextField::labelWithString(&NSString::from_str(&space.icon), mtm);
+        label.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(15.0)));
+        label.setAlignment(objc2_app_kit::NSTextAlignment::Center);
+        label.setFrame(NSRect::new(
+            NSPoint::new(0.0, (DOT - 20.0) / 2.0),
+            NSSize::new(DOT, 20.0),
+        ));
+        label.setAlphaValue(if current { 1.0 } else { 0.62 });
+        this.addSubview(&label);
         this
     }
 

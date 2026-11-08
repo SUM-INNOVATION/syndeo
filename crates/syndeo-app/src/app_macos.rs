@@ -1448,29 +1448,42 @@ impl AppDelegate {
     }
 
     /// Ask for a space's name and emoji, with `name` and `icon` filled in:
-    /// both, or none for Cancel or no name.
+    /// both, or none for Cancel or no name. Pick… opens the system's emoji
+    /// palette into the emoji field.
     fn ask_space(&self, title: &str, name: &str, icon: &str) -> Option<(String, String)> {
         let mtm = self.mtm();
         let alert = objc2_app_kit::NSAlert::new(mtm);
         alert.setMessageText(&NSString::from_str(title));
-        alert.setInformativeText(ns_string!(
-            "A name, and an emoji for the switcher if you like."
-        ));
+        alert.setInformativeText(ns_string!("An emoji for the switcher, and a name."));
         let rect = |x: f64, width: f64| {
             objc2_foundation::NSRect::new(
                 objc2_foundation::NSPoint::new(x, 0.0),
                 objc2_foundation::NSSize::new(width, 24.0),
             )
         };
-        let holder = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 260.0));
+        let holder = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 280.0));
         let emoji = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(0.0, 40.0));
         emoji.setStringValue(&NSString::from_str(icon));
         emoji.setPlaceholderString(Some(ns_string!("🙂")));
         emoji.setAlignment(objc2_app_kit::NSTextAlignment::Center);
-        let field = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(48.0, 212.0));
+        emoji.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(15.0)));
+        let picker = spaces_macos::EmojiPicker::new(mtm, &emoji);
+        let picker_target: &AnyObject = (*picker).as_ref();
+        let pick = unsafe {
+            objc2_app_kit::NSButton::buttonWithTitle_target_action(
+                ns_string!("Pick…"),
+                Some(picker_target),
+                Some(sel!(syndeoPickEmoji:)),
+                mtm,
+            )
+        };
+        pick.setFrame(rect(46.0, 64.0));
+        pick.setControlSize(objc2_app_kit::NSControlSize::Small);
+        let field = NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(118.0, 162.0));
         field.setStringValue(&NSString::from_str(name));
         field.setPlaceholderString(Some(ns_string!("Name")));
         holder.addSubview(&emoji);
+        holder.addSubview(&pick);
         holder.addSubview(&field);
         alert.setAccessoryView(Some(&holder));
         alert.addButtonWithTitle(ns_string!("OK"));

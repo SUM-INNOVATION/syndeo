@@ -1,15 +1,17 @@
 //! The command bar: New Tab, as Arc has it. ⌘T, or the sidebar's New Tab,
-//! opens not a page but a wide field floating over the window; what is
-//! typed there — an address, or words to search for — opens in a new tab
-//! on Return, and Escape, or a click anywhere else, puts the bar away
-//! with nothing opened.
+//! opens not a page but a wide field floating over the middle of the
+//! window, with the window behind it blurred and dimmed; what is typed
+//! there — an address, or words to search for — opens in a new tab on
+//! Return, and Escape, or a click anywhere else, puts the bar away with
+//! nothing opened.
 //!
-//! The bar is a window of its own, borderless and translucent, keyed so
-//! that typing goes to it, placed over the upper part of the browser
-//! window it was asked from. It sends what was typed to the application
-//! (`syndeoOpenTyped:`, with the field as the sender), which opens the tab
-//! beside the window in front, the way New Tab always did; the typed text
-//! is read by `address::interpret`, as the address field's is.
+//! The bar is two windows of its own: the shade, borderless and the size
+//! of the browser window, which blurs and darkens what is behind it and
+//! takes the click that dismisses; and the bar, keyed so that typing goes
+//! to it. It sends what was typed to the application (`syndeoOpenTyped:`,
+//! with the field as the sender), which opens the tab beside the window in
+//! front, the way New Tab always did; the typed text is read by
+//! `address::interpret`, as the address field's is.
 //!
 //! One bar at a time: asking again while it shows just brings it back.
 
@@ -19,21 +21,22 @@ use objc2::{
     define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly, Message,
 };
 use objc2_app_kit::{
-    NSAccessibility, NSBackingStoreType, NSColor, NSFocusRingType, NSFont, NSImage, NSImageScaling,
-    NSImageView, NSTextField, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSAccessibility, NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFocusRingType, NSFont,
+    NSImage, NSImageScaling, NSImageView, NSTextField, NSView, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{ns_string, NSNotification, NSPoint, NSRect, NSSize};
 use std::cell::RefCell;
 
 /// The bar: its width at most, its margin from the window's sides when the
-/// window is narrower, its height, how far below the window's top it sits,
-/// and its corner radius.
+/// window is narrower, its height, and its corner radius. It sits a little
+/// above the window's middle, where the eye rests.
 const WIDTH: f64 = 640.0;
 const MARGIN: f64 = 40.0;
 const HEIGHT: f64 = 72.0;
-const BELOW_TOP: f64 = 120.0;
 const RADIUS: f64 = 16.0;
+const ABOVE_MIDDLE: f64 = 60.0;
 
 /// Inside: the field's inset, the symbol's size and the gap after it.
 const INSET: f64 = 22.0;
@@ -42,6 +45,9 @@ const GAP: f64 = 12.0;
 
 /// Above every ordinary window, as a floating panel is.
 const FLOATING: isize = 3;
+
+/// How dark the shade makes the window behind.
+const DIM: f64 = 0.32;
 
 thread_local! {
     /// The one bar, while it shows.
@@ -69,15 +75,42 @@ define_class!(
     }
 );
 
+define_class!(
+    /// The dimming over the blur, which takes the click that dismisses.
+    #[unsafe(super(NSView, objc2_app_kit::NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SyndeoCommandBarShade"]
+    pub struct Shade;
+
+    impl Shade {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, DIM).setFill();
+            NSBezierPath::fillRect(self.bounds());
+        }
+
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &NSEvent) {
+            dismiss();
+        }
+    }
+);
+
 pub struct BarIvars {
     window: Retained<BarWindow>,
+    shade: Retained<NSWindow>,
     field: Retained<NSTextField>,
     /// The application, which opens what was typed.
     app: Weak<AnyObject>,
 }
 
 define_class!(
-    /// The bar: its window, its field, and what happens to what is typed.
+    /// The bar: its windows, its field, and what happens to what is typed.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "SyndeoCommandBar"]
@@ -87,7 +120,7 @@ define_class!(
     unsafe impl NSObjectProtocol for CommandBar {}
 
     unsafe impl NSWindowDelegate for CommandBar {
-        /// A click elsewhere: away, with nothing opened.
+        /// Another window took the keys: away, with nothing opened.
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _notification: &NSNotification) {
             dismiss();
@@ -124,6 +157,7 @@ pub fn show(mtm: MainThreadMarker, over: &NSWindow, app: &AnyObject) {
     }
     let bar = CommandBar::new(mtm, over, app);
     SHOWING.with(|slot| *slot.borrow_mut() = Some(bar.clone()));
+    bar.ivars().shade.orderFront(None);
     bar.ivars().window.makeKeyAndOrderFront(None);
     let field: &NSView = &bar.ivars().field;
     bar.ivars().window.makeFirstResponder(Some(field));
@@ -136,17 +170,56 @@ fn dismiss() {
         let window = &bar.ivars().window;
         window.setDelegate(None);
         window.orderOut(None);
+        bar.ivars().shade.orderOut(None);
     }
+}
+
+/// A borderless, see-through window at `rect`, floating.
+fn floating_window(mtm: MainThreadMarker, rect: NSRect) -> Retained<NSWindow> {
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            rect,
+            NSWindowStyleMask::Borderless,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setOpaque(false);
+    window.setBackgroundColor(Some(&NSColor::clearColor()));
+    window.setLevel(FLOATING);
+    window.setRestorable(false);
+    window
 }
 
 impl CommandBar {
     fn new(mtm: MainThreadMarker, over: &NSWindow, app: &AnyObject) -> Retained<Self> {
         let frame = over.frame();
+
+        // The shade: the browser window's size, a blur of what is behind it
+        // with a dimming over that.
+        let shade = floating_window(mtm, frame);
+        shade.setHasShadow(false);
+        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
+        let blur = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), bounds);
+        blur.setMaterial(NSVisualEffectMaterial::FullScreenUI);
+        blur.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        blur.setState(NSVisualEffectState::Active);
+        let dim: Retained<Shade> = unsafe { msg_send![Shade::alloc(mtm), initWithFrame: bounds] };
+        dim.setAutoresizingMask(
+            objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable
+                | objc2_app_kit::NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        blur.addSubview(&dim);
+        shade.setContentView(Some(&blur));
+
+        // The bar: in the middle, a little above it.
         let width = WIDTH.min(frame.size.width - 2.0 * MARGIN).max(240.0);
         let rect = NSRect::new(
             NSPoint::new(
                 frame.origin.x + (frame.size.width - width) / 2.0,
-                frame.origin.y + frame.size.height - BELOW_TOP - HEIGHT,
+                frame.origin.y + (frame.size.height - HEIGHT) / 2.0 + ABOVE_MIDDLE,
             ),
             NSSize::new(width, HEIGHT),
         );
@@ -167,8 +240,8 @@ impl CommandBar {
         window.setRestorable(false);
 
         // A translucent card, rounded, with the symbol and the field in it.
-        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), rect.size);
-        let card = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), bounds);
+        let card_bounds = NSRect::new(NSPoint::new(0.0, 0.0), rect.size);
+        let card = NSVisualEffectView::initWithFrame(NSVisualEffectView::alloc(mtm), card_bounds);
         card.setMaterial(NSVisualEffectMaterial::Popover);
         card.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
         card.setState(NSVisualEffectState::Active);
@@ -209,6 +282,7 @@ impl CommandBar {
 
         let this = Self::alloc(mtm).set_ivars(BarIvars {
             window: window.clone(),
+            shade,
             field: field.clone(),
             app: Weak::from_retained(&app.retain()),
         });
