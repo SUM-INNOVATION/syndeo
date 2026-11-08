@@ -72,7 +72,7 @@ const LIST_GAP: f64 = 14.0;
 /// The floating panel, when the sidebar peeks over the page: its margin
 /// from the window's left and bottom, and its corner radius.
 pub const PANEL_MARGIN: f64 = 8.0;
-const PANEL_TOP: f64 = 6.0;
+const PANEL_TOP: f64 = 0.0;
 const PANEL_RADIUS: f64 = 12.0;
 
 /// The edge of the window that brings a hidden sidebar back.
