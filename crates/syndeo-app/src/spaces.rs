@@ -1,4 +1,4 @@
-//! Spaces and folders, as Arc arranges a sidebar: a space is a named set of
+//! Spaces and folders, in the sidebar: a space is a named set of
 //! tabs with a colour of its own, one of which is current, and a folder
 //! is a named group of pinned tabs within a space. Plain Rust: what is
 //! kept, as JSON, and nothing of how it is shown (`sidebar_macos`) or

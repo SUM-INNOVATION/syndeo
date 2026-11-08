@@ -1,4 +1,4 @@
-//! The sidebar: a browser window's tabs down its left side, as Arc has them,
+//! The sidebar: a browser window's tabs down its left side,
 //! with Hide Sidebar, Back, Forward and Reload across its top, the address
 //! field as a pill below them, the favorites as a grid of tiles under that,
 //! and the tabs below.
@@ -24,7 +24,7 @@
 //!   application gives (`menu_for`).
 //! - **Hidden**, the sidebar comes back over the page while the pointer is
 //!   at the window's left edge (`EdgeSensor`), as a floating panel, and
-//!   goes again when the pointer leaves it: Arc's peek. The panel is drawn
+//!   goes again when the pointer leaves it. The panel is drawn
 //!   here; what shows and hides it is the window's chrome (`chrome_macos`),
 //!   which the sensor and the sidebar tell through `syndeoPeekSidebar:` and
 //!   `syndeoUnpeekSidebar:`, sent to the window's controller.

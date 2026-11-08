@@ -1,4 +1,4 @@
-//! The command bar: New Tab, as Arc has it. ⌘T, or the sidebar's New Tab,
+//! The command bar: New Tab. ⌘T, or the sidebar's New Tab,
 //! opens not a page but a wide field floating over the middle of the
 //! window, with the page behind it — and only the page: the sidebar stays
 //! as it is — under a pane of glass; what is typed there — an address, or

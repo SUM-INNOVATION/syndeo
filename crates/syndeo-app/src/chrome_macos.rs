@@ -1,4 +1,4 @@
-//! A browser window's chrome, as Arc arranged a browser's: a sidebar down
+//! A browser window's chrome: a sidebar down
 //! the left (`sidebar_macos`) with the tabs, Back and Forward and the
 //! address field in it, and the page beside it as a card — inset, with
 //! rounded corners — over a soft gradient backdrop (`Backdrop`) that the
@@ -587,8 +587,7 @@ impl Ui {
 
     /// Hide the sidebar, giving the page the window, with the traffic lights
     /// out of sight; or show it again. Hidden, it comes back over the page
-    /// while the pointer is at the window's left edge (`peek_sidebar`), as
-    /// Arc's does.
+    /// while the pointer is at the window's left edge (`peek_sidebar`).
     pub fn toggle_sidebar(&self) {
         let (width, leading) = (self.sidebar_width.borrow(), self.card_leading.borrow());
         let (Some(width), Some(leading)) = (width.as_ref(), leading.as_ref()) else {

@@ -1,5 +1,5 @@
 //! Downloads: WebKit's, kept in a list (`downloads`) and shown from the
-//! sidebar's foot, as Arc shows them from its Library.
+//! sidebar's foot.
 //!
 //! A response a window cannot show as a page, or a link marked for
 //! download, becomes a `WKDownload` (`browser_macos` decides that), which

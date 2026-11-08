@@ -1,11 +1,11 @@
-//! Favorites: the few sites kept at the top of the sidebar, as Arc keeps
-//! them, each a tile with the site's icon, or its initial when the icon is
+//! Favorites: the few sites kept at the top of the sidebar, each a tile
+//! with the site's icon, or its initial when the icon is
 //! not to hand. Plain Rust: what is kept, as JSON, and nothing of how it is
 //! shown (`sidebar_macos`) or stored (the application's defaults).
 
 use serde_json::{json, Value};
 
-/// How many there can be: Arc's twelve, three rows of four.
+/// How many there can be: twelve, three rows of four.
 pub const MOST: usize = 12;
 
 /// A favorite: a page's address, and the title it had when it was added.
