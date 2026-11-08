@@ -518,6 +518,8 @@ mod tests {
                     address: "https://example.com/".into(),
                     title: "Example Domain".into(),
                     pinned: true,
+                    space: crate::spaces::FIRST_SPACE,
+                    folder: None,
                 }],
                 selected: 0,
             }],
