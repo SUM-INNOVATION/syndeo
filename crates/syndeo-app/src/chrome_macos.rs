@@ -57,7 +57,7 @@ const ROUTE_PAD: f64 = 6.0;
 /// The page's card: its margin from the window's top, right and bottom,
 /// and its corner radius.
 const CARD_MARGIN: f64 = 8.0;
-const CARD_RADIUS: f64 = 12.0;
+pub(crate) const CARD_RADIUS: f64 = 12.0;
 
 /// With the sidebar hidden: the strip kept along the top for Show Sidebar,
 /// and the gap between the traffic lights and that button.
@@ -402,6 +402,8 @@ pub struct Ui {
     copy: Retained<NSButton>,
     /// The page's card: the web view, inset and with rounded corners.
     card: Retained<NSView>,
+    /// Glass over the card while the command bar shows (`command_bar_macos`).
+    shade: Retained<crate::command_bar_macos::PageShade>,
     /// The sidebar, with the tabs, Back and Forward and the field in it.
     pub sidebar: Retained<Sidebar>,
     /// The sidebar's width, which Hide Sidebar takes to nothing, and the
@@ -518,6 +520,7 @@ impl Ui {
         let (lights_center, lights_end) = traffic_lights(window).unwrap_or((22.0, 72.0));
         self.sidebar.align_nav(lights_center);
         let edge: &NSView = &self.edge;
+        let shade: &NSView = &self.shade;
         let top = card
             .topAnchor()
             .constraintEqualToAnchor_constant(&content.topAnchor(), CARD_MARGIN);
@@ -549,11 +552,27 @@ impl Ui {
                 .constraintEqualToAnchor(&content.bottomAnchor()),
             edge.widthAnchor()
                 .constraintEqualToConstant(sidebar_macos::EDGE),
+            shade.topAnchor().constraintEqualToAnchor(&card.topAnchor()),
+            shade
+                .bottomAnchor()
+                .constraintEqualToAnchor(&card.bottomAnchor()),
+            shade
+                .leadingAnchor()
+                .constraintEqualToAnchor(&card.leadingAnchor()),
+            shade
+                .trailingAnchor()
+                .constraintEqualToAnchor(&card.trailingAnchor()),
         ]));
         *self.sidebar_width.borrow_mut() = Some(width);
         *self.sidebar_top.borrow_mut() = Some(sidebar_top);
         *self.card_leading.borrow_mut() = Some(leading);
         *self.card_top.borrow_mut() = Some(top);
+    }
+
+    /// Glass over the page, while the command bar shows; or the page as it
+    /// is.
+    pub fn set_shaded(&self, shaded: bool) {
+        self.shade.setHidden(!shaded);
     }
 
     /// Hide the sidebar, giving the page its width but for a strip along
@@ -825,8 +844,11 @@ pub fn browser_content(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     card.addSubview(webview);
-    // The sidebar above the card, so that it can peek over it.
+    // The shade over the card, and the sidebar above both, so that it can
+    // peek over the page.
+    let shade = crate::command_bar_macos::PageShade::new(mtm);
     container.addSubview(&card);
+    container.addSubview(&shade);
     container.addSubview(&sidebar);
     container.addSubview(&show);
     container.addSubview(&edge);
@@ -842,6 +864,7 @@ pub fn browser_content(
         field,
         copy,
         card,
+        shade,
         sidebar,
         sidebar_width: RefCell::new(None),
         card_leading: RefCell::new(None),

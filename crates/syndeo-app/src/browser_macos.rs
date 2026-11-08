@@ -743,11 +743,11 @@ define_class!(
         /// new tab; not a tab straight away.
         #[unsafe(method(newWindowForTab:))]
         fn new_window_for_tab(&self, _sender: Option<&AnyObject>) {
-            let mtm = self.mtm();
-            let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+            let app = objc2_app_kit::NSApplication::sharedApplication(self.mtm());
             if let (Some(window), Some(delegate)) = (self.window(), app.delegate()) {
                 let target: &AnyObject = (*delegate).as_ref();
-                crate::command_bar_macos::show(mtm, &window, target);
+                let sender: &AnyObject = window.as_ref();
+                unsafe { app.sendAction_to_from(sel!(syndeoShowCommandBar:), Some(target), Some(sender)) };
             }
         }
 
@@ -900,6 +900,15 @@ pub fn refresh_sidebars(window: &NSWindow) {
         // The backdrop takes the current space's colour.
         if let Some(content) = w.contentView() {
             content.setNeedsDisplay(true);
+        }
+    }
+}
+
+/// Glass over `window`'s page while the command bar shows, or not.
+pub fn set_shaded(window: &NSWindow, shaded: bool) {
+    if let Some(controller) = controller_of(window) {
+        if let Some(ui) = &*controller.ivars().ui.borrow() {
+            ui.set_shaded(shaded);
         }
     }
 }
@@ -1108,6 +1117,12 @@ impl BrowserController {
 
     pub fn is_pinned(&self) -> bool {
         self.ivars().pinned.get()
+    }
+
+    /// The page's address, as the address field shows it; empty for a
+    /// page with none.
+    pub fn address(&self) -> String {
+        self.ivars().shown.borrow().clone()
     }
 
     /// The space the tab is in.

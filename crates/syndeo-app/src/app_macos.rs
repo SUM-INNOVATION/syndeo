@@ -443,9 +443,23 @@ define_class!(
         #[unsafe(method(newWindowForTab:))]
         fn new_window_for_tab(&self, _sender: Option<&AnyObject>) {
             match self.persons_front() {
-                Some(front) => command_bar_macos::show(self.mtm(), &front, self.as_ref()),
+                Some(front) => self.show_command_bar(&front),
                 None => {
                     self.open_window();
+                }
+            }
+        }
+
+        /// A window's controller asking for the command bar over its window,
+        /// the sender.
+        #[unsafe(method(syndeoShowCommandBar:))]
+        fn show_command_bar_action(&self, sender: Option<&AnyObject>) {
+            match sender.and_then(|s| s.downcast_ref::<NSWindow>()) {
+                Some(window) => self.show_command_bar(window),
+                None => {
+                    if let Some(front) = self.persons_front() {
+                        self.show_command_bar(&front);
+                    }
                 }
             }
         }
@@ -1406,6 +1420,79 @@ impl AppDelegate {
             crate::browser_macos::refresh_sidebars_soon(open);
         }
         tracing::info!(open = windows.len(), "a window closed");
+    }
+
+    /// The command bar over `over`, suggesting from the open tabs and the
+    /// favorites.
+    fn show_command_bar(&self, over: &NSWindow) {
+        let me = Weak::from_retained(&self.retain());
+        let suggest: command_bar_macos::Suggest = Rc::new(move |typed| {
+            me.load()
+                .map(|app| app.suggestions(typed))
+                .unwrap_or_default()
+        });
+        command_bar_macos::show(self.mtm(), over, self.as_ref(), suggest);
+    }
+
+    /// What the command bar suggests for `typed`: the person's open tabs
+    /// whose title or address has it, to switch to, then every space's
+    /// favorites that do, to open; nothing for nothing typed, and no
+    /// address twice.
+    fn suggestions(&self, typed: &str) -> Vec<command_bar_macos::Suggestion> {
+        use command_bar_macos::{Action, Suggestion};
+        let wanted = typed.trim().to_lowercase();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let has = |text: &str| text.to_lowercase().contains(&wanted);
+        let mut found: Vec<Suggestion> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        for (window, controller) in self.ivars().windows.borrow().iter() {
+            if control_macos::is_agents(window) {
+                continue;
+            }
+            let title = window.title().to_string();
+            let address = controller.address();
+            if address.is_empty() || !(has(&title) || has(&address)) {
+                continue;
+            }
+            if seen.contains(&address) {
+                continue;
+            }
+            seen.push(address.clone());
+            found.push(Suggestion {
+                title: if title.is_empty() {
+                    address.clone()
+                } else {
+                    title
+                },
+                detail: address,
+                action: Action::Switch(window.clone()),
+            });
+        }
+        let spaces: Vec<u64> =
+            spaces_macos::read(|layout| layout.spaces.iter().map(|s| s.id).collect());
+        for space in spaces {
+            for favorite in crate::sidebar_macos::favorites_read(space) {
+                if seen.contains(&favorite.address)
+                    || !(has(&favorite.title) || has(&favorite.address))
+                {
+                    continue;
+                }
+                seen.push(favorite.address.clone());
+                let address_again = favorite.address.clone();
+                found.push(Suggestion {
+                    title: if favorite.title.is_empty() {
+                        favorite.address.clone()
+                    } else {
+                        favorite.title
+                    },
+                    detail: favorite.address,
+                    action: Action::Open(address_again),
+                });
+            }
+        }
+        found
     }
 
     /// Make `id` the current space, and bring one of its tabs to the
