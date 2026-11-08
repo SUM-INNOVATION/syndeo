@@ -590,6 +590,25 @@ define_class!(
             }
         }
 
+        /// A tab's row dragged to the favorites: this tab's page, added, if
+        /// it is not one already.
+        #[unsafe(method(syndeoAddFavorite:))]
+        fn add_favorite(&self, _sender: Option<&AnyObject>) {
+            let address = self.ivars().shown.borrow().clone();
+            let title = self
+                .window()
+                .map(|w| w.title().to_string())
+                .unwrap_or_default();
+            let mut kept = sidebar_macos::favorites_read();
+            if tabs::savable(&address) && favorites::add(&mut kept, &address, &title) {
+                sidebar_macos::favorites_write(&kept);
+                tracing::info!(favorites = kept.len(), "a tab dragged to the favorites");
+            }
+            if let Some(window) = self.window() {
+                refresh_sidebars(&window);
+            }
+        }
+
         /// A tab's menu > Add to Favorites, or Remove from Favorites: this
         /// tab's page.
         #[unsafe(method(syndeoToggleFavorite:))]

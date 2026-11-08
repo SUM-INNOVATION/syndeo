@@ -83,6 +83,9 @@ const ICON: f64 = 16.0;
 const CLOSE: f64 = 20.0;
 const ROW_GAP: f64 = 2.0;
 
+/// How far a press has to move to be a drag, not a click.
+const DRAG_SLOP: f64 = 4.0;
+
 /// A favorite's tile: four to a row, with this much between them.
 const TILES_PER_ROW: usize = 4;
 const TILE_GAP: f64 = 6.0;
@@ -228,6 +231,12 @@ pub struct RowIvars {
     pinned: Cell<bool>,
     close: RefCell<Option<Retained<NSButton>>>,
     menu_for: RefCell<Option<MenuFor>>,
+    /// The sidebar, told when the row is dragged: to the favorites, say.
+    sidebar: RefCell<Option<Weak<Sidebar>>>,
+    /// Where the mouse went down, in the window, while it is down; and
+    /// whether it has moved far enough since to be a drag.
+    press: Cell<Option<NSPoint>>,
+    dragging: Cell<bool>,
 }
 
 define_class!(
@@ -269,9 +278,49 @@ define_class!(
             true
         }
 
+        /// A press chooses the tab when it is let go, unless it became a
+        /// drag: dragged up to the favorites, the tab's page is added there.
         #[unsafe(method(mouseDown:))]
-        fn mouse_down(&self, _event: &NSEvent) {
-            self.choose();
+        fn mouse_down(&self, event: &NSEvent) {
+            self.ivars().press.set(Some(event.locationInWindow()));
+            self.ivars().dragging.set(false);
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            let ivars = self.ivars();
+            let (Some(press), Some(sidebar)) = (
+                ivars.press.get(),
+                ivars.sidebar.borrow().as_ref().and_then(Weak::load),
+            ) else {
+                return;
+            };
+            let at = event.locationInWindow();
+            if !ivars.dragging.get() {
+                if (at.x - press.x).abs() < DRAG_SLOP && (at.y - press.y).abs() < DRAG_SLOP {
+                    return;
+                }
+                ivars.dragging.set(true);
+                sidebar.drag_began();
+            }
+            sidebar.drag_moved(at);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            let ivars = self.ivars();
+            let was_drag = ivars.dragging.replace(false);
+            ivars.press.set(None);
+            if !was_drag {
+                self.choose();
+                return;
+            }
+            let tab = ivars.tab.borrow().as_ref().and_then(Weak::load);
+            if let (Some(sidebar), Some(tab)) =
+                (ivars.sidebar.borrow().as_ref().and_then(Weak::load), tab)
+            {
+                sidebar.drag_ended(event.locationInWindow(), &tab);
+            }
         }
 
         #[unsafe(method(rightMouseDown:))]
@@ -342,6 +391,7 @@ impl TabRow {
         width: f64,
         tab: Option<&TabInfo>,
         menu_for: Option<MenuFor>,
+        sidebar: Option<Weak<Sidebar>>,
     ) -> Retained<Self> {
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, ROW_HEIGHT));
         let this = Self::alloc(mtm).set_ivars(RowIvars {
@@ -352,6 +402,9 @@ impl TabRow {
             pinned: Cell::new(tab.is_some_and(|t| t.pinned)),
             close: RefCell::new(None),
             menu_for: RefCell::new(menu_for),
+            sidebar: RefCell::new(sidebar),
+            press: Cell::new(None),
+            dragging: Cell::new(false),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -701,6 +754,83 @@ impl EdgeSensor {
     }
 }
 
+/// The drop hint's least height, when there are no favorites yet.
+const HINT_HEIGHT: f64 = 56.0;
+
+pub struct HintIvars {
+    /// A dragged tab is over it.
+    active: Cell<bool>,
+}
+
+define_class!(
+    /// Where a dragged tab becomes a favorite: a dashed outline over the
+    /// favorites, filled while the tab is over it, saying what dropping
+    /// does. Shown only while a tab is dragged.
+    #[unsafe(super(NSView, objc2_app_kit::NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SyndeoDropHint"]
+    #[ivars = HintIvars]
+    pub struct DropHint;
+
+    impl DropHint {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let bounds = self.bounds();
+            let inset = NSRect::new(
+                NSPoint::new(bounds.origin.x + 1.0, bounds.origin.y + 1.0),
+                NSSize::new(bounds.size.width - 2.0, bounds.size.height - 2.0),
+            );
+            let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                inset,
+                TILE_RADIUS,
+                TILE_RADIUS,
+            );
+            let dark = is_dark(self);
+            if self.ivars().active.get() {
+                lit(if dark { 0.14 } else { 0.5 }).setFill();
+                path.fill();
+            }
+            path.setLineWidth(1.5);
+            let dashes: [f64; 2] = [5.0, 4.0];
+            unsafe { path.setLineDash_count_phase(dashes.as_ptr(), 2, 0.0) };
+            NSColor::secondaryLabelColor().setStroke();
+            path.stroke();
+        }
+    }
+);
+
+impl DropHint {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(HintIvars {
+            active: Cell::new(false),
+        });
+        let this: Retained<Self> = unsafe { msg_send![super(this), init] };
+        this.setTranslatesAutoresizingMaskIntoConstraints(false);
+        this.setHidden(true);
+        let label = NSTextField::labelWithString(ns_string!("Add to Favorites"), mtm);
+        label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        label.setAlignment(NSTextAlignment::Center);
+        label.setTranslatesAutoresizingMaskIntoConstraints(false);
+        this.addSubview(&label);
+        NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+            label
+                .centerXAnchor()
+                .constraintEqualToAnchor(&this.centerXAnchor()),
+            label
+                .bottomAnchor()
+                .constraintEqualToAnchor_constant(&this.bottomAnchor(), -8.0),
+        ]));
+        this
+    }
+
+    fn set_active(&self, active: bool) {
+        if self.ivars().active.replace(active) != active {
+            self.setNeedsDisplay(true);
+        }
+    }
+}
+
 pub struct SidebarIvars {
     list: Retained<NSStackView>,
     favorites: Retained<NSStackView>,
@@ -710,6 +840,9 @@ pub struct SidebarIvars {
     target: Weak<AnyObject>,
     /// Peeking over the page, as a floating panel, rather than beside it.
     floating: Cell<bool>,
+    /// Where a dragged tab is dropped to become a favorite: over the
+    /// favorites, shown while a tab is dragged.
+    hint: Retained<DropHint>,
 }
 
 define_class!(
@@ -786,12 +919,14 @@ impl Sidebar {
         favorites.setAlignment(NSLayoutAttribute::Leading);
         favorites.setSpacing(TILE_GAP);
         favorites.setTranslatesAutoresizingMaskIntoConstraints(false);
+        let hint = DropHint::new(mtm);
         let this = Self::alloc(mtm).set_ivars(SidebarIvars {
             list: list.clone(),
             favorites: favorites.clone(),
             menu_for: RefCell::new(None),
             target: Weak::from_retained(&target.retain()),
             floating: Cell::new(false),
+            hint: hint.clone(),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -808,6 +943,7 @@ impl Sidebar {
         field.setTranslatesAutoresizingMaskIntoConstraints(false);
         this.addSubview(field);
         this.addSubview(&favorites);
+        this.addSubview(&hint);
 
         // The tabs, scrolling when there are more than fit.
         let scroll = NSScrollView::new(mtm);
@@ -879,8 +1015,57 @@ impl Sidebar {
                 .constraintEqualToAnchor(&document.topAnchor()),
             list.bottomAnchor()
                 .constraintEqualToAnchor(&document.bottomAnchor()),
+            hint.topAnchor()
+                .constraintEqualToAnchor_constant(&favorites.topAnchor(), -6.0),
+            hint.leadingAnchor()
+                .constraintEqualToAnchor_constant(&this.leadingAnchor(), SIDE - 4.0),
+            hint.trailingAnchor()
+                .constraintEqualToAnchor_constant(&this.trailingAnchor(), -(SIDE - 4.0)),
+            hint.bottomAnchor()
+                .constraintGreaterThanOrEqualToAnchor_constant(&favorites.bottomAnchor(), 6.0),
+            hint.heightAnchor()
+                .constraintGreaterThanOrEqualToConstant(HINT_HEIGHT),
         ]));
         this
+    }
+
+    /// A tab's row is being dragged: show where it can be dropped.
+    fn drag_began(&self) {
+        let hint = &self.ivars().hint;
+        hint.set_active(false);
+        hint.setHidden(false);
+    }
+
+    /// The dragged row is at `at`, in the window.
+    fn drag_moved(&self, at: NSPoint) {
+        let hint = &self.ivars().hint;
+        hint.set_active(self.over_hint(at));
+    }
+
+    /// The dragged row was let go at `at`, in the window: over the
+    /// favorites, `tab`'s page becomes one, through the tab's controller.
+    fn drag_ended(&self, at: NSPoint, tab: &NSWindow) {
+        let hint = &self.ivars().hint;
+        let over = self.over_hint(at);
+        hint.set_active(false);
+        hint.setHidden(true);
+        if !over {
+            return;
+        }
+        if let Some(delegate) = tab.delegate() {
+            let target: &AnyObject = (*delegate).as_ref();
+            send(self.mtm(), sel!(syndeoAddFavorite:), Some(target), None);
+        }
+    }
+
+    /// Whether `at`, in the window, is over the drop hint.
+    fn over_hint(&self, at: NSPoint) -> bool {
+        let point = self.convertPoint_fromView(at, None);
+        let frame = self.ivars().hint.frame();
+        point.x >= frame.origin.x
+            && point.x <= frame.origin.x + frame.size.width
+            && point.y >= frame.origin.y
+            && point.y <= frame.origin.y + frame.size.height
     }
 
     /// Answer a secondary click on a row with the application's menu for
@@ -948,10 +1133,16 @@ impl Sidebar {
                 rule.setTranslatesAutoresizingMaskIntoConstraints(false);
                 ivars.list.addArrangedSubview(&rule);
             }
-            let row = TabRow::new(mtm, width, Some(tab), menu_for.clone());
+            let row = TabRow::new(
+                mtm,
+                width,
+                Some(tab),
+                menu_for.clone(),
+                Some(Weak::from_retained(&self.retain())),
+            );
             ivars.list.addArrangedSubview(&row);
         }
-        let new_tab = TabRow::new(mtm, width, None, None);
+        let new_tab = TabRow::new(mtm, width, None, None, None);
         ivars.list.addArrangedSubview(&new_tab);
     }
 }
