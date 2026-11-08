@@ -36,6 +36,7 @@
 
 use crate::address::{self, Route, Search, Typed};
 use crate::chrome_macos::Ui;
+use crate::downloads_macos;
 use crate::favorites;
 use crate::sidebar_macos::{self, FavoriteInfo, FavoriteTile, TabInfo};
 use crate::tabs;
@@ -55,8 +56,9 @@ use objc2_foundation::{
     NSURLAuthenticationChallenge, NSURLRequest, NSURL,
 };
 use objc2_web_kit::{
-    WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
-    WKNavigationType, WKUIDelegate, WKWebView, WKWebViewConfiguration, WKWindowFeatures,
+    WKDownload, WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
+    WKNavigationResponse, WKNavigationResponsePolicy, WKNavigationType, WKUIDelegate, WKWebView,
+    WKWebViewConfiguration, WKWindowFeatures,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -250,6 +252,51 @@ define_class!(
     unsafe impl NSObjectProtocol for BrowserController {}
 
     unsafe impl WKNavigationDelegate for BrowserController {
+        /// A response a window can show is a page; one it cannot is a
+        /// download (`downloads_macos`). For the main frame, WebKit then
+        /// reports the page's loading as interrupted, which is not a
+        /// failure to show.
+        #[unsafe(method(webView:decidePolicyForNavigationResponse:decisionHandler:))]
+        fn decide_response_policy(
+            &self,
+            _webview: &WKWebView,
+            response: &WKNavigationResponse,
+            handler: &block2::DynBlock<dyn Fn(WKNavigationResponsePolicy)>,
+        ) {
+            let page = unsafe { response.canShowMIMEType() };
+            if !page {
+                if unsafe { response.isForMainFrame() } {
+                    self.ivars().refused.set(true);
+                }
+                tracing::info!("a response that is not a page: downloading it");
+            }
+            handler.call((if page {
+                WKNavigationResponsePolicy::Allow
+            } else {
+                WKNavigationResponsePolicy::Download
+            },));
+        }
+
+        #[unsafe(method(webView:navigationResponse:didBecomeDownload:))]
+        fn response_became_download(
+            &self,
+            _webview: &WKWebView,
+            _response: &WKNavigationResponse,
+            download: &WKDownload,
+        ) {
+            downloads_macos::adopt(self.mtm(), download);
+        }
+
+        #[unsafe(method(webView:navigationAction:didBecomeDownload:))]
+        fn action_became_download(
+            &self,
+            _webview: &WKWebView,
+            _action: &WKNavigationAction,
+            download: &WKDownload,
+        ) {
+            downloads_macos::adopt(self.mtm(), download);
+        }
+
         #[unsafe(method(webView:didReceiveAuthenticationChallenge:completionHandler:))]
         fn did_receive_challenge(
             &self,
@@ -306,6 +353,13 @@ define_class!(
                     handler.call((WKNavigationActionPolicy::Cancel,));
                     return;
                 }
+            }
+            // A link marked for downloading: a download, not a page.
+            if !zoned && unsafe { action.shouldPerformDownload() } {
+                self.ivars().refused.set(main_frame);
+                handler.call((WKNavigationActionPolicy::Download,));
+                tracing::info!("a link marked for downloading");
+                return;
             }
             let allowed = (!main_frame || address::allowed_in_main_frame(&scheme)) && !zoned;
             if !allowed && main_frame {
@@ -1404,7 +1458,8 @@ impl BrowserController {
         let why = if address::has_zone(&address) {
             address::ZONED.to_string()
         } else if error.domain().to_string() == "WebKitErrorDomain" && error.code() == INTERRUPTED {
-            "Syndeo opens web pages. It does not download files or open other kinds of address."
+            "Syndeo could not show this. It opens web pages, and downloads files it cannot \
+             show; this was neither."
                 .to_string()
         } else {
             error.localizedDescription().to_string()

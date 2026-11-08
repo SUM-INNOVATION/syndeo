@@ -622,6 +622,15 @@ define_class!(
             self.refresh_spaces();
         }
 
+        /// The downloads button, at the sidebar's foot: the downloads, in a
+        /// popover from it.
+        #[unsafe(method(syndeoShowDownloads:))]
+        fn show_downloads(&self, sender: Option<&AnyObject>) {
+            if let Some(view) = sender.and_then(|s| s.downcast_ref::<NSView>()) {
+                crate::downloads_macos::show(self.mtm(), view);
+            }
+        }
+
         /// Syndeo > Settings….
         #[unsafe(method(showSettings:))]
         fn show_settings(&self, _sender: Option<&AnyObject>) {

@@ -268,6 +268,8 @@ impl SpaceDot {
 
 pub struct BarIvars {
     dots: Retained<NSStackView>,
+    /// Downloads, at the left: tinted while anything downloads.
+    downloads: Retained<NSButton>,
 }
 
 define_class!(
@@ -285,9 +287,19 @@ impl SpaceBar {
         dots.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
         dots.setSpacing(DOT_GAP);
         dots.setTranslatesAutoresizingMaskIntoConstraints(false);
-        let this = Self::alloc(mtm).set_ivars(BarIvars { dots: dots.clone() });
+        let downloads = small_button(
+            mtm,
+            "arrow.down.circle",
+            "Downloads",
+            sel!(syndeoShowDownloads:),
+        );
+        let this = Self::alloc(mtm).set_ivars(BarIvars {
+            dots: dots.clone(),
+            downloads: downloads.clone(),
+        });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
+        this.addSubview(&downloads);
         this.addSubview(&dots);
 
         let new_space = small_button(mtm, "plus.circle", "New Space", sel!(syndeoNewSpace:));
@@ -306,8 +318,14 @@ impl SpaceBar {
 
         NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
             this.heightAnchor().constraintEqualToConstant(BAR_HEIGHT),
-            dots.leadingAnchor()
-                .constraintEqualToAnchor_constant(&this.leadingAnchor(), 4.0),
+            downloads
+                .leadingAnchor()
+                .constraintEqualToAnchor(&this.leadingAnchor()),
+            downloads
+                .centerYAnchor()
+                .constraintEqualToAnchor(&this.centerYAnchor()),
+            dots.centerXAnchor()
+                .constraintEqualToAnchor(&this.centerXAnchor()),
             dots.centerYAnchor()
                 .constraintEqualToAnchor(&this.centerYAnchor()),
             right
@@ -320,9 +338,24 @@ impl SpaceBar {
         this
     }
 
-    /// Show `layout`'s spaces, the current one ringed.
+    /// Show `layout`'s spaces, the current one ringed; and whether anything
+    /// is downloading, in the downloads button's tint.
     pub fn reload(&self, layout: &Layout) {
         let mtm = self.mtm();
+        let busy = crate::downloads_macos::receiving() > 0;
+        let downloads = &self.ivars().downloads;
+        let (symbol, tint) = if busy {
+            ("arrow.down.circle.fill", NSColor::controlAccentColor())
+        } else {
+            ("arrow.down.circle", NSColor::secondaryLabelColor())
+        };
+        if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str(symbol),
+            Some(ns_string!("Downloads")),
+        ) {
+            downloads.setImage(Some(&image));
+        }
+        downloads.setContentTintColor(Some(&tint));
         let dots = &self.ivars().dots;
         for view in dots.arrangedSubviews().iter() {
             dots.removeArrangedSubview(&view);

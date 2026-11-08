@@ -22,6 +22,8 @@ mod command_bar_macos;
 #[cfg(target_os = "macos")]
 mod control_macos;
 #[cfg(target_os = "macos")]
+mod downloads_macos;
+#[cfg(target_os = "macos")]
 mod peer_macos;
 #[cfg(target_os = "macos")]
 mod settings_macos;
@@ -39,6 +41,8 @@ mod agent;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod agent_client;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod downloads;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod favorites;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
