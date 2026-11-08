@@ -575,6 +575,12 @@ impl Ui {
         self.shade.setHidden(!shaded);
     }
 
+    /// Where the page's card is, on screen: what the command bar centres on.
+    pub fn page_rect_on_screen(&self, window: &NSWindow) -> NSRect {
+        let in_window = self.card.convertRect_toView(self.card.bounds(), None);
+        window.convertRectToScreen(in_window)
+    }
+
     /// Hide the sidebar, giving the page its width but for a strip along
     /// the top with Show Sidebar in it, beside the traffic lights; or show
     /// it again. Hidden, it comes back over the page while the pointer is

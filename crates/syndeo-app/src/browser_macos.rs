@@ -904,6 +904,13 @@ pub fn refresh_sidebars(window: &NSWindow) {
     }
 }
 
+/// Where `window`'s page is, on screen, if it is a browser's.
+pub fn page_rect_on_screen(window: &NSWindow) -> Option<NSRect> {
+    let controller = controller_of(window)?;
+    let ui = controller.ivars().ui.borrow();
+    ui.as_ref().map(|ui| ui.page_rect_on_screen(window))
+}
+
 /// Glass over `window`'s page while the command bar shows, or not.
 pub fn set_shaded(window: &NSWindow, shaded: bool) {
     if let Some(controller) = controller_of(window) {

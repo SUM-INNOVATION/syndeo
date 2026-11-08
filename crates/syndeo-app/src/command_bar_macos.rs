@@ -39,14 +39,14 @@ use objc2_foundation::{ns_string, NSNotification, NSPoint, NSRect, NSSize, NSStr
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-/// The bar: its width at most, its margin from the window's sides when the
-/// window is narrower, the field's height, and its corner radius. It sits a
-/// little above the window's middle, where the eye rests.
+/// The bar: its width at most, its margin from the page's sides when the
+/// page is narrower, the field's height, and its corner radius. It sits in
+/// the middle of the page.
 const WIDTH: f64 = 640.0;
 const MARGIN: f64 = 40.0;
 const HEIGHT: f64 = 72.0;
 const RADIUS: f64 = 18.0;
-const ABOVE_MIDDLE: f64 = 60.0;
+const ABOVE_MIDDLE: f64 = 0.0;
 
 /// Inside: the field's inset, the symbol's size and the gap after it.
 const INSET: f64 = 22.0;
@@ -433,7 +433,8 @@ impl CommandBar {
         app: &AnyObject,
         suggest: Suggest,
     ) -> Retained<Self> {
-        let frame = over.frame();
+        // Centred on the page, not the window: the sidebar is beside it.
+        let frame = crate::browser_macos::page_rect_on_screen(over).unwrap_or_else(|| over.frame());
         let width = WIDTH.min(frame.size.width - 2.0 * MARGIN).max(240.0);
         let left = frame.origin.x + (frame.size.width - width) / 2.0;
         let top = frame.origin.y + (frame.size.height + HEIGHT) / 2.0 + ABOVE_MIDDLE;
