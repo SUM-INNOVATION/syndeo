@@ -81,7 +81,10 @@ const PANEL_TOP: f64 = 0.0;
 const PANEL_RADIUS: f64 = 12.0;
 /// How far the sidebar's content moves in from its edges while it floats,
 /// so that it sits inside the panel as it sits inside the window otherwise.
-const FLOATING_INSET: f64 = PANEL_MARGIN + 4.0;
+pub const FLOATING_INSET: f64 = PANEL_MARGIN + 4.0;
+/// And how far it moves down, so the traffic lights and buttons are not
+/// in the panel's very corner.
+pub const FLOATING_TOP: f64 = 8.0;
 
 /// The edge of the window that brings a hidden sidebar back.
 pub const EDGE: f64 = 6.0;
@@ -1044,8 +1047,8 @@ pub struct SidebarIvars {
     /// Where the buttons across the top sit: lined up with the window's
     /// traffic lights (`align_nav`).
     nav_top: RefCell<Option<Retained<NSLayoutConstraint>>>,
-    /// The content's distance from the sidebar's left, right and bottom:
-    /// nothing beside the page, the panel's margin while floating.
+    /// The content's distance from the sidebar's left, right, bottom and
+    /// top: nothing beside the page, the panel's margins while floating.
     insets: RefCell<Vec<Retained<NSLayoutConstraint>>>,
 }
 
@@ -1192,14 +1195,20 @@ impl Sidebar {
         let bottom = content
             .bottomAnchor()
             .constraintEqualToAnchor(&this.bottomAnchor());
-        *this.ivars().insets.borrow_mut() = vec![leading.clone(), trailing.clone(), bottom.clone()];
+        let top = content
+            .topAnchor()
+            .constraintEqualToAnchor(&this.topAnchor());
+        *this.ivars().insets.borrow_mut() = vec![
+            leading.clone(),
+            trailing.clone(),
+            bottom.clone(),
+            top.clone(),
+        ];
         NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
             leading,
             trailing,
             bottom,
-            content
-                .topAnchor()
-                .constraintEqualToAnchor(&this.topAnchor()),
+            top,
             this.nav_top_constraint(&row, NAV_TOP),
             row.trailingAnchor()
                 .constraintEqualToAnchor_constant(&content.trailingAnchor(), -SIDE),
@@ -1380,10 +1389,11 @@ impl Sidebar {
         self.ivars().floating.set(floating);
         let inset = if floating { FLOATING_INSET } else { 0.0 };
         let bottom = if floating { PANEL_MARGIN } else { 0.0 };
-        if let [leading, trailing, below] = &self.ivars().insets.borrow()[..] {
+        if let [leading, trailing, below, above] = &self.ivars().insets.borrow()[..] {
             leading.setConstant(inset);
             trailing.setConstant(-inset);
             below.setConstant(-bottom);
+            above.setConstant(if floating { FLOATING_TOP } else { 0.0 });
         }
         // A shadow under the panel, while it floats over the page.
         let layer: *mut AnyObject = unsafe { msg_send![self, layer] };

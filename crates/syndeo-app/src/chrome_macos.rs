@@ -413,6 +413,9 @@ pub struct Ui {
     hidden: Cell<bool>,
     /// The window, whose traffic lights come and go with the sidebar.
     window: RefCell<Option<Weak<NSWindow>>>,
+    /// Where the traffic lights sit by default, to move them into the panel
+    /// while the sidebar floats and back again.
+    lights: RefCell<Vec<(NSWindowButton, NSPoint)>>,
     /// The window's left edge, which brings a hidden sidebar back over the
     /// page while the pointer is there.
     edge: Retained<EdgeSensor>,
@@ -518,6 +521,14 @@ impl Ui {
         let lights_center = traffic_lights(window).unwrap_or(22.0);
         self.sidebar.align_nav(lights_center);
         *self.window.borrow_mut() = Some(Weak::from_retained(&window.retain()));
+        *self.lights.borrow_mut() = LIGHTS
+            .iter()
+            .filter_map(|which| {
+                window
+                    .standardWindowButton(*which)
+                    .map(|button| (*which, button.frame().origin))
+            })
+            .collect();
         let edge: &NSView = &self.edge;
         let shade: &NSView = &self.shade;
         let top = card
@@ -615,6 +626,7 @@ impl Ui {
         sidebar.setHidden(false);
         self.edge.setHidden(true);
         self.set_lights(true);
+        self.offset_lights(sidebar_macos::FLOATING_INSET, sidebar_macos::FLOATING_TOP);
     }
 
     /// The pointer left a peeking sidebar: put it away again.
@@ -630,6 +642,7 @@ impl Ui {
         let sidebar: &NSView = &self.sidebar;
         sidebar.setHidden(true);
         self.edge.setHidden(false);
+        self.offset_lights(0.0, 0.0);
         self.set_lights(false);
     }
 
@@ -639,17 +652,33 @@ impl Ui {
         let Some(window) = self.window.borrow().as_ref().and_then(Weak::load) else {
             return;
         };
-        for which in [
-            NSWindowButton::CloseButton,
-            NSWindowButton::MiniaturizeButton,
-            NSWindowButton::ZoomButton,
-        ] {
+        for which in LIGHTS {
             if let Some(button) = window.standardWindowButton(which) {
                 button.setHidden(!shown);
             }
         }
     }
+
+    /// The traffic lights moved `right` and `down` from where macOS puts
+    /// them: into the floating panel, out of its corner; nothing for back.
+    fn offset_lights(&self, right: f64, down: f64) {
+        let Some(window) = self.window.borrow().as_ref().and_then(Weak::load) else {
+            return;
+        };
+        for (which, origin) in self.lights.borrow().iter() {
+            if let Some(button) = window.standardWindowButton(*which) {
+                button.setFrameOrigin(NSPoint::new(origin.x + right, origin.y - down));
+            }
+        }
+    }
 }
+
+/// The traffic lights, in order.
+const LIGHTS: [NSWindowButton; 3] = [
+    NSWindowButton::CloseButton,
+    NSWindowButton::MiniaturizeButton,
+    NSWindowButton::ZoomButton,
+];
 
 /// Where `window`'s traffic lights are: the centre of the close button
 /// below the window's top.
@@ -747,15 +776,18 @@ pub fn browser_content(
         address.setTarget(Some(target));
         address.setAction(Some(sel!(navigateTo:)));
     }
-    let height = address.fittingSize().height.max(32.0);
+    // The field is as tall as its bezel wants; its holder a little taller,
+    // with the field centred in it.
+    let fitting = address.fittingSize().height;
+    let height = fitting.max(32.0);
     let width = sidebar_macos::WIDTH - 2.0 * sidebar_macos::SIDE;
     let field = NSView::initWithFrame(
         NSView::alloc(mtm),
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
     );
     address.setFrame(NSRect::new(
-        NSPoint::new(0.0, 0.0),
-        NSSize::new(width, height),
+        NSPoint::new(0.0, ((height - fitting) / 2.0).floor()),
+        NSSize::new(width, fitting),
     ));
     address.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
 
@@ -864,6 +896,7 @@ pub fn browser_content(
         card_top: RefCell::new(None),
         hidden: Cell::new(false),
         window: RefCell::new(None),
+        lights: RefCell::new(Vec::new()),
         edge,
         peeking: Cell::new(false),
         following: RefCell::new(None),
