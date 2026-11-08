@@ -60,6 +60,11 @@ const ROUTE_PAD: f64 = 6.0;
 const CARD_MARGIN: f64 = 8.0;
 const CARD_RADIUS: f64 = 12.0;
 
+/// With the sidebar hidden: the strip kept along the top for Show Sidebar,
+/// and where that button sits, clear of the traffic lights.
+const SHOW_STRIP: f64 = 44.0;
+const SHOW_X: f64 = 84.0;
+
 /// The loading progress: its thickness, and how often it follows the page.
 const PROGRESS: f64 = 2.0;
 const PROGRESS_EVERY: f64 = 1.0 / 30.0;
@@ -417,6 +422,10 @@ pub struct Ui {
     /// card's distance from it.
     sidebar_width: RefCell<Option<Retained<NSLayoutConstraint>>>,
     card_leading: RefCell<Option<Retained<NSLayoutConstraint>>>,
+    card_top: RefCell<Option<Retained<NSLayoutConstraint>>>,
+    /// Show Sidebar: beside the traffic lights while the sidebar is hidden,
+    /// and gone while it shows.
+    show: Retained<NSButton>,
     /// Following the page's loading progress, while it loads.
     following: RefCell<Option<Retained<NSTimer>>>,
 }
@@ -507,6 +516,10 @@ impl Ui {
         let leading = card
             .leadingAnchor()
             .constraintEqualToAnchor_constant(&sidebar.trailingAnchor(), 0.0);
+        let top = card
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&content.topAnchor(), CARD_MARGIN);
+        let show: &NSView = &self.show;
         NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
             sidebar
                 .topAnchor()
@@ -518,8 +531,11 @@ impl Ui {
                 .leadingAnchor()
                 .constraintEqualToAnchor(&content.leadingAnchor()),
             width.clone(),
-            card.topAnchor()
-                .constraintEqualToAnchor_constant(&content.topAnchor(), CARD_MARGIN),
+            top.clone(),
+            show.leadingAnchor()
+                .constraintEqualToAnchor_constant(&content.leadingAnchor(), SHOW_X),
+            show.topAnchor()
+                .constraintEqualToAnchor_constant(&content.topAnchor(), 8.0),
             card.bottomAnchor()
                 .constraintEqualToAnchor_constant(&content.bottomAnchor(), -CARD_MARGIN),
             leading.clone(),
@@ -528,19 +544,30 @@ impl Ui {
         ]));
         *self.sidebar_width.borrow_mut() = Some(width);
         *self.card_leading.borrow_mut() = Some(leading);
+        *self.card_top.borrow_mut() = Some(top);
     }
 
-    /// Hide the sidebar, giving the page its width, or show it again.
+    /// Hide the sidebar, giving the page its width but for a strip along
+    /// the top with Show Sidebar in it, beside the traffic lights; or show
+    /// it again.
     pub fn toggle_sidebar(&self) {
-        let (width, leading) = (self.sidebar_width.borrow(), self.card_leading.borrow());
-        let (Some(width), Some(leading)) = (width.as_ref(), leading.as_ref()) else {
+        let (width, leading, top) = (
+            self.sidebar_width.borrow(),
+            self.card_leading.borrow(),
+            self.card_top.borrow(),
+        );
+        let (Some(width), Some(leading), Some(top)) =
+            (width.as_ref(), leading.as_ref(), top.as_ref())
+        else {
             return;
         };
         let hide = width.constant() > 0.0;
         width.setConstant(if hide { 0.0 } else { sidebar_macos::WIDTH });
         leading.setConstant(if hide { CARD_MARGIN } else { 0.0 });
+        top.setConstant(if hide { SHOW_STRIP } else { CARD_MARGIN });
         let sidebar: &NSView = &self.sidebar;
         sidebar.setHidden(hide);
+        self.show.setHidden(!hide);
     }
 }
 
@@ -599,6 +626,14 @@ pub fn browser_content(
         target,
         sel!(syndeoToggleSidebar:),
     );
+    let show = nav_button(
+        mtm,
+        "sidebar.left",
+        "Show Sidebar",
+        target,
+        sel!(syndeoToggleSidebar:),
+    );
+    show.setHidden(true);
     let back = nav_button(mtm, "chevron.left", "Back", target, sel!(syndeoBack:));
     let forward = nav_button(
         mtm,
@@ -712,6 +747,7 @@ pub fn browser_content(
     card.addSubview(webview);
     container.addSubview(&sidebar);
     container.addSubview(&card);
+    container.addSubview(&show);
 
     let ui = Ui {
         address,
@@ -726,6 +762,8 @@ pub fn browser_content(
         sidebar,
         sidebar_width: RefCell::new(None),
         card_leading: RefCell::new(None),
+        card_top: RefCell::new(None),
+        show,
         following: RefCell::new(None),
     };
     ui.show_route(None);

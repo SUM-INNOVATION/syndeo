@@ -294,6 +294,27 @@ pub fn place(beside: &NSWindow, window: &NSWindow, index: usize) {
 /// windows, so this is asked after every placing, and when a tab comes to
 /// the front.
 pub fn hide_tab_bar(window: &NSWindow) {
+    hide_tab_bar_now(window);
+    // AppKit shows the bar a moment after the group grows, not within the
+    // call that grew it: so look again, twice, a little later.
+    let weak = Weak::from_retained(&window.retain());
+    for delay in [0.0, 0.3] {
+        let weak = weak.clone();
+        let tick = block2::RcBlock::new(move |_timer: NonNull<objc2_foundation::NSTimer>| {
+            if let Some(window) = weak.load() {
+                hide_tab_bar_now(&window);
+            }
+        });
+        unsafe {
+            objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_repeats_block(
+                delay, false, &tick,
+            )
+        };
+    }
+}
+
+/// `hide_tab_bar`, now only: if the bar is showing, hide it.
+pub fn hide_tab_bar_now(window: &NSWindow) {
     if window
         .tabGroup()
         .is_some_and(|group| group.isTabBarVisible())

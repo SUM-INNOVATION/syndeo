@@ -645,6 +645,7 @@ pub fn controller_of(window: &NSWindow) -> Option<Retained<BrowserController>> {
 /// Show every sidebar in `window`'s tab group the group's tabs as they are
 /// now: titles, icons, which are pinned or loading, and which is in front.
 pub fn refresh_sidebars(window: &NSWindow) {
+    tabs_macos::hide_tab_bar_now(window);
     let windows = tabs_macos::tabs_of(window);
     let front = window.tabGroup().and_then(|group| group.selectedWindow());
     let tabs: Vec<TabInfo> = windows
