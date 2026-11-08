@@ -313,13 +313,22 @@ pub fn hide_tab_bar(window: &NSWindow) {
     }
 }
 
-/// `hide_tab_bar`, now only: if the bar is showing, hide it.
+/// `hide_tab_bar`, now only. AppKit's `toggleTabBar:` was seen to leave
+/// the bar as it was (`isTabBarVisible` true before and after), so the bar
+/// is hidden as what it is: the title bar accessory whose view holds
+/// AppKit's tab bar. The application's own accessory, an agent's banner
+/// (`control_macos`), holds no such thing and is left alone.
 pub fn hide_tab_bar_now(window: &NSWindow) {
-    if window
-        .tabGroup()
-        .is_some_and(|group| group.isTabBarVisible())
-    {
-        window.toggleTabBar(None);
+    for accessory in window.titlebarAccessoryViewControllers().iter() {
+        let view = accessory.view();
+        let is_tab_bar = view
+            .subviews()
+            .iter()
+            .any(|part| part.class().name().to_string_lossy().contains("TabBar"));
+        if is_tab_bar && !accessory.isHidden() {
+            accessory.setHidden(true);
+            tracing::info!("AppKit's tab bar hidden; the sidebar shows the tabs");
+        }
     }
 }
 
