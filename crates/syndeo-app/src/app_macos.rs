@@ -1109,6 +1109,12 @@ impl AppDelegate {
                 Some(to_tab),
             ),
             tabs_macos::item(mtm, pin, sel!(syndeoTogglePin:), Some(to_tab)),
+            tabs_macos::item(
+                mtm,
+                "Add to Favorites",
+                sel!(syndeoToggleFavorite:),
+                Some(to_tab),
+            ),
             NSMenuItem::separatorItem(mtm),
             tabs_macos::item(mtm, "Close Tab", sel!(syndeoCloseTab:), Some(to_tab)),
             tabs_macos::item(

@@ -36,7 +36,8 @@
 
 use crate::address::{self, Route, Search, Typed};
 use crate::chrome_macos::Ui;
-use crate::sidebar_macos::TabInfo;
+use crate::favorites;
+use crate::sidebar_macos::{self, FavoriteInfo, FavoriteTile, TabInfo};
 use crate::tabs;
 use crate::tabs_macos::{self, Badge};
 use objc2::rc::{Retained, Weak};
@@ -525,6 +526,91 @@ define_class!(
             }
         }
 
+        /// The pointer at the window's left edge, the sidebar hidden.
+        #[unsafe(method(syndeoPeekSidebar:))]
+        fn peek_sidebar(&self, _sender: Option<&AnyObject>) {
+            if let Some(ui) = &*self.ivars().ui.borrow() {
+                ui.peek_sidebar();
+            }
+        }
+
+        /// The pointer left the peeking sidebar.
+        #[unsafe(method(syndeoUnpeekSidebar:))]
+        fn unpeek_sidebar(&self, _sender: Option<&AnyObject>) {
+            if let Some(ui) = &*self.ivars().ui.borrow() {
+                ui.unpeek_sidebar();
+            }
+        }
+
+        /// Copy Link, in the address field: the page's address, to the
+        /// clipboard; nothing for a page without one.
+        #[unsafe(method(syndeoCopyAddress:))]
+        fn copy_address(&self, _sender: Option<&AnyObject>) {
+            let address = self.ivars().shown.borrow().clone();
+            if address.is_empty() {
+                return;
+            }
+            let pasteboard = objc2_app_kit::NSPasteboard::generalPasteboard();
+            pasteboard.clearContents();
+            pasteboard.setString_forType(&NSString::from_str(&address), unsafe {
+                objc2_app_kit::NSPasteboardTypeString
+            });
+            tracing::info!("the page's address copied");
+        }
+
+        /// A favorite's tile: its page, in this tab.
+        #[unsafe(method(syndeoOpenFavorite:))]
+        fn open_favorite(&self, sender: Option<&AnyObject>) {
+            if let Some(tile) = sender.and_then(|s| s.downcast_ref::<FavoriteTile>()) {
+                self.go(&tile.address());
+            }
+        }
+
+        /// A favorite's menu > Remove from Favorites: the item stands for
+        /// the tile.
+        #[unsafe(method(syndeoRemoveFavorite:))]
+        fn remove_favorite(&self, sender: Option<&AnyObject>) {
+            let tile = sender
+                .and_then(|s| s.downcast_ref::<NSMenuItem>())
+                .and_then(|item| item.representedObject());
+            let Some(address) = tile
+                .as_deref()
+                .and_then(|t| t.downcast_ref::<FavoriteTile>())
+                .map(FavoriteTile::address)
+            else {
+                return;
+            };
+            let mut kept = sidebar_macos::favorites_read();
+            if favorites::remove(&mut kept, &address) {
+                sidebar_macos::favorites_write(&kept);
+                tracing::info!("a favorite removed");
+            }
+            if let Some(window) = self.window() {
+                refresh_sidebars(&window);
+            }
+        }
+
+        /// A tab's menu > Add to Favorites, or Remove from Favorites: this
+        /// tab's page.
+        #[unsafe(method(syndeoToggleFavorite:))]
+        fn toggle_favorite(&self, _sender: Option<&AnyObject>) {
+            let address = self.ivars().shown.borrow().clone();
+            let title = self.window().map(|w| w.title().to_string()).unwrap_or_default();
+            let mut kept = sidebar_macos::favorites_read();
+            let changed = if kept.iter().any(|f| f.address == address) {
+                favorites::remove(&mut kept, &address)
+            } else {
+                tabs::savable(&address) && favorites::add(&mut kept, &address, &title)
+            };
+            if changed {
+                sidebar_macos::favorites_write(&kept);
+                tracing::info!(favorites = kept.len(), "the favorites changed");
+            }
+            if let Some(window) = self.window() {
+                refresh_sidebars(&window);
+            }
+        }
+
         /// The address field's action: Return.
         #[unsafe(method(navigateTo:))]
         fn navigate_to(&self, _sender: Option<&AnyObject>) {
@@ -662,9 +748,11 @@ pub fn refresh_sidebars(window: &NSWindow) {
                 .borrow()
                 .as_ref()
                 .and_then(|badge| badge.icon());
+            let address = controller.ivars().shown.borrow().clone();
             Some(TabInfo {
                 window: w.clone(),
                 title: w.title().to_string(),
+                address,
                 icon,
                 pinned: controller.ivars().pinned.get(),
                 loading: controller.ivars().loading.get(),
@@ -672,10 +760,23 @@ pub fn refresh_sidebars(window: &NSWindow) {
             })
         })
         .collect();
+    // A favorite's icon: an open tab of its site has one, or it has none.
+    let favorites: Vec<FavoriteInfo> = sidebar_macos::favorites_read()
+        .into_iter()
+        .map(|favorite| {
+            let host = favorites::host(&favorite.address);
+            let icon = host.and_then(|host| {
+                tabs.iter()
+                    .find(|t| favorites::host(&t.address).as_deref() == Some(host.as_str()))
+                    .and_then(|t| t.icon.clone())
+            });
+            FavoriteInfo { favorite, icon }
+        })
+        .collect();
     for w in &windows {
         if let Some(controller) = controller_of(w) {
             if let Some(ui) = &*controller.ivars().ui.borrow() {
-                ui.sidebar.reload(&tabs);
+                ui.sidebar.reload(&tabs, &favorites);
             }
         }
     }
@@ -1025,6 +1126,19 @@ impl BrowserController {
                 "Pin Tab"
             };
             item.setTitle(&NSString::from_str(title));
+        }
+        if action == Some(sel!(syndeoToggleFavorite:)) {
+            let address = self.ivars().shown.borrow().clone();
+            let kept = sidebar_macos::favorites_read()
+                .iter()
+                .any(|f| f.address == address);
+            let title = if kept {
+                "Remove from Favorites"
+            } else {
+                "Add to Favorites"
+            };
+            item.setTitle(&NSString::from_str(title));
+            return kept || (tabs::savable(&address) && !self.ivars().web.borrow().is_none());
         }
         if action == Some(sel!(syndeoSelectTab:)) {
             let count = self

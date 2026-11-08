@@ -27,15 +27,13 @@
 //! than macOS 13.
 
 use crate::address::Route;
-use crate::sidebar_macos::{self, Sidebar};
+use crate::sidebar_macos::{self, EdgeSensor, Sidebar};
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject, Sel};
-use objc2::{
-    define_class, msg_send, sel, AnyThread, DeclaredClass, MainThreadMarker, MainThreadOnly,
-};
+use objc2::{define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAccessibility, NSAutoresizingMaskOptions, NSBezierPath, NSButton, NSColor, NSControlSize,
-    NSFont, NSFontWeightMedium, NSFontWeightSemibold, NSGradient, NSImage, NSImageScaling,
+    NSFont, NSFontWeightMedium, NSFontWeightSemibold, NSImage, NSImageScaling,
     NSImageSymbolConfiguration, NSImageView, NSLayoutConstraint, NSLineBreakMode, NSTextField,
     NSTextFieldBezelStyle, NSTextFieldCell, NSTextFieldDelegate, NSView, NSWindow,
     NSWindowStyleMask, NSWindowTitleVisibility,
@@ -44,10 +42,11 @@ use objc2_foundation::{ns_string, NSArray, NSNumber, NSPoint, NSRect, NSSize, NS
 use objc2_web_kit::WKWebView;
 use std::cell::{Cell, RefCell};
 
-/// Inside the address field: the margin at either end, Reload's size, and
-/// the gap between the route and Reload, and between the text and the route.
+/// Inside the address field: the margin at either end, the size of Copy
+/// Link at its trailing end, and the gap between the route and Copy Link,
+/// and between the text and the route.
 const INSET: f64 = 6.0;
-const RELOAD: f64 = 22.0;
+const END_BUTTON: f64 = 22.0;
 const GAP: f64 = 4.0;
 
 /// The route's height, and the size of its symbol and its words.
@@ -84,17 +83,7 @@ define_class!(
     impl Backdrop {
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
-            let dark = sidebar_macos::is_dark(self);
-            let (from, to) = if dark {
-                (rgb(0.165, 0.145, 0.235), rgb(0.235, 0.165, 0.215))
-            } else {
-                (rgb(0.851, 0.831, 0.969), rgb(0.969, 0.851, 0.890))
-            };
-            if let Some(gradient) =
-                NSGradient::initWithStartingColor_endingColor(NSGradient::alloc(), &from, &to)
-            {
-                gradient.drawInRect_angle(self.bounds(), -35.0);
-            }
+            sidebar_macos::fill_gradient(self, self.bounds(), None);
         }
 
         #[unsafe(method(isOpaque))]
@@ -108,11 +97,6 @@ impl Backdrop {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
         unsafe { msg_send![Self::alloc(mtm), initWithFrame: frame] }
     }
-}
-
-/// An sRGB colour, opaque.
-fn rgb(r: f64, g: f64, b: f64) -> Retained<NSColor> {
-    NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0)
 }
 
 /// Round `view`'s corners, clipping what is inside it to them, with the
@@ -392,7 +376,7 @@ define_class!(
 impl AddressCell {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(CellIvars {
-            trailing: Cell::new(RELOAD + INSET),
+            trailing: Cell::new(END_BUTTON + INSET),
         });
         unsafe { msg_send![super(this), initTextCell: ns_string!("")] }
     }
@@ -412,8 +396,10 @@ pub struct Ui {
     route: Retained<RouteBadge>,
     progress: Retained<ProgressLine>,
     cell: Retained<AddressCell>,
-    /// What holds the address field, its route, Reload and progress.
+    /// What holds the address field, its route, Copy Link and progress.
     field: Retained<NSView>,
+    /// Copy Link, inside the address field.
+    copy: Retained<NSButton>,
     /// The page's card: the web view, inset and with rounded corners.
     card: Retained<NSView>,
     /// The sidebar, with the tabs, Back and Forward and the field in it.
@@ -423,9 +409,15 @@ pub struct Ui {
     sidebar_width: RefCell<Option<Retained<NSLayoutConstraint>>>,
     card_leading: RefCell<Option<Retained<NSLayoutConstraint>>>,
     card_top: RefCell<Option<Retained<NSLayoutConstraint>>>,
+    sidebar_top: RefCell<Option<Retained<NSLayoutConstraint>>>,
     /// Show Sidebar: beside the traffic lights while the sidebar is hidden,
     /// and gone while it shows.
     show: Retained<NSButton>,
+    /// The window's left edge, which brings a hidden sidebar back over the
+    /// page while the pointer is there.
+    edge: Retained<EdgeSensor>,
+    /// The sidebar is hidden, and peeking over the page.
+    peeking: Cell<bool>,
     /// Following the page's loading progress, while it loads.
     following: RefCell<Option<Retained<NSTimer>>>,
 }
@@ -434,10 +426,12 @@ impl Ui {
     /// Say in the address field how the page on screen was reached, or
     /// nothing for one of Syndeo's own pages.
     pub fn show_route(&self, route: Option<Route>) {
+        // Copy Link has something to copy only for a page with an address.
+        self.copy.setEnabled(route.is_some());
         let width = self.route.show(route);
         let field = self.field.bounds().size;
-        let reload_x = field.width - INSET - RELOAD;
-        let mut trailing = RELOAD + INSET + GAP;
+        let reload_x = field.width - INSET - END_BUTTON;
+        let mut trailing = END_BUTTON + INSET + GAP;
         if width > 0.0 {
             self.route.setFrameOrigin(NSPoint::new(
                 reload_x - GAP - width,
@@ -515,15 +509,17 @@ impl Ui {
             .constraintEqualToConstant(sidebar_macos::WIDTH);
         let leading = card
             .leadingAnchor()
-            .constraintEqualToAnchor_constant(&sidebar.trailingAnchor(), 0.0);
+            .constraintEqualToAnchor_constant(&content.leadingAnchor(), sidebar_macos::WIDTH);
+        let sidebar_top = sidebar
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&content.topAnchor(), 0.0);
+        let edge: &NSView = &self.edge;
         let top = card
             .topAnchor()
             .constraintEqualToAnchor_constant(&content.topAnchor(), CARD_MARGIN);
         let show: &NSView = &self.show;
         NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-            sidebar
-                .topAnchor()
-                .constraintEqualToAnchor(&content.topAnchor()),
+            sidebar_top.clone(),
             sidebar
                 .bottomAnchor()
                 .constraintEqualToAnchor(&content.bottomAnchor()),
@@ -541,15 +537,25 @@ impl Ui {
             leading.clone(),
             card.trailingAnchor()
                 .constraintEqualToAnchor_constant(&content.trailingAnchor(), -CARD_MARGIN),
+            edge.leadingAnchor()
+                .constraintEqualToAnchor(&content.leadingAnchor()),
+            edge.topAnchor()
+                .constraintEqualToAnchor_constant(&content.topAnchor(), SHOW_STRIP),
+            edge.bottomAnchor()
+                .constraintEqualToAnchor(&content.bottomAnchor()),
+            edge.widthAnchor()
+                .constraintEqualToConstant(sidebar_macos::EDGE),
         ]));
         *self.sidebar_width.borrow_mut() = Some(width);
+        *self.sidebar_top.borrow_mut() = Some(sidebar_top);
         *self.card_leading.borrow_mut() = Some(leading);
         *self.card_top.borrow_mut() = Some(top);
     }
 
     /// Hide the sidebar, giving the page its width but for a strip along
     /// the top with Show Sidebar in it, beside the traffic lights; or show
-    /// it again.
+    /// it again. Hidden, it comes back over the page while the pointer is
+    /// at the window's left edge (`peek_sidebar`).
     pub fn toggle_sidebar(&self) {
         let (width, leading, top) = (
             self.sidebar_width.borrow(),
@@ -561,13 +567,58 @@ impl Ui {
         else {
             return;
         };
-        let hide = width.constant() > 0.0;
+        let hide = self.show.isHidden();
+        if self.peeking.get() {
+            self.unpeek_sidebar();
+        }
         width.setConstant(if hide { 0.0 } else { sidebar_macos::WIDTH });
-        leading.setConstant(if hide { CARD_MARGIN } else { 0.0 });
+        leading.setConstant(if hide {
+            CARD_MARGIN
+        } else {
+            sidebar_macos::WIDTH
+        });
         top.setConstant(if hide { SHOW_STRIP } else { CARD_MARGIN });
         let sidebar: &NSView = &self.sidebar;
         sidebar.setHidden(hide);
         self.show.setHidden(!hide);
+        self.edge.setHidden(!hide);
+    }
+
+    /// The pointer is at the window's left edge with the sidebar hidden:
+    /// show it over the page, as a floating panel below the top strip.
+    pub fn peek_sidebar(&self) {
+        if self.show.isHidden() || self.peeking.get() {
+            return;
+        }
+        let (width, top) = (self.sidebar_width.borrow(), self.sidebar_top.borrow());
+        let (Some(width), Some(top)) = (width.as_ref(), top.as_ref()) else {
+            return;
+        };
+        self.peeking.set(true);
+        self.sidebar.set_floating(true);
+        top.setConstant(SHOW_STRIP - sidebar_macos::NAV_TOP);
+        width.setConstant(sidebar_macos::WIDTH);
+        let sidebar: &NSView = &self.sidebar;
+        sidebar.setHidden(false);
+        self.edge.setHidden(true);
+    }
+
+    /// The pointer left a peeking sidebar: put it away again.
+    pub fn unpeek_sidebar(&self) {
+        if !self.peeking.get() {
+            return;
+        }
+        let (width, top) = (self.sidebar_width.borrow(), self.sidebar_top.borrow());
+        let (Some(width), Some(top)) = (width.as_ref(), top.as_ref()) else {
+            return;
+        };
+        self.peeking.set(false);
+        self.sidebar.set_floating(false);
+        top.setConstant(0.0);
+        width.setConstant(0.0);
+        let sidebar: &NSView = &self.sidebar;
+        sidebar.setHidden(true);
+        self.edge.setHidden(false);
     }
 }
 
@@ -678,28 +729,38 @@ pub fn browser_content(
     ));
     address.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
 
-    let reload_symbol = symbol_image("arrow.clockwise", "Reload").unwrap_or_default();
-    let reload = unsafe {
+    let reload = nav_button(
+        mtm,
+        "arrow.clockwise",
+        "Reload",
+        target,
+        sel!(syndeoReloadOrStop:),
+    );
+
+    // Copy Link, at the field's trailing end: the page's address, to the
+    // clipboard.
+    let copy_symbol = symbol_image("link", "Copy Link").unwrap_or_default();
+    let copy = unsafe {
         NSButton::buttonWithImage_target_action(
-            &reload_symbol,
+            &copy_symbol,
             Some(target),
-            Some(sel!(syndeoReloadOrStop:)),
+            Some(sel!(syndeoCopyAddress:)),
             mtm,
         )
     };
-    reload.setBordered(false);
-    reload.setSymbolConfiguration(Some(
+    copy.setBordered(false);
+    copy.setSymbolConfiguration(Some(
         &NSImageSymbolConfiguration::configurationWithPointSize_weight(12.0, unsafe {
             NSFontWeightSemibold
         }),
     ));
-    reload.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
-    reload.setToolTip(Some(ns_string!("Reload")));
-    reload.setFrame(NSRect::new(
-        NSPoint::new(width - INSET - RELOAD, (height - RELOAD) / 2.0),
-        NSSize::new(RELOAD, RELOAD),
+    copy.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+    copy.setToolTip(Some(ns_string!("Copy Link")));
+    copy.setFrame(NSRect::new(
+        NSPoint::new(width - INSET - END_BUTTON, (height - END_BUTTON) / 2.0),
+        NSSize::new(END_BUTTON, END_BUTTON),
     ));
-    reload.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
+    copy.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
 
     let route = RouteBadge::new(mtm);
     route.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinXMargin);
@@ -720,11 +781,12 @@ pub fn browser_content(
         (&*back as &NSView, "syndeo.back"),
         (&*forward, "syndeo.forward"),
         (&*reload, "syndeo.reload"),
+        (&*copy, "syndeo.copy"),
         (&*address, "syndeo.address"),
     ] {
         control.setAccessibilityIdentifier(Some(&NSString::from_str(name)));
     }
-    for view in [&*address as &NSView, &*route, &*reload, &*progress] {
+    for view in [&*address as &NSView, &*route, &*copy, &*progress] {
         field.addSubview(view);
     }
     // The sidebar sizes the field's width; its height is its own.
@@ -733,7 +795,8 @@ pub fn browser_content(
         .constraintEqualToConstant(height)
         .setActive(true);
 
-    let sidebar = Sidebar::new(mtm, &[&*hide, &*back, &*forward], &field);
+    let sidebar = Sidebar::new(mtm, &[&*hide, &*back, &*forward, &*reload], &field, target);
+    let edge = EdgeSensor::new(mtm, target);
 
     // The backdrop fills the window; the sidebar and the page's card sit on
     // it, and the web view fills the card.
@@ -745,9 +808,11 @@ pub fn browser_content(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     card.addSubview(webview);
-    container.addSubview(&sidebar);
+    // The sidebar above the card, so that it can peek over it.
     container.addSubview(&card);
+    container.addSubview(&sidebar);
     container.addSubview(&show);
+    container.addSubview(&edge);
 
     let ui = Ui {
         address,
@@ -758,12 +823,16 @@ pub fn browser_content(
         progress,
         cell,
         field,
+        copy,
         card,
         sidebar,
         sidebar_width: RefCell::new(None),
         card_leading: RefCell::new(None),
         card_top: RefCell::new(None),
+        sidebar_top: RefCell::new(None),
         show,
+        edge,
+        peeking: Cell::new(false),
         following: RefCell::new(None),
     };
     ui.show_route(None);

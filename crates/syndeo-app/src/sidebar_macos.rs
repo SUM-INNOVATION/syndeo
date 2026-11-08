@@ -1,6 +1,7 @@
 //! The sidebar: a browser window's tabs down its left side, as Arc has them,
-//! with Back, Forward and Reload across its top and the address field as a
-//! pill below them.
+//! with Hide Sidebar, Back, Forward and Reload across its top, the address
+//! field as a pill below them, the favorites as a grid of tiles under that,
+//! and the tabs below.
 //!
 //! Every tab is still a window of its own, tabbed with the others by AppKit
 //! (`tabs_macos`): the sidebar is a view of that tab group, drawn in each of
@@ -8,8 +9,12 @@
 //! the front, changes nothing but which row is lit. AppKit's own tab bar is
 //! kept hidden (`tabs_macos::hide_tab_bar`).
 //!
-//! - **Pinned tabs** come first, then a rule, then the rest, in the order
-//!   their windows are in the group.
+//! - **Favorites** (`favorites`) are tiles, four to a row: the site's icon
+//!   when a tab of that site is open and has one, its initial otherwise.
+//!   Choosing one opens its page in this tab; a secondary click offers to
+//!   take it out of the favorites.
+//! - **Pinned tabs** come first among the rows, then a rule, then the rest,
+//!   in the order their windows are in the group.
 //! - **A row** is the page's icon, or a globe for a page without one, and
 //!   its title; the row in front is lit, a row pointed at is lit less, and
 //!   either shows Close at its end. A pinned tab shows a pin there instead,
@@ -17,24 +22,35 @@
 //! - **New Tab** is the last row, always.
 //! - **A secondary click** on a row opens the tab's own menu, the one the
 //!   application gives (`menu_for`).
+//! - **Hidden**, the sidebar comes back over the page while the pointer is
+//!   at the window's left edge (`EdgeSensor`), as a floating panel, and
+//!   goes again when the pointer leaves it: Arc's peek. The panel is drawn
+//!   here; what shows and hides it is the window's chrome (`chrome_macos`),
+//!   which the sensor and the sidebar tell through `syndeoPeekSidebar:` and
+//!   `syndeoUnpeekSidebar:`, sent to the window's controller.
 //!
 //! Nothing here fetches anything: icons are the ones each tab's badge has.
 //! To Accessibility each row is a button named for its tab, and the UI test
-//! finds the rows by `syndeo.sidebar-tab`.
+//! finds the rows by `syndeo.sidebar-tab` and the tiles by
+//! `syndeo.favorite`.
 
+use crate::favorites::{self, Favorite};
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{
     define_class, msg_send, sel, AnyThread, DeclaredClass, MainThreadMarker, MainThreadOnly,
+    Message,
 };
 use objc2_app_kit::{
     NSAccessibility, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSApplication,
-    NSBezierPath, NSBox, NSBoxType, NSButton, NSClipView, NSColor, NSEvent, NSFont, NSImage,
-    NSImageScaling, NSImageView, NSLayoutAttribute, NSLayoutConstraint, NSLineBreakMode, NSMenu,
-    NSScrollView, NSStackView, NSTextField, NSTrackingArea, NSTrackingAreaOptions,
-    NSUserInterfaceLayoutOrientation, NSView, NSWindow,
+    NSBezierPath, NSBox, NSBoxType, NSButton, NSClipView, NSColor, NSEvent, NSFont, NSGradient,
+    NSImage, NSImageScaling, NSImageView, NSLayoutAttribute, NSLayoutConstraint, NSLineBreakMode,
+    NSMenu, NSScrollView, NSStackView, NSTextAlignment, NSTextField, NSTrackingArea,
+    NSTrackingAreaOptions, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
 };
-use objc2_foundation::{ns_string, NSArray, NSEdgeInsets, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    ns_string, NSArray, NSEdgeInsets, NSPoint, NSRect, NSSize, NSString, NSUserDefaults,
+};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -43,13 +59,21 @@ pub const WIDTH: f64 = 248.0;
 
 /// Inside the sidebar: the margin at either side, where the top row of
 /// buttons sits below the window's top (clear of the traffic lights, which
-/// take the first 80 points of its width), and the gap below the address
-/// field before the tabs.
-const SIDE: f64 = 10.0;
-const NAV_TOP: f64 = 8.0;
-const NAV_HEIGHT: f64 = 28.0;
+/// take the first 80 points of its width), and the gaps below the address
+/// field and the favorites.
+pub const SIDE: f64 = 10.0;
+pub const NAV_TOP: f64 = 8.0;
+pub const NAV_HEIGHT: f64 = 28.0;
 const ADDRESS_TOP: f64 = NAV_TOP + NAV_HEIGHT + 10.0;
 const LIST_GAP: f64 = 14.0;
+
+/// The floating panel, when the sidebar peeks over the page: its margin
+/// from the window's left and bottom, and its corner radius.
+pub const PANEL_MARGIN: f64 = 8.0;
+const PANEL_RADIUS: f64 = 12.0;
+
+/// The edge of the window that brings a hidden sidebar back.
+pub const EDGE: f64 = 6.0;
 
 /// A row: its height, its corner radius, the icon's size, and the gaps.
 const ROW_HEIGHT: f64 = 32.0;
@@ -59,6 +83,12 @@ const ICON: f64 = 16.0;
 const CLOSE: f64 = 20.0;
 const ROW_GAP: f64 = 2.0;
 
+/// A favorite's tile: four to a row, with this much between them.
+const TILES_PER_ROW: usize = 4;
+const TILE_GAP: f64 = 6.0;
+const TILE_RADIUS: f64 = 10.0;
+const TILE_ICON: f64 = 22.0;
+
 /// The menu for a tab's window, from the application.
 pub type MenuFor = Rc<dyn Fn(&NSWindow) -> Option<Retained<NSMenu>>>;
 
@@ -66,11 +96,21 @@ pub type MenuFor = Rc<dyn Fn(&NSWindow) -> Option<Retained<NSMenu>>>;
 pub struct TabInfo {
     pub window: Retained<NSWindow>,
     pub title: String,
+    /// The page's address, as the address field shows it; empty for a page
+    /// that has none, such as the start page.
+    pub address: String,
     pub icon: Option<Retained<NSImage>>,
     pub pinned: bool,
     pub loading: bool,
     /// The tab in front of its window.
     pub active: bool,
+}
+
+/// A favorite, as the sidebar shows it: with an icon when a tab of its
+/// site has one.
+pub struct FavoriteInfo {
+    pub favorite: Favorite,
+    pub icon: Option<Retained<NSImage>>,
 }
 
 /// Whether `view` is drawn in dark appearance.
@@ -80,9 +120,38 @@ pub fn is_dark(view: &NSView) -> bool {
         .isEqualToString(unsafe { NSAppearanceNameDarkAqua })
 }
 
-/// White, at `alpha`: what rows are lit with, over the backdrop.
+/// An sRGB colour, opaque.
+fn rgb(r: f64, g: f64, b: f64) -> Retained<NSColor> {
+    NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0)
+}
+
+/// White, at `alpha`: what rows and tiles are lit with, over the backdrop.
 fn lit(alpha: f64) -> Retained<NSColor> {
     NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, alpha)
+}
+
+/// The backdrop's gradient, lavender into blush in light appearance and
+/// the same hues deepened in dark, filling `rect` in `view`, with corners
+/// rounded by `radius` if any.
+pub fn fill_gradient(view: &NSView, rect: NSRect, radius: Option<f64>) {
+    let (from, to) = if is_dark(view) {
+        (rgb(0.165, 0.145, 0.235), rgb(0.235, 0.165, 0.215))
+    } else {
+        (rgb(0.851, 0.831, 0.969), rgb(0.969, 0.851, 0.890))
+    };
+    let Some(gradient) =
+        NSGradient::initWithStartingColor_endingColor(NSGradient::alloc(), &from, &to)
+    else {
+        return;
+    };
+    match radius {
+        Some(radius) => {
+            let path =
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius);
+            gradient.drawInBezierPath_angle(&path, -35.0);
+        }
+        None => gradient.drawInRect_angle(rect, -35.0),
+    }
 }
 
 /// An SF Symbol, described for VoiceOver and Accessibility by `label`.
@@ -91,6 +160,61 @@ fn symbol(name: &str, label: &str) -> Option<Retained<NSImage>> {
         &NSString::from_str(name),
         Some(&NSString::from_str(label)),
     )
+}
+
+/// Send `action` to `target`, from `sender`, as a control would.
+fn send(
+    mtm: MainThreadMarker,
+    action: objc2::runtime::Sel,
+    target: Option<&AnyObject>,
+    sender: Option<&AnyObject>,
+) {
+    let app = NSApplication::sharedApplication(mtm);
+    unsafe { app.sendAction_to_from(action, target, sender) };
+}
+
+/// A tracking area for `view`'s whole visible rect, told of the pointer
+/// entering and leaving while the window is key.
+fn track(view: &NSView) {
+    for area in view.trackingAreas().iter() {
+        view.removeTrackingArea(&area);
+    }
+    let options = NSTrackingAreaOptions::MouseEnteredAndExited
+        | NSTrackingAreaOptions::ActiveInKeyWindow
+        | NSTrackingAreaOptions::InVisibleRect;
+    let area = unsafe {
+        NSTrackingArea::initWithRect_options_owner_userInfo(
+            NSTrackingArea::alloc(),
+            view.bounds(),
+            options,
+            Some(view),
+            None,
+        )
+    };
+    view.addTrackingArea(&area);
+}
+
+// ------------------------------------------------------------ favorites kept
+
+/// The defaults key the favorites are kept under, as `favorites::render`.
+const FAVORITES_KEY: &str = "SyndeoFavorites";
+
+/// The favorites, as kept.
+pub fn favorites_read() -> Vec<Favorite> {
+    NSUserDefaults::standardUserDefaults()
+        .stringForKey(&NSString::from_str(FAVORITES_KEY))
+        .map(|json| favorites::parse(&json.to_string()))
+        .unwrap_or_default()
+}
+
+/// Keep `favorites`.
+pub fn favorites_write(favorites: &[Favorite]) {
+    let json = NSString::from_str(&favorites::render(favorites));
+    let value: &AnyObject = json.as_ref();
+    unsafe {
+        NSUserDefaults::standardUserDefaults()
+            .setObject_forKey(Some(value), &NSString::from_str(FAVORITES_KEY))
+    };
 }
 
 // ---------------------------------------------------------------- a row
@@ -176,22 +300,7 @@ define_class!(
 
         #[unsafe(method(updateTrackingAreas))]
         fn update_tracking_areas(&self) {
-            for area in self.trackingAreas().iter() {
-                self.removeTrackingArea(&area);
-            }
-            let options = NSTrackingAreaOptions::MouseEnteredAndExited
-                | NSTrackingAreaOptions::ActiveInKeyWindow
-                | NSTrackingAreaOptions::InVisibleRect;
-            let area = unsafe {
-                NSTrackingArea::initWithRect_options_owner_userInfo(
-                    NSTrackingArea::alloc(),
-                    self.bounds(),
-                    options,
-                    Some(self),
-                    None,
-                )
-            };
-            self.addTrackingArea(&area);
+            track(self);
             let _: () = unsafe { msg_send![super(self), updateTrackingAreas] };
         }
 
@@ -330,10 +439,7 @@ impl TabRow {
         let tab = self.ivars().tab.borrow().as_ref().and_then(Weak::load);
         match tab {
             Some(window) => window.makeKeyAndOrderFront(None),
-            None => {
-                let app = NSApplication::sharedApplication(self.mtm());
-                unsafe { app.sendAction_to_from(sel!(newWindowForTab:), None, None) };
-            }
+            None => send(self.mtm(), sel!(newWindowForTab:), None, None),
         }
     }
 
@@ -344,6 +450,195 @@ impl TabRow {
             close.setHidden(!(hover || ivars.active.get()) || ivars.pinned.get());
         }
         self.setNeedsDisplay(true);
+    }
+}
+
+// --------------------------------------------------------------- a tile
+
+pub struct TileIvars {
+    address: String,
+    title: String,
+    hover: Cell<bool>,
+    /// The window's controller, which opens the page and keeps the favorites.
+    target: Weak<AnyObject>,
+}
+
+define_class!(
+    /// One favorite, as a tile.
+    #[unsafe(super(NSView, objc2_app_kit::NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SyndeoFavoriteTile"]
+    #[ivars = TileIvars]
+    pub struct FavoriteTile;
+
+    impl FavoriteTile {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let alpha = match (is_dark(self), self.ivars().hover.get()) {
+                (true, true) => 0.18,
+                (true, false) => 0.10,
+                (false, true) => 0.72,
+                (false, false) => 0.45,
+            };
+            lit(alpha).setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                self.bounds(),
+                TILE_RADIUS,
+                TILE_RADIUS,
+            )
+            .fill();
+        }
+
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &NSEvent) {
+            self.choose();
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            let mtm = self.mtm();
+            let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Favorite"));
+            let target = self.ivars().target.load();
+            let me: &AnyObject = self.as_ref();
+            let item = unsafe {
+                objc2_app_kit::NSMenuItem::initWithTitle_action_keyEquivalent(
+                    objc2_app_kit::NSMenuItem::alloc(mtm),
+                    ns_string!("Remove from Favorites"),
+                    Some(sel!(syndeoRemoveFavorite:)),
+                    &NSString::new(),
+                )
+            };
+            unsafe {
+                item.setTarget(target.as_deref());
+                item.setRepresentedObject(Some(me));
+            }
+            menu.addItem(&item);
+            NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+        }
+
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            self.ivars().hover.set(true);
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            self.ivars().hover.set(false);
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(updateTrackingAreas))]
+        fn update_tracking_areas(&self) {
+            track(self);
+            let _: () = unsafe { msg_send![super(self), updateTrackingAreas] };
+        }
+
+        #[unsafe(method(isAccessibilityElement))]
+        fn is_accessibility_element(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method_id(accessibilityRole))]
+        fn accessibility_role(&self) -> Option<Retained<NSString>> {
+            Some(NSString::from_str("AXButton"))
+        }
+
+        #[unsafe(method_id(accessibilityLabel))]
+        fn accessibility_label(&self) -> Option<Retained<NSString>> {
+            let ivars = self.ivars();
+            let label = if ivars.title.is_empty() {
+                ivars.address.clone()
+            } else {
+                ivars.title.clone()
+            };
+            Some(NSString::from_str(&label))
+        }
+
+        #[unsafe(method(accessibilityPerformPress))]
+        fn accessibility_perform_press(&self) -> bool {
+            self.choose();
+            true
+        }
+    }
+);
+
+impl FavoriteTile {
+    fn new(
+        mtm: MainThreadMarker,
+        size: f64,
+        favorite: &FavoriteInfo,
+        target: Weak<AnyObject>,
+    ) -> Retained<Self> {
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(size, size));
+        let this = Self::alloc(mtm).set_ivars(TileIvars {
+            address: favorite.favorite.address.clone(),
+            title: favorite.favorite.title.clone(),
+            hover: Cell::new(false),
+            target,
+        });
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        this.setTranslatesAutoresizingMaskIntoConstraints(false);
+        NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+            this.widthAnchor().constraintEqualToConstant(size),
+            this.heightAnchor().constraintEqualToConstant(size),
+        ]));
+        this.setAccessibilityIdentifier(Some(ns_string!("syndeo.favorite")));
+        let title = if favorite.favorite.title.is_empty() {
+            favorite.favorite.address.clone()
+        } else {
+            favorite.favorite.title.clone()
+        };
+        this.setToolTip(Some(&NSString::from_str(&title)));
+
+        match &favorite.icon {
+            Some(image) => {
+                let icon = NSImageView::new(mtm);
+                icon.setImage(Some(image));
+                icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+                icon.setFrame(NSRect::new(
+                    NSPoint::new((size - TILE_ICON) / 2.0, (size - TILE_ICON) / 2.0),
+                    NSSize::new(TILE_ICON, TILE_ICON),
+                ));
+                this.addSubview(&icon);
+            }
+            None => {
+                let initial =
+                    favorites::initial(&favorite.favorite.address, &favorite.favorite.title);
+                let label = NSTextField::labelWithString(&NSString::from_str(&initial), mtm);
+                label.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
+                label.setTextColor(Some(&NSColor::labelColor()));
+                label.setAlignment(NSTextAlignment::Center);
+                label.setFrame(NSRect::new(
+                    NSPoint::new(0.0, (size - 22.0) / 2.0),
+                    NSSize::new(size, 22.0),
+                ));
+                this.addSubview(&label);
+            }
+        }
+        this
+    }
+
+    /// The favorite's address.
+    pub fn address(&self) -> String {
+        self.ivars().address.clone()
+    }
+
+    /// Open the page, in this tab.
+    fn choose(&self) {
+        let target = self.ivars().target.load();
+        let me: &AnyObject = self.as_ref();
+        send(
+            self.mtm(),
+            sel!(syndeoOpenFavorite:),
+            target.as_deref(),
+            Some(me),
+        );
     }
 }
 
@@ -365,14 +660,62 @@ define_class!(
     }
 );
 
-pub struct SidebarIvars {
-    list: Retained<NSStackView>,
-    menu_for: RefCell<Option<MenuFor>>,
+pub struct EdgeIvars {
+    target: Weak<AnyObject>,
 }
 
 define_class!(
-    /// The sidebar itself: see the module's notes. It draws nothing of its
-    /// own, so the window's backdrop shows through it.
+    /// The window's left edge while the sidebar is hidden: the pointer
+    /// arriving there asks the window's controller to show the sidebar
+    /// over the page (`syndeoPeekSidebar:`).
+    #[unsafe(super(NSView, objc2_app_kit::NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SyndeoEdgeSensor"]
+    #[ivars = EdgeIvars]
+    pub struct EdgeSensor;
+
+    impl EdgeSensor {
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            let target = self.ivars().target.load();
+            send(self.mtm(), sel!(syndeoPeekSidebar:), target.as_deref(), None);
+        }
+
+        #[unsafe(method(updateTrackingAreas))]
+        fn update_tracking_areas(&self) {
+            track(self);
+            let _: () = unsafe { msg_send![super(self), updateTrackingAreas] };
+        }
+    }
+);
+
+impl EdgeSensor {
+    pub fn new(mtm: MainThreadMarker, target: &AnyObject) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(EdgeIvars {
+            target: Weak::from_retained(&target.retain()),
+        });
+        let this: Retained<Self> = unsafe { msg_send![super(this), init] };
+        this.setTranslatesAutoresizingMaskIntoConstraints(false);
+        this.setHidden(true);
+        this
+    }
+}
+
+pub struct SidebarIvars {
+    list: Retained<NSStackView>,
+    favorites: Retained<NSStackView>,
+    menu_for: RefCell<Option<MenuFor>>,
+    /// The window's controller, told of favorites chosen, and of the
+    /// pointer leaving while the sidebar peeks.
+    target: Weak<AnyObject>,
+    /// Peeking over the page, as a floating panel, rather than beside it.
+    floating: Cell<bool>,
+}
+
+define_class!(
+    /// The sidebar itself: see the module's notes. Beside the page it draws
+    /// nothing of its own, so the window's backdrop shows through it;
+    /// peeking over the page, it draws itself as a floating panel.
     #[unsafe(super(NSView, objc2_app_kit::NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "SyndeoSidebar"]
@@ -380,19 +723,54 @@ define_class!(
     pub struct Sidebar;
 
     impl Sidebar {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            if !self.ivars().floating.get() {
+                return;
+            }
+            let panel = self.panel_rect();
+            fill_gradient(self, panel, Some(PANEL_RADIUS));
+            let edge =
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(panel, PANEL_RADIUS, PANEL_RADIUS);
+            edge.setLineWidth(1.0);
+            lit(if is_dark(self) { 0.12 } else { 0.7 }).setStroke();
+            edge.stroke();
+        }
+
         /// Dragging the sidebar's empty parts moves the window, as dragging
         /// a title bar does.
         #[unsafe(method(mouseDownCanMoveWindow))]
         fn mouse_down_can_move_window(&self) -> bool {
-            true
+            !self.ivars().floating.get()
+        }
+
+        /// Peeking, the sidebar goes when the pointer leaves it.
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            if self.ivars().floating.get() {
+                let target = self.ivars().target.load();
+                send(self.mtm(), sel!(syndeoUnpeekSidebar:), target.as_deref(), None);
+            }
+        }
+
+        #[unsafe(method(updateTrackingAreas))]
+        fn update_tracking_areas(&self) {
+            track(self);
+            let _: () = unsafe { msg_send![super(self), updateTrackingAreas] };
         }
     }
 );
 
 impl Sidebar {
-    /// The sidebar, with `nav` (Back, Forward, Reload and the rest) across
-    /// its top, right-aligned, and `field`, the address field, below them.
-    pub fn new(mtm: MainThreadMarker, nav: &[&NSView], field: &NSView) -> Retained<Self> {
+    /// The sidebar, with `nav` (Hide Sidebar, Back, Forward, Reload) across
+    /// its top, right-aligned, and `field`, the address field, below them;
+    /// its favorites and rows send to `target`, the window's controller.
+    pub fn new(
+        mtm: MainThreadMarker,
+        nav: &[&NSView],
+        field: &NSView,
+        target: &AnyObject,
+    ) -> Retained<Self> {
         let list = NSStackView::new(mtm);
         list.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
         list.setAlignment(NSLayoutAttribute::Width);
@@ -403,9 +781,17 @@ impl Sidebar {
             bottom: 8.0,
             right: 0.0,
         });
+        let favorites = NSStackView::new(mtm);
+        favorites.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        favorites.setAlignment(NSLayoutAttribute::Leading);
+        favorites.setSpacing(TILE_GAP);
+        favorites.setTranslatesAutoresizingMaskIntoConstraints(false);
         let this = Self::alloc(mtm).set_ivars(SidebarIvars {
             list: list.clone(),
+            favorites: favorites.clone(),
             menu_for: RefCell::new(None),
+            target: Weak::from_retained(&target.retain()),
+            floating: Cell::new(false),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -421,6 +807,7 @@ impl Sidebar {
 
         field.setTranslatesAutoresizingMaskIntoConstraints(false);
         this.addSubview(field);
+        this.addSubview(&favorites);
 
         // The tabs, scrolling when there are more than fit.
         let scroll = NSScrollView::new(mtm);
@@ -454,9 +841,18 @@ impl Sidebar {
             field
                 .trailingAnchor()
                 .constraintEqualToAnchor_constant(&this.trailingAnchor(), -SIDE),
-            scroll
+            favorites
                 .topAnchor()
                 .constraintEqualToAnchor_constant(&field.bottomAnchor(), LIST_GAP),
+            favorites
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&this.leadingAnchor(), SIDE),
+            favorites
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&this.trailingAnchor(), -SIDE),
+            scroll
+                .topAnchor()
+                .constraintEqualToAnchor_constant(&favorites.bottomAnchor(), LIST_GAP),
             scroll
                 .leadingAnchor()
                 .constraintEqualToAnchor_constant(&this.leadingAnchor(), SIDE - 2.0),
@@ -465,7 +861,7 @@ impl Sidebar {
                 .constraintEqualToAnchor_constant(&this.trailingAnchor(), -(SIDE - 2.0)),
             scroll
                 .bottomAnchor()
-                .constraintEqualToAnchor(&this.bottomAnchor()),
+                .constraintEqualToAnchor_constant(&this.bottomAnchor(), -PANEL_MARGIN),
             document
                 .leadingAnchor()
                 .constraintEqualToAnchor(&clip.leadingAnchor()),
@@ -493,15 +889,56 @@ impl Sidebar {
         *self.ivars().menu_for.borrow_mut() = Some(menu_for);
     }
 
-    /// Show `tabs`, in their order: pinned, a rule, the rest, New Tab.
-    pub fn reload(&self, tabs: &[TabInfo]) {
+    /// Peek over the page as a floating panel, or sit beside it.
+    pub fn set_floating(&self, floating: bool) {
+        self.ivars().floating.set(floating);
+        self.setNeedsDisplay(true);
+    }
+
+    /// Where the floating panel is drawn: the sidebar's bounds, less a
+    /// margin at the left and the bottom, so that it floats clear of the
+    /// window's edges; the page's card is to its right.
+    fn panel_rect(&self) -> NSRect {
+        let bounds = self.bounds();
+        NSRect::new(
+            NSPoint::new(PANEL_MARGIN, PANEL_MARGIN),
+            NSSize::new(
+                (bounds.size.width - PANEL_MARGIN).max(0.0),
+                (bounds.size.height - PANEL_MARGIN).max(0.0),
+            ),
+        )
+    }
+
+    /// Show `favorites` as tiles, and `tabs` as rows in their order:
+    /// pinned, a rule, the rest, New Tab.
+    pub fn reload(&self, tabs: &[TabInfo], favorites: &[FavoriteInfo]) {
         let mtm = self.mtm();
-        let list = &self.ivars().list;
-        for view in list.arrangedSubviews().iter() {
-            list.removeArrangedSubview(&view);
-            view.removeFromSuperview();
+        let ivars = self.ivars();
+        let clear = |stack: &NSStackView| {
+            for view in stack.arrangedSubviews().iter() {
+                stack.removeArrangedSubview(&view);
+                view.removeFromSuperview();
+            }
+        };
+
+        clear(&ivars.favorites);
+        let inner = WIDTH - 2.0 * SIDE;
+        let tile = (inner - TILE_GAP * (TILES_PER_ROW as f64 - 1.0)) / TILES_PER_ROW as f64;
+        for row in favorites.chunks(TILES_PER_ROW) {
+            let tiles: Vec<Retained<FavoriteTile>> = row
+                .iter()
+                .map(|f| FavoriteTile::new(mtm, tile, f, ivars.target.clone()))
+                .collect();
+            let views: Vec<&NSView> = tiles.iter().map(|t| -> &NSView { t }).collect();
+            let line = NSStackView::stackViewWithViews(&NSArray::from_slice(&views), mtm);
+            line.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            line.setSpacing(TILE_GAP);
+            line.setTranslatesAutoresizingMaskIntoConstraints(false);
+            ivars.favorites.addArrangedSubview(&line);
         }
-        let menu_for = self.ivars().menu_for.borrow().clone();
+
+        clear(&ivars.list);
+        let menu_for = ivars.menu_for.borrow().clone();
         let width = WIDTH - 2.0 * (SIDE - 2.0);
         let pinned = tabs.iter().filter(|t| t.pinned).count();
         for (i, tab) in tabs.iter().enumerate() {
@@ -509,12 +946,12 @@ impl Sidebar {
                 let rule = NSBox::new(mtm);
                 rule.setBoxType(NSBoxType::Separator);
                 rule.setTranslatesAutoresizingMaskIntoConstraints(false);
-                list.addArrangedSubview(&rule);
+                ivars.list.addArrangedSubview(&rule);
             }
             let row = TabRow::new(mtm, width, Some(tab), menu_for.clone());
-            list.addArrangedSubview(&row);
+            ivars.list.addArrangedSubview(&row);
         }
         let new_tab = TabRow::new(mtm, width, None, None);
-        list.addArrangedSubview(&new_tab);
+        ivars.list.addArrangedSubview(&new_tab);
     }
 }

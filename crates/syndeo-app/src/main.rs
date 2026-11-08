@@ -36,6 +36,8 @@ mod agent;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod agent_client;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod favorites;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod passkeys;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod tabs;
