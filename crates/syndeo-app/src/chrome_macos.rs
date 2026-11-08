@@ -101,7 +101,7 @@ impl Backdrop {
 
 /// Round `view`'s corners, clipping what is inside it to them, with the
 /// continuous curve macOS draws its own rounded corners with.
-fn round_corners(view: &NSView, radius: f64) {
+pub(crate) fn round_corners(view: &NSView, radius: f64) {
     view.setWantsLayer(true);
     let layer: *mut AnyObject = unsafe { msg_send![view, layer] };
     if layer.is_null() {

@@ -78,6 +78,7 @@ use crate::address::{self, Asked, Search};
 use crate::browser_macos::{
     browser_content, controller_of, BrowserController, Hooks, Place, Snapshot, Start,
 };
+use crate::command_bar_macos;
 use crate::control_macos;
 use crate::settings_macos::{self, Clearing, SettingsController};
 use crate::tabs::{self, Closed, Session};
@@ -436,9 +437,35 @@ define_class!(
         }
 
         /// File > New Tab with no window in front: a window.
+        /// File > New Tab, ⌘T, and the sidebar's New Tab: the command bar
+        /// over the window in front, or a window when there is none.
         #[unsafe(method(newWindowForTab:))]
         fn new_window_for_tab(&self, _sender: Option<&AnyObject>) {
-            self.open_window();
+            match self.persons_front() {
+                Some(front) => command_bar_macos::show(self.mtm(), &front, self.as_ref()),
+                None => {
+                    self.open_window();
+                }
+            }
+        }
+
+        /// The command bar's Return: what was typed, in a new tab beside the
+        /// window in front.
+        #[unsafe(method(syndeoOpenTyped:))]
+        fn open_typed(&self, sender: Option<&AnyObject>) {
+            let Some(typed) = command_bar_macos::typed(sender) else {
+                return;
+            };
+            match self.persons_front() {
+                Some(front) => {
+                    self.open_tab(&front, &front, Start::Typed(typed), Place::Front);
+                }
+                None => {
+                    let window = self.new_window(Start::Typed(typed));
+                    window.center();
+                    window.makeKeyAndOrderFront(None);
+                }
+            }
         }
 
         /// Syndeo > Settings….
@@ -1215,6 +1242,7 @@ impl AppDelegate {
                     Start::Request(request) => controller.load(&request),
                     Start::Again(snapshot) => controller.restore(snapshot),
                     Start::Later { address, title } => controller.open_later(address, title),
+                    Start::Typed(typed) => controller.go(&typed),
                 }
                 controller
             }

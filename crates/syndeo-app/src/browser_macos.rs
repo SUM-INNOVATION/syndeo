@@ -73,6 +73,9 @@ pub enum Start {
     /// A tab from the last session: its address and title, its page opened
     /// when the tab is first shown.
     Later { address: String, title: String },
+    /// With what was typed in the command bar: an address, or words to
+    /// search for, read as the address field's are.
+    Typed(String),
 }
 
 /// Where a new tab goes.
@@ -1285,7 +1288,7 @@ impl BrowserController {
     }
 
     /// Open what was typed, or say why not.
-    fn go(&self, typed: &str) {
+    pub fn go(&self, typed: &str) {
         // What was typed has been given: it is no longer being typed.
         self.ivars().typing.set(false);
         let search = self.search();
