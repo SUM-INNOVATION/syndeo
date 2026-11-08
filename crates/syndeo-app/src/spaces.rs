@@ -408,7 +408,7 @@ mod tests {
         assert_ne!(a, b);
         let read = Layout::parse(&layout.render());
         let mut again = read.clone();
-        let c = again.add_space("C").unwrap();
+        let c = again.add_space("C", "").unwrap();
         assert!(c > b);
     }
 
