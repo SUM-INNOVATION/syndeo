@@ -1,54 +1,48 @@
-//! A browser window's chrome: one unified toolbar in the title bar, over a
-//! full-size content view, as current macOS browsers have it.
+//! A browser window's chrome, as Arc arranged a browser's: a sidebar down
+//! the left (`sidebar_macos`) with the tabs, Back and Forward and the
+//! address field in it, and the page beside it as a card — inset, with
+//! rounded corners — over a soft gradient backdrop (`Backdrop`) that the
+//! title bar lets show through. There is no toolbar: the title bar holds
+//! only the window's traffic lights, over the sidebar's top.
 //!
-//! - **Back and Forward** lead the toolbar, as toolbar buttons.
-//! - **The address field** is its centre item: a rounded field that grows
-//!   with the window. Inside it, at its trailing end, are the page's route
-//!   and Reload, which is Stop while a page loads; along its bottom edge is
-//!   the page's loading progress.
+//! - **Back and Forward**, and Hide Sidebar, are buttons across the
+//!   sidebar's top, at its right, clear of the traffic lights.
+//! - **The address field** is a pill below them, as wide as the sidebar.
+//!   Inside it, at its trailing end, are the page's route and Reload, which
+//!   is Stop while a page loads; along its bottom edge is the page's
+//!   loading progress.
 //! - **The route** (`address::Route`) is a symbol. Its words are its help
 //!   tag, and are shown beside it too for the two routes Syndeo does not
 //!   cache, Direct and Local, so that those are never left to a help tag.
 //!   Accessibility reads the words, whichever is shown.
 //!
-//! The page sits below the toolbar and any tab bar, never under them. Every
-//! control keeps the accessibility identifier `ci/test-app.sh` drives it by:
-//! `syndeo.back`, `syndeo.forward`, `syndeo.address`, `syndeo.route` and
-//! `syndeo.reload`; and the loading progress is `syndeo.progress`, there
+//! Every control keeps the accessibility identifier `ci/test-app.sh` drives
+//! it by: `syndeo.back`, `syndeo.forward`, `syndeo.address`, `syndeo.route`
+//! and `syndeo.reload`; and the loading progress is `syndeo.progress`, there
 //! while a page loads and gone once it has.
 //!
-//! Only AppKit's own controls and colours, which follow the system's
-//! appearance, light or dark, and its accent colour; nothing here needs more
+//! AppKit's own controls and colours for the controls, which follow the
+//! system's appearance, light or dark, and its accent colour; the backdrop
+//! and the sidebar's rows are the two things drawn here. Nothing needs more
 //! than macOS 13.
 
 use crate::address::Route;
+use crate::sidebar_macos::{self, Sidebar};
 use objc2::rc::{Retained, Weak};
-use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
-use objc2::{define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly};
+use objc2::runtime::{AnyObject, NSObject, ProtocolObject, Sel};
+use objc2::{
+    define_class, msg_send, sel, AnyThread, DeclaredClass, MainThreadMarker, MainThreadOnly,
+};
 use objc2_app_kit::{
-    NSAccessibility, NSAutoresizingMaskOptions, NSBezelStyle, NSBezierPath, NSButton, NSColor,
-    NSControlSize, NSFont, NSFontWeightMedium, NSFontWeightSemibold, NSImage, NSImageScaling,
-    NSImageSymbolConfiguration, NSImageView, NSLayoutConstraint, NSLayoutGuide, NSLineBreakMode,
-    NSTextField, NSTextFieldBezelStyle, NSTextFieldCell, NSTextFieldDelegate, NSToolbar,
-    NSToolbarDelegate, NSToolbarDisplayMode, NSToolbarItem, NSToolbarItemIdentifier, NSView,
-    NSWindow, NSWindowStyleMask, NSWindowTitleVisibility, NSWindowToolbarStyle,
+    NSAccessibility, NSAutoresizingMaskOptions, NSBezierPath, NSButton, NSColor, NSControlSize,
+    NSFont, NSFontWeightMedium, NSFontWeightSemibold, NSGradient, NSImage, NSImageScaling,
+    NSImageSymbolConfiguration, NSImageView, NSLayoutConstraint, NSLineBreakMode, NSTextField,
+    NSTextFieldBezelStyle, NSTextFieldCell, NSTextFieldDelegate, NSView, NSWindow,
+    NSWindowStyleMask, NSWindowTitleVisibility,
 };
-use objc2_foundation::{
-    ns_string, NSArray, NSNumber, NSPoint, NSRect, NSSet, NSSize, NSString, NSTimer,
-};
+use objc2_foundation::{ns_string, NSArray, NSNumber, NSPoint, NSRect, NSSize, NSString, NSTimer};
 use objc2_web_kit::WKWebView;
 use std::cell::{Cell, RefCell};
-
-/// Every browser window's toolbar: the same items, in the same places.
-const TOOLBAR: &str = "com.sum.syndeo.browser";
-const BACK_ITEM: &str = "syndeo.toolbar.back";
-const FORWARD_ITEM: &str = "syndeo.toolbar.forward";
-const ADDRESS_ITEM: &str = "syndeo.toolbar.address";
-
-/// The address field's width in the toolbar: never narrower, and never
-/// wider, however wide the window.
-const ADDRESS_MIN: f64 = 240.0;
-const ADDRESS_MAX: f64 = 820.0;
 
 /// Inside the address field: the margin at either end, Reload's size, and
 /// the gap between the route and Reload, and between the text and the route.
@@ -61,9 +55,75 @@ const ROUTE_HEIGHT: f64 = 18.0;
 const ROUTE_SYMBOL: f64 = 11.0;
 const ROUTE_PAD: f64 = 6.0;
 
+/// The page's card: its margin from the window's top, right and bottom,
+/// and its corner radius.
+const CARD_MARGIN: f64 = 8.0;
+const CARD_RADIUS: f64 = 12.0;
+
 /// The loading progress: its thickness, and how often it follows the page.
 const PROGRESS: f64 = 2.0;
 const PROGRESS_EVERY: f64 = 1.0 / 30.0;
+
+// ---------------------------------------------------------- the backdrop
+
+define_class!(
+    /// The window's backdrop, behind the page's card and under the title
+    /// bar: a soft diagonal gradient, lavender into blush in light
+    /// appearance and the same hues deepened in dark. Nothing in it is
+    /// read by Accessibility: it is decoration.
+    #[unsafe(super(NSView, objc2_app_kit::NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SyndeoBackdrop"]
+    pub struct Backdrop;
+
+    impl Backdrop {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let dark = sidebar_macos::is_dark(self);
+            let (from, to) = if dark {
+                (rgb(0.165, 0.145, 0.235), rgb(0.235, 0.165, 0.215))
+            } else {
+                (rgb(0.851, 0.831, 0.969), rgb(0.969, 0.851, 0.890))
+            };
+            if let Some(gradient) =
+                NSGradient::initWithStartingColor_endingColor(NSGradient::alloc(), &from, &to)
+            {
+                gradient.drawInRect_angle(self.bounds(), -35.0);
+            }
+        }
+
+        #[unsafe(method(isOpaque))]
+        fn is_opaque(&self) -> bool {
+            true
+        }
+    }
+);
+
+impl Backdrop {
+    fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+        unsafe { msg_send![Self::alloc(mtm), initWithFrame: frame] }
+    }
+}
+
+/// An sRGB colour, opaque.
+fn rgb(r: f64, g: f64, b: f64) -> Retained<NSColor> {
+    NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0)
+}
+
+/// Round `view`'s corners, clipping what is inside it to them, with the
+/// continuous curve macOS draws its own rounded corners with.
+fn round_corners(view: &NSView, radius: f64) {
+    view.setWantsLayer(true);
+    let layer: *mut AnyObject = unsafe { msg_send![view, layer] };
+    if layer.is_null() {
+        return;
+    }
+    unsafe {
+        let _: () = msg_send![layer, setCornerRadius: radius];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+        let _: () = msg_send![layer, setCornerCurve: &*ns_string!("continuous")];
+    }
+}
 
 // ------------------------------------------------------------- the route
 
@@ -335,77 +395,6 @@ impl AddressCell {
 
 // ------------------------------------------------------------- the toolbar
 
-pub struct ItemsIvars {
-    back: Retained<NSButton>,
-    forward: Retained<NSButton>,
-    address: Retained<NSView>,
-}
-
-define_class!(
-    /// The toolbar's delegate: Back, Forward and the address field.
-    #[unsafe(super(NSObject))]
-    #[thread_kind = MainThreadOnly]
-    #[name = "SyndeoToolbarItems"]
-    #[ivars = ItemsIvars]
-    pub struct ToolbarItems;
-
-    unsafe impl NSObjectProtocol for ToolbarItems {}
-
-    unsafe impl NSToolbarDelegate for ToolbarItems {
-        #[unsafe(method_id(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:))]
-        fn item(
-            &self,
-            _toolbar: &NSToolbar,
-            identifier: &NSToolbarItemIdentifier,
-            _inserted: bool,
-        ) -> Option<Retained<NSToolbarItem>> {
-            let ivars = self.ivars();
-            let found: Option<(&NSView, &str, bool)> = match identifier.to_string().as_str() {
-                BACK_ITEM => Some((&ivars.back, "Back", true)),
-                FORWARD_ITEM => Some((&ivars.forward, "Forward", true)),
-                ADDRESS_ITEM => Some((&ivars.address, "Address", false)),
-                _ => None,
-            };
-            found.map(|(view, label, navigational)| {
-                let item = NSToolbarItem::initWithItemIdentifier(
-                    NSToolbarItem::alloc(self.mtm()),
-                    identifier,
-                );
-                item.setLabel(&NSString::from_str(label));
-                item.setPaletteLabel(&NSString::from_str(label));
-                item.setNavigational(navigational);
-                item.setView(Some(view));
-                item
-            })
-        }
-
-        #[unsafe(method_id(toolbarDefaultItemIdentifiers:))]
-        fn default_items(
-            &self,
-            _toolbar: &NSToolbar,
-        ) -> Retained<NSArray<NSToolbarItemIdentifier>> {
-            items()
-        }
-
-        #[unsafe(method_id(toolbarAllowedItemIdentifiers:))]
-        fn allowed_items(
-            &self,
-            _toolbar: &NSToolbar,
-        ) -> Retained<NSArray<NSToolbarItemIdentifier>> {
-            items()
-        }
-    }
-);
-
-/// The toolbar's items, in order.
-fn items() -> Retained<NSArray<NSToolbarItemIdentifier>> {
-    NSArray::from_retained_slice(&[
-        NSString::from_str(BACK_ITEM),
-        NSString::from_str(FORWARD_ITEM),
-        NSString::from_str(ADDRESS_ITEM),
-    ])
-}
-
 // ------------------------------------------------------------- the window
 
 /// The controls of a browser window.
@@ -420,8 +409,14 @@ pub struct Ui {
     cell: Retained<AddressCell>,
     /// What holds the address field, its route, Reload and progress.
     field: Retained<NSView>,
-    /// The toolbar's delegate, which the toolbar does not keep.
-    items: Retained<ToolbarItems>,
+    /// The page's card: the web view, inset and with rounded corners.
+    card: Retained<NSView>,
+    /// The sidebar, with the tabs, Back and Forward and the field in it.
+    pub sidebar: Retained<Sidebar>,
+    /// The sidebar's width, which Hide Sidebar takes to nothing, and the
+    /// card's distance from it.
+    sidebar_width: RefCell<Option<Retained<NSLayoutConstraint>>>,
+    card_leading: RefCell<Option<Retained<NSLayoutConstraint>>>,
     /// Following the page's loading progress, while it loads.
     following: RefCell<Option<Retained<NSTimer>>>,
 }
@@ -490,43 +485,62 @@ impl Ui {
         *self.following.borrow_mut() = Some(timer);
     }
 
-    /// Give `window` its toolbar, unified with its title bar, over a
-    /// full-size content view, and keep `web` below the toolbar and any tab
-    /// bar. `web` has to be in the window's content view already.
-    pub fn dress(&self, window: &NSWindow, web: &WKWebView) {
-        let mtm = self.address.mtm();
-        let toolbar =
-            NSToolbar::initWithIdentifier(NSToolbar::alloc(mtm), &NSString::from_str(TOOLBAR));
-        toolbar.setDelegate(Some(ProtocolObject::from_ref(&*self.items)));
-        toolbar.setDisplayMode(NSToolbarDisplayMode::IconOnly);
-        toolbar.setAllowsUserCustomization(false);
-        toolbar.setCenteredItemIdentifiers(&NSSet::from_retained_slice(&[NSString::from_str(
-            ADDRESS_ITEM,
-        )]));
+    /// Give `window` a title bar that is see-through to the backdrop and
+    /// holds only the traffic lights, over a full-size content view, and
+    /// lay out the sidebar down its left and the page's card beside it,
+    /// inset from the window's other edges. `web` fills the card, and the
+    /// sidebar and the card have to be in the window's content view already.
+    pub fn dress(&self, window: &NSWindow, _web: &WKWebView) {
         window.setStyleMask(window.styleMask() | NSWindowStyleMask::FullSizeContentView);
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
-        window.setToolbarStyle(NSWindowToolbarStyle::Unified);
-        window.setToolbar(Some(&toolbar));
-
-        // The page below the toolbar and the tab bar, whatever they take.
-        let (Some(content), Some(guide)) = (
-            window.contentView(),
-            window
-                .contentLayoutGuide()
-                .and_then(|guide| guide.downcast::<NSLayoutGuide>().ok()),
-        ) else {
+        window.setTitlebarAppearsTransparent(true);
+        window.setContentMinSize(NSSize::new(sidebar_macos::WIDTH + 360.0, 320.0));
+        let Some(content) = window.contentView() else {
             return;
         };
-        web.setTranslatesAutoresizingMaskIntoConstraints(false);
+        let sidebar: &NSView = &self.sidebar;
+        let card = &self.card;
+        card.setTranslatesAutoresizingMaskIntoConstraints(false);
+        let width = sidebar
+            .widthAnchor()
+            .constraintEqualToConstant(sidebar_macos::WIDTH);
+        let leading = card
+            .leadingAnchor()
+            .constraintEqualToAnchor_constant(&sidebar.trailingAnchor(), 0.0);
         NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-            web.topAnchor().constraintEqualToAnchor(&guide.topAnchor()),
-            web.bottomAnchor()
+            sidebar
+                .topAnchor()
+                .constraintEqualToAnchor(&content.topAnchor()),
+            sidebar
+                .bottomAnchor()
                 .constraintEqualToAnchor(&content.bottomAnchor()),
-            web.leadingAnchor()
+            sidebar
+                .leadingAnchor()
                 .constraintEqualToAnchor(&content.leadingAnchor()),
-            web.trailingAnchor()
-                .constraintEqualToAnchor(&content.trailingAnchor()),
+            width.clone(),
+            card.topAnchor()
+                .constraintEqualToAnchor_constant(&content.topAnchor(), CARD_MARGIN),
+            card.bottomAnchor()
+                .constraintEqualToAnchor_constant(&content.bottomAnchor(), -CARD_MARGIN),
+            leading.clone(),
+            card.trailingAnchor()
+                .constraintEqualToAnchor_constant(&content.trailingAnchor(), -CARD_MARGIN),
         ]));
+        *self.sidebar_width.borrow_mut() = Some(width);
+        *self.card_leading.borrow_mut() = Some(leading);
+    }
+
+    /// Hide the sidebar, giving the page its width, or show it again.
+    pub fn toggle_sidebar(&self) {
+        let (width, leading) = (self.sidebar_width.borrow(), self.card_leading.borrow());
+        let (Some(width), Some(leading)) = (width.as_ref(), leading.as_ref()) else {
+            return;
+        };
+        let hide = width.constant() > 0.0;
+        width.setConstant(if hide { 0.0 } else { sidebar_macos::WIDTH });
+        leading.setConstant(if hide { CARD_MARGIN } else { 0.0 });
+        let sidebar: &NSView = &self.sidebar;
+        sidebar.setHidden(hide);
     }
 }
 
@@ -538,9 +552,9 @@ pub fn symbol_image(name: &str, label: &str) -> Option<Retained<NSImage>> {
     )
 }
 
-/// A button in the toolbar: a symbol, described by `label`, sending `action`
-/// to `target`.
-fn toolbar_button(
+/// A button across the sidebar's top: a symbol, described by `label`,
+/// sending `action` to `target`, with no border of its own.
+fn nav_button(
     mtm: MainThreadMarker,
     symbol: &str,
     label: &str,
@@ -550,15 +564,27 @@ fn toolbar_button(
     let image = symbol_image(symbol, label).unwrap_or_default();
     let button =
         unsafe { NSButton::buttonWithImage_target_action(&image, Some(target), Some(action), mtm) };
-    button.setBezelStyle(NSBezelStyle::Toolbar);
+    button.setBordered(false);
+    button.setSymbolConfiguration(Some(
+        &NSImageSymbolConfiguration::configurationWithPointSize_weight(14.0, unsafe {
+            NSFontWeightMedium
+        }),
+    ));
+    button.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
     button.setToolTip(Some(&NSString::from_str(label)));
+    button.setTranslatesAutoresizingMaskIntoConstraints(false);
+    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+        button.widthAnchor().constraintEqualToConstant(28.0),
+        button.heightAnchor().constraintEqualToConstant(28.0),
+    ]));
     button
 }
 
-/// The window's content and its controls: `webview`, filling `frame` until
-/// [`Ui::dress`] puts it below the toolbar, and the toolbar's controls, which
-/// send their actions to `target`, the window's controller, with `delegate`
-/// told of typing in the address field.
+/// The window's content and its controls: the backdrop, filling `frame`,
+/// with the sidebar and the page's card on it, laid out by [`Ui::dress`];
+/// `webview` fills the card, and the sidebar's controls send their actions
+/// to `target`, the window's controller, with `delegate` told of typing in
+/// the address field.
 pub fn browser_content(
     mtm: MainThreadMarker,
     frame: NSRect,
@@ -566,8 +592,15 @@ pub fn browser_content(
     target: &AnyObject,
     delegate: &ProtocolObject<dyn NSTextFieldDelegate>,
 ) -> (Retained<NSView>, Ui) {
-    let back = toolbar_button(mtm, "chevron.left", "Back", target, sel!(syndeoBack:));
-    let forward = toolbar_button(
+    let hide = nav_button(
+        mtm,
+        "sidebar.left",
+        "Hide Sidebar",
+        target,
+        sel!(syndeoToggleSidebar:),
+    );
+    let back = nav_button(mtm, "chevron.left", "Back", target, sel!(syndeoBack:));
+    let forward = nav_button(
         mtm,
         "chevron.right",
         "Forward",
@@ -598,8 +631,8 @@ pub fn browser_content(
         address.setTarget(Some(target));
         address.setAction(Some(sel!(navigateTo:)));
     }
-    let height = address.fittingSize().height.max(28.0);
-    let width = ADDRESS_MAX;
+    let height = address.fittingSize().height.max(30.0);
+    let width = sidebar_macos::WIDTH - 20.0;
     let field = NSView::initWithFrame(
         NSView::alloc(mtm),
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
@@ -659,32 +692,26 @@ pub fn browser_content(
     for view in [&*address as &NSView, &*route, &*reload, &*progress] {
         field.addSubview(view);
     }
-    // The toolbar sizes the field by these: as wide as there is room for,
-    // between the two.
-    field.setTranslatesAutoresizingMaskIntoConstraints(false);
-    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-        field
-            .widthAnchor()
-            .constraintGreaterThanOrEqualToConstant(ADDRESS_MIN),
-        field
-            .widthAnchor()
-            .constraintLessThanOrEqualToConstant(ADDRESS_MAX),
-        field.heightAnchor().constraintEqualToConstant(height),
-    ]));
+    // The sidebar sizes the field's width; its height is its own.
+    field
+        .heightAnchor()
+        .constraintEqualToConstant(height)
+        .setActive(true);
 
-    let container = NSView::initWithFrame(NSView::alloc(mtm), frame);
+    let sidebar = Sidebar::new(mtm, &[&*hide, &*back, &*forward], &field);
+
+    // The backdrop fills the window; the sidebar and the page's card sit on
+    // it, and the web view fills the card.
+    let container = Backdrop::new(mtm, frame);
+    let card = NSView::initWithFrame(NSView::alloc(mtm), frame);
+    round_corners(&card, CARD_RADIUS);
     webview.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
     webview.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
-    container.addSubview(webview);
-
-    let items = ToolbarItems::alloc(mtm).set_ivars(ItemsIvars {
-        back: back.clone(),
-        forward: forward.clone(),
-        address: field.clone(),
-    });
-    let items: Retained<ToolbarItems> = unsafe { msg_send![super(items), init] };
+    card.addSubview(webview);
+    container.addSubview(&sidebar);
+    container.addSubview(&card);
 
     let ui = Ui {
         address,
@@ -695,9 +722,12 @@ pub fn browser_content(
         progress,
         cell,
         field,
-        items,
+        card,
+        sidebar,
+        sidebar_width: RefCell::new(None),
+        card_leading: RefCell::new(None),
         following: RefCell::new(None),
     };
     ui.show_route(None);
-    (container, ui)
+    (Retained::into_super(container), ui)
 }

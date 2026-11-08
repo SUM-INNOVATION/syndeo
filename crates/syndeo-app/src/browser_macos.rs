@@ -36,6 +36,7 @@
 
 use crate::address::{self, Route, Search, Typed};
 use crate::chrome_macos::Ui;
+use crate::sidebar_macos::TabInfo;
 use crate::tabs;
 use crate::tabs_macos::{self, Badge};
 use objc2::rc::{Retained, Weak};
@@ -112,6 +113,9 @@ pub struct Snapshot {
 /// placed as `Place` says. The new tab's window, if one was made.
 pub type OpenTab = Box<dyn Fn(&NSWindow, &NSWindow, Start, Place) -> Option<Retained<NSWindow>>>;
 
+/// A tab's own menu, for its window, if it is a browser's.
+pub type TabMenu = Box<dyn Fn(&NSWindow) -> Option<Retained<objc2_app_kit::NSMenu>>>;
+
 /// A window is closing, as the tab in the snapshot, if it browsed.
 pub type OnClosed = Box<dyn Fn(&NSWindow, Option<Snapshot>)>;
 
@@ -122,6 +126,9 @@ pub type SendDirect = Box<dyn Fn(&[String]) -> bool>;
 pub struct Hooks {
     /// Open a tab beside a window.
     pub open_tab: OpenTab,
+    /// A tab's own menu, for its window: what the sidebar shows for a
+    /// secondary click on its row.
+    pub tab_menu: TabMenu,
     /// `window` is closing, as the tab in the snapshot, if it browsed; let
     /// it go.
     pub closed: OnClosed,
@@ -407,6 +414,10 @@ define_class!(
         /// draw for a page never shown.
         #[unsafe(method(windowDidBecomeKey:))]
         fn window_did_become_key(&self, _notification: &NSNotification) {
+            if let Some(window) = self.window() {
+                tabs_macos::hide_tab_bar(&window);
+                refresh_sidebars(&window);
+            }
             let later = self.ivars().later.borrow_mut().take();
             if let Some((address, _)) = later {
                 self.go(&address);
@@ -504,6 +515,14 @@ define_class!(
         #[unsafe(method(stopPage:))]
         fn stop_page(&self, _sender: Option<&AnyObject>) {
             self.stop();
+        }
+
+        /// View > Toggle Sidebar, and the sidebar's own button.
+        #[unsafe(method(syndeoToggleSidebar:))]
+        fn toggle_sidebar(&self, _sender: Option<&AnyObject>) {
+            if let Some(ui) = &*self.ivars().ui.borrow() {
+                ui.toggle_sidebar();
+            }
         }
 
         /// The address field's action: Return.
@@ -621,6 +640,60 @@ pub fn controller_of(window: &NSWindow) -> Option<Retained<BrowserController>> {
     object
         .downcast_ref::<BrowserController>()
         .map(|c| c.retain())
+}
+
+/// Show every sidebar in `window`'s tab group the group's tabs as they are
+/// now: titles, icons, which are pinned or loading, and which is in front.
+pub fn refresh_sidebars(window: &NSWindow) {
+    let windows = tabs_macos::tabs_of(window);
+    let front = window.tabGroup().and_then(|group| group.selectedWindow());
+    let tabs: Vec<TabInfo> = windows
+        .iter()
+        .filter_map(|w| {
+            let controller = controller_of(w)?;
+            let active = match &front {
+                Some(front) => std::ptr::eq(&**front, &**w),
+                None => true,
+            };
+            let icon = controller
+                .ivars()
+                .badge
+                .borrow()
+                .as_ref()
+                .and_then(|badge| badge.icon());
+            Some(TabInfo {
+                window: w.clone(),
+                title: w.title().to_string(),
+                icon,
+                pinned: controller.ivars().pinned.get(),
+                loading: controller.ivars().loading.get(),
+                active,
+            })
+        })
+        .collect();
+    for w in &windows {
+        if let Some(controller) = controller_of(w) {
+            if let Some(ui) = &*controller.ivars().ui.borrow() {
+                ui.sidebar.reload(&tabs);
+            }
+        }
+    }
+}
+
+/// `refresh_sidebars`, on the next turn of the run loop: for when a window
+/// is leaving its group and is still counted in it.
+pub fn refresh_sidebars_soon(window: &NSWindow) {
+    let weak = Weak::from_retained(&window.retain());
+    let tick = block2::RcBlock::new(
+        move |_timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+            if let Some(window) = weak.load() {
+                refresh_sidebars(&window);
+            }
+        },
+    );
+    unsafe {
+        objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.0, false, &tick)
+    };
 }
 
 /// Whether `window`'s tab is pinned.
@@ -744,6 +817,11 @@ impl BrowserController {
     /// Give the controller its window, the window's controls and the
     /// application's hooks.
     pub fn attach(&self, window: &NSWindow, ui: Ui, hooks: Rc<Hooks>) {
+        {
+            let hooks = hooks.clone();
+            ui.sidebar
+                .set_menu(Rc::new(move |window| (hooks.tab_menu)(window)));
+        }
         *self.ivars().window.borrow_mut() = Some(Weak::from_retained(&window.retain()));
         *self.ivars().ui.borrow_mut() = Some(ui);
         *self.ivars().hooks.borrow_mut() = Some(hooks);
@@ -827,6 +905,8 @@ impl BrowserController {
                 window.makeKeyAndOrderFront(None);
             }
         }
+        tabs_macos::hide_tab_bar(&window);
+        refresh_sidebars(&window);
         tracing::info!(pinned = pin, "a tab pinned or unpinned");
     }
 
@@ -924,6 +1004,9 @@ impl BrowserController {
                 if let Some(badge) = &*me.ivars().badge.borrow() {
                     badge.set_icon(icon.as_deref());
                     tracing::info!(found = icon.is_some(), "a page's icon, for its tab");
+                }
+                if let Some(window) = me.window() {
+                    refresh_sidebars(&window);
                 }
             }
         });
@@ -1308,6 +1391,7 @@ impl BrowserController {
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_else(|| "Syndeo".to_string());
             window.setTitle(&NSString::from_str(&title));
+            refresh_sidebars(&window);
         }
     }
 }

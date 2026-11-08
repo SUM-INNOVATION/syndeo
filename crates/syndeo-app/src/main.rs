@@ -24,6 +24,8 @@ mod peer_macos;
 #[cfg(target_os = "macos")]
 mod settings_macos;
 #[cfg(target_os = "macos")]
+mod sidebar_macos;
+#[cfg(target_os = "macos")]
 mod tabs_macos;
 // Plain Rust, and used only by the macOS application; tested everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]

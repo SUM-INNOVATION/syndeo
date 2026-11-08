@@ -576,6 +576,7 @@ impl AppDelegate {
         }
         let me = Weak::from_retained(&self.retain());
         let (tab, closed, start) = (me.clone(), me.clone(), me.clone());
+        let menu = me.clone();
         let (direct, send, refused) = (me.clone(), me.clone(), me);
         let search: Box<dyn Fn() -> Search> = Box::new(settings_macos::search);
         let hooks = Rc::new(Hooks {
@@ -583,6 +584,7 @@ impl AppDelegate {
                 tab.load()
                     .map(|app| app.open_tab(parent, after, start, place))
             }),
+            tab_menu: Box::new(move |window| menu.load().and_then(|app| app.tab_menu(window))),
             closed: Box::new(move |window, snapshot| {
                 if let Some(app) = closed.load() {
                     app.forget(window, snapshot);
@@ -783,6 +785,8 @@ impl AppDelegate {
             .count();
         let index = tabs::after_pinned(tabs_macos::index_of(after) + 1, pinned);
         tabs_macos::place(after, &window, index);
+        tabs_macos::hide_tab_bar(after);
+        crate::browser_macos::refresh_sidebars(after);
         match place {
             Place::Behind => parent.makeKeyAndOrderFront(None),
             _ => window.makeKeyAndOrderFront(None),
@@ -1153,6 +1157,9 @@ impl AppDelegate {
             }
         }
         *windows = kept;
+        for (open, _) in windows.iter() {
+            crate::browser_macos::refresh_sidebars_soon(open);
+        }
         tracing::info!(open = windows.len(), "a window closed");
     }
 
@@ -1371,6 +1378,7 @@ fn main_menu(
         "View",
         &[
             show_all_tabs,
+            item(mtm, "Toggle Sidebar", sel!(syndeoToggleSidebar:), "s"),
             NSMenuItem::separatorItem(mtm),
             item(mtm, "Reload Page", sel!(reloadPage:), "r"),
             item(mtm, "Stop Loading", sel!(stopPage:), "."),

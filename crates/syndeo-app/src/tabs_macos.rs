@@ -134,6 +134,11 @@ impl Badge {
         }
     }
 
+    /// The page's icon, if it has one.
+    pub fn icon(&self) -> Option<Retained<NSImage>> {
+        self.icon.image()
+    }
+
     /// Let the tab go of it.
     pub fn detach(&self, window: &NSWindow) {
         window.tab().setAccessoryView(None);
@@ -282,6 +287,19 @@ pub fn place(beside: &NSWindow, window: &NSWindow, index: usize) {
     }
     let count = group.windows().len();
     group.insertWindow_atIndex(window, index.min(count) as isize);
+}
+
+/// Keep AppKit's own tab bar out of sight in `window`'s group: the sidebar
+/// shows the tabs instead. AppKit shows the bar when a group grows to two
+/// windows, so this is asked after every placing, and when a tab comes to
+/// the front.
+pub fn hide_tab_bar(window: &NSWindow) {
+    if window
+        .tabGroup()
+        .is_some_and(|group| group.isTabBarVisible())
+    {
+        window.toggleTabBar(None);
+    }
 }
 
 /// The accessibility role of an element AppKit hands back, if it has one.

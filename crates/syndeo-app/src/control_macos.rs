@@ -1328,7 +1328,10 @@ impl Control {
         let number = self.agents.borrow().get(key).map_or(0, |a| a.number);
         window.setTabbingIdentifier(&tabbing(number));
         match self.window_of(key) {
-            Some(beside) => beside.addTabbedWindow_ordered(&window, NSWindowOrderingMode::Above),
+            Some(beside) => {
+                beside.addTabbedWindow_ordered(&window, NSWindowOrderingMode::Above);
+                crate::tabs_macos::hide_tab_bar(&beside);
+            }
             None => window.center(),
         }
         // In front, where the person can see it, without taking their keys.
