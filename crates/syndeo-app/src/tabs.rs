@@ -167,6 +167,10 @@ pub struct SavedTab {
     pub address: String,
     pub title: String,
     pub pinned: bool,
+    /// The space it is in (`spaces`): the first, when nothing says.
+    pub space: u64,
+    /// The folder it is in, if any; only a pinned tab is in one.
+    pub folder: Option<u64>,
 }
 
 /// A window's tabs, in order, and the one that was in front.
@@ -262,12 +266,20 @@ impl Session {
         for window in &self.windows {
             text.push_str(&format!("window\t{}\n", window.selected));
             for tab in &window.tabs {
-                text.push_str(&format!(
-                    "tab\t{}\t{}\t{}\n",
+                // The space and folder follow, as `key=value` fields a
+                // reader that does not know them can leave alone.
+                let mut line = format!(
+                    "tab\t{}\t{}\t{}\tspace={}",
                     if tab.pinned { "pinned" } else { "-" },
                     one_line(&tab.address),
-                    one_line(&tab.title)
-                ));
+                    one_line(&tab.title),
+                    tab.space
+                );
+                if let Some(folder) = tab.folder {
+                    line.push_str(&format!("\tfolder={folder}"));
+                }
+                line.push('\n');
+                text.push_str(&line);
             }
         }
         text
@@ -295,13 +307,21 @@ impl Session {
                         selected: selected.parse().unwrap_or(0),
                     });
                 }
-                ["tab", pin, address, title] if *pin == "pinned" || *pin == "-" => {
+                ["tab", pin, address, title, rest @ ..] if *pin == "pinned" || *pin == "-" => {
+                    let field = |key: &str| {
+                        rest.iter()
+                            .find_map(|f| f.strip_prefix(key))
+                            .and_then(|v| v.parse::<u64>().ok())
+                    };
                     if let Some(window) = session.windows.last_mut() {
                         if window.tabs.len() < SESSION_TABS {
+                            let pinned = *pin == "pinned";
                             window.tabs.push(SavedTab {
                                 address: (*address).to_string(),
                                 title: (*title).to_string(),
-                                pinned: *pin == "pinned",
+                                pinned,
+                                space: field("space=").unwrap_or(crate::spaces::FIRST_SPACE),
+                                folder: field("folder=").filter(|_| pinned),
                             });
                         }
                     }
@@ -446,6 +466,8 @@ mod tests {
             address: address.into(),
             title: title.into(),
             pinned,
+            space: crate::spaces::FIRST_SPACE,
+            folder: None,
         }
     }
 
@@ -481,6 +503,33 @@ mod tests {
     /// Whatever the file says, only web addresses that typing would open
     /// come back: no other scheme, no address with a zone, nothing that is
     /// not an address at all.
+    #[test]
+    fn a_tabs_space_and_folder_read_back_and_an_old_file_still_reads() {
+        let mut pinned = tab("https://a.test/", "A", true);
+        pinned.space = 7;
+        pinned.folder = Some(12);
+        let mut loose = tab("https://b.test/", "B", false);
+        loose.space = 7;
+        let session = Session {
+            windows: vec![SavedWindow {
+                tabs: vec![pinned.clone(), loose.clone()],
+                selected: 1,
+            }],
+        };
+        let read = Session::from_text(&session.to_text());
+        assert_eq!(read, session);
+        // Written before there were spaces: every tab in the first space.
+        let old = "syndeo-session 1\nwindow\t0\ntab\tpinned\thttps://a.test/\tA\n";
+        let read = Session::from_text(old);
+        assert_eq!(read.windows[0].tabs[0].space, crate::spaces::FIRST_SPACE);
+        assert_eq!(read.windows[0].tabs[0].folder, None);
+        // A folder is a pinned tab's: an unpinned one's is dropped.
+        let odd = "syndeo-session 1\nwindow\t0\ntab\t-\thttps://a.test/\tA\tspace=2\tfolder=3\n";
+        let read = Session::from_text(odd);
+        assert_eq!(read.windows[0].tabs[0].space, 2);
+        assert_eq!(read.windows[0].tabs[0].folder, None);
+    }
+
     #[test]
     fn a_session_opens_nothing_a_window_could_not() {
         let text = format!(

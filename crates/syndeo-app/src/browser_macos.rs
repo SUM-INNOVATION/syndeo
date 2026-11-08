@@ -108,6 +108,9 @@ pub struct Snapshot {
     pub address: String,
     pub title: String,
     pub pinned: bool,
+    /// The space it was in, and its folder.
+    pub space: u64,
+    pub folder: Option<u64>,
     /// WebKit's own record of its history, for a web page, kept in memory
     /// and never written anywhere.
     state: Option<Retained<AnyObject>>,
@@ -182,6 +185,9 @@ pub struct Ivars {
     typing: Cell<bool>,
     /// The tab is pinned.
     pinned: Cell<bool>,
+    /// The space the tab is in (`spaces`), and its folder, if any.
+    space: Cell<u64>,
+    folder: Cell<Option<u64>>,
     /// A tab from the last session not yet shown: its address and title.
     later: RefCell<Option<(String, String)>>,
     /// The tab's badge.
@@ -593,6 +599,33 @@ define_class!(
             }
         }
 
+        /// A tab's row dropped on a folder's: into that folder, pinned.
+        #[unsafe(method(syndeoDropOnFolder:))]
+        fn drop_on_folder(&self, sender: Option<&AnyObject>) {
+            if let Some(row) = sender.and_then(|s| s.downcast_ref::<crate::sidebar_macos::FolderRow>()) {
+                self.set_folder(Some(row.id()));
+                tracing::info!("a tab dragged into a folder");
+            }
+        }
+
+        /// A tab's menu > Move to Folder > a folder: the item's tag.
+        #[unsafe(method(syndeoMoveToFolder:))]
+        fn move_to_folder(&self, sender: Option<&AnyObject>) {
+            let tag = sender
+                .and_then(|s| s.downcast_ref::<NSMenuItem>())
+                .map(|item| item.tag())
+                .and_then(|tag| u64::try_from(tag).ok());
+            if let Some(folder) = tag {
+                self.set_folder(Some(folder));
+            }
+        }
+
+        /// A tab's menu > Remove from Folder.
+        #[unsafe(method(syndeoRemoveFromFolder:))]
+        fn remove_from_folder(&self, _sender: Option<&AnyObject>) {
+            self.set_folder(None);
+        }
+
         /// A tab's row dragged to the favorites: this tab's page, added, if
         /// it is not one already.
         #[unsafe(method(syndeoAddFavorite:))]
@@ -779,6 +812,8 @@ pub fn refresh_sidebars(window: &NSWindow) {
                 pinned: controller.ivars().pinned.get(),
                 loading: controller.ivars().loading.get(),
                 active,
+                space: controller.ivars().space.get(),
+                folder: controller.ivars().folder.get(),
             })
         })
         .collect();
@@ -795,11 +830,16 @@ pub fn refresh_sidebars(window: &NSWindow) {
             FavoriteInfo { favorite, icon }
         })
         .collect();
+    let layout = crate::spaces_macos::read(Clone::clone);
     for w in &windows {
         if let Some(controller) = controller_of(w) {
             if let Some(ui) = &*controller.ivars().ui.borrow() {
-                ui.sidebar.reload(&tabs, &favorites);
+                ui.sidebar.reload(&tabs, &favorites, &layout);
             }
+        }
+        // The backdrop takes the current space's colour.
+        if let Some(content) = w.contentView() {
+            content.setNeedsDisplay(true);
         }
     }
 }
@@ -1010,6 +1050,35 @@ impl BrowserController {
         self.ivars().pinned.get()
     }
 
+    /// The space the tab is in.
+    pub fn space(&self) -> u64 {
+        self.ivars().space.get()
+    }
+
+    /// Put the tab in a space: the current one, for one that is not a
+    /// space. Leaving a space leaves its folder too.
+    pub fn set_space(&self, space: u64) {
+        let space = crate::spaces_macos::space_or_current(space);
+        if self.ivars().space.replace(space) != space {
+            self.ivars().folder.set(None);
+        }
+    }
+
+    /// The folder the tab is in, if any.
+    pub fn folder(&self) -> Option<u64> {
+        self.ivars().folder.get()
+    }
+
+    /// Put the tab in a folder, pinning it if it is not, or take it out.
+    pub fn set_folder(&self, folder: Option<u64>) {
+        self.ivars().folder.set(folder);
+        if folder.is_some() && !self.ivars().pinned.get() {
+            self.set_pinned(true);
+        } else if let Some(window) = self.window() {
+            refresh_sidebars(&window);
+        }
+    }
+
     /// Pin the tab, or unpin it: pinned tabs come first in their window, in
     /// the order they were pinned; one unpinned goes first after them.
     pub fn set_pinned(&self, pin: bool) {
@@ -1039,11 +1108,15 @@ impl BrowserController {
         let web = self.ivars().web.borrow();
         let web = web.as_ref()?;
         let pinned = self.ivars().pinned.get();
+        let space = self.ivars().space.get();
+        let folder = self.ivars().folder.get();
         if let Some((address, title)) = self.ivars().later.borrow().clone() {
             return Some(Snapshot {
                 address,
                 title,
                 pinned,
+                space,
+                folder,
                 state: None,
             });
         }
@@ -1055,6 +1128,8 @@ impl BrowserController {
                 address,
                 title,
                 pinned,
+                space,
+                folder,
                 state: None,
             });
         }
@@ -1067,6 +1142,8 @@ impl BrowserController {
                 address,
                 title,
                 pinned,
+                space,
+                folder,
                 state: unsafe { web.view.interactionState() },
             },
             // The start page, or one of Syndeo's own.
@@ -1074,6 +1151,8 @@ impl BrowserController {
                 address: String::new(),
                 title: String::new(),
                 pinned,
+                space,
+                folder,
                 state: None,
             },
         })
@@ -1083,6 +1162,10 @@ impl BrowserController {
     /// navigation policy as any page, or its address, as if typed, or the
     /// start page. Pinning it again is for whoever places it.
     pub fn restore(&self, snapshot: Snapshot) {
+        self.set_space(snapshot.space);
+        self.ivars()
+            .folder
+            .set(snapshot.folder.filter(|_| snapshot.pinned));
         match (&*self.ivars().web.borrow(), snapshot.state) {
             (Some(web), Some(state)) if !snapshot.address.is_empty() => {
                 unsafe { web.view.setInteractionState(Some(&state)) };

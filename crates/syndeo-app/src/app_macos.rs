@@ -81,6 +81,7 @@ use crate::browser_macos::{
 use crate::command_bar_macos;
 use crate::control_macos;
 use crate::settings_macos::{self, Clearing, SettingsController};
+use crate::spaces_macos;
 use crate::tabs::{self, Closed, Session};
 use crate::tabs_macos;
 use anyhow::{Context, Result};
@@ -466,6 +467,159 @@ define_class!(
                     window.makeKeyAndOrderFront(None);
                 }
             }
+        }
+
+        /// A dot in the sidebar's switcher: that space.
+        #[unsafe(method(syndeoSwitchSpace:))]
+        fn switch_space_action(&self, sender: Option<&AnyObject>) {
+            if let Some(dot) = sender.and_then(|s| s.downcast_ref::<spaces_macos::SpaceDot>()) {
+                self.switch_space(dot.id());
+            }
+        }
+
+        #[unsafe(method(syndeoNextSpace:))]
+        fn next_space(&self, _sender: Option<&AnyObject>) {
+            let id = spaces_macos::read(|layout| layout.next_space());
+            self.switch_space(id);
+        }
+
+        #[unsafe(method(syndeoPreviousSpace:))]
+        fn previous_space(&self, _sender: Option<&AnyObject>) {
+            let id = spaces_macos::read(|layout| layout.previous_space());
+            self.switch_space(id);
+        }
+
+        /// New Space…: named, in the next colour along, and switched to.
+        #[unsafe(method(syndeoNewSpace:))]
+        fn new_space(&self, _sender: Option<&AnyObject>) {
+            let count = spaces_macos::read(|layout| layout.spaces.len());
+            let suggested = format!("Space {}", count + 1);
+            let Some(name) = self.ask_name("New Space", "A name for the space.", &suggested)
+            else {
+                return;
+            };
+            match spaces_macos::change(|layout| layout.add_space(&name)) {
+                Some(id) => self.switch_space(id),
+                None => tracing::warn!("no room for another space"),
+            }
+        }
+
+        /// Rename Space…: the one in the item's tag, or the current one.
+        #[unsafe(method(syndeoRenameSpace:))]
+        fn rename_space(&self, sender: Option<&AnyObject>) {
+            let id = tag_or_current(sender);
+            let Some(was) = spaces_macos::read(|layout| layout.space(id).map(|s| s.name.clone()))
+            else {
+                return;
+            };
+            let Some(name) = self.ask_name("Rename Space", "", &was) else {
+                return;
+            };
+            spaces_macos::change(|layout| layout.rename_space(id, &name));
+            self.refresh_spaces();
+        }
+
+        /// A space's colour: the item's tag says which space and which.
+        #[unsafe(method(syndeoSetSpaceHue:))]
+        fn set_space_hue(&self, sender: Option<&AnyObject>) {
+            let Some(tag) = menu_tag(sender) else { return };
+            let (id, hue) = (tag / spaces_macos::HUE_BASE, tag % spaces_macos::HUE_BASE);
+            if let (Ok(id), Ok(hue)) = (u64::try_from(id), usize::try_from(hue)) {
+                spaces_macos::change(|layout| layout.set_hue(id, hue));
+                self.refresh_spaces();
+            }
+        }
+
+        /// Delete Space: its tabs go to the first space left; the last
+        /// space stays.
+        #[unsafe(method(syndeoDeleteSpace:))]
+        fn delete_space(&self, sender: Option<&AnyObject>) {
+            let id = tag_or_current(sender);
+            let home = spaces_macos::read(|layout| {
+                layout.spaces.iter().find(|s| s.id != id).map(|s| s.id)
+            });
+            let Some(home) = home else { return };
+            if !spaces_macos::change(|layout| layout.remove_space(id)) {
+                return;
+            }
+            let controllers: Vec<Retained<BrowserController>> = self
+                .ivars()
+                .windows
+                .borrow()
+                .iter()
+                .map(|(_, c)| c.clone())
+                .collect();
+            for controller in controllers {
+                if controller.space() == id {
+                    controller.set_space(home);
+                }
+            }
+            tracing::info!(space = id, "a space deleted");
+            self.switch_space(spaces_macos::current());
+        }
+
+        /// New Folder…: in the current space.
+        #[unsafe(method(syndeoNewFolder:))]
+        fn new_folder(&self, _sender: Option<&AnyObject>) {
+            let Some(name) =
+                self.ask_name("New Folder", "A name for the folder, in this space.", "")
+            else {
+                return;
+            };
+            spaces_macos::change(|layout| {
+                let space = layout.current;
+                layout.add_folder(space, &name)
+            });
+            self.refresh_spaces();
+        }
+
+        /// A folder's row: fold it, or open it.
+        #[unsafe(method(syndeoToggleFolder:))]
+        fn toggle_folder(&self, sender: Option<&AnyObject>) {
+            let row = sender.and_then(|s| s.downcast_ref::<crate::sidebar_macos::FolderRow>());
+            if let Some(row) = row {
+                spaces_macos::change(|layout| layout.toggle_folder(row.id()));
+                self.refresh_spaces();
+            }
+        }
+
+        #[unsafe(method(syndeoRenameFolder:))]
+        fn rename_folder(&self, sender: Option<&AnyObject>) {
+            let Some(id) = menu_tag(sender).and_then(|t| u64::try_from(t).ok()) else {
+                return;
+            };
+            let Some(was) =
+                spaces_macos::read(|layout| layout.folder(id).map(|f| f.name.clone()))
+            else {
+                return;
+            };
+            let Some(name) = self.ask_name("Rename Folder", "", &was) else {
+                return;
+            };
+            spaces_macos::change(|layout| layout.rename_folder(id, &name));
+            self.refresh_spaces();
+        }
+
+        /// Delete Folder: its tabs stay, pinned, out of any folder.
+        #[unsafe(method(syndeoDeleteFolder:))]
+        fn delete_folder(&self, sender: Option<&AnyObject>) {
+            let Some(id) = menu_tag(sender).and_then(|t| u64::try_from(t).ok()) else {
+                return;
+            };
+            spaces_macos::change(|layout| layout.remove_folder(id));
+            let controllers: Vec<Retained<BrowserController>> = self
+                .ivars()
+                .windows
+                .borrow()
+                .iter()
+                .map(|(_, c)| c.clone())
+                .collect();
+            for controller in controllers {
+                if controller.folder() == Some(id) {
+                    controller.set_folder(None);
+                }
+            }
+            self.refresh_spaces();
         }
 
         /// Syndeo > Settings….
@@ -857,9 +1011,11 @@ impl AppDelegate {
                     Some(last) => tabs_macos::place(last, &window, opened.len()),
                     None => window.center(),
                 }
-                if tab.pinned {
-                    if let Some(controller) = controller_of(&window) {
+                if let Some(controller) = controller_of(&window) {
+                    controller.set_space(tab.space);
+                    if tab.pinned {
                         controller.set_pinned(true);
+                        controller.set_folder(tab.folder);
                     }
                 }
                 opened.push(window);
@@ -979,7 +1135,9 @@ impl AppDelegate {
                 None => window.center(),
             }
             if let Some(controller) = controller_of(&window) {
+                controller.set_space(tab.space);
                 controller.set_pinned(true);
+                controller.set_folder(tab.folder);
             }
             first.get_or_insert(window);
         }
@@ -1033,11 +1191,15 @@ impl AppDelegate {
                         address: s.address,
                         title: s.title,
                         pinned: s.pinned,
+                        space: s.space,
+                        folder: s.folder,
                     },
                     None => tabs::SavedTab {
                         address: String::new(),
                         title: String::new(),
                         pinned: false,
+                        space: crate::spaces::FIRST_SPACE,
+                        folder: None,
                     },
                 });
             }
@@ -1161,6 +1323,44 @@ impl AppDelegate {
         ] {
             menu.addItem(&entry);
         }
+        // This space's folders, to move the tab into, after the favorites
+        // item; and out of its folder, if it is in one.
+        let folders: Vec<crate::spaces::Folder> = spaces_macos::read(|layout| {
+            layout
+                .folders_of(layout.current)
+                .into_iter()
+                .cloned()
+                .collect()
+        });
+        let mut at = 3;
+        if !folders.is_empty() {
+            let into = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Move to Folder"));
+            for folder in &folders {
+                let entry =
+                    tabs_macos::item(mtm, &folder.name, sel!(syndeoMoveToFolder:), Some(to_tab));
+                entry.setTag(folder.id as isize);
+                if controller.folder() == Some(folder.id) {
+                    entry.setState(objc2_app_kit::NSControlStateValueOn);
+                }
+                into.addItem(&entry);
+            }
+            let holder = NSMenuItem::new(mtm);
+            holder.setTitle(ns_string!("Move to Folder"));
+            holder.setSubmenu(Some(&into));
+            menu.insertItem_atIndex(&holder, at);
+            at += 1;
+        }
+        if controller.folder().is_some() {
+            menu.insertItem_atIndex(
+                &tabs_macos::item(
+                    mtm,
+                    "Remove from Folder",
+                    sel!(syndeoRemoveFromFolder:),
+                    Some(to_tab),
+                ),
+                at,
+            );
+        }
         tracing::info!("a tab's menu shown");
         Some(menu)
     }
@@ -1194,6 +1394,73 @@ impl AppDelegate {
             crate::browser_macos::refresh_sidebars_soon(open);
         }
         tracing::info!(open = windows.len(), "a window closed");
+    }
+
+    /// Make `id` the current space, and bring one of its tabs to the
+    /// front, or open one when it has none.
+    fn switch_space(&self, id: u64) {
+        if !spaces_macos::change(|layout| layout.switch_to(id)) {
+            return;
+        }
+        let Some(front) = self.persons_front() else {
+            self.open_window();
+            return;
+        };
+        let in_space = tabs_macos::tabs_of(&front)
+            .into_iter()
+            .find(|w| controller_of(w).is_some_and(|c| c.space() == id));
+        match in_space {
+            Some(window) => {
+                window.makeKeyAndOrderFront(None);
+                crate::browser_macos::refresh_sidebars(&window);
+            }
+            None => {
+                self.open_tab(&front, &front, Start::Page, Place::Front);
+            }
+        }
+        tracing::info!(space = id, "a space switched to");
+    }
+
+    /// Every window's sidebar and backdrop, as the spaces are now.
+    fn refresh_spaces(&self) {
+        let windows: Vec<Retained<NSWindow>> = self
+            .ivars()
+            .windows
+            .borrow()
+            .iter()
+            .map(|(w, _)| w.clone())
+            .collect();
+        for window in windows {
+            crate::browser_macos::refresh_sidebars(&window);
+        }
+    }
+
+    /// Ask for a name, with `suggested` filled in: the name, trimmed, or
+    /// none for Cancel or nothing typed.
+    fn ask_name(&self, title: &str, detail: &str, suggested: &str) -> Option<String> {
+        let mtm = self.mtm();
+        let alert = objc2_app_kit::NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        if !detail.is_empty() {
+            alert.setInformativeText(&NSString::from_str(detail));
+        }
+        let field = NSTextField::initWithFrame(
+            NSTextField::alloc(mtm),
+            objc2_foundation::NSRect::new(
+                objc2_foundation::NSPoint::new(0.0, 0.0),
+                objc2_foundation::NSSize::new(260.0, 24.0),
+            ),
+        );
+        field.setStringValue(&NSString::from_str(suggested));
+        alert.setAccessoryView(Some(&field));
+        alert.addButtonWithTitle(ns_string!("OK"));
+        alert.addButtonWithTitle(ns_string!("Cancel"));
+        alert.window().setInitialFirstResponder(Some(&field));
+        if alert.runModal() != objc2_app_kit::NSAlertFirstButtonReturn {
+            return None;
+        }
+        let name = field.stringValue().to_string();
+        (!name.trim().is_empty()).then(|| name.trim().to_string())
     }
 
     /// A window: browsing through the proxy if this application can, a
@@ -1237,6 +1504,8 @@ impl AppDelegate {
                 window.setContentView(Some(&container));
                 ui.dress(&window, &webview);
                 controller.attach(&window, ui, hooks);
+                // In the current space, unless what it starts as says otherwise.
+                controller.set_space(spaces_macos::current());
                 match start {
                     Start::Page => controller.show_start_page(),
                     Start::Request(request) => controller.load(&request),
@@ -1416,6 +1685,33 @@ fn main_menu(
             NSMenuItem::separatorItem(mtm),
             item(mtm, "Reload Page", sel!(reloadPage:), "r"),
             item(mtm, "Stop Loading", sel!(stopPage:), "."),
+        ],
+    );
+    submenu(
+        mtm,
+        &bar,
+        "Spaces",
+        &[
+            item(mtm, "New Space…", sel!(syndeoNewSpace:), ""),
+            item(mtm, "New Folder…", sel!(syndeoNewFolder:), ""),
+            NSMenuItem::separatorItem(mtm),
+            item_with(
+                mtm,
+                "Next Space",
+                sel!(syndeoNextSpace:),
+                "\u{F703}",
+                command | NSEventModifierFlags::Option,
+            ),
+            item_with(
+                mtm,
+                "Previous Space",
+                sel!(syndeoPreviousSpace:),
+                "\u{F702}",
+                command | NSEventModifierFlags::Option,
+            ),
+            NSMenuItem::separatorItem(mtm),
+            item(mtm, "Rename Space…", sel!(syndeoRenameSpace:), ""),
+            item(mtm, "Delete Space", sel!(syndeoDeleteSpace:), ""),
         ],
     );
     let recent = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Recently Closed"));
@@ -1937,4 +2233,20 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
             Path::new("/Users/someone/Library/Application Support/Syndeo/proxy/syndeo-ca.pem")
         );
     }
+}
+
+/// A menu item's tag, when `sender` is one.
+fn menu_tag(sender: Option<&AnyObject>) -> Option<isize> {
+    sender
+        .and_then(|s| s.downcast_ref::<NSMenuItem>())
+        .map(|item| item.tag())
+}
+
+/// The space a menu item's tag names, or the current space for an item
+/// with none (the menu bar's).
+fn tag_or_current(sender: Option<&AnyObject>) -> u64 {
+    menu_tag(sender)
+        .and_then(|tag| u64::try_from(tag).ok())
+        .filter(|id| *id > 0)
+        .unwrap_or_else(spaces_macos::current)
 }

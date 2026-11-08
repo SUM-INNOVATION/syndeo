@@ -35,6 +35,8 @@
 //! `syndeo.favorite`.
 
 use crate::favorites::{self, Favorite};
+use crate::spaces::{Folder, Layout};
+use crate::spaces_macos::{self, SpaceBar};
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{
@@ -107,6 +109,9 @@ pub struct TabInfo {
     pub loading: bool,
     /// The tab in front of its window.
     pub active: bool,
+    /// The space it is in, and the folder, if any.
+    pub space: u64,
+    pub folder: Option<u64>,
 }
 
 /// A favorite, as the sidebar shows it: with an icon when a tab of its
@@ -123,11 +128,6 @@ pub fn is_dark(view: &NSView) -> bool {
         .isEqualToString(unsafe { NSAppearanceNameDarkAqua })
 }
 
-/// An sRGB colour, opaque.
-fn rgb(r: f64, g: f64, b: f64) -> Retained<NSColor> {
-    NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0)
-}
-
 /// White, at `alpha`: what rows and tiles are lit with, over the backdrop.
 fn lit(alpha: f64) -> Retained<NSColor> {
     NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, alpha)
@@ -137,11 +137,7 @@ fn lit(alpha: f64) -> Retained<NSColor> {
 /// the same hues deepened in dark, filling `rect` in `view`, with corners
 /// rounded by `radius` if any.
 pub fn fill_gradient(view: &NSView, rect: NSRect, radius: Option<f64>) {
-    let (from, to) = if is_dark(view) {
-        (rgb(0.165, 0.145, 0.235), rgb(0.235, 0.165, 0.215))
-    } else {
-        (rgb(0.851, 0.831, 0.969), rgb(0.969, 0.851, 0.890))
-    };
+    let (from, to) = spaces_macos::current_colors(is_dark(view));
     let Some(gradient) =
         NSGradient::initWithStartingColor_endingColor(NSGradient::alloc(), &from, &to)
     else {
@@ -392,6 +388,7 @@ impl TabRow {
         tab: Option<&TabInfo>,
         menu_for: Option<MenuFor>,
         sidebar: Option<Weak<Sidebar>>,
+        indent: f64,
     ) -> Retained<Self> {
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, ROW_HEIGHT));
         let this = Self::alloc(mtm).set_ivars(RowIvars {
@@ -425,7 +422,7 @@ impl TabRow {
         icon.setImageScaling(NSImageScaling::ScaleProportionallyDown);
         icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
         icon.setFrame(NSRect::new(
-            NSPoint::new(ROW_PAD, (ROW_HEIGHT - ICON) / 2.0),
+            NSPoint::new(ROW_PAD + indent, (ROW_HEIGHT - ICON) / 2.0),
             NSSize::new(ICON, ICON),
         ));
         this.addSubview(&icon);
@@ -441,7 +438,7 @@ impl TabRow {
             NSColor::labelColor()
         };
         label.setTextColor(Some(&colour));
-        let text_x = ROW_PAD + ICON + 8.0;
+        let text_x = ROW_PAD + indent + ICON + 8.0;
         let text_w = width - text_x - CLOSE - ROW_PAD;
         label.setFrame(NSRect::new(
             NSPoint::new(text_x, (ROW_HEIGHT - 17.0) / 2.0),
@@ -695,6 +692,183 @@ impl FavoriteTile {
     }
 }
 
+// --------------------------------------------------------------- a folder
+
+/// How far a folder's tabs are set in from its row.
+const FOLDER_INDENT: f64 = 18.0;
+
+pub struct FolderIvars {
+    id: u64,
+    hover: Cell<bool>,
+    /// A dragged tab is over it.
+    drop: Cell<bool>,
+}
+
+define_class!(
+    /// A folder's row: a chevron, open or shut, the folder symbol and its
+    /// name. A click folds it or opens it, a secondary click offers to
+    /// rename or delete it, and a tab dragged onto it goes into it.
+    #[unsafe(super(NSView, objc2_app_kit::NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "SyndeoFolderRow"]
+    #[ivars = FolderIvars]
+    pub struct FolderRow;
+
+    impl FolderRow {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let ivars = self.ivars();
+            let dark = is_dark(self);
+            let alpha = match (ivars.drop.get(), ivars.hover.get()) {
+                (true, _) if dark => 0.2,
+                (true, _) => 0.7,
+                (false, true) if dark => 0.07,
+                (false, true) => 0.30,
+                _ => return,
+            };
+            lit(alpha).setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                self.bounds(),
+                ROW_RADIUS,
+                ROW_RADIUS,
+            )
+            .fill();
+        }
+
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, _event: &NSEvent) {
+            let me: &AnyObject = self.as_ref();
+            send(self.mtm(), sel!(syndeoToggleFolder:), None, Some(me));
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            let mtm = self.mtm();
+            let id = self.ivars().id as isize;
+            let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Folder"));
+            for (title, action) in [
+                ("Rename Folder…", sel!(syndeoRenameFolder:)),
+                ("Delete Folder", sel!(syndeoDeleteFolder:)),
+            ] {
+                let item = unsafe {
+                    objc2_app_kit::NSMenuItem::initWithTitle_action_keyEquivalent(
+                        objc2_app_kit::NSMenuItem::alloc(mtm),
+                        &NSString::from_str(title),
+                        Some(action),
+                        &NSString::new(),
+                    )
+                };
+                item.setTag(id);
+                menu.addItem(&item);
+            }
+            NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+        }
+
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            self.ivars().hover.set(true);
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            self.ivars().hover.set(false);
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(updateTrackingAreas))]
+        fn update_tracking_areas(&self) {
+            track(self);
+            let _: () = unsafe { msg_send![super(self), updateTrackingAreas] };
+        }
+
+        #[unsafe(method(isAccessibilityElement))]
+        fn is_accessibility_element(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method_id(accessibilityRole))]
+        fn accessibility_role(&self) -> Option<Retained<NSString>> {
+            Some(NSString::from_str("AXDisclosureTriangle"))
+        }
+    }
+);
+
+impl FolderRow {
+    fn new(mtm: MainThreadMarker, width: f64, folder: &Folder) -> Retained<Self> {
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, ROW_HEIGHT));
+        let this = Self::alloc(mtm).set_ivars(FolderIvars {
+            id: folder.id,
+            hover: Cell::new(false),
+            drop: Cell::new(false),
+        });
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        this.setTranslatesAutoresizingMaskIntoConstraints(false);
+        this.heightAnchor()
+            .constraintEqualToConstant(ROW_HEIGHT)
+            .setActive(true);
+        this.setAccessibilityIdentifier(Some(ns_string!("syndeo.folder")));
+        this.setAccessibilityLabel(Some(&NSString::from_str(&folder.name)));
+
+        let chevron = NSImageView::new(mtm);
+        let (name, label) = if folder.collapsed {
+            ("chevron.right", "Closed")
+        } else {
+            ("chevron.down", "Open")
+        };
+        chevron.setImage(symbol(name, label).as_deref());
+        chevron.setContentTintColor(Some(&NSColor::tertiaryLabelColor()));
+        chevron.setFrame(NSRect::new(
+            NSPoint::new(2.0, (ROW_HEIGHT - 12.0) / 2.0),
+            NSSize::new(12.0, 12.0),
+        ));
+        this.addSubview(&chevron);
+
+        let icon = NSImageView::new(mtm);
+        icon.setImage(symbol("folder.fill", "Folder").as_deref());
+        icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+        icon.setFrame(NSRect::new(
+            NSPoint::new(ROW_PAD + 8.0, (ROW_HEIGHT - ICON) / 2.0),
+            NSSize::new(ICON, ICON),
+        ));
+        this.addSubview(&icon);
+
+        let title = NSTextField::labelWithString(&NSString::from_str(&folder.name), mtm);
+        title.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        title.setTextColor(Some(&NSColor::labelColor()));
+        let text_x = ROW_PAD + 8.0 + ICON + 8.0;
+        title.setFrame(NSRect::new(
+            NSPoint::new(text_x, (ROW_HEIGHT - 17.0) / 2.0),
+            NSSize::new((width - text_x - ROW_PAD).max(10.0), 17.0),
+        ));
+        title.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable);
+        this.addSubview(&title);
+        this
+    }
+
+    /// The folder's id.
+    pub fn id(&self) -> u64 {
+        self.ivars().id
+    }
+
+    fn set_drop(&self, drop: bool) {
+        if self.ivars().drop.replace(drop) != drop {
+            self.setNeedsDisplay(true);
+        }
+    }
+}
+
 // ------------------------------------------------------------ the sidebar
 
 define_class!(
@@ -843,6 +1017,8 @@ pub struct SidebarIvars {
     /// Where a dragged tab is dropped to become a favorite: over the
     /// favorites, shown while a tab is dragged.
     hint: Retained<DropHint>,
+    /// The spaces, at the foot.
+    spaces: Retained<SpaceBar>,
 }
 
 define_class!(
@@ -920,6 +1096,7 @@ impl Sidebar {
         favorites.setSpacing(TILE_GAP);
         favorites.setTranslatesAutoresizingMaskIntoConstraints(false);
         let hint = DropHint::new(mtm);
+        let spaces = SpaceBar::new(mtm);
         let this = Self::alloc(mtm).set_ivars(SidebarIvars {
             list: list.clone(),
             favorites: favorites.clone(),
@@ -927,6 +1104,7 @@ impl Sidebar {
             target: Weak::from_retained(&target.retain()),
             floating: Cell::new(false),
             hint: hint.clone(),
+            spaces: spaces.clone(),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -944,6 +1122,7 @@ impl Sidebar {
         this.addSubview(field);
         this.addSubview(&favorites);
         this.addSubview(&hint);
+        this.addSubview(&spaces);
 
         // The tabs, scrolling when there are more than fit.
         let scroll = NSScrollView::new(mtm);
@@ -997,7 +1176,16 @@ impl Sidebar {
                 .constraintEqualToAnchor_constant(&this.trailingAnchor(), -(SIDE - 2.0)),
             scroll
                 .bottomAnchor()
-                .constraintEqualToAnchor_constant(&this.bottomAnchor(), -PANEL_MARGIN),
+                .constraintEqualToAnchor_constant(&spaces.topAnchor(), -6.0),
+            spaces
+                .leadingAnchor()
+                .constraintEqualToAnchor_constant(&this.leadingAnchor(), SIDE),
+            spaces
+                .trailingAnchor()
+                .constraintEqualToAnchor_constant(&this.trailingAnchor(), -SIDE),
+            spaces
+                .bottomAnchor()
+                .constraintEqualToAnchor_constant(&this.bottomAnchor(), -(PANEL_MARGIN + 4.0)),
             document
                 .leadingAnchor()
                 .constraintEqualToAnchor(&clip.leadingAnchor()),
@@ -1040,21 +1228,60 @@ impl Sidebar {
     fn drag_moved(&self, at: NSPoint) {
         let hint = &self.ivars().hint;
         hint.set_active(self.over_hint(at));
+        let under = self.folder_under(at);
+        for row in self.folder_rows() {
+            row.set_drop(under.as_deref().is_some_and(|u| std::ptr::eq(u, &*row)));
+        }
+    }
+
+    /// The folder rows in the list.
+    fn folder_rows(&self) -> Vec<Retained<FolderRow>> {
+        self.ivars()
+            .list
+            .arrangedSubviews()
+            .iter()
+            .filter_map(|view| view.downcast::<FolderRow>().ok())
+            .collect()
+    }
+
+    /// The folder row under `at`, in the window, if any.
+    fn folder_under(&self, at: NSPoint) -> Option<Retained<FolderRow>> {
+        self.folder_rows().into_iter().find(|row| {
+            let point = row.convertPoint_fromView(at, None);
+            let bounds = row.bounds();
+            point.x >= bounds.origin.x
+                && point.x <= bounds.origin.x + bounds.size.width
+                && point.y >= bounds.origin.y
+                && point.y <= bounds.origin.y + bounds.size.height
+        })
     }
 
     /// The dragged row was let go at `at`, in the window: over the
-    /// favorites, `tab`'s page becomes one, through the tab's controller.
+    /// favorites, `tab`'s page becomes one; over a folder, the tab goes
+    /// into it; both through the tab's controller.
     fn drag_ended(&self, at: NSPoint, tab: &NSWindow) {
         let hint = &self.ivars().hint;
         let over = self.over_hint(at);
         hint.set_active(false);
         hint.setHidden(true);
-        if !over {
-            return;
+        let folder = self.folder_under(at);
+        for row in self.folder_rows() {
+            row.set_drop(false);
         }
-        if let Some(delegate) = tab.delegate() {
-            let target: &AnyObject = (*delegate).as_ref();
+        let Some(delegate) = tab.delegate() else {
+            return;
+        };
+        let target: &AnyObject = (*delegate).as_ref();
+        if over {
             send(self.mtm(), sel!(syndeoAddFavorite:), Some(target), None);
+        } else if let Some(folder) = folder {
+            let sender: &AnyObject = folder.as_ref();
+            send(
+                self.mtm(),
+                sel!(syndeoDropOnFolder:),
+                Some(target),
+                Some(sender),
+            );
         }
     }
 
@@ -1094,9 +1321,10 @@ impl Sidebar {
         )
     }
 
-    /// Show `favorites` as tiles, and `tabs` as rows in their order:
-    /// pinned, a rule, the rest, New Tab.
-    pub fn reload(&self, tabs: &[TabInfo], favorites: &[FavoriteInfo]) {
+    /// Show `favorites` as tiles, `layout`'s spaces at the foot, and the
+    /// current space's `tabs` as rows: its folders and their tabs, the
+    /// pinned tabs in none, a rule, the rest, New Tab.
+    pub fn reload(&self, tabs: &[TabInfo], favorites: &[FavoriteInfo], layout: &Layout) {
         let mtm = self.mtm();
         let ivars = self.ivars();
         let clear = |stack: &NSStackView| {
@@ -1122,27 +1350,72 @@ impl Sidebar {
             ivars.favorites.addArrangedSubview(&line);
         }
 
+        ivars.spaces.reload(layout);
+
         clear(&ivars.list);
         let menu_for = ivars.menu_for.borrow().clone();
         let width = WIDTH - 2.0 * (SIDE - 2.0);
-        let pinned = tabs.iter().filter(|t| t.pinned).count();
-        for (i, tab) in tabs.iter().enumerate() {
-            if i == pinned && pinned > 0 {
-                let rule = NSBox::new(mtm);
-                rule.setBoxType(NSBoxType::Separator);
-                rule.setTranslatesAutoresizingMaskIntoConstraints(false);
-                ivars.list.addArrangedSubview(&rule);
-            }
-            let row = TabRow::new(
-                mtm,
-                width,
-                Some(tab),
-                menu_for.clone(),
-                Some(Weak::from_retained(&self.retain())),
-            );
+        let me = || Some(Weak::from_retained(&self.retain()));
+        let row_for = |tab: &TabInfo, indent: f64| {
+            TabRow::new(mtm, width, Some(tab), menu_for.clone(), me(), indent)
+        };
+
+        // The current space's name, over its tabs.
+        let space = layout.current_space();
+        let name = NSTextField::labelWithString(&NSString::from_str(&space.name), mtm);
+        name.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
+        name.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        name.setTranslatesAutoresizingMaskIntoConstraints(false);
+        let header = NSView::new(mtm);
+        header.setTranslatesAutoresizingMaskIntoConstraints(false);
+        header.addSubview(&name);
+        NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+            header.heightAnchor().constraintEqualToConstant(22.0),
+            name.leadingAnchor()
+                .constraintEqualToAnchor_constant(&header.leadingAnchor(), ROW_PAD),
+            name.centerYAnchor()
+                .constraintEqualToAnchor(&header.centerYAnchor()),
+        ]));
+        ivars.list.addArrangedSubview(&header);
+
+        // This space's tabs only: its folders and their tabs, the pinned
+        // tabs in no folder, a rule, then the rest.
+        let here: Vec<&TabInfo> = tabs.iter().filter(|t| t.space == space.id).collect();
+        let folders = layout.folders_of(space.id);
+        let in_folder = |tab: &TabInfo| {
+            tab.pinned
+                && tab
+                    .folder
+                    .is_some_and(|id| folders.iter().any(|f| f.id == id))
+        };
+        for folder in &folders {
+            let row = FolderRow::new(mtm, width, folder);
             ivars.list.addArrangedSubview(&row);
+            if folder.collapsed {
+                continue;
+            }
+            for tab in here
+                .iter()
+                .filter(|t| t.pinned && t.folder == Some(folder.id))
+            {
+                ivars.list.addArrangedSubview(&row_for(tab, FOLDER_INDENT));
+            }
         }
-        let new_tab = TabRow::new(mtm, width, None, None, None);
+        let loose: Vec<&&TabInfo> = here.iter().filter(|t| t.pinned && !in_folder(t)).collect();
+        for tab in &loose {
+            ivars.list.addArrangedSubview(&row_for(tab, 0.0));
+        }
+        let unpinned: Vec<&&TabInfo> = here.iter().filter(|t| !t.pinned).collect();
+        if (!folders.is_empty() || !loose.is_empty()) && !unpinned.is_empty() {
+            let rule = NSBox::new(mtm);
+            rule.setBoxType(NSBoxType::Separator);
+            rule.setTranslatesAutoresizingMaskIntoConstraints(false);
+            ivars.list.addArrangedSubview(&rule);
+        }
+        for tab in &unpinned {
+            ivars.list.addArrangedSubview(&row_for(tab, 0.0));
+        }
+        let new_tab = TabRow::new(mtm, width, None, None, None, 0.0);
         ivars.list.addArrangedSubview(&new_tab);
     }
 }
