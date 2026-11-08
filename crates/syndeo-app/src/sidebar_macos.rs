@@ -63,35 +63,43 @@ pub const WIDTH: f64 = 248.0;
 /// buttons sits below the window's top (clear of the traffic lights, which
 /// take the first 80 points of its width), and the gaps below the address
 /// field and the favorites.
-pub const SIDE: f64 = 10.0;
+pub const SIDE: f64 = 12.0;
 pub const NAV_TOP: f64 = 8.0;
 pub const NAV_HEIGHT: f64 = 28.0;
-const ADDRESS_TOP: f64 = NAV_TOP + NAV_HEIGHT + 10.0;
-const LIST_GAP: f64 = 14.0;
+const ADDRESS_TOP: f64 = NAV_TOP + NAV_HEIGHT + 12.0;
+const LIST_GAP: f64 = 18.0;
+
+/// The space's name over its tabs: its row's height; and the room left
+/// after it, and around the rule between the pinned tabs and the rest.
+const HEADER_HEIGHT: f64 = 30.0;
+const SECTION_GAP: f64 = 10.0;
 
 /// The floating panel, when the sidebar peeks over the page: its margin
 /// from the window's left and bottom, and its corner radius.
 pub const PANEL_MARGIN: f64 = 8.0;
 const PANEL_TOP: f64 = 0.0;
 const PANEL_RADIUS: f64 = 12.0;
+/// How far the sidebar's content moves in from its edges while it floats,
+/// so that it sits inside the panel as it sits inside the window otherwise.
+const FLOATING_INSET: f64 = PANEL_MARGIN + 4.0;
 
 /// The edge of the window that brings a hidden sidebar back.
 pub const EDGE: f64 = 6.0;
 
 /// A row: its height, its corner radius, the icon's size, and the gaps.
-const ROW_HEIGHT: f64 = 32.0;
-const ROW_RADIUS: f64 = 8.0;
-const ROW_PAD: f64 = 9.0;
-const ICON: f64 = 16.0;
+const ROW_HEIGHT: f64 = 36.0;
+const ROW_RADIUS: f64 = 9.0;
+const ROW_PAD: f64 = 10.0;
+const ICON: f64 = 18.0;
 const CLOSE: f64 = 20.0;
-const ROW_GAP: f64 = 2.0;
+const ROW_GAP: f64 = 3.0;
 
 /// How far a press has to move to be a drag, not a click.
 const DRAG_SLOP: f64 = 4.0;
 
 /// A favorite's tile: four to a row, with this much between them.
 const TILES_PER_ROW: usize = 4;
-const TILE_GAP: f64 = 6.0;
+const TILE_GAP: f64 = 8.0;
 const TILE_RADIUS: f64 = 10.0;
 const TILE_ICON: f64 = 22.0;
 
@@ -444,7 +452,7 @@ impl TabRow {
         // The title, clipped at its end.
         let label =
             NSTextField::labelWithString(&NSString::from_str(&this.ivars().title.borrow()), mtm);
-        label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        label.setFont(Some(&NSFont::systemFontOfSize(14.0)));
         label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         let colour = if tab.is_none() {
             NSColor::secondaryLabelColor()
@@ -455,8 +463,8 @@ impl TabRow {
         let text_x = ROW_PAD + indent + ICON + 8.0;
         let text_w = width - text_x - CLOSE - ROW_PAD;
         label.setFrame(NSRect::new(
-            NSPoint::new(text_x, (ROW_HEIGHT - 17.0) / 2.0),
-            NSSize::new(text_w.max(10.0), 17.0),
+            NSPoint::new(text_x, (ROW_HEIGHT - 18.0) / 2.0),
+            NSSize::new(text_w.max(10.0), 18.0),
         ));
         label.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable);
         this.addSubview(&label);
@@ -858,13 +866,13 @@ impl FolderRow {
         this.addSubview(&icon);
 
         let title = NSTextField::labelWithString(&NSString::from_str(&folder.name), mtm);
-        title.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        title.setFont(Some(&NSFont::systemFontOfSize(14.0)));
         title.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         title.setTextColor(Some(&NSColor::labelColor()));
         let text_x = ROW_PAD + 8.0 + ICON + 8.0;
         title.setFrame(NSRect::new(
-            NSPoint::new(text_x, (ROW_HEIGHT - 17.0) / 2.0),
-            NSSize::new((width - text_x - ROW_PAD).max(10.0), 17.0),
+            NSPoint::new(text_x, (ROW_HEIGHT - 18.0) / 2.0),
+            NSSize::new((width - text_x - ROW_PAD).max(10.0), 18.0),
         ));
         title.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable);
         this.addSubview(&title);
@@ -1036,6 +1044,9 @@ pub struct SidebarIvars {
     /// Where the buttons across the top sit: lined up with the window's
     /// traffic lights (`align_nav`).
     nav_top: RefCell<Option<Retained<NSLayoutConstraint>>>,
+    /// The content's distance from the sidebar's left, right and bottom:
+    /// nothing beside the page, the panel's margin while floating.
+    insets: RefCell<Vec<Retained<NSLayoutConstraint>>>,
 }
 
 define_class!(
@@ -1134,19 +1145,26 @@ impl Sidebar {
             hint: hint.clone(),
             spaces: spaces.clone(),
             nav_top: RefCell::new(None),
+            insets: RefCell::new(Vec::new()),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
         // Layer-backed, for the shadow it casts while it peeks.
         this.setWantsLayer(true);
 
+        // Everything sits in one content view, which moves in from the
+        // sidebar's edges while the sidebar floats as a panel.
+        let content = NSView::new(mtm);
+        content.setTranslatesAutoresizingMaskIntoConstraints(false);
+        this.addSubview(&content);
+
         // The buttons across the top, right-aligned, clear of the traffic
         // lights at the left.
-        this.addSubview(&row);
-        this.addSubview(field);
-        this.addSubview(&favorites);
-        this.addSubview(&hint);
-        this.addSubview(&spaces);
+        content.addSubview(&row);
+        content.addSubview(field);
+        content.addSubview(&favorites);
+        content.addSubview(&hint);
+        content.addSubview(&spaces);
 
         // The tabs, scrolling when there are more than fit.
         let scroll = NSScrollView::new(mtm);
@@ -1163,52 +1181,68 @@ impl Sidebar {
         scroll.setDocumentView(Some(&document));
         let clip: Retained<NSClipView> = scroll.contentView();
         clip.setDrawsBackground(false);
-        this.addSubview(&scroll);
+        content.addSubview(&scroll);
 
+        let leading = content
+            .leadingAnchor()
+            .constraintEqualToAnchor(&this.leadingAnchor());
+        let trailing = content
+            .trailingAnchor()
+            .constraintEqualToAnchor(&this.trailingAnchor());
+        let bottom = content
+            .bottomAnchor()
+            .constraintEqualToAnchor(&this.bottomAnchor());
+        *this.ivars().insets.borrow_mut() = vec![leading.clone(), trailing.clone(), bottom.clone()];
         NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+            leading,
+            trailing,
+            bottom,
+            content
+                .topAnchor()
+                .constraintEqualToAnchor(&this.topAnchor()),
             this.nav_top_constraint(&row, NAV_TOP),
             row.trailingAnchor()
-                .constraintEqualToAnchor_constant(&this.trailingAnchor(), -SIDE),
+                .constraintEqualToAnchor_constant(&content.trailingAnchor(), -SIDE),
             row.heightAnchor().constraintEqualToConstant(NAV_HEIGHT),
             field
                 .topAnchor()
-                .constraintEqualToAnchor_constant(&this.topAnchor(), ADDRESS_TOP),
+                .constraintEqualToAnchor_constant(&content.topAnchor(), ADDRESS_TOP),
             field
                 .leadingAnchor()
-                .constraintEqualToAnchor_constant(&this.leadingAnchor(), SIDE),
+                .constraintEqualToAnchor_constant(&content.leadingAnchor(), SIDE),
             field
                 .trailingAnchor()
-                .constraintEqualToAnchor_constant(&this.trailingAnchor(), -SIDE),
+                .constraintEqualToAnchor_constant(&content.trailingAnchor(), -SIDE),
             favorites
                 .topAnchor()
                 .constraintEqualToAnchor_constant(&field.bottomAnchor(), LIST_GAP),
             favorites
                 .leadingAnchor()
-                .constraintEqualToAnchor_constant(&this.leadingAnchor(), SIDE),
+                .constraintEqualToAnchor_constant(&content.leadingAnchor(), SIDE),
             favorites
                 .trailingAnchor()
-                .constraintEqualToAnchor_constant(&this.trailingAnchor(), -SIDE),
+                .constraintEqualToAnchor_constant(&content.trailingAnchor(), -SIDE),
             scroll
                 .topAnchor()
                 .constraintEqualToAnchor_constant(&favorites.bottomAnchor(), LIST_GAP),
             scroll
                 .leadingAnchor()
-                .constraintEqualToAnchor_constant(&this.leadingAnchor(), SIDE - 2.0),
+                .constraintEqualToAnchor_constant(&content.leadingAnchor(), SIDE - 2.0),
             scroll
                 .trailingAnchor()
-                .constraintEqualToAnchor_constant(&this.trailingAnchor(), -(SIDE - 2.0)),
+                .constraintEqualToAnchor_constant(&content.trailingAnchor(), -(SIDE - 2.0)),
             scroll
                 .bottomAnchor()
                 .constraintEqualToAnchor_constant(&spaces.topAnchor(), -6.0),
             spaces
                 .leadingAnchor()
-                .constraintEqualToAnchor_constant(&this.leadingAnchor(), SIDE),
+                .constraintEqualToAnchor_constant(&content.leadingAnchor(), SIDE),
             spaces
                 .trailingAnchor()
-                .constraintEqualToAnchor_constant(&this.trailingAnchor(), -SIDE),
+                .constraintEqualToAnchor_constant(&content.trailingAnchor(), -SIDE),
             spaces
                 .bottomAnchor()
-                .constraintEqualToAnchor_constant(&this.bottomAnchor(), -(PANEL_MARGIN + 4.0)),
+                .constraintEqualToAnchor_constant(&content.bottomAnchor(), -(PANEL_MARGIN + 4.0)),
             document
                 .leadingAnchor()
                 .constraintEqualToAnchor(&clip.leadingAnchor()),
@@ -1229,9 +1263,9 @@ impl Sidebar {
             hint.topAnchor()
                 .constraintEqualToAnchor_constant(&favorites.topAnchor(), -6.0),
             hint.leadingAnchor()
-                .constraintEqualToAnchor_constant(&this.leadingAnchor(), SIDE - 4.0),
+                .constraintEqualToAnchor_constant(&content.leadingAnchor(), SIDE - 4.0),
             hint.trailingAnchor()
-                .constraintEqualToAnchor_constant(&this.trailingAnchor(), -(SIDE - 4.0)),
+                .constraintEqualToAnchor_constant(&content.trailingAnchor(), -(SIDE - 4.0)),
             hint.bottomAnchor()
                 .constraintGreaterThanOrEqualToAnchor_constant(&favorites.bottomAnchor(), 6.0),
             hint.heightAnchor()
@@ -1344,6 +1378,13 @@ impl Sidebar {
     /// Peek over the page as a floating panel, or sit beside it.
     pub fn set_floating(&self, floating: bool) {
         self.ivars().floating.set(floating);
+        let inset = if floating { FLOATING_INSET } else { 0.0 };
+        let bottom = if floating { PANEL_MARGIN } else { 0.0 };
+        if let [leading, trailing, below] = &self.ivars().insets.borrow()[..] {
+            leading.setConstant(inset);
+            trailing.setConstant(-inset);
+            below.setConstant(-bottom);
+        }
         // A shadow under the panel, while it floats over the page.
         let layer: *mut AnyObject = unsafe { msg_send![self, layer] };
         if !layer.is_null() {
@@ -1419,20 +1460,27 @@ impl Sidebar {
             format!("{}  {}", space.icon, space.name)
         };
         let name = NSTextField::labelWithString(&NSString::from_str(&heading), mtm);
-        name.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
+        name.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, unsafe {
+            objc2_app_kit::NSFontWeightSemibold
+        })));
         name.setTextColor(Some(&NSColor::secondaryLabelColor()));
         name.setTranslatesAutoresizingMaskIntoConstraints(false);
         let header = NSView::new(mtm);
         header.setTranslatesAutoresizingMaskIntoConstraints(false);
         header.addSubview(&name);
         NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-            header.heightAnchor().constraintEqualToConstant(22.0),
+            header
+                .heightAnchor()
+                .constraintEqualToConstant(HEADER_HEIGHT),
             name.leadingAnchor()
                 .constraintEqualToAnchor_constant(&header.leadingAnchor(), ROW_PAD),
             name.centerYAnchor()
                 .constraintEqualToAnchor(&header.centerYAnchor()),
         ]));
         ivars.list.addArrangedSubview(&header);
+        ivars
+            .list
+            .setCustomSpacing_afterView(SECTION_GAP - ROW_GAP, &header);
 
         // This space's tabs only: its folders and their tabs, the pinned
         // tabs in no folder, a rule, then the rest.
@@ -1463,10 +1511,25 @@ impl Sidebar {
         }
         let unpinned: Vec<&&TabInfo> = here.iter().filter(|t| !t.pinned).collect();
         if (!folders.is_empty() || !loose.is_empty()) && !unpinned.is_empty() {
+            // The rule, with room above and below it.
             let rule = NSBox::new(mtm);
             rule.setBoxType(NSBoxType::Separator);
             rule.setTranslatesAutoresizingMaskIntoConstraints(false);
-            ivars.list.addArrangedSubview(&rule);
+            let around = NSView::new(mtm);
+            around.setTranslatesAutoresizingMaskIntoConstraints(false);
+            around.addSubview(&rule);
+            NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+                around
+                    .heightAnchor()
+                    .constraintEqualToConstant(2.0 * SECTION_GAP),
+                rule.leadingAnchor()
+                    .constraintEqualToAnchor_constant(&around.leadingAnchor(), ROW_PAD),
+                rule.trailingAnchor()
+                    .constraintEqualToAnchor_constant(&around.trailingAnchor(), -ROW_PAD),
+                rule.centerYAnchor()
+                    .constraintEqualToAnchor(&around.centerYAnchor()),
+            ]));
+            ivars.list.addArrangedSubview(&around);
         }
         for tab in &unpinned {
             ivars.list.addArrangedSubview(&row_for(tab, 0.0));

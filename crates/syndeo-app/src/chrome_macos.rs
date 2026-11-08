@@ -747,8 +747,8 @@ pub fn browser_content(
         address.setTarget(Some(target));
         address.setAction(Some(sel!(navigateTo:)));
     }
-    let height = address.fittingSize().height.max(30.0);
-    let width = sidebar_macos::WIDTH - 20.0;
+    let height = address.fittingSize().height.max(32.0);
+    let width = sidebar_macos::WIDTH - 2.0 * sidebar_macos::SIDE;
     let field = NSView::initWithFrame(
         NSView::alloc(mtm),
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
