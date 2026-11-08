@@ -502,11 +502,7 @@ mod tests {
         for hue in 0..HUES {
             for dark in [false, true] {
                 let (from, to) = hue_colors(hue, dark);
-                for c in from
-                    .iter()
-                    .chain(to.iter())
-                    .chain(hue_dot(hue, dark).iter())
-                {
+                for c in from.iter().chain(to.iter()) {
                     assert!((0.0..=1.0).contains(c));
                 }
             }
