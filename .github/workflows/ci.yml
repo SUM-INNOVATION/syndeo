@@ -467,8 +467,10 @@ jobs:
       # https page on this Mac's loopback links for downloading, directly and
       # through a redirect within its origin, arrive byte for byte, each on a
       # TLS connection of its own with a certificate the window has not been
-      # shown, issued by Syndeo's own authority, and the download's own
-      # challenges answered with that authority; downloads redirected to an
+      # shown, issued by Syndeo's own authority, which macOS does not trust,
+      # so their arriving means Syndeo pinned them; the one redirected within
+      # its origin has its own challenges answered with that authority, as
+      # WebKit asks the download about it; downloads redirected to an
       # IPv6 address with a zone, or to a file: address, save nothing.
       # Measured, not gated: whether a file saved is quarantined, and what a
       # download redirected to another origin becomes. ~/Downloads is put
