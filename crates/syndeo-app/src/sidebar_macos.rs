@@ -30,9 +30,9 @@
 //!   `syndeoUnpeekSidebar:`, sent to the window's controller.
 //!
 //! Nothing here fetches anything: icons are the ones each tab's badge has.
-//! To Accessibility each row is a button named for its tab, and the UI test
-//! finds the rows by `syndeo.sidebar-tab` and the tiles by
-//! `syndeo.favorite`.
+//! To Accessibility each row is a button named for its tab, selected while
+//! its tab is in front, and the UI test finds the rows by
+//! `syndeo.sidebar-tab` and the tiles by `syndeo.favorite`.
 
 use crate::favorites::{self, Favorite};
 use crate::spaces::{Folder, Layout};
@@ -387,6 +387,12 @@ define_class!(
         #[unsafe(method_id(accessibilityLabel))]
         fn accessibility_label(&self) -> Option<Retained<NSString>> {
             Some(NSString::from_str(&self.ivars().title.borrow()))
+        }
+
+        /// The row of the tab in front is the one selected, as it is lit.
+        #[unsafe(method(isAccessibilitySelected))]
+        fn is_accessibility_selected(&self) -> bool {
+            self.ivars().active.get()
         }
 
         #[unsafe(method(accessibilityPerformPress))]
