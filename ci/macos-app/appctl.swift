@@ -32,8 +32,6 @@
 //   appctl enabled <pid> <id>    "enabled" or "disabled", for that element
 //   appctl describe <pid> <id>   that element's description and help (its
 //                                tooltip), "description<TAB>help"
-//   appctl in-toolbar <pid> <id>   whether that element is in its window's
-//                                toolbar: says so, or exits 1
 //   appctl menu <pid> <menu> <item>   press a menu item, as a click on it would;
 //                                exits 1 if there is no such item
 //   appctl menu-items <pid> <menu>    the title of each item in that menu, one a line
@@ -58,17 +56,49 @@
 //                                text contains <text>; exits 1 if there is none
 //   appctl window-text <pid> <text>   all the text, whole, of the first of pid's
 //                                windows whose text contains <text>; exits 1 if none
-//   appctl frames <pid> <text>   in the first of pid's windows whose text contains
-//                                <text>, where its parts are, as "part x y width
-//                                height" lines, y downwards: the window, the
-//                                element with identifier syndeo.agent-indicator, the
-//                                toolbar's syndeo.address, the page (AXWebArea), and
-//                                each tab in its tab bar; exits 1 if there is no such
-//                                window
-//   appctl tabs <pid>            the front window's tabs, as its tab bar has them, in
-//                                order, one title a line, the one in front marked "* "
-//                                and the others "  "; nothing for a window with no
-//                                tab bar showing
+//   appctl frames <pid> [<text>]   where the parts of pid's front window are, as
+//                                "part x y width height" lines, y downwards, a row's
+//                                title after a tab: the window, its traffic lights
+//                                (lights), the page (AXWebArea), the sidebar's Hide
+//                                Sidebar (hide), back, forward, reload, address, its
+//                                route and Copy Link (copy), each favorite, folder
+//                                and tab row (row), New Tab (new-tab), downloads and
+//                                each space; AppKit's tab bar (tab-bar, its tabs
+//                                appkit-tab) if it shows, tab-bar-hidden if
+//                                Accessibility keeps it but it does not; and an
+//                                agent's banner (indicator) and its stop, with a
+//                                "covered <part> by ..." line for either that a
+//                                click in its middle would not find; exits 1 if
+//                                there is no front window, or it does not say <text>
+//   appctl tabs <pid>            the front window's tabs, as its sidebar's rows have
+//                                them, in order, one title a line, the one in front
+//                                (its row selected) marked "* " and the others "  ";
+//                                New Tab, the last row, is not a tab
+//   appctl rows <pid>            each of the front window's sidebar rows, New Tab
+//                                too, a line each: "front|-<TAB>pinned|-<TAB>folder|-
+//                                <TAB>icon<TAB>title", the icon being what the row
+//                                shows: own (the page's own icon), globe (a page
+//                                without one), loading, new-tab, or none
+//   appctl tab-bar <pid>         whether AppKit's own tab bar shows in the front
+//                                window, as Accessibility has it: "hidden", or exits
+//                                1 saying how many tabs it shows
+//   appctl new-tab-row <pid>     press the sidebar's New Tab row, as a click would
+//   appctl bar <pid>             the command bar's field, while it shows, in
+//                                whichever of pid's windows has it: its value; exits
+//                                1 if no command bar shows
+//   appctl bar-focused <pid>     whether the command bar's field has the keys: says
+//                                "focused", or exits 1
+//   appctl bar-type <pid> <text>     bring pid to the front without raising any of its
+//                                windows, so the command bar keeps the keys, then
+//                                type the text and Return; exits 1 if no command bar
+//                                shows, or pid is not frontmost
+//   appctl bar-type-only <pid> <text>   the same, without Return
+//   appctl bar-key <pid> <key>   the same, pressing <key>: escape, return, down or up
+//   appctl bar-suggestions <pid>   the command bar's suggestions, in order, a line
+//                                each: "kind<TAB>title<TAB>detail", kind being what
+//                                its symbol says (Switch to tab, or Favorite)
+//   appctl bar-pick <pid> <title>    click the command bar's suggestion with that
+//                                title, as a person clicks it; exits 1 if none has it
 //   appctl ids <pid> <id>        each element outside the page, in pid's front window,
 //                                with that accessibility identifier: "role<TAB>description"
 //                                a line; exits 1 if there is none
@@ -83,13 +113,15 @@
 //                                at its middle, holding <keys> (none, or cmd, shift and
 //                                option joined by +), with <button> (left or middle)
 //   appctl keys <pid> <key> <keys>    bring pid to the front and press <key> (a digit,
-//                                a letter, [, ], \ or escape) holding <keys>, as above
+//                                t, w, d, l, s, [, ], \, escape, return, down or up)
+//                                holding <keys>, as above
 //   appctl menu-dump <pid> <menu>    each item of that menu, one a line:
 //                                "title<TAB>key<TAB>modifiers<TAB>enabled"
 //   appctl id-tree <pid>         each element outside the page in pid's front window
 //                                that has an accessibility identifier: "role<TAB>identifier"
 //   appctl tab-press <pid> <index>    press the front window's tab <index>, counted from 1,
-//                                as a click on it would; exits 1 if there is no such tab
+//                                its row in the sidebar, as a click on it would; exits 1
+//                                if there is no such tab
 //   appctl menu-enabled <pid> <menu> <item>   "enabled" or "disabled", for that menu
 //                                item, read with its menu open, as a person sees it;
 //                                exits 1 if there is no such item
@@ -97,7 +129,8 @@
 //                                menu, one a line
 //   appctl submenu <pid> <menu> <item> <title>   press that item's menu's item <title>
 //   appctl tab-menu <pid> <index> [<title>]   a secondary click on the front window's
-//                                tab <index>, counted from 1, as a person makes it; print
+//                                tab <index>, counted from 1, on its row in the sidebar,
+//                                as a person makes it; print
 //                                each item of the menu it opens, one a line, then press
 //                                <title>, or close it choosing nothing; exits 1 if no menu
 //                                opened, or there is no such item
@@ -277,33 +310,279 @@ func all(_ element: AXUIElement, depth: Int, _ matches: (AXUIElement) -> Bool) -
     return found
 }
 
-/// The front window's tab bar's tabs, in order.
-func tabButtons(_ pid: Int32) -> [AXUIElement] {
-    guard let window = frontWindow(of: pid),
-          let bar = all(window, depth: 6, { (attribute($0, kAXRoleAttribute) as? String) == "AXTabGroup" }).first else { return [] }
-    return children(bar).filter { (attribute($0, kAXRoleAttribute) as? String) == "AXRadioButton" }
+func role(_ element: AXUIElement) -> String { attribute(element, kAXRoleAttribute) as? String ?? "" }
+func identifier(_ element: AXUIElement) -> String { attribute(element, "AXIdentifier") as? String ?? "" }
+func described(_ element: AXUIElement) -> String { oneLine(attribute(element, kAXDescriptionAttribute)) }
+
+/// Whether `element` says `label`: what Accessibility calls it, or its help tag.
+func says(_ element: AXUIElement, _ label: String) -> Bool {
+    described(element) == label || oneLine(attribute(element, kAXHelpAttribute)) == label
+}
+
+/// A row of a window's sidebar, as Accessibility has it.
+struct Row {
+    let element: AXUIElement
+    let title: String
+    /// Its tab is the one in front: the row is selected.
+    let active: Bool
+    /// It shows a pin.
+    let pinned: Bool
+    /// The folder it is set in under, or "".
+    let folder: String
+    /// What its icon shows: see iconKind.
+    let icon: String
+    var isNewTab: Bool { icon == "new-tab" }
+}
+
+/// What a row's icon shows: by the identifier the sidebar gives it, as the
+/// tab bar's badge had them, syndeo.tab-loading while its page loads and
+/// syndeo.tab-icon for the page's own icon; otherwise by what Accessibility
+/// calls it, as the symbols the sidebar draws say what they are, and a
+/// page's own icon is called none of them.
+func iconKind(_ icon: AXUIElement) -> String {
+    switch identifier(icon) {
+    case "syndeo.tab-loading": return "loading"
+    case "syndeo.tab-icon": return "own"
+    default: break
+    }
+    switch described(icon) {
+    case "Loading": return "loading"
+    case "Page": return "globe"
+    case "New Tab": return "new-tab"
+    default: return "own"
+    }
+}
+
+/// How far in from its row a folder's tab's icon is, at least: the sidebar
+/// sets a folder's tabs in under it.
+let folderIndent: CGFloat = 19
+
+/// The rows of the sidebar in pid's front window, in order: each tab's, and
+/// New Tab, the last. Read from the front window only: another window's
+/// sidebar may have no rows.
+func sidebarRows(_ pid: Int32) -> [Row] {
+    guard let window = frontWindow(of: pid) else { return [] }
+    var rows: [Row] = []
+    var folder = ""
+    for element in all(window, depth: 24, { ["syndeo.sidebar-tab", "syndeo.folder"].contains(identifier($0)) }) {
+        if identifier(element) == "syndeo.folder" {
+            folder = described(element)
+            continue
+        }
+        let parts = children(element)
+        let images = parts.filter { role($0) == "AXImage" }
+        let icon = images.first
+        var indent: CGFloat = 0
+        if let icon, let box = frame(of: icon), let row = frame(of: element) {
+            indent = box.minX - row.minX
+        }
+        // A folder's tabs follow its row, set in; the first that is not ends it.
+        if indent < folderIndent { folder = "" }
+        var title = described(element)
+        if title.isEmpty, let label = parts.first(where: { role($0) == "AXStaticText" }) {
+            title = oneLine(attribute(label, kAXValueAttribute))
+        }
+        rows.append(Row(
+            element: element,
+            title: title,
+            active: (attribute(element, kAXSelectedAttribute) as? Bool) == true,
+            pinned: images.dropFirst().contains { identifier($0) == "syndeo.tab-pinned" || described($0) == "Pinned" },
+            folder: folder,
+            icon: icon.map(iconKind) ?? "none"))
+    }
+    return rows
+}
+
+/// The front window's tabs: its sidebar's rows, New Tab left out.
+func tabRows(_ pid: Int32) -> [Row] { sidebarRows(pid).filter { !$0.isNewTab } }
+
+/// The command bar's window and its field, while it shows: a window of its
+/// own, which has the keys, so it is looked for first among the focused one.
+func commandBar(_ pid: Int32) -> (window: AXUIElement, field: AXUIElement)? {
+    let app = AXUIElementCreateApplication(pid)
+    var candidates = windows(of: pid)
+    if let focused = asElement(attribute(app, kAXFocusedWindowAttribute)) {
+        candidates.insert(focused, at: 0)
+    }
+    for window in candidates {
+        if let field = find(window, depth: 10, { identifier($0) == "syndeo.command-bar" }) {
+            return (window, field)
+        }
+    }
+    return nil
+}
+
+/// Bring pid to the front, as a click on it would, without raising any of its
+/// windows: the command bar has the keys, and raising the window under it
+/// would take them, and put the bar away.
+func frontKeepingKeys(_ pid: Int32) -> Bool {
+    _ = AXUIElementSetAttributeValue(AXUIElementCreateApplication(pid), kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+    for _ in 0..<50 {
+        if frontmost(pid) { return true }
+        usleep(100_000)
+    }
+    return false
+}
+
+/// One key to pid, down and up, as the keyboard sends it, nothing held.
+func press(_ pid: Int32, _ code: CGKeyCode) {
+    let source = CGEventSource(stateID: .hidSystemState)
+    for down in [true, false] {
+        guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { continue }
+        event.postToPid(pid)
+        usleep(30_000)
+    }
+}
+
+/// The command bar's suggestions, in order: what each one's symbol says it
+/// does, its title and its detail, each a row's parts as Accessibility has
+/// them, with the title's element.
+func suggestions(_ bar: AXUIElement) -> [(kind: String, title: String, detail: String, element: AXUIElement?)] {
+    var found: [(kind: String, title: String, detail: String, element: AXUIElement?)] = []
+    for element in all(bar, depth: 12, { ["AXImage", "AXStaticText"].contains(role($0)) }) {
+        if role(element) == "AXImage" {
+            let kind = described(element)
+            if ["Switch to tab", "Favorite"].contains(kind) { found.append((kind, "", "", nil)) }
+            continue
+        }
+        guard var last = found.popLast() else { continue }
+        let value = oneLine(attribute(element, kAXValueAttribute))
+        if last.element == nil {
+            last.title = value
+            last.element = element
+        } else if last.detail.isEmpty {
+            last.detail = value
+        }
+        found.append(last)
+    }
+    return found
+}
+
+/// Where the parts of `window` are, as "part x y width height" lines.
+func layout(_ pid: Int32, _ window: AXUIElement) {
+    func line(_ part: String, _ element: AXUIElement?, _ extra: String = "") {
+        guard let element, let box = frame(of: element) else { return }
+        print("\(part) \(Int(box.minX)) \(Int(box.minY)) \(Int(box.width)) \(Int(box.height))\(extra.isEmpty ? "" : "\t" + extra)")
+    }
+    let named = [
+        "syndeo.back": "back", "syndeo.forward": "forward", "syndeo.reload": "reload",
+        "syndeo.address": "address", "syndeo.route": "route", "syndeo.copy": "copy",
+        "syndeo.favorite": "favorite", "syndeo.folder": "folder", "syndeo.space": "space",
+        "syndeo.agent-indicator": "indicator", "syndeo.agent-stop": "stop",
+    ]
+    line("window", window)
+    for light in [kAXCloseButtonAttribute, kAXMinimizeButtonAttribute, kAXZoomButtonAttribute] {
+        line("lights", asElement(attribute(window, light)))
+    }
+    for element in all(window, depth: 24, { _ in true }) {
+        let id = identifier(element)
+        if let part = named[id] {
+            line(part, element)
+            // An agent's banner and its Stop: anything a click on them would
+            // find instead is over them.
+            if ["indicator", "stop"].contains(part), let box = frame(of: element),
+               let found = hit(pid, CGPoint(x: box.midX, y: box.midY)), !within(found, element) {
+                print("covered \(part) by \(role(found)) \(identifier(found)) \(described(found))")
+            }
+        } else if id == "syndeo.sidebar-tab" {
+            let icon = children(element).first { role($0) == "AXImage" }
+            let isNewTab = icon.map(iconKind) == "new-tab"
+            line(isNewTab ? "new-tab" : "row", element, described(element))
+        } else if role(element) == "AXWebArea" {
+            line("page", element)
+        } else if role(element) == "AXTabGroup" {
+            guard showing(pid, element) else {
+                line("tab-bar-hidden", element)
+                continue
+            }
+            line("tab-bar", element)
+            for tab in children(element) where role(tab) == "AXRadioButton" {
+                line("appkit-tab", tab, oneLine(attribute(tab, kAXTitleAttribute)))
+            }
+        } else if role(element) == "AXButton" && says(element, "Hide Sidebar") {
+            line("hide", element)
+        } else if role(element) == "AXButton" && says(element, "Downloads") {
+            line("downloads", element)
+        }
+    }
 }
 
 /// The menu open in pid now, if one is: a context menu, under the application.
-func openMenu(_ pid: Int32) -> (AXUIElement, [AXUIElement])? {
+/// The menu open in pid now, if one is: a context menu, under the application,
+/// or under the view it was opened from, in one of pid's windows; or, if
+/// `near` is where it was asked for, the one Accessibility finds just below
+/// and right of that point, where a context menu opens.
+func openMenu(_ pid: Int32, near point: CGPoint? = nil) -> (AXUIElement, [AXUIElement])? {
     let app = AXUIElementCreateApplication(pid)
+    func items(_ menu: AXUIElement) -> [AXUIElement]? {
+        // Not one of the menu bar's.
+        if let parent = asElement(attribute(menu, kAXParentAttribute)), role(parent) == "AXMenuBarItem" { return nil }
+        let found = children(menu).filter { role($0) == "AXMenuItem" }
+        return found.isEmpty ? nil : found
+    }
     for _ in 0..<30 {
-        for menu in all(app, depth: 3, { (attribute($0, kAXRoleAttribute) as? String) == "AXMenu" }) {
-            // Not one of the menu bar's.
-            if let parent = asElement(attribute(menu, kAXParentAttribute)),
-               (attribute(parent, kAXRoleAttribute) as? String) == "AXMenuBarItem" { continue }
-            let items = children(menu).filter { (attribute($0, kAXRoleAttribute) as? String) == "AXMenuItem" }
-            if !items.isEmpty { return (menu, items) }
+        var menus = all(app, depth: 3, { role($0) == "AXMenu" })
+        for window in windows(of: pid) {
+            menus += all(window, depth: 24, { role($0) == "AXMenu" })
+        }
+        if let point {
+            for (dx, dy) in [(14.0, 10.0), (40.0, 10.0), (14.0, 30.0)] {
+                var at = hit(pid, CGPoint(x: point.x + dx, y: point.y + dy))
+                for _ in 0..<4 {
+                    guard let now = at else { break }
+                    if role(now) == "AXMenu" { menus.append(now); break }
+                    at = asElement(attribute(now, kAXParentAttribute))
+                }
+            }
+        }
+        for menu in menus {
+            if let found = items(menu) { return (menu, found) }
         }
         usleep(100_000)
     }
     return nil
 }
 
+/// Whether `element` is `ancestor`, or inside it.
+func within(_ element: AXUIElement, _ ancestor: AXUIElement) -> Bool {
+    var at: AXUIElement? = element
+    for _ in 0..<24 {
+        guard let now = at else { return false }
+        if CFEqual(now, ancestor) { return true }
+        at = asElement(attribute(now, kAXParentAttribute))
+    }
+    return false
+}
+
+/// What Accessibility finds at `point` on screen among pid's windows, as a
+/// click there would.
+func hit(_ pid: Int32, _ point: CGPoint) -> AXUIElement? {
+    var found: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(AXUIElementCreateApplication(pid), Float(point.x), Float(point.y), &found) == .success else {
+        return nil
+    }
+    return found
+}
+
+/// Whether AppKit's tab bar `bar` shows, as a person sees it: a click in
+/// the middle of one of its tabs lands on it. Hidden, the bar keeps its
+/// place in Accessibility's tree, its frame and all, while the title bar
+/// gives it no room; a click there finds what is under it instead.
+func showing(_ pid: Int32, _ bar: AXUIElement) -> Bool {
+    let tabs = children(bar).filter { role($0) == "AXRadioButton" }
+    for tab in tabs.isEmpty ? [bar] : tabs {
+        guard let box = frame(of: tab), box.width > 0, box.height > 0,
+              let found = hit(pid, CGPoint(x: box.midX, y: box.midY)) else { continue }
+        if within(found, bar) { return true }
+    }
+    return false
+}
+
 /// The virtual key code of `key` on a US keyboard, as the runner has.
 let keyCodes: [String: CGKeyCode] = [
     "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26, "8": 28, "9": 25, "0": 29,
-    "t": 17, "w": 13, "d": 2, "l": 37, "[": 33, "]": 30, "\\": 42, "escape": 53,
+    "t": 17, "w": 13, "d": 2, "l": 37, "s": 1, "[": 33, "]": 30, "\\": 42, "escape": 53,
+    "return": 36, "down": 125, "up": 126,
 ]
 
 /// The items of the menu bar item `menu`.
@@ -466,18 +745,6 @@ case "enabled" where args.count == 4:
 case "describe" where args.count == 4:
     guard let pid = Int32(args[2]), let element = identified(pid, args[3]) else { exit(1) }
     print("\(oneLine(attribute(element, kAXDescriptionAttribute)))\t\(oneLine(attribute(element, kAXHelpAttribute)))")
-case "in-toolbar" where args.count == 4:
-    guard let pid = Int32(args[2]), var element = identified(pid, args[3]) else { exit(1) }
-    for _ in 0..<12 {
-        if (attribute(element, kAXRoleAttribute) as? String) == "AXToolbar" {
-            print("in the toolbar")
-            exit(0)
-        }
-        guard let parent = asElement(attribute(element, kAXParentAttribute)) else { break }
-        element = parent
-    }
-    print("not in a toolbar")
-    exit(1)
 case "menu" where args.count == 5:
     guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
     exit(AXUIElementPerformAction(item, kAXPressAction as CFString) == .success ? 0 : 1)
@@ -542,26 +809,14 @@ case "press-near" where args.count == 5:
         }
     }
     exit(1)
-case "frames" where args.count == 4:
+case "frames" where args.count == 3 || args.count == 4:
     guard let pid = Int32(args[2]) else { exit(2) }
-    func line(_ part: String, _ element: AXUIElement?) {
-        guard let element, let box = frame(of: element) else { return }
-        print("\(part) \(Int(box.minX)) \(Int(box.minY)) \(Int(box.width)) \(Int(box.height))")
+    guard let window = frontWindow(of: pid) else { print("no front window"); exit(1) }
+    if args.count == 4, !text(of: window, depth: 12).contains(args[3]) {
+        print("the front window, \(oneLine(attribute(window, kAXTitleAttribute))), does not say \(args[3])")
+        exit(1)
     }
-    guard let window = windows(of: pid).first(where: { text(of: $0, depth: 12).contains(args[3]) }) else { exit(1) }
-    line("window", window)
-    line("indicator", find(window, depth: 12) { (attribute($0, "AXIdentifier") as? String) == "syndeo.agent-indicator" })
-    line("address", find(window, depth: 12) { (attribute($0, "AXIdentifier") as? String) == "syndeo.address" })
-    line("page", find(window, depth: 12) { (attribute($0, kAXRoleAttribute) as? String) == "AXWebArea" })
-    if let bar = all(window, depth: 6, { (attribute($0, kAXRoleAttribute) as? String) == "AXTabGroup" }).first {
-        for tab in children(bar) where (attribute(tab, kAXRoleAttribute) as? String) == "AXRadioButton" {
-            line("tab", tab)
-        }
-    }
-    // The sidebar's rows, one per tab, where the tabs are now.
-    for row in all(window, depth: 16, { (attribute($0, "AXIdentifier") as? String) == "syndeo.sidebar-tab" }) {
-        line("tab", row)
-    }
+    layout(pid, window)
 case "window-text" where args.count == 4:
     guard let pid = Int32(args[2]) else { exit(2) }
     for window in windows(of: pid) {
@@ -571,10 +826,76 @@ case "window-text" where args.count == 4:
     exit(1)
 case "tabs" where args.count == 3:
     guard let pid = Int32(args[2]) else { exit(2) }
-    for tab in tabButtons(pid) {
-        let front = (attribute(tab, kAXValueAttribute) as? Int) == 1
-        print("\(front ? "* " : "  ")\(oneLine(attribute(tab, kAXTitleAttribute)))")
+    for row in tabRows(pid) {
+        print("\(row.active ? "* " : "  ")\(row.title)")
     }
+case "rows" where args.count == 3:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    for row in sidebarRows(pid) {
+        print([row.active ? "front" : "-", row.pinned ? "pinned" : "-", row.folder.isEmpty ? "-" : row.folder,
+               row.icon, row.title].joined(separator: "\t"))
+    }
+case "tab-bar" where args.count == 3:
+    guard let pid = Int32(args[2]), let window = frontWindow(of: pid) else { exit(2) }
+    let bars = all(window, depth: 24) { role($0) == "AXTabGroup" }
+    let tabs = bars.flatMap { children($0) }.filter { role($0) == "AXRadioButton" }
+    if let shown = bars.first(where: { showing(pid, $0) }) {
+        print("shown, with \(children(shown).filter { role($0) == "AXRadioButton" }.count) tabs, at \(frame(of: shown).map { "\($0)" } ?? "?")")
+        exit(1)
+    }
+    if bars.isEmpty {
+        print("hidden: not there")
+    } else {
+        let landed = tabs.compactMap { frame(of: $0) }.compactMap { hit(pid, CGPoint(x: $0.midX, y: $0.midY)) }
+            .map { "\(role($0)) \(identifier($0))" }
+        print("hidden: Accessibility keeps it, with \(tabs.count) tabs, but a click on them lands on: \(landed.joined(separator: ", "))")
+    }
+case "new-tab-row" where args.count == 3:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    guard let row = sidebarRows(pid).last(where: { $0.isNewTab }) else { print("no New Tab row"); exit(1) }
+    exit(AXUIElementPerformAction(row.element, kAXPressAction as CFString) == .success ? 0 : 1)
+case "bar" where args.count == 3:
+    guard let pid = Int32(args[2]), let (_, field) = commandBar(pid) else { exit(1) }
+    print(oneLine(attribute(field, kAXValueAttribute)))
+case "bar-focused" where args.count == 3:
+    guard let pid = Int32(args[2]), let (_, field) = commandBar(pid) else { print("no command bar"); exit(1) }
+    let focused = asElement(attribute(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute))
+    if (attribute(field, kAXFocusedAttribute) as? Bool) == true || focused.map({ identifier($0) == "syndeo.command-bar" }) == true {
+        print("focused")
+        exit(0)
+    }
+    print("not focused: the keys are with \(focused.map { "\(role($0)) \(identifier($0))" } ?? "nothing")")
+    exit(1)
+case "bar-type" where args.count == 4, "bar-type-only" where args.count == 4:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    guard commandBar(pid) != nil else { print("no command bar"); exit(1) }
+    guard frontKeepingKeys(pid) else { print("not frontmost"); exit(1) }
+    for character in args[3] {
+        key(pid, 0, String(character))
+    }
+    if args[1] == "bar-type" { key(pid, 36, "\r") }
+case "bar-key" where args.count == 4:
+    guard let pid = Int32(args[2]), let code = keyCodes[args[3]], ["escape", "return", "down", "up"].contains(args[3]) else { exit(2) }
+    guard commandBar(pid) != nil else { print("no command bar"); exit(1) }
+    guard frontKeepingKeys(pid) else { print("not frontmost"); exit(1) }
+    switch args[3] {
+    case "escape": key(pid, code, "\u{1b}")
+    case "return": key(pid, code, "\r")
+    default: press(pid, code)
+    }
+case "bar-suggestions" where args.count == 3:
+    guard let pid = Int32(args[2]), let (bar, _) = commandBar(pid) else { exit(1) }
+    for suggestion in suggestions(bar) {
+        print("\(suggestion.kind)\t\(suggestion.title)\t\(suggestion.detail)")
+    }
+case "bar-pick" where args.count == 4:
+    guard let pid = Int32(args[2]), let (bar, _) = commandBar(pid) else { print("no command bar"); exit(1) }
+    let listed = suggestions(bar)
+    guard let chosen = listed.first(where: { $0.title == args[3] }), let element = chosen.element, let box = frame(of: element) else {
+        print("no suggestion \(args[3]): \(listed.map { $0.title }.joined(separator: " | "))")
+        exit(1)
+    }
+    click(CGPoint(x: box.midX, y: box.midY), .left, [])
 case "ids" where args.count == 4:
     guard let pid = Int32(args[2]), let window = frontWindow(of: pid) else { exit(2) }
     let found = all(window, depth: 24) { (attribute($0, "AXIdentifier") as? String) == args[3] }
@@ -664,9 +985,9 @@ case "id-tree" where args.count == 3:
     }
 case "tab-press" where args.count == 4:
     guard let pid = Int32(args[2]), let index = Int(args[3]) else { exit(2) }
-    let tabs = tabButtons(pid)
+    let tabs = tabRows(pid)
     guard index >= 1, index <= tabs.count else { print("no tab \(args[3]) of \(tabs.count)"); exit(1) }
-    exit(AXUIElementPerformAction(tabs[index - 1], kAXPressAction as CFString) == .success ? 0 : 1)
+    exit(AXUIElementPerformAction(tabs[index - 1].element, kAXPressAction as CFString) == .success ? 0 : 1)
 case "submenu-items" where args.count == 5:
     guard let pid = Int32(args[2]), let item = menuItem(pid, args[3], args[4]) else { exit(1) }
     for entry in children(item).flatMap({ children($0) }) {
@@ -679,14 +1000,15 @@ case "submenu" where args.count == 6:
     exit(AXUIElementPerformAction(entry, kAXPressAction as CFString) == .success ? 0 : 1)
 case "tab-menu" where args.count == 4 || args.count == 5:
     guard let pid = Int32(args[2]), let index = Int(args[3]), activate(pid) else { exit(1) }
-    let tabs = tabButtons(pid)
-    guard index >= 1, index <= tabs.count, let box = frame(of: tabs[index - 1]) else {
+    let tabs = tabRows(pid)
+    guard index >= 1, index <= tabs.count, let box = frame(of: tabs[index - 1].element) else {
         print("no tab \(args[3]) of \(tabs.count)")
         exit(1)
     }
-    // Left of the middle, away from the tab's close button and its badge.
-    click(CGPoint(x: box.minX + box.width * 0.4, y: box.midY), .right, [])
-    guard let (menu, items) = openMenu(pid) else { print("no menu opened"); exit(1) }
+    // Left of the middle, on its title, away from the row's Close or pin.
+    let point = CGPoint(x: box.minX + box.width * 0.4, y: box.midY)
+    click(point, .right, [])
+    guard let (menu, items) = openMenu(pid, near: point) else { print("no menu opened"); exit(1) }
     for item in items {
         print(oneLine(attribute(item, kAXTitleAttribute)))
     }
