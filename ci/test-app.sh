@@ -454,7 +454,7 @@ controls() { printf 'Back %s, Forward %s' "$("$APPCTL" enabled "$PID" syndeo.bac
 # Return there with nothing typed opens a tab with the start page, as New
 # Tab once did straight away.
 new_tab() {
-  new_tab
+  choose File "New Tab"
   wait_for 5 "$APPCTL" value "$PID" syndeo.command-bar >/dev/null 2>&1 || true
   "$APPCTL" type "$PID" "" >/dev/null 2>&1 || true
 }
@@ -2230,7 +2230,7 @@ realtime() {
 #            authority in no trust settings;
 #   visible: its tabs say who controls them, with Stop, in a window of their
 #            own on screen;
-#   placed:  that bar below the toolbar and the tab bar, above the page, and
+#   placed:  that bar across the top of the page, beside the sidebar, and
 #            the route the agent reads what the address field says
 #            (agents_placed);
 #   act:     on a page this test serves, the agent types into a field, clicks
@@ -2665,9 +2665,9 @@ agents_off_again() {
 }
 
 # agents_placed: in the agent's window, chosen, with two tabs of its own.
-#   placed:  the bar saying who controls its tabs is below the toolbar and
-#            its address field, above the page, and overlaps none of its tabs
-#            in the tab bar, as Accessibility has them;
+#   placed:  the bar saying who controls its tabs is across the top of the
+#            page, beside the sidebar and right of its address field, and
+#            overlaps none of the sidebar's tabs, as Accessibility has them;
 #   placed:  the route the agent reads for its tab is what the address field
 #            says: its words, which for Through Syndeo are in its help tag
 #            alone, beside the symbol.
@@ -2697,17 +2697,20 @@ if missing:
     sys.exit("missing: " + " ".join(missing))
 ind, addr, page = parts["indicator"], parts["address"], parts["page"]
 top, bottom = ind[1], ind[1] + ind[3]
-if top < addr[1] + addr[3]:
-    sys.exit("the bar is not below the address field: %r, %r" % (ind, addr))
+# The bar is across the top of the card that holds the page, beside the
+# sidebar with the address field and the tabs: right of the field, above
+# the page, and over none of the tabs.
+if ind[0] < addr[0] + addr[2]:
+    sys.exit("the bar is not beside the sidebar, right of the address field: %r, %r" % (ind, addr))
 if bottom > page[1] + 1:
     sys.exit("the bar is over the page: %r, %r" % (ind, page))
 for tab in tabs:
-    if tab[1] < bottom and tab[1] + tab[3] > top:
+    if tab[0] < ind[0] + ind[2] and tab[0] + tab[2] > ind[0] and tab[1] < bottom and tab[1] + tab[3] > top:
         sys.exit("the bar overlaps a tab: %r, %r" % (ind, tab))
-print("placed, with %d tabs in the bar" % len(tabs))
+print("placed, with %d tabs in the sidebar" % len(tabs))
 ' 2>&1)"
-  must "$(printf '%s' "$verdict" | grep -q '^placed, with [2-9]' && echo yes)" \
-    "placed: the bar saying who controls an agent's tab is below the toolbar and the tab bar, above the page, and covered by neither" \
+  must "$(printf '%s' "$verdict" | grep -q '^placed, with [2-9].* in the sidebar' && echo yes)" \
+    "placed: the bar saying who controls an agent's tab is across the top of its page, beside the sidebar, and covered by neither" \
     "$verdict; $(tr '\n' ';' <"$LOGS/agent-frames.txt")"
   agent "$out" "{\"cmd\":\"read\",\"tab\":${AGENT_T1:-1}}"
   must "$([ "$(answered "$out" result.route)" = "$(bar)" ] &&
