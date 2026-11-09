@@ -524,12 +524,12 @@ separate, and removing the application touches neither.
     or in Recently Closed, ⌘1 to ⌘9 within the window in front, and none of
     the person's in the agent's list; and nothing downloaded in an agent's
     tab, the agent told so;
-  - downloads in your window: a file an `https` page links, saved byte for
-    byte, and a download redirected through Syndeo's proxy, each on a TLS
-    connection of its own, pinned to Syndeo's authority as the window's
-    pages are; and redirects to where a window may not go refused;
-  - twenty-one mutants, each the application with one safeguard taken out,
-    every one of which the test has to catch;
+  - downloads in your window: files an `https` page links, saved byte for
+    byte, each on a TLS connection of its own, with a certificate the window
+    has not seen, pinned to Syndeo's authority as the window's pages are;
+    and nothing saved from a download redirected where a window may not go;
+  - twenty mutants, each the application with one safeguard taken out, every
+    one of which the test has to catch;
   - its controls in its toolbar and browsing, in light and in dark
     appearance, with pictures of each kept with the run's logs.
 - **Checked by hand, for every signed release:** on an existing Mac and

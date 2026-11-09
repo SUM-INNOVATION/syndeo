@@ -144,8 +144,8 @@
 # pinned (agent traffic:), for agent-unproxied-tab. For
 # agent-downloads-allowed, agent-downloads' checks (agent downloads:), after
 # the prompt; for download-challenge-unpinned, downloads' files arriving
-# over TLS connections of their own, and for download-redirect-unchecked,
-# its redirects refused (downloads:). Any other failure is a failure.
+# over TLS connections of their own, their challenges answered with
+# Syndeo's authority (downloads:). Any other failure is a failure.
 #
 # agents, which gates programs on this Mac driving Syndeo with the person's
 # leave: see the section of that name below.
@@ -1368,8 +1368,7 @@ mutant() {
     direct-for-every-host) intended='^(https://example\.com stays Through Syndeo|and nothing was sent directly for it)$' ;;
     never-retry-direct) intended='^(on macOS [0-9]+, https://github\.com, on macOS.s HSTS preload list, opens|and the bar says Direct — not cached by Syndeo|and the log says it sent a host directly)' ;;
     agent-downloads-allowed) intended='^agent downloads:' ;;
-    download-challenge-unpinned) intended='^downloads: (a file an https page links for downloading arrives|and it came on a TLS connection of its own|a download redirected to https://example\.com)' ;;
-    download-redirect-unchecked) intended='^downloads: (a download redirected to (an IPv6 address with a zone|a file: address) is refused|and the log says a download.s redirect was refused)' ;;
+    download-challenge-unpinned) intended='^downloads: a file an https page links ' ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
   # What a mutant that downloads saves in ~/Downloads is removed again.
@@ -3403,32 +3402,36 @@ tabs_test() {
 # downloads, which gates downloads in a person's window, on pages this Mac
 # serves (ci/macos-app/download-origin.py). Each check's name starts with
 # "downloads:":
-#   - an https page on this Mac's loopback opens, pinned. Its certificate is
-#     issued for this test by Syndeo's own authority, which the proxy made
-#     at launch and which is in no trust settings. Every connection that
-#     origin takes serves one request, with no TLS session to resume, so a
-#     download from it comes on a TLS connection of its own, checked anew.
-#     (A page by a name, through Syndeo's proxy, cannot be served from this
-#     Mac over https: the proxy checks an origin's certificate as macOS
-#     does, and a trust setting on this runner waits for someone to allow
-#     it; see measure.);
+#   - an https page on this Mac's loopback opens, pinned. Its certificates
+#     are issued for this test by Syndeo's own authority, which the proxy
+#     made at launch and which is in no trust settings. Every connection
+#     that origin takes serves one request, with no TLS session to resume,
+#     and presents a certificate of its own, one no connection before it
+#     presented: so a download comes on a TLS connection of its own, whose
+#     certificate the window has not been shown, and something has to decide
+#     whether to believe it. (A page by a name, through Syndeo's proxy,
+#     cannot be served from this Mac over https: the proxy checks an
+#     origin's certificate as macOS does, and a trust setting on this runner
+#     waits for someone to allow it; see measure.);
 #   - its link marked for downloading, to a file of its own, saves that file
-#     in ~/Downloads byte for byte, and the origin served it on a TLS
-#     connection other than the page's: the download's own certificate
-#     check was answered with Syndeo's authority, as its window's are;
-#   - its link marked for downloading that redirects to https://example.com
-#     saves that page, through Syndeo's proxy (its count rises), on a TLS
-#     connection of its own to the proxy, answered the same way;
+#     in ~/Downloads byte for byte, on such a connection, and the app's log
+#     says the download's own TLS challenges were answered with Syndeo's
+#     authority, as its window's are, and none any other way;
+#   - so does its link marked for downloading that redirects within its own
+#     origin;
 #   - on an http page, a download redirected to an IPv6 address with a zone
 #     (lo0's own link-local address, where the origin answers) is refused:
-#     nothing is saved, the origin does not hear of it, and the log says a
-#     download's redirect was refused; one redirected to a file: address
-#     saves nothing;
+#     nothing is saved, and the origin does not hear of it; one redirected
+#     to a file: address saves nothing;
 #   - nothing of a download's address is in the app's log or its proxy's.
 # Measured, not gated: whether each file saved has com.apple.quarantine,
-# and what it says; and whether the page saved through Syndeo is byte for
-# byte what curl fetches directly. ~/Downloads is put back as it was, which
-# is gated, as are the trust settings.
+# and what it says; whether WebKit asked the download about its redirect
+# within its own origin; what a download redirected to another origin
+# becomes; and which refused the zone and the file: address, the
+# download's own redirect check or the window's navigation policy, WebKit
+# having made the redirect a navigation of the window, as CI 42541397760
+# saw it do. ~/Downloads is put back as it was, which is gated, as are the
+# trust settings.
 #
 # agent-downloads, which gates that an agent's tab downloads nothing, after
 # agents are turned on and ci-agent is allowed for the session (on: and
@@ -3445,6 +3448,8 @@ tabs_test() {
 DOWNLOADS="$HOME/Downloads"
 SYNDEO_CA="$HOME/Library/Application Support/Syndeo/proxy"
 DL_DIR='' DL_HTTP='' DL_HTTPS='' DL_PID='' DL_TLS='' DL_SNAP=''
+# How many certificates the origin has to present, one a TLS connection.
+DL_LEAVES=24
 
 # dl_list: the names in ~/Downloads, one a line, sorted; "(no folder)" when
 # there is none.
@@ -3471,7 +3476,7 @@ dl_put_back() {
   dl_new >"$LOGS/downloads-saved.txt"
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    if [ -f "$DOWNLOADS/$name" ] && [ ! -L "$DOWNLOADS/$name" ]; then rm -f -- "$DOWNLOADS/$name"; fi
+    if [ -f "${DOWNLOADS:?}/${name:?}" ] && [ ! -L "${DOWNLOADS:?}/${name:?}" ]; then rm -f -- "${DOWNLOADS:?}/${name:?}"; fi
   done <"$LOGS/downloads-saved.txt"
   if [ "$(cat "$DL_SNAP")" = '(no folder)' ] && [ -d "$DOWNLOADS" ]; then rmdir "$DOWNLOADS" 2>/dev/null || true; fi
   if [ "$(dl_list)" = "$(cat "$DL_SNAP")" ]; then
@@ -3482,37 +3487,41 @@ dl_put_back() {
   DL_SNAP=''
 }
 
-# dl_issue DIR: a certificate for 127.0.0.1 issued by Syndeo's own authority,
-# which the proxy made at launch, and its key, in DIR as the origin serves
-# them: chain.pem, the certificate then the authority's, and leaf.key. The
-# authority's key is only read: nothing is written beside it.
+# dl_issue DIR: DL_LEAVES certificates for 127.0.0.1, each with a key of its
+# own, issued by Syndeo's own authority, which the proxy made at launch; in
+# DIR as the origin serves them: chain-N.pem, the certificate then the
+# authority's, and leaf-N.key. The authority's key is only read: nothing is
+# written beside it.
 dl_issue() {
-  local dir="$1"
+  local dir="$1" n
   wait_for 20 test -s "$SYNDEO_CA/syndeo-ca.key" || { printf 'no authority at %s\n' "$SYNDEO_CA" >"$dir/openssl.log"; return 1; }
   printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n' >"$dir/leaf.ext"
-  openssl genrsa -out "$dir/leaf.key" 2048 >"$dir/openssl.log" 2>&1 &&
-    openssl req -new -key "$dir/leaf.key" -subj "/CN=127.0.0.1" -out "$dir/leaf.csr" >>"$dir/openssl.log" 2>&1 &&
-    openssl x509 -req -in "$dir/leaf.csr" -CA "$SYNDEO_CA/syndeo-ca.pem" -CAkey "$SYNDEO_CA/syndeo-ca.key" \
-      -set_serial "0x$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')" -days 1 -sha256 \
-      -extfile "$dir/leaf.ext" -out "$dir/leaf.pem" >>"$dir/openssl.log" 2>&1 &&
-    cat "$dir/leaf.pem" "$SYNDEO_CA/syndeo-ca.pem" >"$dir/chain.pem"
+  : >"$dir/openssl.log"
+  for n in $(seq 1 "$DL_LEAVES"); do
+    openssl ecparam -name prime256v1 -genkey -noout -out "$dir/leaf-$n.key" >>"$dir/openssl.log" 2>&1 &&
+      openssl req -new -key "$dir/leaf-$n.key" -subj "/CN=127.0.0.1" -out "$dir/leaf-$n.csr" >>"$dir/openssl.log" 2>&1 &&
+      openssl x509 -req -in "$dir/leaf-$n.csr" -CA "$SYNDEO_CA/syndeo-ca.pem" -CAkey "$SYNDEO_CA/syndeo-ca.key" \
+        -set_serial "0x$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')" -days 1 -sha256 \
+        -extfile "$dir/leaf.ext" -out "$dir/leaf-$n.pem" >>"$dir/openssl.log" 2>&1 &&
+      cat "$dir/leaf-$n.pem" "$SYNDEO_CA/syndeo-ca.pem" >"$dir/chain-$n.pem" || return 1
+  done
 }
 
 # dl_origin [tls]: start ci/macos-app/download-origin.py, serving DL_DIR over
-# http and, with tls, over https too, with a certificate dl_issue made in a
-# folder of its own outside the logs. Sets DL_HTTP and DL_HTTPS, its ports.
+# http and, with tls, over https too, with the certificates dl_issue made in
+# a folder of its own outside the logs. Sets DL_HTTP and DL_HTTPS, its ports.
 dl_origin() {
-  local certs=()
+  local certs=() n
   DL_DIR="$LOGS/downloads-origin"
   mkdir -p "$DL_DIR"
   : >"$LOGS/downloads-origin.jsonl"
   if [ "${1:-}" = tls ]; then
     DL_TLS="$(mktemp -d "${TMPDIR:-/tmp}/syndeo-dl-tls.XXXXXX")"
     if ! dl_issue "$DL_TLS"; then
-      bad "download origin: a certificate for this Mac's loopback, issued by Syndeo's authority" "$(tail -n 3 "$DL_TLS/openssl.log" 2>&1 | tr '\n' ' ')"
+      bad "download origin: certificates for this Mac's loopback, issued by Syndeo's authority" "$(tail -n 3 "$DL_TLS/openssl.log" 2>&1 | tr '\n' ' ')"
       return 1
     fi
-    certs=("$DL_TLS/chain.pem" "$DL_TLS/leaf.key")
+    for n in $(seq 1 "$DL_LEAVES"); do certs+=("$DL_TLS/chain-$n.pem" "$DL_TLS/leaf-$n.key"); done
   fi
   python3 -I -u "$here/macos-app/download-origin.py" "$DL_DIR" "$LOGS/downloads-origin.jsonl" ${certs[@]+"${certs[@]}"} \
     >"$LOGS/downloads-origin.out" 2>&1 &
@@ -3525,7 +3534,7 @@ dl_origin() {
   DL_HTTPS="$(sed -n 's/^http [0-9][0-9]* https \([0-9][0-9]*\)$/\1/p' "$LOGS/downloads-origin.out")"
 }
 # dl_origin_stop: stop the origin, which has to be running until then, and
-# remove the certificate dl_issue made.
+# remove the certificates dl_issue made.
 dl_origin_stop() {
   local status
   if [ -n "$DL_PID" ]; then
@@ -3542,7 +3551,7 @@ dl_origin_stop() {
       bad "download origin" "it raised: $(grep -A3 'Traceback' "$LOGS/downloads-origin.out" | tail -n 1)"
     fi
   fi
-  case "$DL_TLS" in */syndeo-dl-tls.*) rm -rf -- "$DL_TLS" ;; esac
+  case "$DL_TLS" in */syndeo-dl-tls.*) rm -rf -- "${DL_TLS:?}" ;; esac
   DL_PID='' DL_HTTP='' DL_HTTPS='' DL_TLS=''
 }
 
@@ -3553,24 +3562,26 @@ print(sum(1 for line in open(sys.argv[1], encoding="utf-8") if json.loads(line).
     "$LOGS/downloads-origin.jsonl" "$1"
 }
 
-# dl_fresh_tls PAGE FILE: the origin served FILE over TLS, on a connection
-# other than any it served PAGE on; says which, or why not.
+# dl_fresh_tls PATH: the origin served PATH over TLS, on a connection whose
+# certificate no connection before it had presented, handshakes that failed
+# included; says which, or why not.
 dl_fresh_tls() {
-  python3 -I - "$LOGS/downloads-origin.jsonl" "$1" "$2" <<'PY'
+  python3 -I - "$LOGS/downloads-origin.jsonl" "$1" <<'PY'
 import json, sys
-log, page, file = sys.argv[1:]
+log, path = sys.argv[1:]
 with open(log, encoding="utf-8") as f:
     seen = [json.loads(line) for line in f]
-pages = {e["conn"] for e in seen if e.get("path") == page and e.get("server") == "https"}
-files = [e for e in seen if e.get("path") == file]
+asked = [e for e in seen if e.get("path") == path]
 failed = [e for e in seen if e.get("handshake") == "failed"]
-if not files:
-    sys.exit("the origin was never asked for it; TLS handshakes that failed: %d %s" % (len(failed), failed[-1:] or ""))
-if any(e.get("server") != "https" for e in files):
-    sys.exit("asked for it other than over TLS: %r" % files)
-if any(e["conn"] in pages for e in files):
-    sys.exit("asked for it on the page's own connection: %r" % files)
-print("connection %s, the page's %s" % (",".join(str(e["conn"]) for e in files), ",".join(map(str, sorted(pages))) or "none"))
+if not asked:
+    sys.exit("the origin was never asked for it; TLS handshakes that failed: %d, the last %s" % (len(failed), failed[-1:] or "none"))
+first = asked[0]
+if first.get("server") != "https":
+    sys.exit("asked for it other than over TLS: %r" % first)
+shown = {e.get("leaf") for e in seen if "handshake" in e and e.get("conn", 0) < first["conn"]}
+if first.get("leaf") in shown:
+    sys.exit("its connection, %d, presented certificate %d, which an earlier one had" % (first["conn"], first["leaf"]))
+print("connection %d, certificate %d, which no connection before it presented" % (first["conn"], first["leaf"]))
 PY
 }
 
@@ -3582,6 +3593,8 @@ dl_ended() { plain_log "$1" | grep -cE "$DL_ENDED"; }
 dl_more() { [ "$(dl_ended "$1")" -gt "$2" ]; }
 # dl_said LOG: the app's last lines about downloads, for a failure's detail.
 dl_said() { plain_log "$1" | grep -iE 'download' | tail -n 4 | cut -c 1-220 | tr '\n' '|'; }
+# dl_count LOG TEXT: how many of LOG's lines have TEXT.
+dl_count() { plain_log "$1" | grep -cF "$2"; }
 
 # dl_press LOG TEXT: press the page's link TEXT, as a click would, and wait
 # up to 45 s for a download to end, as LOG says.
@@ -3606,19 +3619,49 @@ dl_quarantine() {
   fi
 }
 
+# dl_file LOG TEXT PATH ORIGINAL WHAT: press the https page's link TEXT,
+# which downloads PATH, whose bytes are ORIGINAL; require the file saved in
+# ~/Downloads byte for byte, the origin to have served PATH on a TLS
+# connection with a certificate not shown before, and the app's log to say
+# the download's own TLS challenges were answered with Syndeo's authority,
+# at least one, and none any other way. WHAT names the checks.
+dl_file() {
+  local log="$1" text="$2" path="$3" original="$4" what="$5" saved name fresh ok_fresh answers vouched other
+  dl_new >"$LOGS/downloads-new.txt"
+  plain_log "$log" | grep -F "a download's TLS challenge answered" | LC_ALL=C sort >"$LOGS/downloads-answers-before.txt"
+  dl_press "$log" "$text"
+  saved="$(dl_since "$LOGS/downloads-new.txt")"
+  name="$DOWNLOADS/$(printf '%s\n' "$saved" | head -n 1)"
+  must "$([ "$(printf '%s\n' "$saved" | grep -c .)" = 1 ] && [ -f "$name" ] && cmp -s "$name" "$original" && echo yes)" \
+    "$what arrives in ~/Downloads, byte for byte" "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_said "$log")"
+  fresh="$(dl_fresh_tls "$path" 2>&1)" && ok_fresh=yes || ok_fresh=no
+  must "$ok_fresh" "$what came on a TLS connection of its own, with a certificate the window had not been shown ($fresh)" "$fresh"
+  plain_log "$log" | grep -F "a download's TLS challenge answered" | LC_ALL=C sort |
+    LC_ALL=C comm -13 "$LOGS/downloads-answers-before.txt" - >"$LOGS/downloads-answers.txt"
+  answers="$(grep -c . "$LOGS/downloads-answers.txt")"
+  vouched="$(grep -c "vouched for, by Syndeo's authority" "$LOGS/downloads-answers.txt")"
+  other=$((answers - vouched))
+  must "$([ "$vouched" -ge 1 ] && [ "$other" = 0 ] && echo yes)" \
+    "$what had its own TLS challenges answered with Syndeo's authority, as its window's are: $vouched, and $other any other way" \
+    "$(cut -c 1-200 "$LOGS/downloads-answers.txt" | tr '\n' '|')"
+  dl_quarantine "$(basename "$name")" "$name"
+}
+
 # downloads_checks LOG: downloads' checks, in the application running as PID,
 # whose log is LOG; see the top of this section.
 downloads_checks() {
-  local log="$1" t z p page before fresh name saved direct
+  local log="$1" t z s page saved before stopped refused
   dl_origin tls || return 1
-  t="$(token)"; z="$(token)"; p="$(token)"
+  t="$(token)"; z="$(token)"; s="$(token)"
   head -c 300000 /dev/urandom >"$DL_DIR/payload-$t.bin"
+  head -c 200000 /dev/urandom >"$DL_DIR/second-$t.bin"
   head -c 1000 /dev/urandom >"$DL_DIR/zoned-$t.bin"
   cat >"$DL_DIR/page-$t.html" <<EOF
 <!doctype html><meta charset="utf-8"><title>Downloads test</title>
 <h1>SYNDEO-DOWNLOADS-PAGE</h1>
 <p><a href="/payload-$t.bin?t=$t" download="syndeo-download-$t.bin">Download the file</a></p>
-<p><a href="/redirect?t=$t&amp;to=https://example.com/?$p" download="syndeo-proxied-$t.html">Download through Syndeo</a></p>
+<p><a href="/redirect?t=$t&amp;to=/second-$t.bin?t=$t" download="syndeo-redirected-$t.bin">Download by a redirect</a></p>
+<p><a href="/redirect?t=$t&amp;to=https://example.com/?$s" download="syndeo-elsewhere-$t.html">Download from another origin</a></p>
 EOF
   cat >"$DL_DIR/redirects-$t.html" <<EOF
 <!doctype html><meta charset="utf-8"><title>Download redirects</title>
@@ -3627,70 +3670,63 @@ EOF
 <p><a href="/redirect?t=$t&amp;to=file:///etc/hosts" download="syndeo-scheme-$t.txt">Download by another scheme</a></p>
 EOF
 
-  counted "before downloads"
-  before="$COUNTED"
   page="https://127.0.0.1:$DL_HTTPS/page-$t.html?t=$t"
   visit "$page" "$page" 'SYNDEO-DOWNLOADS-PAGE' \
     "download page: an https page on this Mac's loopback, its certificate issued by Syndeo's authority, opens pinned"
 
-  # A file of the page's own, on a TLS connection of its own.
-  dl_new >"$LOGS/downloads-new.txt"
-  dl_press "$log" "Download the file"
-  saved="$(dl_since "$LOGS/downloads-new.txt")"
-  name="$DOWNLOADS/$(printf '%s\n' "$saved" | head -n 1)"
-  must "$([ "$(printf '%s\n' "$saved" | grep -c .)" = 1 ] && [ -f "$name" ] && cmp -s "$name" "$DL_DIR/payload-$t.bin" && echo yes)" \
-    "downloads: a file an https page links for downloading arrives in ~/Downloads, byte for byte" \
-    "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_said "$log")"
-  printf '  MEASURE  saved as %s, its link naming it syndeo-download-%s.bin\n' "$(basename "$name")" "$t"
-  fresh="$(dl_fresh_tls "/page-$t.html" "/payload-$t.bin" 2>&1)" && saved=yes || saved=no
-  must "$saved" "downloads: and it came on a TLS connection of its own, answered with Syndeo's authority as the window's are ($fresh)" "$fresh"
-  dl_quarantine "a file from this Mac's loopback" "$name"
+  # The page's own files, each on a TLS connection of its own, with a
+  # certificate the window has not been shown.
+  dl_file "$log" "Download the file" "/payload-$t.bin" "$DL_DIR/payload-$t.bin" \
+    "downloads: a file an https page links for downloading"
+  before="$(dl_count "$log" "a download's redirect allowed")"
+  dl_file "$log" "Download by a redirect" "/second-$t.bin" "$DL_DIR/second-$t.bin" \
+    "downloads: a file an https page links through a redirect within its own origin"
+  printf '  MEASURE  a download redirected within its own origin: WebKit %s the download about it\n' \
+    "$([ "$(dl_count "$log" "a download's redirect allowed")" -gt "$before" ] && echo asked || echo 'did not ask')"
 
-  # Redirected to example.com: through the proxy, on a TLS connection of
-  # its own to it.
+  # A download redirected to another origin: what it becomes, measured.
   dl_new >"$LOGS/downloads-new.txt"
-  dl_press "$log" "Download through Syndeo"
+  stopped="$(dl_count "$log" "a download stopped before it finished")"
+  dl_press "$log" "Download from another origin"
+  sleep 3
   saved="$(dl_since "$LOGS/downloads-new.txt")"
-  name="$DOWNLOADS/$(printf '%s\n' "$saved" | head -n 1)"
-  must "$([ "$(printf '%s\n' "$saved" | grep -c .)" = 1 ] && [ -f "$name" ] && grep -qF "$EXAMPLE_BODY" "$name" && echo yes)" \
-    "downloads: a download redirected to https://example.com arrives, on a TLS connection of its own to Syndeo's proxy" \
-    "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_said "$log")"
-  dl_quarantine "a page through Syndeo's proxy" "$name"
-  direct="$LOGS/downloads-example-direct.html"
-  if [ -f "$name" ] && curl -sS --max-time 20 -o "$direct" "https://example.com/?$p" 2>/dev/null; then
-    printf '  MEASURE  the page saved through Syndeo is %s what curl fetches directly (%s and %s bytes)\n' \
-      "$(cmp -s "$name" "$direct" && echo 'byte for byte' || echo 'NOT byte for byte')" "$(wc -c <"$name" | tr -d ' ')" "$(wc -c <"$direct" | tr -d ' ')"
-  else
-    printf '  MEASURE  the page saved through Syndeo was not compared with a direct fetch: nothing was saved, or curl failed\n'
-  fi
-  counted "after downloads"
-  risen "$before" "downloads: a download redirected to https://example.com came through Syndeo's proxy"
+  printf '  MEASURE  a download redirected to another origin, https://example.com: %s; the download %s; the window shows %s, its bar saying "%s"\n' \
+    "$([ -n "$saved" ] && echo "saved as $(printf '%s' "$saved" | tr '\n' ' ')" || echo 'nothing saved')" \
+    "$([ "$(dl_count "$log" "a download stopped before it finished")" -gt "$stopped" ] && echo 'was stopped by WebKit' || echo 'was not stopped')" \
+    "$(address)" "$(bar)"
 
   # Redirects to where no window may go.
   page="http://127.0.0.1:$DL_HTTP/redirects-$t.html?t=$t"
   visit "$page" "$page" 'SYNDEO-REDIRECTS-PAGE' "download page: an http page on this Mac's loopback opens"
   dl_new >"$LOGS/downloads-new.txt"
-  before="$(plain_log "$log" | grep -c "refused a download's redirect")"
+  before="$(dl_count "$log" "refused a download's redirect")"
+  refused="$(plain_log "$log" | grep -c 'refused a page in a window.*zoned=true')"
   dl_press "$log" "Download by a zone"
   sleep 2
   saved="$(dl_since "$LOGS/downloads-new.txt")"
   must "$([ -z "$saved" ] && [ "$(dl_heard "/zoned-$t.bin")" = 0 ] && echo yes)" \
     "downloads: a download redirected to an IPv6 address with a zone is refused: nothing is saved, and the origin does not hear of it" \
     "saved: ${saved:-nothing}; the origin was asked for it $(dl_heard "/zoned-$t.bin") time(s); the app: $(dl_said "$log")"
-  must "$([ "$(plain_log "$log" | grep -c "refused a download's redirect")" -gt "$before" ] && echo yes)" \
-    "downloads: and the log says a download's redirect was refused" "the app: $(dl_said "$log")"
+  printf '  MEASURE  the zone was refused by %s\n' \
+    "$(if [ "$(dl_count "$log" "refused a download's redirect")" -gt "$before" ]; then echo "the download's own redirect check"
+    elif [ "$(plain_log "$log" | grep -c 'refused a page in a window.*zoned=true')" -gt "$refused" ]; then echo "the window's navigation policy, WebKit having made the redirect a navigation"
+    else echo "neither, as the log says: $(dl_said "$log")"; fi)"
+  visit "$page" "$page" 'SYNDEO-REDIRECTS-PAGE' "download page: the http page on this Mac's loopback opens again"
   dl_new >"$LOGS/downloads-new.txt"
-  before="$(plain_log "$log" | grep -c "refused a download's redirect")"
+  before="$(dl_count "$log" "refused a download's redirect")"
+  refused="$(plain_log "$log" | grep -c 'refused a page in a window scheme=file')"
   dl_press "$log" "Download by another scheme"
   sleep 2
   saved="$(dl_since "$LOGS/downloads-new.txt")"
   must "$([ -z "$saved" ] && echo yes)" "downloads: a download redirected to a file: address is refused: nothing is saved" \
     "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_said "$log")"
-  printf '  MEASURE  a download redirected to a file: address: %s\n' \
-    "$([ "$(plain_log "$log" | grep -c "refused a download's redirect")" -gt "$before" ] && echo "Syndeo refused the redirect" || echo "WebKit did not ask Syndeo about the redirect: $(dl_said "$log")")"
+  printf '  MEASURE  the file: address was refused by %s\n' \
+    "$(if [ "$(dl_count "$log" "refused a download's redirect")" -gt "$before" ]; then echo "the download's own redirect check"
+    elif [ "$(plain_log "$log" | grep -c 'refused a page in a window scheme=file')" -gt "$refused" ]; then echo "the window's navigation policy, WebKit having made the redirect a navigation"
+    else echo "WebKit, asking neither: $(dl_said "$log")"; fi)"
 
-  must "$(! grep -qE "$t|$z|$p" "$log" && echo yes)" "downloads: nothing of a download's address is in the app's log or its proxy's" \
-    "$(grep -cE "$t|$z|$p" "$log") lines"
+  must "$(! grep -qE "$t|$z|$s" "$log" && echo yes)" "downloads: nothing of a download's address is in the app's log or its proxy's" \
+    "$(grep -cE "$t|$z|$s" "$log") lines"
 }
 
 # dl_leftover: nothing of the application left running for the next step.

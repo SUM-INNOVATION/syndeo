@@ -27,7 +27,9 @@
 //! - **Redirects** go only where the window's main frame may
 //!   (`address::download_may_follow`): the web's own addresses, never an
 //!   IPv6 address with a zone. Any other is refused, and the download with
-//!   it, which the list says.
+//!   it, which the list says. (WebKit asks only of a redirect within the
+//!   download's own origin; one elsewhere it makes a navigation of the
+//!   window, which the window's navigation policy decides.)
 //! - **An agent's tab downloads nothing.** Its window refuses both ways a
 //!   download begins (`browser_macos`), and one handed here all the same is
 //!   cancelled before it has a place to go.
@@ -245,13 +247,23 @@ define_class!(
             challenge: &NSURLAuthenticationChallenge,
             completion: &block2::DynBlock<dyn Fn(isize, *mut AnyObject)>,
         ) {
-            let trust = active(download).map_or_else(Trust::none, |a| a.trust);
+            let known = active(download);
+            let id = known.as_ref().map(|a| a.id);
+            let trust = known.map_or_else(Trust::none, |a| a.trust);
             let judged = trust.judge(challenge, browser_macos::host_of(challenge).as_deref());
-            completion.call((judged.disposition, judged.credential));
+            let answer = (judged.disposition, judged.credential);
+            // How it was answered, and nothing of the host.
+            tracing::info!(download = ?id, answer = answered(answer.0), "a download's TLS challenge answered");
+            completion.call(answer);
         }
 
         /// A redirect goes only where the window's main frame may go; any
-        /// other is refused, and the download with it.
+        /// other is refused, and the download with it. WebKit asks this
+        /// only of a redirect to the download's own origin, measured on
+        /// macOS 15 (CI 42541397760): one to another origin, from a link
+        /// marked for downloading, it turns into a navigation of the
+        /// window, which its navigation policy decides. This is the rule
+        /// should WebKit ever ask of another.
         #[unsafe(method(download:willPerformHTTPRedirection:newRequest:decisionHandler:))]
         unsafe fn will_redirect(
             &self,
@@ -264,7 +276,9 @@ define_class!(
             let scheme = browser_macos::scheme_of(request);
             let target = browser_macos::address_of(request);
             let allowed = id.is_some() && address::download_may_follow(&scheme, &target);
-            if !allowed {
+            if allowed {
+                tracing::info!(download = ?id, scheme = %scheme, "a download's redirect allowed");
+            } else {
                 if let Some(id) = id {
                     LIST.with(|list| list.borrow_mut().fail(id, downloads::REDIRECT_REFUSED));
                     forget_active(id);
@@ -369,6 +383,16 @@ define_class!(
 impl Keeper {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         unsafe { msg_send![Self::alloc(mtm), init] }
+    }
+}
+
+/// A TLS challenge's answer, `NSURLSessionAuthChallengeDisposition`, in
+/// words for the log.
+fn answered(disposition: isize) -> &'static str {
+    match disposition {
+        0 => "vouched for, by Syndeo's authority",
+        1 => "left to macOS",
+        _ => "refused",
     }
 }
 
