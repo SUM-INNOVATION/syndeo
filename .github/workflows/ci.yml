@@ -327,7 +327,7 @@ jobs:
     # opened by one; passkeys reported unavailable, asking nothing; its last
     # window closed and brought back by opening it again, quit as the Quit
     # menu item would, and opened again; four mutants, each of which the
-    # test has to catch (the other seventeen are macos-agents'); a copy whose proxy cannot start, which has to refuse
+    # test has to catch (the other sixteen are macos-agents'); a copy whose proxy cannot start, which has to refuse
     # to browse; and the route bar against what WebKit does, the proxy's
     # cache keeping nothing from this Mac, and Clear Browsing Data. Unsigned
     # with a Developer ID, and with no secrets: a pull request never signs.
@@ -387,7 +387,7 @@ jobs:
       # mutants.py names macos-app): the schemes a new tab may open, the
       # address field's guard for typing, Reload asking the origin, and Clear
       # Browsing Data forgetting closed tabs and the session. The other
-      # seventeen run in macos-agents, by their measured times (mutants.py,
+      # sixteen run in macos-agents, by their measured times (mutants.py,
       # MACOS_AGENTS), so that neither job nears its 60 minutes; each mutant
       # runs in exactly one, which mutants.py --check requires. Each is built
       # from this tree, the app and its helper, which is then put back, and
@@ -462,16 +462,17 @@ jobs:
         if: always()
         run: bash ci/test-app.sh realtime "$PWD/dist/Syndeo.app"
 
-      # Downloads in a person's window (ci/test-app.sh downloads): a file an
-      # https page on this Mac's loopback links for downloading, its
-      # certificate issued by Syndeo's own authority, arrives byte for byte
-      # on a TLS connection of its own; one redirected to https://example.com
-      # arrives through Syndeo's proxy on a TLS connection of its own to it,
-      # each connection's certificate answered as the window answers its
-      # page's; downloads redirected to an IPv6 address with a zone, or to a
-      # file: address, are refused. Whether a file saved is quarantined is
-      # measured, not gated. ~/Downloads is put back as it was.
-      - name: Downloads, each on a TLS connection of its own answered as its window's are, and their redirects held to a window's rules
+      # Downloads in a person's window (ci/test-app.sh downloads): files an
+      # https page on this Mac's loopback links for downloading, directly and
+      # through a redirect within its origin, arrive byte for byte, each on a
+      # TLS connection of its own with a certificate the window has not been
+      # shown, issued by Syndeo's own authority, and the download's own
+      # challenges answered with that authority; downloads redirected to an
+      # IPv6 address with a zone, or to a file: address, save nothing.
+      # Measured, not gated: whether a file saved is quarantined, and what a
+      # download redirected to another origin becomes. ~/Downloads is put
+      # back as it was.
+      - name: Downloads, each on a TLS connection of its own answered as its window's are, and none where a window may not go
         if: always()
         run: bash ci/test-app.sh downloads "$PWD/dist/Syndeo.app"
 
@@ -560,8 +561,8 @@ jobs:
     # proxy and pinned, saying who controls them; reading, acting, a
     # screenshot, JavaScript only with its own leave; Stop and Revoke All;
     # MCP; and root refused. ci/test-app.sh agents says each check. Then an
-    # agent's tab downloading nothing; seventeen of the mutants (the agents'
-    # seven, eight of the application's and the downloads' two); and tabs
+    # agent's tab downloading nothing; sixteen of the mutants (the agents'
+    # seven, eight of the application's and the downloads' one); and tabs
     # and its look, light and dark.
     runs-on: macos-15
     timeout-minutes: 60
@@ -613,9 +614,9 @@ jobs:
       # bar's rule for names, the refusal of a link to an IPv6 address with
       # a zone, a WebSocket carried rather than stripped of its Upgrade, and
       # the hosts sent directly; an agent's tab refusing downloads; and a
-      # download's TLS challenges answered as its window's are, and its
-      # redirects held to a window's rules, whose checks macos-app's
-      # downloads step runs too. Built, run and judged as macos-app's are.
+      # download's TLS challenges answered as its window's are, whose checks
+      # macos-app's downloads step runs too. Built, run and judged as
+      # macos-app's are.
       - name: Build each of its mutants, and require the test to catch it
         if: always()
         shell: bash

@@ -90,12 +90,15 @@ back.
   download begun and a file saved.
 - download-challenge-unpinned: a download's own TLS challenges get macOS's
   default handling, not its window's answer, which pins Syndeo's authority.
-  A file an https page links, on a TLS connection of its own, and a download
-  redirected to https://example.com, on a TLS connection of its own to the
-  proxy, must then be seen not arriving.
-- download-redirect-unchecked: a download follows every redirect, wherever
-  it goes. One redirected to an IPv6 address with a zone must then be seen
-  followed, the origin hearing of it, and the log not saying it was refused.
+  A file an https page links, on a TLS connection of its own with a
+  certificate the window has not been shown, must then be seen not
+  arriving, its challenge left to macOS.
+
+Not a mutant: a download's own redirect check, which WebKit asks only of a
+redirect within the download's origin, which the check allows. One to
+another origin WebKit makes a navigation of the window, which the window's
+navigation policy refuses (CI 42541397760), so nothing on the runner can
+tell the check taken out from the check in place.
 
 Each mutant runs in exactly one CI job: macos-agents runs the agent-*
 mutants, beside its gate, and those in MACOS_AGENTS; macos-app runs the
@@ -335,16 +338,9 @@ MUTANTS = {
     "download-challenge-unpinned": [
         (
             DOWNLOADS,
-            "            completion.call((judged.disposition, judged.credential));\n",
+            "            let answer = (judged.disposition, judged.credential);\n",
             "            let _ = judged;\n"
-            "            completion.call((1, std::ptr::null_mut()));\n",
-        ),
-    ],
-    "download-redirect-unchecked": [
-        (
-            DOWNLOADS,
-            "            let allowed = id.is_some() && address::download_may_follow(&scheme, &target);\n",
-            "            let allowed = true || (id.is_some() && address::download_may_follow(&scheme, &target));\n",
+            "            let answer: (isize, *mut AnyObject) = (1, std::ptr::null_mut());\n",
         ),
     ],
 }
@@ -355,10 +351,11 @@ MUTANTS = {
 # direct-for-every-host 124, websocket-headers-stripped 104,
 # no-navigation-policy 102, zoned-links-followed 98, asked-any-scheme 96,
 # never-retry-direct 94 and direct-for-every-name 87; 843 s of the 1061.
-# And the downloads' two, which need nothing of macos-app's but the
-# Syndeo.app every job assembles: macos-agents runs its mutants whatever its
-# gate before them did, where macos-app skips its own once its launch step
-# has failed, and has the room (CI 40284010783: 28m28s, with its fourteen).
+# And download-challenge-unpinned, which needs nothing of macos-app's but
+# the Syndeo.app every job assembles: macos-agents runs its mutants whatever
+# its gate before them did, where macos-app skips its own once its launch
+# step has failed, and has the room (CI 42541397760: 33m56s, its mutants
+# 26m13s, download-challenge-unpinned 105 s of it).
 MACOS_AGENTS = {
     "no-pinning-delegate",
     "direct-for-every-host",
@@ -369,7 +366,6 @@ MACOS_AGENTS = {
     "never-retry-direct",
     "direct-for-every-name",
     "download-challenge-unpinned",
-    "download-redirect-unchecked",
 }
 
 JOBS = ("macos-app", "macos-agents")
