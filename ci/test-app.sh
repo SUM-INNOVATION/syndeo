@@ -10,6 +10,8 @@
 #   ci/test-app.sh agents <Syndeo.app>
 #   ci/test-app.sh looks <Syndeo.app>
 #   ci/test-app.sh tabs <Syndeo.app>
+#   ci/test-app.sh downloads <Syndeo.app>
+#   ci/test-app.sh agent-downloads <Syndeo.app>
 #   ci/test-app.sh measure
 #
 # launch, which gates: open the app with `open`, never by running its
@@ -138,11 +140,17 @@
 # JavaScript refused (grants:) for agent-approval-skipped, what a grant allows
 # (grants:) for agent-grant-unenforced, root refused (peer:) for
 # agent-peer-unchecked, and the agent's https page through the proxy,
-# pinned (agent traffic:), for agent-unproxied-tab. Any other failure is a
-# failure.
+# pinned (agent traffic:), for agent-unproxied-tab. For
+# agent-downloads-allowed, agent-downloads' checks (agent downloads:), after
+# the prompt; for download-challenge-unpinned, downloads' files arriving
+# over TLS connections of their own, and for download-redirect-unchecked,
+# its redirects refused (downloads:). Any other failure is a failure.
 #
 # agents, which gates programs on this Mac driving Syndeo with the person's
 # leave: see the section of that name below.
+#
+# downloads and agent-downloads, which gate downloads in a person's window
+# and none in an agent's tab: see the section named downloads below.
 #
 # routes, which gates: the bar's route against what WebKit actually does,
 # the proxy caching nothing from this Mac, and Clear Browsing Data. From a
@@ -1350,8 +1358,13 @@ mutant() {
     agent-tabs-recently-closed) intended='^closed:' ;;
     direct-for-every-host) intended='^(https://example\.com stays Through Syndeo|and nothing was sent directly for it)$' ;;
     never-retry-direct) intended='^(on macOS [0-9]+, https://github\.com, on macOS.s HSTS preload list, opens|and the bar says Direct — not cached by Syndeo|and the log says it sent a host directly)' ;;
+    agent-downloads-allowed) intended='^agent downloads:' ;;
+    download-challenge-unpinned) intended='^downloads: (a file an https page links for downloading arrives|and it came on a TLS connection of its own|a download redirected to https://example\.com)' ;;
+    download-redirect-unchecked) intended='^downloads: (a download redirected to (an IPv6 address with a zone|a file: address) is refused|and the log says a download.s redirect was refused)' ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
+  # What a mutant that downloads saves in ~/Downloads is removed again.
+  case "$name" in *download*) dl_snapshot ;; esac
   # Agents off, as they are until someone turns them on.
   defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
   if [ "$name" = tabs-kept-after-clear ]; then
@@ -1373,13 +1386,16 @@ mutant() {
       websocket-headers-stripped) realtime_origin && rt_through_syndeo ;;
       agent-*) agents_mutant "$name" "$app" ;;
       direct-for-every-host | never-retry-direct) preloaded "$log" ;;
+      download-*) downloads_checks "$log" ;;
       *) policy "$log" ;;
     esac
   fi
   origin_stop
   route_origin_stop
   realtime_origin_stop
+  dl_origin_stop
   stopped "mutant-$name"
+  dl_put_back
   defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
   # What it kept, which a clear would have forgotten.
   [ "$name" = tabs-kept-after-clear ] && rm -f "$session"
@@ -2840,6 +2856,10 @@ agents_mutant() {
       agents_approval
       agents_traffic
       ;;
+    agent-downloads-allowed)
+      agents_approval
+      agents_downloads "$LOGS/app-mutant-$1.stderr"
+      ;;
   esac
 }
 
@@ -3369,6 +3389,419 @@ tabs_test() {
   [ "$fails" = 0 ]
 }
 
+# ------------------------------------------------------------- downloads
+#
+# downloads, which gates downloads in a person's window, on pages this Mac
+# serves (ci/macos-app/download-origin.py). Each check's name starts with
+# "downloads:":
+#   - an https page on this Mac's loopback opens, pinned. Its certificate is
+#     issued for this test by Syndeo's own authority, which the proxy made
+#     at launch and which is in no trust settings. Every connection that
+#     origin takes serves one request, with no TLS session to resume, so a
+#     download from it comes on a TLS connection of its own, checked anew.
+#     (A page by a name, through Syndeo's proxy, cannot be served from this
+#     Mac over https: the proxy checks an origin's certificate as macOS
+#     does, and a trust setting on this runner waits for someone to allow
+#     it; see measure.);
+#   - its link marked for downloading, to a file of its own, saves that file
+#     in ~/Downloads byte for byte, and the origin served it on a TLS
+#     connection other than the page's: the download's own certificate
+#     check was answered with Syndeo's authority, as its window's are;
+#   - its link marked for downloading that redirects to https://example.com
+#     saves that page, through Syndeo's proxy (its count rises), on a TLS
+#     connection of its own to the proxy, answered the same way;
+#   - on an http page, a download redirected to an IPv6 address with a zone
+#     (lo0's own link-local address, where the origin answers) is refused:
+#     nothing is saved, the origin does not hear of it, and the log says a
+#     download's redirect was refused; one redirected to a file: address
+#     saves nothing;
+#   - nothing of a download's address is in the app's log or its proxy's.
+# Measured, not gated: whether each file saved has com.apple.quarantine,
+# and what it says; and whether the page saved through Syndeo is byte for
+# byte what curl fetches directly. ~/Downloads is put back as it was, which
+# is gated, as are the trust settings.
+#
+# agent-downloads, which gates that an agent's tab downloads nothing, after
+# agents are turned on and ci-agent is allowed for the session (on: and
+# approval:, as agents has them). Each check's name starts with "agent
+# downloads:":
+#   - the agent's goto to a file is refused, and it is told so: "downloads
+#     are not allowed for agents"; its tab's page stays as it was;
+#   - a link marked for downloading that it clicks is refused, and its wait
+#     says so;
+#   - nothing is saved in ~/Downloads, no download began, and the log says
+#     each was refused in an agent's tab, with nothing of their addresses.
+# ~/Downloads is put back as it was, which is gated, as are the trust
+# settings.
+DOWNLOADS="$HOME/Downloads"
+SYNDEO_CA="$HOME/Library/Application Support/Syndeo/proxy"
+DL_DIR='' DL_HTTP='' DL_HTTPS='' DL_PID='' DL_TLS='' DL_SNAP=''
+
+# dl_list: the names in ~/Downloads, one a line, sorted; "(no folder)" when
+# there is none.
+dl_list() {
+  if [ -d "$DOWNLOADS" ]; then ls -A "$DOWNLOADS" | LC_ALL=C sort; else echo '(no folder)'; fi
+}
+# dl_snapshot: ~/Downloads as it is before the test, to put it back to.
+dl_snapshot() {
+  DL_SNAP="$LOGS/downloads-before.txt"
+  dl_list >"$DL_SNAP"
+}
+# dl_new: the names in ~/Downloads now that were not there before the test.
+dl_new() { dl_list | LC_ALL=C comm -13 "$DL_SNAP" - | grep -vx '(no folder)'; }
+# dl_since FILE: the names dl_new gives now that it did not when FILE was
+# written with it.
+dl_since() { dl_new | LC_ALL=C comm -13 "$1" -; }
+
+# dl_put_back: remove what the test saved in ~/Downloads, the files it
+# saved and nothing else, and the folder if the app made it; require
+# ~/Downloads to be as it was.
+dl_put_back() {
+  local name
+  [ -n "$DL_SNAP" ] && [ -f "$DL_SNAP" ] || return 0
+  dl_new >"$LOGS/downloads-saved.txt"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if [ -f "$DOWNLOADS/$name" ] && [ ! -L "$DOWNLOADS/$name" ]; then rm -f -- "$DOWNLOADS/$name"; fi
+  done <"$LOGS/downloads-saved.txt"
+  if [ "$(cat "$DL_SNAP")" = '(no folder)' ] && [ -d "$DOWNLOADS" ]; then rmdir "$DOWNLOADS" 2>/dev/null || true; fi
+  if [ "$(dl_list)" = "$(cat "$DL_SNAP")" ]; then
+    ok "the Downloads folder is as it was before the test: what was saved there is removed ($(grep -c . "$LOGS/downloads-saved.txt") file(s))"
+  else
+    bad "the Downloads folder is as it was before the test" "it differs: $(dl_list | LC_ALL=C comm -3 "$DL_SNAP" - | tr '\n\t' '| ')"
+  fi
+  DL_SNAP=''
+}
+
+# dl_issue DIR: a certificate for 127.0.0.1 issued by Syndeo's own authority,
+# which the proxy made at launch, and its key, in DIR as the origin serves
+# them: chain.pem, the certificate then the authority's, and leaf.key. The
+# authority's key is only read: nothing is written beside it.
+dl_issue() {
+  local dir="$1"
+  wait_for 20 test -s "$SYNDEO_CA/syndeo-ca.key" || { printf 'no authority at %s\n' "$SYNDEO_CA" >"$dir/openssl.log"; return 1; }
+  printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n' >"$dir/leaf.ext"
+  openssl genrsa -out "$dir/leaf.key" 2048 >"$dir/openssl.log" 2>&1 &&
+    openssl req -new -key "$dir/leaf.key" -subj "/CN=127.0.0.1" -out "$dir/leaf.csr" >>"$dir/openssl.log" 2>&1 &&
+    openssl x509 -req -in "$dir/leaf.csr" -CA "$SYNDEO_CA/syndeo-ca.pem" -CAkey "$SYNDEO_CA/syndeo-ca.key" \
+      -set_serial "0x$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')" -days 1 -sha256 \
+      -extfile "$dir/leaf.ext" -out "$dir/leaf.pem" >>"$dir/openssl.log" 2>&1 &&
+    cat "$dir/leaf.pem" "$SYNDEO_CA/syndeo-ca.pem" >"$dir/chain.pem"
+}
+
+# dl_origin [tls]: start ci/macos-app/download-origin.py, serving DL_DIR over
+# http and, with tls, over https too, with a certificate dl_issue made in a
+# folder of its own outside the logs. Sets DL_HTTP and DL_HTTPS, its ports.
+dl_origin() {
+  local certs=()
+  DL_DIR="$LOGS/downloads-origin"
+  mkdir -p "$DL_DIR"
+  : >"$LOGS/downloads-origin.jsonl"
+  if [ "${1:-}" = tls ]; then
+    DL_TLS="$(mktemp -d "${TMPDIR:-/tmp}/syndeo-dl-tls.XXXXXX")"
+    if ! dl_issue "$DL_TLS"; then
+      bad "download origin: a certificate for this Mac's loopback, issued by Syndeo's authority" "$(tail -n 3 "$DL_TLS/openssl.log" 2>&1 | tr '\n' ' ')"
+      return 1
+    fi
+    certs=("$DL_TLS/chain.pem" "$DL_TLS/leaf.key")
+  fi
+  python3 -I -u "$here/macos-app/download-origin.py" "$DL_DIR" "$LOGS/downloads-origin.jsonl" ${certs[@]+"${certs[@]}"} \
+    >"$LOGS/downloads-origin.out" 2>&1 &
+  DL_PID=$!
+  if ! wait_for 10 grep -q '^http [0-9]' "$LOGS/downloads-origin.out"; then
+    bad "download origin" "it did not start: $(head -c 300 "$LOGS/downloads-origin.out")"
+    return 1
+  fi
+  DL_HTTP="$(sed -n 's/^http \([0-9][0-9]*\) https .*$/\1/p' "$LOGS/downloads-origin.out")"
+  DL_HTTPS="$(sed -n 's/^http [0-9][0-9]* https \([0-9][0-9]*\)$/\1/p' "$LOGS/downloads-origin.out")"
+}
+# dl_origin_stop: stop the origin, which has to be running until then, and
+# remove the certificate dl_issue made.
+dl_origin_stop() {
+  local status
+  if [ -n "$DL_PID" ]; then
+    if kill -0 "$DL_PID" 2>/dev/null; then
+      kill "$DL_PID"
+      wait "$DL_PID" 2>/dev/null
+      status=$?
+      [ "$status" = 143 ] || bad "download origin" "it ended with status $status, not from the SIGTERM sent"
+    else
+      wait "$DL_PID" 2>/dev/null
+      bad "download origin" "it had already ended, status $?, before it was stopped: $(tail -n 3 "$LOGS/downloads-origin.out" | tr '\n' ' ')"
+    fi
+    if grep -q 'Traceback' "$LOGS/downloads-origin.out"; then
+      bad "download origin" "it raised: $(grep -A3 'Traceback' "$LOGS/downloads-origin.out" | tail -n 1)"
+    fi
+  fi
+  case "$DL_TLS" in */syndeo-dl-tls.*) rm -rf -- "$DL_TLS" ;; esac
+  DL_PID='' DL_HTTP='' DL_HTTPS='' DL_TLS=''
+}
+
+# dl_heard PATH: how many times the origin was asked for PATH.
+dl_heard() {
+  python3 -I -c 'import json, sys
+print(sum(1 for line in open(sys.argv[1], encoding="utf-8") if json.loads(line).get("path") == sys.argv[2]))' \
+    "$LOGS/downloads-origin.jsonl" "$1"
+}
+
+# dl_fresh_tls PAGE FILE: the origin served FILE over TLS, on a connection
+# other than any it served PAGE on; says which, or why not.
+dl_fresh_tls() {
+  python3 -I - "$LOGS/downloads-origin.jsonl" "$1" "$2" <<'PY'
+import json, sys
+log, page, file = sys.argv[1:]
+with open(log, encoding="utf-8") as f:
+    seen = [json.loads(line) for line in f]
+pages = {e["conn"] for e in seen if e.get("path") == page and e.get("server") == "https"}
+files = [e for e in seen if e.get("path") == file]
+failed = [e for e in seen if e.get("handshake") == "failed"]
+if not files:
+    sys.exit("the origin was never asked for it; TLS handshakes that failed: %d %s" % (len(failed), failed[-1:] or ""))
+if any(e.get("server") != "https" for e in files):
+    sys.exit("asked for it other than over TLS: %r" % files)
+if any(e["conn"] in pages for e in files):
+    sys.exit("asked for it on the page's own connection: %r" % files)
+print("connection %s, the page's %s" % (",".join(str(e["conn"]) for e in files), ",".join(map(str, sorted(pages))) or "none"))
+PY
+}
+
+# The app's log lines that end a download: finished, failed, stopped, or
+# refused a redirect.
+DL_ENDED='a download (finished|failed|stopped)|refused a download.s redirect'
+dl_ended() { plain_log "$1" | grep -cE "$DL_ENDED"; }
+# dl_more LOG N: more than N downloads have ended, as LOG says.
+dl_more() { [ "$(dl_ended "$1")" -gt "$2" ]; }
+# dl_said LOG: the app's last lines about downloads, for a failure's detail.
+dl_said() { plain_log "$1" | grep -iE 'download' | tail -n 4 | cut -c 1-220 | tr '\n' '|'; }
+
+# dl_press LOG TEXT: press the page's link TEXT, as a click would, and wait
+# up to 45 s for a download to end, as LOG says.
+dl_press() {
+  local ended
+  ended="$(dl_ended "$1")"
+  "$APPCTL" press-web "$PID" "$2" || bad "download page: its link '$2' is pressed" "no such link: $(page_text)"
+  wait_for 45 dl_more "$1" "$ended" || true
+}
+
+# dl_quarantine WHAT FILE: measured, not gated: whether FILE has
+# com.apple.quarantine, and what it says.
+dl_quarantine() {
+  local said
+  if [ ! -f "$2" ]; then
+    printf '  MEASURE  quarantine of %s: no file was saved to look at\n' "$1"
+  elif said="$(xattr -p com.apple.quarantine "$2" 2>&1)"; then
+    printf '  MEASURE  quarantine of %s: com.apple.quarantine is set: %s\n' "$1" "$said"
+  else
+    printf '  MEASURE  quarantine of %s: com.apple.quarantine is not set (xattr: %s); its attributes: %s\n' "$1" \
+      "$(printf '%s' "$said" | sed 's/^xattr: .*: \(No such xattr\)/\1/' | head -c 160)" "$(xattr "$2" 2>&1 | tr '\n' ' ')"
+  fi
+}
+
+# downloads_checks LOG: downloads' checks, in the application running as PID,
+# whose log is LOG; see the top of this section.
+downloads_checks() {
+  local log="$1" t z p page before fresh name saved direct
+  dl_origin tls || return 1
+  t="$(token)"; z="$(token)"; p="$(token)"
+  head -c 300000 /dev/urandom >"$DL_DIR/payload-$t.bin"
+  head -c 1000 /dev/urandom >"$DL_DIR/zoned-$t.bin"
+  cat >"$DL_DIR/page-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>Downloads test</title>
+<h1>SYNDEO-DOWNLOADS-PAGE</h1>
+<p><a href="/payload-$t.bin?t=$t" download="syndeo-download-$t.bin">Download the file</a></p>
+<p><a href="/redirect?t=$t&amp;to=https://example.com/?$p" download="syndeo-proxied-$t.html">Download through Syndeo</a></p>
+EOF
+  cat >"$DL_DIR/redirects-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>Download redirects</title>
+<h1>SYNDEO-REDIRECTS-PAGE</h1>
+<p><a href="/redirect?t=$t&amp;to=http://[fe80::1%2525lo0]:$DL_HTTP/zoned-$t.bin?t=$z" download="syndeo-zoned-$t.bin">Download by a zone</a></p>
+<p><a href="/redirect?t=$t&amp;to=file:///etc/hosts" download="syndeo-scheme-$t.txt">Download by another scheme</a></p>
+EOF
+
+  counted "before downloads"
+  before="$COUNTED"
+  page="https://127.0.0.1:$DL_HTTPS/page-$t.html?t=$t"
+  visit "$page" "$page" 'SYNDEO-DOWNLOADS-PAGE' \
+    "download page: an https page on this Mac's loopback, its certificate issued by Syndeo's authority, opens pinned"
+
+  # A file of the page's own, on a TLS connection of its own.
+  dl_new >"$LOGS/downloads-new.txt"
+  dl_press "$log" "Download the file"
+  saved="$(dl_since "$LOGS/downloads-new.txt")"
+  name="$DOWNLOADS/$(printf '%s\n' "$saved" | head -n 1)"
+  must "$([ "$(printf '%s\n' "$saved" | grep -c .)" = 1 ] && [ -f "$name" ] && cmp -s "$name" "$DL_DIR/payload-$t.bin" && echo yes)" \
+    "downloads: a file an https page links for downloading arrives in ~/Downloads, byte for byte" \
+    "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_said "$log")"
+  printf '  MEASURE  saved as %s, its link naming it syndeo-download-%s.bin\n' "$(basename "$name")" "$t"
+  fresh="$(dl_fresh_tls "/page-$t.html" "/payload-$t.bin" 2>&1)" && saved=yes || saved=no
+  must "$saved" "downloads: and it came on a TLS connection of its own, answered with Syndeo's authority as the window's are ($fresh)" "$fresh"
+  dl_quarantine "a file from this Mac's loopback" "$name"
+
+  # Redirected to example.com: through the proxy, on a TLS connection of
+  # its own to it.
+  dl_new >"$LOGS/downloads-new.txt"
+  dl_press "$log" "Download through Syndeo"
+  saved="$(dl_since "$LOGS/downloads-new.txt")"
+  name="$DOWNLOADS/$(printf '%s\n' "$saved" | head -n 1)"
+  must "$([ "$(printf '%s\n' "$saved" | grep -c .)" = 1 ] && [ -f "$name" ] && grep -qF "$EXAMPLE_BODY" "$name" && echo yes)" \
+    "downloads: a download redirected to https://example.com arrives, on a TLS connection of its own to Syndeo's proxy" \
+    "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_said "$log")"
+  dl_quarantine "a page through Syndeo's proxy" "$name"
+  direct="$LOGS/downloads-example-direct.html"
+  if [ -f "$name" ] && curl -sS --max-time 20 -o "$direct" "https://example.com/?$p" 2>/dev/null; then
+    printf '  MEASURE  the page saved through Syndeo is %s what curl fetches directly (%s and %s bytes)\n' \
+      "$(cmp -s "$name" "$direct" && echo 'byte for byte' || echo 'NOT byte for byte')" "$(wc -c <"$name" | tr -d ' ')" "$(wc -c <"$direct" | tr -d ' ')"
+  else
+    printf '  MEASURE  the page saved through Syndeo was not compared with a direct fetch: nothing was saved, or curl failed\n'
+  fi
+  counted "after downloads"
+  risen "$before" "downloads: a download redirected to https://example.com came through Syndeo's proxy"
+
+  # Redirects to where no window may go.
+  page="http://127.0.0.1:$DL_HTTP/redirects-$t.html?t=$t"
+  visit "$page" "$page" 'SYNDEO-REDIRECTS-PAGE' "download page: an http page on this Mac's loopback opens"
+  dl_new >"$LOGS/downloads-new.txt"
+  before="$(plain_log "$log" | grep -c "refused a download's redirect")"
+  dl_press "$log" "Download by a zone"
+  sleep 2
+  saved="$(dl_since "$LOGS/downloads-new.txt")"
+  must "$([ -z "$saved" ] && [ "$(dl_heard "/zoned-$t.bin")" = 0 ] && echo yes)" \
+    "downloads: a download redirected to an IPv6 address with a zone is refused: nothing is saved, and the origin does not hear of it" \
+    "saved: ${saved:-nothing}; the origin was asked for it $(dl_heard "/zoned-$t.bin") time(s); the app: $(dl_said "$log")"
+  must "$([ "$(plain_log "$log" | grep -c "refused a download's redirect")" -gt "$before" ] && echo yes)" \
+    "downloads: and the log says a download's redirect was refused" "the app: $(dl_said "$log")"
+  dl_new >"$LOGS/downloads-new.txt"
+  before="$(plain_log "$log" | grep -c "refused a download's redirect")"
+  dl_press "$log" "Download by another scheme"
+  sleep 2
+  saved="$(dl_since "$LOGS/downloads-new.txt")"
+  must "$([ -z "$saved" ] && echo yes)" "downloads: a download redirected to a file: address is refused: nothing is saved" \
+    "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_said "$log")"
+  printf '  MEASURE  a download redirected to a file: address: %s\n' \
+    "$([ "$(plain_log "$log" | grep -c "refused a download's redirect")" -gt "$before" ] && echo "Syndeo refused the redirect" || echo "WebKit did not ask Syndeo about the redirect: $(dl_said "$log")")"
+
+  must "$(! grep -qE "$t|$z|$p" "$log" && echo yes)" "downloads: nothing of a download's address is in the app's log or its proxy's" \
+    "$(grep -cE "$t|$z|$p" "$log") lines"
+}
+
+# dl_leftover: nothing of the application left running for the next step.
+dl_leftover() {
+  if ! no_app; then
+    bad "the application is gone at the end" "still running: $("$APPCTL" pids "$ID" | tr '\n' ' ')"
+    pkill -x Syndeo 2>/dev/null || true
+    pkill -x syndeo-proxy 2>/dev/null || true
+  fi
+}
+
+# downloads APP: see the top of this section.
+downloads() {
+  local app
+  [ -d "${1:-}" ] || { say "usage: $0 downloads <Syndeo.app>"; exit 2; }
+  app="$(cd "$1" && pwd -P)"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  printf "\ndownloads, in a person's window: %s\n" "$app"
+  security dump-trust-settings >"$LOGS/trust-before-downloads.txt" 2>&1 || true
+  dl_snapshot
+  if started "$app" downloads; then
+    helper_of "$app" downloads
+    browses downloads
+    downloads_checks "$LOGS/app-downloads.stderr"
+    stopped downloads
+  fi
+  dl_origin_stop
+  dl_leftover
+  dl_put_back
+  security dump-trust-settings >"$LOGS/trust-after-downloads.txt" 2>&1 || true
+  must "$(cmp -s "$LOGS/trust-before-downloads.txt" "$LOGS/trust-after-downloads.txt" && echo yes)" "the user's trust settings are as they were" \
+    "$(diff "$LOGS/trust-before-downloads.txt" "$LOGS/trust-after-downloads.txt" | head -5)"
+  printf '\n%d failed\n' "$fails"
+  [ "$fails" = 0 ]
+}
+
+# agents_downloads LOG: agent-downloads' checks, with agents on and ci-agent
+# allowed for the session, in the application whose log is LOG.
+agents_downloads() {
+  local log="$1" t page out st tab link begun refused
+  dl_origin || return 1
+  t="$(token)"
+  head -c 100000 /dev/urandom >"$DL_DIR/agent-$t.bin"
+  cat >"$DL_DIR/agent-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>Agent downloads</title>
+<h1>SYNDEO-AGENT-DOWNLOADS-PAGE</h1>
+<p><a href="/agent-$t.bin?t=$t" download="syndeo-agent-$t.bin">Download it</a></p>
+EOF
+  page="http://127.0.0.1:$DL_HTTP/agent-$t.html?t=$t"
+  begun="$(plain_log "$log" | grep -c 'a download begun')"
+  refused="$(plain_log "$log" | grep -c "refused a download in an agent's tab")"
+  dl_new >"$LOGS/downloads-new.txt"
+  out="$LOGS/agent-dl-open.json"
+  agent "$out" "{\"cmd\":\"open\",\"url\":\"$page\"}"
+  tab="$(answered "$out" result.tab)"
+  must "$([ -n "$tab" ] && [ "$(answered "$out" result.title)" = 'Agent downloads' ] && echo yes)" \
+    "agent: a page with a file to download opens in a tab of the agent's" "$(head -c 300 "$out")"
+
+  out="$LOGS/agent-dl-goto.json"
+  agent "$out" "{\"cmd\":\"goto\",\"tab\":${tab:-1},\"url\":\"http://127.0.0.1:$DL_HTTP/agent-$t.bin?t=$t\"}"
+  st=$?
+  must "$([ "$st" = 1 ] && [ "$(code_of "$out")" = refused ] && answered "$out" error.message | grep -qF 'downloads are not allowed for agents' && echo yes)" \
+    "agent downloads: the agent's goto to a file is refused, and it is told downloads are not allowed for agents" "exit $st: $(head -c 300 "$out")"
+  out="$LOGS/agent-dl-wait.json"
+  agent "$out" "{\"cmd\":\"wait\",\"tab\":${tab:-1},\"timeout_ms\":10000}"
+  must "$([ "$(answered "$out" result.loaded)" = true ] && [ "$(answered "$out" result.url)" = "$page" ] && echo yes)" \
+    "agent: and its tab's page is as it was, its next wait told nothing more" "$(head -c 300 "$out")"
+
+  agent "$LOGS/agent-dl-snapshot.json" "{\"cmd\":\"snapshot\",\"tab\":${tab:-1}}"
+  link="$(driver ref "$LOGS/agent-dl-snapshot.json" link 'Download it')"
+  must "$([ -n "$link" ] && echo yes)" "agent: its snapshot lists the page's link to download, with a reference" \
+    "$(head -c 300 "$LOGS/agent-dl-snapshot.json")"
+  agent "$LOGS/agent-dl-click.json" "{\"cmd\":\"click\",\"tab\":${tab:-1},\"ref\":\"${link:-e0}\"}"
+  sleep 1
+  out="$LOGS/agent-dl-click-wait.json"
+  agent "$out" "{\"cmd\":\"wait\",\"tab\":${tab:-1},\"timeout_ms\":15000}"
+  st=$?
+  must "$([ "$st" = 1 ] && [ "$(code_of "$out")" = refused ] && answered "$out" error.message | grep -qF 'downloads are not allowed for agents' && echo yes)" \
+    "agent downloads: a link marked for downloading that the agent clicks is refused, and its wait says so" \
+    "click: $(head -c 160 "$LOGS/agent-dl-click.json"); wait: exit $st: $(head -c 300 "$out")"
+
+  sleep 2
+  must "$([ -z "$(dl_since "$LOGS/downloads-new.txt")" ] && echo yes)" "agent downloads: nothing is saved in ~/Downloads" \
+    "saved: $(dl_since "$LOGS/downloads-new.txt" | tr '\n' '|')"
+  must "$([ "$(plain_log "$log" | grep -c 'a download begun')" = "$begun" ] &&
+    [ "$(plain_log "$log" | grep -c "refused a download in an agent's tab")" -ge "$((refused + 2))" ] && echo yes)" \
+    "agent downloads: no download began, and the log says each was refused in an agent's tab" "the app: $(dl_said "$log")"
+  must "$(! grep -qF "$t" "$log" && echo yes)" "agent: nothing of the addresses it opened is in the app's log" "$(grep -cF "$t" "$log") lines"
+}
+
+# agent_downloads APP: see the top of this section.
+agent_downloads() {
+  local app
+  [ -d "${1:-}" ] || { say "usage: $0 agent-downloads <Syndeo.app>"; exit 2; }
+  app="$(cd "$1" && pwd -P)"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  agent_paths "$app"
+  printf "\nan agent's tab downloads nothing: %s\n" "$app"
+  security dump-trust-settings >"$LOGS/trust-before-agent-downloads.txt" 2>&1 || true
+  defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
+  dl_snapshot
+  if started "$app" agent-downloads; then
+    helper_of "$app" agent-downloads
+    browses agent-downloads
+    agents_on
+    agents_approval
+    agents_downloads "$LOGS/app-agent-downloads.stderr"
+    stopped agent-downloads
+  fi
+  dl_origin_stop
+  dl_leftover
+  dl_put_back
+  defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
+  security dump-trust-settings >"$LOGS/trust-after-agent-downloads.txt" 2>&1 || true
+  must "$(cmp -s "$LOGS/trust-before-agent-downloads.txt" "$LOGS/trust-after-agent-downloads.txt" && echo yes)" "the user's trust settings are as they were" \
+    "$(diff "$LOGS/trust-before-agent-downloads.txt" "$LOGS/trust-after-agent-downloads.txt" | head -5)"
+  printf '\n%d failed\n' "$fails"
+  [ "$fails" = 0 ]
+}
+
 measure() {
   local probe out status started
   printf '\nwhat this runner allows (measured; not a gate)\n'
@@ -3418,6 +3851,8 @@ case "${1:-}" in
   looks) shift; looks "$@" ;;
   tabs) shift; tabs_test "$@" ;;
   preloaded) shift; preloaded_only "$@" ;;
+  downloads) shift; downloads "$@" ;;
+  agent-downloads) shift; agent_downloads "$@" ;;
   measure) measure ;;
-  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | looks <Syndeo.app> | agents <Syndeo.app> | tabs <Syndeo.app> | preloaded <Syndeo.app> | measure"; exit 2 ;;
+  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | looks <Syndeo.app> | agents <Syndeo.app> | tabs <Syndeo.app> | preloaded <Syndeo.app> | downloads <Syndeo.app> | agent-downloads <Syndeo.app> | measure"; exit 2 ;;
 esac

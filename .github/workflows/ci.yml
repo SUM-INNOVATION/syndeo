@@ -327,7 +327,7 @@ jobs:
     # opened by one; passkeys reported unavailable, asking nothing; its last
     # window closed and brought back by opening it again, quit as the Quit
     # menu item would, and opened again; four mutants, each of which the
-    # test has to catch (the other fourteen are macos-agents'); a copy whose proxy cannot start, which has to refuse
+    # test has to catch (the other seventeen are macos-agents'); a copy whose proxy cannot start, which has to refuse
     # to browse; and the route bar against what WebKit does, the proxy's
     # cache keeping nothing from this Mac, and Clear Browsing Data. Unsigned
     # with a Developer ID, and with no secrets: a pull request never signs.
@@ -387,7 +387,7 @@ jobs:
       # mutants.py names macos-app): the schemes a new tab may open, the
       # address field's guard for typing, Reload asking the origin, and Clear
       # Browsing Data forgetting closed tabs and the session. The other
-      # fourteen run in macos-agents, by their measured times (mutants.py,
+      # seventeen run in macos-agents, by their measured times (mutants.py,
       # MACOS_AGENTS), so that neither job nears its 60 minutes; each mutant
       # runs in exactly one, which mutants.py --check requires. Each is built
       # from this tree, the app and its helper, which is then put back, and
@@ -461,6 +461,19 @@ jobs:
       - name: WebSockets through Syndeo, and WebRTC around it, as the start page says
         if: always()
         run: bash ci/test-app.sh realtime "$PWD/dist/Syndeo.app"
+
+      # Downloads in a person's window (ci/test-app.sh downloads): a file an
+      # https page on this Mac's loopback links for downloading, its
+      # certificate issued by Syndeo's own authority, arrives byte for byte
+      # on a TLS connection of its own; one redirected to https://example.com
+      # arrives through Syndeo's proxy on a TLS connection of its own to it,
+      # each connection's certificate answered as the window answers its
+      # page's; downloads redirected to an IPv6 address with a zone, or to a
+      # file: address, are refused. Whether a file saved is quarantined is
+      # measured, not gated. ~/Downloads is put back as it was.
+      - name: Downloads, each on a TLS connection of its own answered as its window's are, and their redirects held to a window's rules
+        if: always()
+        run: bash ci/test-app.sh downloads "$PWD/dist/Syndeo.app"
 
       # Pages in WebKit by itself and through this tree's proxy, as Syndeo.app
       # runs it, cold and warm, interleaved run by run: first contentful
@@ -546,9 +559,10 @@ jobs:
     # person gives it; the agent's pages in tabs of its own, through Syndeo's
     # proxy and pinned, saying who controls them; reading, acting, a
     # screenshot, JavaScript only with its own leave; Stop and Revoke All;
-    # MCP; and root refused. ci/test-app.sh agents says each check. Then
-    # fourteen of the mutants (the agents' and eight of the application's),
-    # and tabs and its look, light and dark.
+    # MCP; and root refused. ci/test-app.sh agents says each check. Then an
+    # agent's tab downloading nothing; seventeen of the mutants (the agents'
+    # seven, eight of the application's and the downloads' two); and tabs
+    # and its look, light and dark.
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -581,6 +595,14 @@ jobs:
       - name: Agents drive it, with the person's leave, in the open, through Syndeo
         run: bash ci/test-app.sh agents "$PWD/dist/Syndeo.app"
 
+      # An agent's tab downloads nothing (ci/test-app.sh agent-downloads):
+      # the agent's goto to a file, and a link marked for downloading that
+      # it clicks, are refused, and it is told so; nothing is saved, and no
+      # download begins.
+      - name: An agent's tab downloads nothing, and the agent is told so
+        if: always()
+        run: bash ci/test-app.sh agent-downloads "$PWD/dist/Syndeo.app"
+
       # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
       # mutants.py names macos-agents): the agents' — the person's prompt,
       # what a grant allows, the socket's peer being this user, an agent's
@@ -590,7 +612,10 @@ jobs:
       # policy, the schemes another application may ask Syndeo to open, the
       # bar's rule for names, the refusal of a link to an IPv6 address with
       # a zone, a WebSocket carried rather than stripped of its Upgrade, and
-      # the hosts sent directly. Built, run and judged as macos-app's are.
+      # the hosts sent directly; an agent's tab refusing downloads; and a
+      # download's TLS challenges answered as its window's are, and its
+      # redirects held to a window's rules, whose checks macos-app's
+      # downloads step runs too. Built, run and judged as macos-app's are.
       - name: Build each of its mutants, and require the test to catch it
         if: always()
         shell: bash

@@ -83,6 +83,19 @@ back.
   retried directly. https://github.com, on macOS 15's HSTS preload list,
   must then be seen not opening, the bar not saying Direct, and the log not
   saying a host was sent directly.
+- agent-downloads-allowed: an agent's tab downloads as a person's window
+  does: neither of its window's policies, nor the downloads' keeper, refuses
+  a download there. The agent's goto to a file and its click on a link marked
+  for downloading must then be seen not refused, the agent not told, a
+  download begun and a file saved.
+- download-challenge-unpinned: a download's own TLS challenges get macOS's
+  default handling, not its window's answer, which pins Syndeo's authority.
+  A file an https page links, on a TLS connection of its own, and a download
+  redirected to https://example.com, on a TLS connection of its own to the
+  proxy, must then be seen not arriving.
+- download-redirect-unchecked: a download follows every redirect, wherever
+  it goes. One redirected to an IPv6 address with a zone must then be seen
+  followed, the origin hearing of it, and the log not saying it was refused.
 
 Each mutant runs in exactly one CI job: macos-agents runs the agent-*
 mutants, beside its gate, and those in MACOS_AGENTS; macos-app runs the
@@ -99,6 +112,7 @@ SETTINGS = "crates/syndeo-app/src/settings_macos.rs"
 PROXY = "crates/syndeo-proxy/src/main.rs"
 CONTROL = "crates/syndeo-app/src/control_macos.rs"
 APP = "crates/syndeo-app/src/app_macos.rs"
+DOWNLOADS = "crates/syndeo-app/src/downloads_macos.rs"
 
 MUTANTS = {
     "no-pinning-delegate": [
@@ -310,6 +324,29 @@ MUTANTS = {
             "Some(refusal) if !retried && false => AfterFailure::RetryDirect(refusal),",
         ),
     ],
+    "agent-downloads-allowed": [
+        (
+            BROWSER,
+            "        self.window()\n"
+            "            .is_some_and(|window| crate::control_macos::is_agents(&window))\n",
+            "        self.window().is_some_and(|_| false)\n",
+        ),
+    ],
+    "download-challenge-unpinned": [
+        (
+            DOWNLOADS,
+            "            completion.call((judged.disposition, judged.credential));\n",
+            "            let _ = judged;\n"
+            "            completion.call((1, std::ptr::null_mut()));\n",
+        ),
+    ],
+    "download-redirect-unchecked": [
+        (
+            DOWNLOADS,
+            "            let allowed = id.is_some() && address::download_may_follow(&scheme, &target);\n",
+            "            let allowed = true || (id.is_some() && address::download_may_follow(&scheme, &target));\n",
+        ),
+    ],
 }
 
 
@@ -318,6 +355,10 @@ MUTANTS = {
 # direct-for-every-host 124, websocket-headers-stripped 104,
 # no-navigation-policy 102, zoned-links-followed 98, asked-any-scheme 96,
 # never-retry-direct 94 and direct-for-every-name 87; 843 s of the 1061.
+# And the downloads' two, which need nothing of macos-app's but the
+# Syndeo.app every job assembles: macos-agents runs its mutants whatever its
+# gate before them did, where macos-app skips its own once its launch step
+# has failed, and has the room (CI 40284010783: 28m28s, with its fourteen).
 MACOS_AGENTS = {
     "no-pinning-delegate",
     "direct-for-every-host",
@@ -327,6 +368,8 @@ MACOS_AGENTS = {
     "asked-any-scheme",
     "never-retry-direct",
     "direct-for-every-name",
+    "download-challenge-unpinned",
+    "download-redirect-unchecked",
 }
 
 JOBS = ("macos-app", "macos-agents")
