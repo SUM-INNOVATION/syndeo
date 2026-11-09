@@ -446,6 +446,17 @@ impl TabRow {
         icon.setImage(image.as_deref());
         icon.setImageScaling(NSImageScaling::ScaleProportionallyDown);
         icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+        // What the UI test finds a tab's state by, as the tab bar's badge
+        // once showed it: loading, or the page's own icon.
+        match tab {
+            Some(t) if t.loading => {
+                icon.setAccessibilityIdentifier(Some(ns_string!("syndeo.tab-loading")));
+            }
+            Some(t) if t.icon.is_some() => {
+                icon.setAccessibilityIdentifier(Some(ns_string!("syndeo.tab-icon")));
+            }
+            _ => {}
+        }
         icon.setFrame(NSRect::new(
             NSPoint::new(ROW_PAD + indent, (ROW_HEIGHT - ICON) / 2.0),
             NSSize::new(ICON, ICON),
@@ -482,6 +493,7 @@ impl TabRow {
                 let pin = NSImageView::new(mtm);
                 pin.setImage(symbol("pin.fill", "Pinned").as_deref());
                 pin.setContentTintColor(Some(&NSColor::tertiaryLabelColor()));
+                pin.setAccessibilityIdentifier(Some(ns_string!("syndeo.tab-pinned")));
                 pin.setFrame(end);
                 pin.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewMinXMargin);
                 this.addSubview(&pin);
