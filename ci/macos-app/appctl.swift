@@ -72,6 +72,12 @@
 //   appctl ids <pid> <id>        each element outside the page, in pid's front window,
 //                                with that accessibility identifier: "role<TAB>description"
 //                                a line; exits 1 if there is none
+//   appctl count-ids <pid> <id>  how many elements outside pages have that identifier in
+//                                each window Accessibility has for pid, "window <n><TAB>
+//                                title<TAB>count" a line, then "total<TAB>count". It has
+//                                one window for each tab group: the tab in front's
+//   appctl press-nth <pid> <id> <n>   press the nth element, counted from 1, that `ids`
+//                                lists for <id>; exits 1 if there is no such element
 //   appctl click-web <pid> <text> <keys> <button>   click the first link in the front
 //                                window's page whose text contains <text>, with the mouse,
 //                                at its middle, holding <keys> (none, or cmd, shift and
@@ -572,6 +578,20 @@ case "ids" where args.count == 4:
         print("\(attribute(element, kAXRoleAttribute) as? String ?? "?")\t\(oneLine(attribute(element, kAXDescriptionAttribute)))")
     }
     exit(found.isEmpty ? 1 : 0)
+case "count-ids" where args.count == 4:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    var total = 0
+    for (index, window) in windows(of: pid).enumerated() {
+        let count = all(window, depth: 24) { (attribute($0, "AXIdentifier") as? String) == args[3] }.count
+        total += count
+        print("window \(index + 1)\t\(oneLine(attribute(window, kAXTitleAttribute)))\t\(count)")
+    }
+    print("total\t\(total)")
+case "press-nth" where args.count == 5:
+    guard let pid = Int32(args[2]), let nth = Int(args[4]), let window = frontWindow(of: pid) else { exit(2) }
+    let found = all(window, depth: 24) { (attribute($0, "AXIdentifier") as? String) == args[3] }
+    guard nth >= 1, nth <= found.count else { print("no \(args[3]) \(nth) of \(found.count)"); exit(1) }
+    exit(AXUIElementPerformAction(found[nth - 1], kAXPressAction as CFString) == .success ? 0 : 1)
 case "click-web" where args.count == 6:
     guard let pid = Int32(args[2]), activate(pid), let window = frontWindow(of: pid),
           let page = find(window, depth: 12, { (attribute($0, kAXRoleAttribute) as? String) == "AXWebArea" }) else { exit(1) }
