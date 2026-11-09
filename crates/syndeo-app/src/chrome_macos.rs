@@ -399,6 +399,11 @@ pub struct Ui {
     copy: Retained<NSButton>,
     /// The page's card: the web view, inset and with rounded corners.
     card: Retained<NSView>,
+    /// Across the card's top, above the page: room for a banner, such as
+    /// the one saying an agent controls the tab (`control_macos`); nothing
+    /// tall when there is none.
+    banner: Retained<NSView>,
+    banner_height: RefCell<Option<Retained<NSLayoutConstraint>>>,
     /// Glass over the card while the command bar shows (`command_bar_macos`).
     shade: Retained<crate::command_bar_macos::PageShade>,
     /// The sidebar, with the tabs, Back and Forward and the field in it.
@@ -496,7 +501,7 @@ impl Ui {
     /// lay out the sidebar down its left and the page's card beside it,
     /// inset from the window's other edges. `web` fills the card, and the
     /// sidebar and the card have to be in the window's content view already.
-    pub fn dress(&self, window: &NSWindow, _web: &WKWebView) {
+    pub fn dress(&self, window: &NSWindow, web: &WKWebView) {
         window.setStyleMask(window.styleMask() | NSWindowStyleMask::FullSizeContentView);
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
         window.setTitlebarAppearsTransparent(true);
@@ -531,6 +536,11 @@ impl Ui {
             .collect();
         let edge: &NSView = &self.edge;
         let shade: &NSView = &self.shade;
+        // Inside the card: the banner across the top, the page below it.
+        let banner = &self.banner;
+        web.setTranslatesAutoresizingMaskIntoConstraints(false);
+        let banner_height = banner.heightAnchor().constraintEqualToConstant(0.0);
+        *self.banner_height.borrow_mut() = Some(banner_height.clone());
         let top = card
             .topAnchor()
             .constraintEqualToAnchor_constant(&content.topAnchor(), CARD_MARGIN);
@@ -567,10 +577,59 @@ impl Ui {
             shade
                 .trailingAnchor()
                 .constraintEqualToAnchor(&card.trailingAnchor()),
+            banner
+                .topAnchor()
+                .constraintEqualToAnchor(&card.topAnchor()),
+            banner
+                .leadingAnchor()
+                .constraintEqualToAnchor(&card.leadingAnchor()),
+            banner
+                .trailingAnchor()
+                .constraintEqualToAnchor(&card.trailingAnchor()),
+            banner_height,
+            web.topAnchor()
+                .constraintEqualToAnchor(&banner.bottomAnchor()),
+            web.leadingAnchor()
+                .constraintEqualToAnchor(&card.leadingAnchor()),
+            web.trailingAnchor()
+                .constraintEqualToAnchor(&card.trailingAnchor()),
+            web.bottomAnchor()
+                .constraintEqualToAnchor(&card.bottomAnchor()),
         ]));
         *self.sidebar_width.borrow_mut() = Some(width);
         *self.card_leading.borrow_mut() = Some(leading);
         *self.card_top.borrow_mut() = Some(top);
+    }
+
+    /// A banner across the card's top, above the page — or none, and the
+    /// page has the card. The banner is pinned to the slot's edges and keeps
+    /// its own height.
+    pub fn set_banner(&self, view: Option<&NSView>) {
+        for old in self.banner.subviews().iter() {
+            old.removeFromSuperview();
+        }
+        let height = match view {
+            Some(view) => {
+                let height = view.frame().size.height;
+                view.setTranslatesAutoresizingMaskIntoConstraints(false);
+                self.banner.addSubview(view);
+                NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+                    view.topAnchor()
+                        .constraintEqualToAnchor(&self.banner.topAnchor()),
+                    view.bottomAnchor()
+                        .constraintEqualToAnchor(&self.banner.bottomAnchor()),
+                    view.leadingAnchor()
+                        .constraintEqualToAnchor(&self.banner.leadingAnchor()),
+                    view.trailingAnchor()
+                        .constraintEqualToAnchor(&self.banner.trailingAnchor()),
+                ]));
+                height
+            }
+            None => 0.0,
+        };
+        if let Some(constraint) = &*self.banner_height.borrow() {
+            constraint.setConstant(height);
+        }
     }
 
     /// Glass over the page, while the command bar shows; or the page as it
@@ -869,6 +928,9 @@ pub fn browser_content(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
     card.addSubview(webview);
+    let banner = NSView::new(mtm);
+    banner.setTranslatesAutoresizingMaskIntoConstraints(false);
+    card.addSubview(&banner);
     // The shade over the card, and the sidebar above both, so that it can
     // peek over the page.
     let shade = crate::command_bar_macos::PageShade::new(mtm);
@@ -888,6 +950,8 @@ pub fn browser_content(
         field,
         copy,
         card,
+        banner,
+        banner_height: RefCell::new(None),
         shade,
         sidebar,
         sidebar_width: RefCell::new(None),
