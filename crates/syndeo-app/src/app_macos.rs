@@ -1974,6 +1974,22 @@ pub fn run(install: InstallDir) -> Result<()> {
     Ok(())
 }
 
+/// A menu item's tag, when `sender` is one.
+fn menu_tag(sender: Option<&AnyObject>) -> Option<isize> {
+    sender
+        .and_then(|s| s.downcast_ref::<NSMenuItem>())
+        .map(|item| item.tag())
+}
+
+/// The space a menu item's tag names, or the current space for an item
+/// with none (the menu bar's).
+fn tag_or_current(sender: Option<&AnyObject>) -> u64 {
+    menu_tag(sender)
+        .and_then(|tag| u64::try_from(tag).ok())
+        .filter(|id| *id > 0)
+        .unwrap_or_else(spaces_macos::current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2382,20 +2398,4 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
             Path::new("/Users/someone/Library/Application Support/Syndeo/proxy/syndeo-ca.pem")
         );
     }
-}
-
-/// A menu item's tag, when `sender` is one.
-fn menu_tag(sender: Option<&AnyObject>) -> Option<isize> {
-    sender
-        .and_then(|s| s.downcast_ref::<NSMenuItem>())
-        .map(|item| item.tag())
-}
-
-/// The space a menu item's tag names, or the current space for an item
-/// with none (the menu bar's).
-fn tag_or_current(sender: Option<&AnyObject>) -> u64 {
-    menu_tag(sender)
-        .and_then(|tag| u64::try_from(tag).ok())
-        .filter(|id| *id > 0)
-        .unwrap_or_else(spaces_macos::current)
 }
