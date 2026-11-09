@@ -1079,6 +1079,9 @@ impl Control {
             ids.into_iter().filter_map(|id| tabs.remove(&id)).collect()
         };
         for tab in released {
+            if let Some(window) = tab.window.load() {
+                crate::browser_macos::set_banner(&window, None);
+            }
             tab.indicator.removeFromParentViewController();
         }
     }
@@ -1131,7 +1134,8 @@ impl Control {
             .map(|a| (a.name.clone(), a.number))
             .unwrap_or_else(|| (agent::display_name(""), 0));
         let (indicator, stop) = indicator(self.mtm, &name, number);
-        window.addTitlebarAccessoryViewController(&indicator);
+        // Across the top of the tab's page, in the window's card.
+        crate::browser_macos::set_banner(window, Some(&indicator.view()));
         let id = self.next_tab.get();
         self.next_tab.set(id + 1);
         self.tabs.borrow_mut().insert(
