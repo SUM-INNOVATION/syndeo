@@ -15,7 +15,25 @@
 //!
 //! Downloaded files are quarantined, as a browser's are, through the
 //! bundle's `LSFileQuarantineEnabled`.
+//!
+//! A download is the window's load, as its page is, and held to the same
+//! rules:
+//! - **TLS challenges** a download meets, on a connection of its own to the
+//!   proxy or to a host sent directly, are answered exactly as its window
+//!   answers its page's (`browser_macos::Trust`, kept with the download when
+//!   it is adopted): a host sent directly gets macOS's own trust, every other
+//!   is pinned to the proxy's authority. A download nothing is known of is
+//!   refused.
+//! - **Redirects** go only where the window's main frame may
+//!   (`address::download_may_follow`): the web's own addresses, never an
+//!   IPv6 address with a zone. Any other is refused, and the download with
+//!   it, which the list says.
+//! - **An agent's tab downloads nothing.** Its window refuses both ways a
+//!   download begins (`browser_macos`), and one handed here all the same is
+//!   cancelled before it has a place to go.
 
+use crate::address;
+use crate::browser_macos::{self, BrowserController, Trust};
 use crate::downloads::{self, List, State};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
@@ -28,9 +46,9 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     ns_string, NSArray, NSEdgeInsets, NSError, NSPoint, NSProgress, NSRect, NSRectEdge, NSSize,
-    NSString, NSTimer, NSURLResponse, NSURL,
+    NSString, NSTimer, NSURLAuthenticationChallenge, NSURLRequest, NSURLResponse, NSURL,
 };
-use objc2_web_kit::{WKDownload, WKDownloadDelegate};
+use objc2_web_kit::{WKDownload, WKDownloadDelegate, WKDownloadRedirectPolicy};
 use std::cell::RefCell;
 use std::path::PathBuf;
 
@@ -44,25 +62,50 @@ const TICK: f64 = 0.3;
 /// `NSURLErrorCancelled`: a download stopped on purpose, not a failure.
 const CANCELLED: isize = -999;
 
+/// A download still coming in: its row's id, and how the window it began
+/// in answers TLS challenges.
+#[derive(Clone)]
+struct Active {
+    id: u64,
+    download: Retained<WKDownload>,
+    trust: Trust,
+}
+
 thread_local! {
     static LIST: RefCell<List> = RefCell::new(List::default());
-    /// The downloads still coming in, with their rows' ids.
-    static ACTIVE: RefCell<Vec<(u64, Retained<WKDownload>)>> = const { RefCell::new(Vec::new()) };
+    /// The downloads still coming in.
+    static ACTIVE: RefCell<Vec<Active>> = const { RefCell::new(Vec::new()) };
     static KEEPER: RefCell<Option<Retained<Keeper>>> = const { RefCell::new(None) };
     static POPOVER: RefCell<Option<Retained<NSPopover>>> = const { RefCell::new(None) };
     static TICKING: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
 }
 
-/// Take a download WebKit has begun: give it its delegate and its row.
-pub fn adopt(mtm: MainThreadMarker, download: &WKDownload) {
+/// Take a download WebKit has begun in `from`'s window: give it its
+/// delegate, its row, and the window's way of answering TLS challenges. In
+/// an agent's tab, which neither of its window's policies lets download,
+/// cancel it instead, before it has anywhere to go.
+pub fn adopt(mtm: MainThreadMarker, download: &WKDownload, from: &BrowserController) {
     let keeper = KEEPER.with(|slot| {
         slot.borrow_mut()
             .get_or_insert_with(|| Keeper::new(mtm))
             .clone()
     });
+    // This module's delegate either way: one it keeps no record of is given
+    // no place to go, and its challenges and redirects are refused.
     unsafe { download.setDelegate(Some(ProtocolObject::from_ref(&*keeper))) };
+    if from.refuses_downloads() {
+        unsafe { download.cancel(None) };
+        tracing::warn!("a download began in an agent's tab: cancelled");
+        return;
+    }
     let id = LIST.with(|list| list.borrow_mut().begin());
-    ACTIVE.with(|active| active.borrow_mut().push((id, download.retain())));
+    ACTIVE.with(|active| {
+        active.borrow_mut().push(Active {
+            id,
+            download: download.retain(),
+            trust: from.trust(),
+        })
+    });
     tracing::info!(download = id, "a download begun");
     tick_while_receiving(mtm);
     changed(mtm);
@@ -83,18 +126,24 @@ fn folder() -> PathBuf {
     dir
 }
 
-fn id_of(download: &WKDownload) -> Option<u64> {
+/// What this module keeps of `download`, if it adopted it and it is still
+/// coming in.
+fn active(download: &WKDownload) -> Option<Active> {
     ACTIVE.with(|active| {
         active
             .borrow()
             .iter()
-            .find(|(_, d)| std::ptr::eq(&**d, download))
-            .map(|(id, _)| *id)
+            .find(|a| std::ptr::eq(&*a.download, download))
+            .cloned()
     })
 }
 
+fn id_of(download: &WKDownload) -> Option<u64> {
+    active(download).map(|a| a.id)
+}
+
 fn forget_active(id: u64) {
-    ACTIVE.with(|active| active.borrow_mut().retain(|(i, _)| *i != id));
+    ACTIVE.with(|active| active.borrow_mut().retain(|a| a.id != id));
 }
 
 /// Something about the downloads changed: the popover, if it shows, and
@@ -113,8 +162,13 @@ fn tick_while_receiving(mtm: MainThreadMarker) {
         return;
     }
     let tick = block2::RcBlock::new(move |timer: std::ptr::NonNull<NSTimer>| {
-        let active: Vec<(u64, Retained<WKDownload>)> =
-            ACTIVE.with(|active| active.borrow().clone());
+        let active: Vec<(u64, Retained<WKDownload>)> = ACTIVE.with(|active| {
+            active
+                .borrow()
+                .iter()
+                .map(|a| (a.id, a.download.clone()))
+                .collect()
+        });
         if active.is_empty() {
             unsafe { timer.as_ref() }.invalidate();
             TICKING.with(|slot| *slot.borrow_mut() = None);
@@ -159,19 +213,73 @@ define_class!(
             suggested: &NSString,
             completion: &block2::DynBlock<dyn Fn(*mut NSURL)>,
         ) {
+            // Only a download adopted, and still coming in, has a place:
+            // one cancelled in an agent's tab, or one never handed here,
+            // goes nowhere.
+            let Some(id) = id_of(download) else {
+                tracing::warn!("a download nothing is known of was given no place");
+                completion.call((std::ptr::null_mut(),));
+                return;
+            };
             let dir = folder();
             let name = downloads::safe_name(&suggested.to_string());
             let path = downloads::unique_path(&dir, &name, |p| p.exists());
             let total = u64::try_from(response.expectedContentLength())
                 .ok()
                 .filter(|t| *t > 0);
-            if let Some(id) = id_of(download) {
-                LIST.with(|list| list.borrow_mut().place(id, path.clone(), total));
-                tracing::info!(download = id, "a download placed");
-            }
+            LIST.with(|list| list.borrow_mut().place(id, path.clone(), total));
+            tracing::info!(download = id, "a download placed");
             let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
             completion.call((Retained::as_ptr(&url).cast_mut(),));
             changed(self.mtm());
+        }
+
+        /// A TLS challenge the download meets on a connection of its own,
+        /// answered exactly as its window answers its page's: a host sent
+        /// directly gets macOS's own trust, every other is pinned to the
+        /// proxy's authority. Nothing known of the download: refused.
+        #[unsafe(method(download:didReceiveAuthenticationChallenge:completionHandler:))]
+        unsafe fn did_receive_challenge(
+            &self,
+            download: &WKDownload,
+            challenge: &NSURLAuthenticationChallenge,
+            completion: &block2::DynBlock<dyn Fn(isize, *mut AnyObject)>,
+        ) {
+            let trust = active(download).map_or_else(Trust::none, |a| a.trust);
+            let judged = trust.judge(challenge, browser_macos::host_of(challenge).as_deref());
+            completion.call((judged.disposition, judged.credential));
+        }
+
+        /// A redirect goes only where the window's main frame may go; any
+        /// other is refused, and the download with it.
+        #[unsafe(method(download:willPerformHTTPRedirection:newRequest:decisionHandler:))]
+        unsafe fn will_redirect(
+            &self,
+            download: &WKDownload,
+            _response: &AnyObject,
+            request: &NSURLRequest,
+            decision: &block2::DynBlock<dyn Fn(WKDownloadRedirectPolicy)>,
+        ) {
+            let id = id_of(download);
+            let scheme = browser_macos::scheme_of(request);
+            let target = browser_macos::address_of(request);
+            let allowed = id.is_some() && address::download_may_follow(&scheme, &target);
+            if !allowed {
+                if let Some(id) = id {
+                    LIST.with(|list| list.borrow_mut().fail(id, downloads::REDIRECT_REFUSED));
+                    forget_active(id);
+                }
+                // Its scheme, and nothing else of where it was sent.
+                tracing::info!(download = ?id, scheme = %scheme, "refused a download's redirect");
+            }
+            decision.call((if allowed {
+                WKDownloadRedirectPolicy::Allow
+            } else {
+                WKDownloadRedirectPolicy::Cancel
+            },));
+            if !allowed {
+                changed(self.mtm());
+            }
         }
 
         #[unsafe(method(downloadDidFinish:))]
@@ -193,7 +301,10 @@ define_class!(
         ) {
             if let Some(id) = id_of(download) {
                 if error.code() == CANCELLED {
+                    // Stopped by WebKit, not by Cancel, which forgets it
+                    // first: a TLS challenge refused, say.
                     LIST.with(|list| list.borrow_mut().cancel(id));
+                    tracing::info!(download = id, "a download stopped before it finished");
                 } else {
                     let why = error.localizedDescription().to_string();
                     LIST.with(|list| list.borrow_mut().fail(id, &why));
@@ -229,8 +340,8 @@ define_class!(
                 active
                     .borrow()
                     .iter()
-                    .find(|(i, _)| *i == id)
-                    .map(|(_, d)| d.clone())
+                    .find(|a| a.id == id)
+                    .map(|a| a.download.clone())
             });
             if let Some(download) = download {
                 unsafe { download.cancel(None) };

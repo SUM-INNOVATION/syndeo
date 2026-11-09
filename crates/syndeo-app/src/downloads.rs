@@ -38,6 +38,11 @@ pub struct List {
 /// The most kept: older finished ones fall off the end.
 const MOST: usize = 50;
 
+/// Why a download failed that a server redirected somewhere a window may not
+/// go (`address::download_may_follow`).
+pub const REDIRECT_REFUSED: &str =
+    "it was redirected to an address Syndeo does not open, and was stopped";
+
 impl List {
     /// A download that has started, not yet with a name or a place. Its id.
     pub fn begin(&mut self) -> u64 {
@@ -310,5 +315,17 @@ mod tests {
         // Nothing moves a finished download on.
         list.progress(a, 10, None);
         assert_eq!(list.get(a).unwrap().received, 0);
+    }
+
+    #[test]
+    fn a_refused_redirect_says_why() {
+        let mut list = List::default();
+        let id = list.begin();
+        list.fail(id, REDIRECT_REFUSED);
+        assert_eq!(
+            describe(list.get(id).unwrap()),
+            "Failed: it was redirected to an address Syndeo does not open, and was stopped"
+        );
+        assert_eq!(list.receiving(), 0);
     }
 }

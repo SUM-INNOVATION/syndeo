@@ -286,9 +286,11 @@ never sees your own tabs. Its pages are opened as yours are: through
 Syndeo's proxy, pinned to Syndeo's authority, and only `http` and `https`
 addresses. It cannot reach Settings, Clear Browsing Data, cookies or storage
 except as a page in its tab could, the proxy's controls or anything else of
-Syndeo's. Agent Access lists what each program is allowed, and **Revoke** and
-**Revoke All** take it back. Turning agents off disconnects every program,
-and takes back everything.
+Syndeo's. A program's tabs download nothing: a file one is sent is
+refused, nothing is saved, and the program is told that downloads are not
+allowed for agents. Agent Access lists what each program is allowed, and
+**Revoke** and **Revoke All** take it back. Turning agents off disconnects
+every program, and takes back everything.
 
 A program's tabs are kept apart from yours. They are not part of the
 session Syndeo keeps when it quits, and they are not offered again in

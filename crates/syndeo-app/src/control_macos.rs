@@ -20,7 +20,10 @@
 //!   allowed; its tabs become the person's. The person's own tabs are never
 //!   shown to an agent.
 //! - **Nothing else.** Settings, Clear Browsing Data, cookies, storage, the
-//!   proxy's controls and the keystore have no request.
+//!   proxy's controls and the keystore have no request. An agent's tabs
+//!   download nothing (`browser_macos`): a file its tab is sent is refused,
+//!   nothing is saved, and the agent's wait for the tab ends saying so
+//!   (`agent::download_refused`).
 //!
 //! The socket is served on threads of its own; everything to do with AppKit
 //! and WebKit happens on the main thread, where each request is handed.
@@ -491,6 +494,11 @@ fn settle(
     let mut seen = false;
     loop {
         let mut state = probe(conn, tab, needs)?;
+        // What it went to was a file, which its tab refused to download: no
+        // page is coming, and the agent is told so.
+        if refused_download(&state) {
+            return Err(agent::download_refused(tab));
+        }
         let loading = busy(&state);
         seen |= loading;
         let arrived = match &arrival {
@@ -502,6 +510,9 @@ fn settle(
             // A failure page may follow a failed load at once.
             std::thread::sleep(Duration::from_millis(200));
             state = probe(conn, tab, needs)?;
+            if refused_download(&state) {
+                return Err(agent::download_refused(tab));
+            }
             if !busy(&state) {
                 state["loaded"] = json!(true);
                 return Ok(state);
@@ -521,6 +532,14 @@ fn settle(
 /// is not over until it is neither, so it ends on the page loaded again.
 fn busy(state: &Value) -> bool {
     state["loading"] == json!(true) || state["settling"] == json!(true)
+}
+
+/// Whether a tab's state, as `probe` gives it to a wait, says that what its
+/// main frame went to was a file its window refused to download. Only a
+/// wait's probe says so, and only once (`BrowserController::
+/// take_refused_download`); no state an agent is given has it.
+fn refused_download(state: &Value) -> bool {
+    state["download_refused"] == json!(true)
 }
 
 /// A tab's state, from the main thread.
@@ -1192,7 +1211,13 @@ impl Control {
             }
         }
         let (view, controller, _) = self.tab(&key, tab)?;
-        Ok(self.state(tab, &view, &controller))
+        let mut state = self.state(tab, &view, &controller);
+        // Once its load is over, whether it was a file the tab refused to
+        // download: told to this wait, which ends on it, and to no other.
+        if !unsafe { view.isLoading() } && controller.take_refused_download() {
+            state["download_refused"] = json!(true);
+        }
+        Ok(state)
     }
 
     // ------------------------------------------------------------- requests
@@ -1373,6 +1398,7 @@ impl Control {
             _ => {}
         }
         let none: Option<&AnyObject> = None;
+        controller.forget_refused_download();
         // The window's own Back, Forward, Reload and Stop, as its menu sends them.
         unsafe {
             match step {
@@ -1426,7 +1452,13 @@ impl Control {
     /// One of Syndeo's own operations, in its own world in the tab's page.
     fn in_world(&self, key: &AgentKey, tab: u64, op: &'static str, args: Value, reply: Reply) {
         let view = match self.tab(key, tab) {
-            Ok((view, _, _)) => view,
+            Ok((view, controller, _)) => {
+                // What it does next may go somewhere new.
+                if op != "read" && op != "snapshot" {
+                    controller.forget_refused_download();
+                }
+                view
+            }
             Err(failure) => return reply.done(Err(failure)),
         };
         let world = self.world();

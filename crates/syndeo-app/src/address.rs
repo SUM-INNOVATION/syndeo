@@ -391,6 +391,23 @@ pub fn allowed_in_main_frame(scheme: &str) -> bool {
     )
 }
 
+/// Whether a window lets a load with this scheme go ahead, in its main frame
+/// (`main_frame`) or in a frame of its page: an address naming an IPv6 host
+/// with a zone (`zoned`, from [`has_zone`]) nowhere, as typing it is refused;
+/// and in the main frame, only the web's own pages and Syndeo's
+/// ([`allowed_in_main_frame`]). The navigation policy every window has.
+pub fn may_load(scheme: &str, zoned: bool, main_frame: bool) -> bool {
+    !zoned && (!main_frame || allowed_in_main_frame(scheme))
+}
+
+/// Whether a download may follow a redirect to `address`, whose scheme is
+/// `scheme`: only where a window's main frame may go ([`may_load`]). A
+/// download is fetched for its window, as the window's own page is, so where
+/// a server sends it is held to the same rule as where a page may take it.
+pub fn download_may_follow(scheme: &str, address: &str) -> bool {
+    may_load(scheme, has_zone(address), true)
+}
+
 /// `NSURLErrorSecureConnectionFailed`.
 pub const SECURE_CONNECTION_FAILED: isize = -1200;
 
@@ -493,6 +510,31 @@ pub fn covered(host: &str, domain: &str) -> bool {
 /// Whether `host` goes around the proxy, given the domains sent directly.
 pub fn sent_direct(host: &str, direct: &[String]) -> bool {
     direct.iter().any(|domain| covered(host, domain))
+}
+
+/// Who answers a TLS challenge in a window's loads: its pages', and the
+/// downloads it begins, alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vouching {
+    /// macOS's own trust, as for any application: a host sent around the
+    /// proxy, directly (#58), is not Syndeo's to vouch for.
+    MacOs,
+    /// The window's pinner, with the proxy's authority as the only anchor.
+    Pinned,
+    /// Nobody: the challenge is refused. A load with no pinner behind it.
+    Refused,
+}
+
+/// Who answers a TLS challenge for `host`, given the domains sent directly
+/// and whether there is a pinner (`pinner`) to judge it.
+pub fn vouching(host: Option<&str>, direct: &[String], pinner: bool) -> Vouching {
+    if host.is_some_and(|host| sent_direct(host, direct)) {
+        Vouching::MacOs
+    } else if pinner {
+        Vouching::Pinned
+    } else {
+        Vouching::Refused
+    }
 }
 
 /// The hosts a page's window sends directly once the page has loaded: those
@@ -986,6 +1028,46 @@ mod tests {
         }
     }
 
+    /// The navigation policy: a zone refused in any frame; another scheme
+    /// refused in the main frame only, where a page within a page may load
+    /// what its own rules allow.
+    #[test]
+    fn a_zone_is_refused_anywhere_and_other_schemes_in_the_main_frame() {
+        for main_frame in [true, false] {
+            assert!(may_load("https", false, main_frame));
+            assert!(may_load("http", false, main_frame));
+            assert!(!may_load("https", true, main_frame), "{main_frame}");
+        }
+        assert!(may_load("about", false, true));
+        for scheme in ["file", "data", "blob", "javascript", "ftp", ""] {
+            assert!(!may_load(scheme, false, true), "{scheme}");
+            assert!(may_load(scheme, false, false), "{scheme}");
+        }
+    }
+
+    /// A download's redirect goes only where a window's main frame may.
+    #[test]
+    fn a_download_is_redirected_only_where_a_page_may_go() {
+        for allowed in [
+            ("https", "https://example.com/file.zip"),
+            ("http", "http://127.0.0.1:8080/a.bin"),
+            ("http", "http://[::1]:8080/a.bin"),
+        ] {
+            assert!(download_may_follow(allowed.0, allowed.1), "{allowed:?}");
+        }
+        for refused in [
+            ("http", "http://[fe80::1%25lo0]:8080/a.bin"),
+            ("https", "https://[fe80::1%en0]/a.bin"),
+            ("file", "file:///etc/hosts"),
+            ("data", "data:application/octet-stream,abc"),
+            ("blob", "blob:https://example.com/x"),
+            ("ftp", "ftp://example.com/a.bin"),
+            ("javascript", "javascript:alert(1)"),
+        ] {
+            assert!(!download_may_follow(refused.0, refused.1), "{refused:?}");
+        }
+    }
+
     fn opened(address: &str) -> String {
         match asked(address) {
             Asked::Open(url) => url.to_string(),
@@ -1147,6 +1229,39 @@ mod tests {
         assert!(sent_direct("www.apple.com", &direct));
         assert!(!sent_direct("apple.com", &direct));
         assert!(!sent_direct("example.com", &direct));
+    }
+
+    /// A TLS challenge, a page's or a download's: macOS's own trust for a
+    /// host sent directly, whether or not there is a pinner; the pinner for
+    /// every other; and, with no pinner, nobody's.
+    #[test]
+    fn a_challenge_is_the_pinners_unless_its_host_is_sent_directly() {
+        let direct = vec!["github.com".to_string()];
+        assert_eq!(vouching(Some("github.com"), &direct, true), Vouching::MacOs);
+        assert_eq!(
+            vouching(Some("gist.github.com"), &direct, true),
+            Vouching::MacOs
+        );
+        assert_eq!(
+            vouching(Some("github.com"), &direct, false),
+            Vouching::MacOs
+        );
+        assert_eq!(
+            vouching(Some("notgithub.com"), &direct, true),
+            Vouching::Pinned
+        );
+        assert_eq!(
+            vouching(Some("example.com"), &direct, true),
+            Vouching::Pinned
+        );
+        assert_eq!(vouching(None, &direct, true), Vouching::Pinned);
+        assert_eq!(
+            vouching(Some("example.com"), &direct, false),
+            Vouching::Refused
+        );
+        assert_eq!(vouching(None, &direct, false), Vouching::Refused);
+        // A load nothing is known of, sent nowhere directly: refused.
+        assert_eq!(vouching(Some("github.com"), &[], false), Vouching::Refused);
     }
 
     /// Only hosts the window vouched for that the proxy said were refused,

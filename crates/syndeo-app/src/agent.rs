@@ -670,6 +670,19 @@ pub fn web_url(text: &str) -> Result<Url, Failure> {
     }
 }
 
+/// What an agent is told when what it navigated tab `tab` to turned out to
+/// be a file to download: an agent's tab downloads nothing, so Syndeo
+/// refused it, saved nothing, and left the tab's page as it was.
+pub fn download_refused(tab: u64) -> Failure {
+    Failure::new(
+        "refused",
+        format!(
+            "downloads are not allowed for agents: tab {tab} was sent a file to download, and \
+             Syndeo refused it; nothing was saved, and the tab's page is as it was"
+        ),
+    )
+}
+
 // ------------------------------------------------------------- who asks
 
 /// One process in the line from a client up to what started it.
@@ -1442,6 +1455,29 @@ mod tests {
             assert_eq!(failure.code, "refused", "{refused}: {failure:?}");
         }
         assert_eq!(web_url("  ").unwrap_err().code, "bad_request");
+    }
+
+    /// A download in an agent's tab is refused, and the agent is told so, in
+    /// words that name its tab and nothing of the address.
+    #[test]
+    fn an_agent_is_told_its_download_was_refused() {
+        let failure = download_refused(7);
+        assert_eq!(failure.code, "refused");
+        assert!(
+            failure
+                .message
+                .starts_with("downloads are not allowed for agents: tab 7 "),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("nothing was saved"),
+            "{}",
+            failure.message
+        );
+        let answer = err(&json!(3), &failure);
+        assert_eq!(answer["ok"], json!(false));
+        assert_eq!(answer["error"]["code"], json!("refused"));
     }
 
     #[test]

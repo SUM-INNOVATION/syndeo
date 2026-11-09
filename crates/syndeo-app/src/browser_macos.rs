@@ -14,7 +14,11 @@
 //!   (`address::Refusal`: macOS 15's preloaded HSTS sites, Apple's pinned
 //!   ones), it sends that host directly from then on and loads the page
 //!   again, once (#58); a host sent directly gets macOS's own trust, and the
-//!   address field says Direct for a page from one.
+//!   address field says Direct for a page from one. A response a window
+//!   cannot show, or a link marked for downloading, becomes a download
+//!   (`downloads_macos`), which keeps the window's way of answering TLS
+//!   challenges (`Trust`); but an agent's tab downloads nothing: it refuses
+//!   both, leaves its page as it was, and its agent is told.
 //! - **Its UI delegate.** A page that asks for a new window gets a new tab,
 //!   made the way every other is, never a web view WebKit made for it. A
 //!   link followed with ⌘ or the middle button opens in a tab the same way,
@@ -177,6 +181,10 @@ pub struct Ivars {
     /// WebKit may then report as a load it interrupted: the page stays as it
     /// was, and there is no failure to show.
     refused: Cell<bool>,
+    /// What the main frame last went to was a file to download, which this
+    /// window refused, being an agent's tab; until another navigation starts,
+    /// or the agent is told (`take_refused_download`).
+    download_refused: Cell<bool>,
     /// The address the field shows when nobody is typing in it: the page's,
     /// as navigation reports it, an address that failed, or nothing for the
     /// start page. Kept apart from the field, so that what someone types is
@@ -228,6 +236,9 @@ const USE_CREDENTIAL: isize = 0;
 /// `NSURLSessionAuthChallengePerformDefaultHandling`: macOS's own trust.
 const DEFAULT_HANDLING: isize = 1;
 
+/// `NSURLSessionAuthChallengeCancelAuthenticationChallenge`: refused.
+const CANCEL_CHALLENGE: isize = 2;
+
 /// How long after a page has loaded to look once more for parts of it the
 /// proxy says macOS refused: the proxy's word can come just after the page.
 const LOOK_AGAIN: f64 = 1.0;
@@ -264,17 +275,20 @@ define_class!(
             handler: &block2::DynBlock<dyn Fn(WKNavigationResponsePolicy)>,
         ) {
             let page = unsafe { response.canShowMIMEType() };
-            if !page {
-                if unsafe { response.isForMainFrame() } {
+            let main_frame = unsafe { response.isForMainFrame() };
+            let policy = if page {
+                WKNavigationResponsePolicy::Allow
+            } else if self.refuses_downloads() {
+                self.refuse_download(main_frame);
+                WKNavigationResponsePolicy::Cancel
+            } else {
+                if main_frame {
                     self.ivars().refused.set(true);
                 }
                 tracing::info!("a response that is not a page: downloading it");
-            }
-            handler.call((if page {
-                WKNavigationResponsePolicy::Allow
-            } else {
                 WKNavigationResponsePolicy::Download
-            },));
+            };
+            handler.call((policy,));
         }
 
         #[unsafe(method(webView:navigationResponse:didBecomeDownload:))]
@@ -284,7 +298,7 @@ define_class!(
             _response: &WKNavigationResponse,
             download: &WKDownload,
         ) {
-            downloads_macos::adopt(self.mtm(), download);
+            downloads_macos::adopt(self.mtm(), download, self);
         }
 
         #[unsafe(method(webView:navigationAction:didBecomeDownload:))]
@@ -294,7 +308,7 @@ define_class!(
             _action: &WKNavigationAction,
             download: &WKDownload,
         ) {
-            downloads_macos::adopt(self.mtm(), download);
+            downloads_macos::adopt(self.mtm(), download, self);
         }
 
         #[unsafe(method(webView:didReceiveAuthenticationChallenge:completionHandler:))]
@@ -305,22 +319,7 @@ define_class!(
             handler: &block2::DynBlock<dyn Fn(isize, *mut AnyObject)>,
         ) {
             let host = host_of(challenge);
-            // A host sent around the proxy, directly, is not Syndeo's to
-            // vouch for: macOS's own trust decides, as for any application.
-            let direct = self.hooks().map(|hooks| (hooks.direct)()).unwrap_or_default();
-            if host.as_deref().is_some_and(|host| address::sent_direct(host, &direct)) {
-                handler.call((DEFAULT_HANDLING, std::ptr::null_mut()));
-                return;
-            }
-            // Only ever made with a pinner; without one, refuse.
-            let judged = match &*self.ivars().web.borrow() {
-                Some(web) => web.pinner.judge_noting(challenge),
-                None => pin::Judged {
-                    disposition: 2,
-                    credential: std::ptr::null_mut(),
-                    pinned_by_macos: false,
-                },
-            };
+            let judged = self.trust().judge(challenge, host.as_deref());
             if let Some(host) = host {
                 if judged.disposition == USE_CREDENTIAL {
                     remember(&self.ivars().vouched, host);
@@ -354,14 +353,20 @@ define_class!(
                     return;
                 }
             }
-            // A link marked for downloading: a download, not a page.
+            // A link marked for downloading: a download, not a page; and in
+            // an agent's tab, nothing at all.
             if !zoned && unsafe { action.shouldPerformDownload() } {
                 self.ivars().refused.set(main_frame);
+                if self.refuses_downloads() {
+                    self.refuse_download(main_frame);
+                    handler.call((WKNavigationActionPolicy::Cancel,));
+                    return;
+                }
                 handler.call((WKNavigationActionPolicy::Download,));
                 tracing::info!("a link marked for downloading");
                 return;
             }
-            let allowed = (!main_frame || address::allowed_in_main_frame(&scheme)) && !zoned;
+            let allowed = address::may_load(&scheme, zoned, main_frame);
             if !allowed && main_frame {
                 self.ivars().refused.set(true);
                 tracing::info!(scheme = %scheme, zoned, "refused a page in a window");
@@ -375,6 +380,7 @@ define_class!(
         #[unsafe(method(webView:didStartProvisionalNavigation:))]
         fn did_start(&self, _webview: &WKWebView, _navigation: Option<&WKNavigation>) {
             self.ivars().refused.set(false);
+            self.ivars().download_refused.set(false);
             // Another page than the one last loaded again may be, once.
             let now = self.page_address();
             let mut retried = self.ivars().retried.borrow_mut();
@@ -958,8 +964,58 @@ fn browsing_action(action: Option<Sel>) -> bool {
     })
 }
 
+/// How a window answers the TLS challenges in its loads: its pinner, and
+/// the hosts the session sends directly, read when a challenge comes, as
+/// they may have grown. Each download a window begins keeps a copy
+/// (`downloads_macos`), so that its challenges are answered exactly as the
+/// window's are, by the same rule, even once the window has closed.
+#[derive(Clone, Default)]
+pub struct Trust {
+    pinner: Option<Retained<pin::Pinner>>,
+    hooks: Option<Rc<Hooks>>,
+}
+
+impl Trust {
+    /// No window's: every challenge refused.
+    pub fn none() -> Trust {
+        Trust::default()
+    }
+
+    /// The answer to `challenge`, for `host` (`host_of`): macOS's own trust
+    /// for a host sent around the proxy, directly, which is not Syndeo's to
+    /// vouch for; the pinner, with the proxy's authority as the only anchor,
+    /// for every other; and with no pinner, refused (`address::vouching`).
+    pub fn judge(
+        &self,
+        challenge: &NSURLAuthenticationChallenge,
+        host: Option<&str>,
+    ) -> pin::Judged {
+        let direct = self
+            .hooks
+            .as_ref()
+            .map(|hooks| (hooks.direct)())
+            .unwrap_or_default();
+        match (
+            address::vouching(host, &direct, self.pinner.is_some()),
+            &self.pinner,
+        ) {
+            (address::Vouching::MacOs, _) => pin::Judged {
+                disposition: DEFAULT_HANDLING,
+                credential: std::ptr::null_mut(),
+                pinned_by_macos: false,
+            },
+            (address::Vouching::Pinned, Some(pinner)) => pinner.judge_noting(challenge),
+            _ => pin::Judged {
+                disposition: CANCEL_CHALLENGE,
+                credential: std::ptr::null_mut(),
+                pinned_by_macos: false,
+            },
+        }
+    }
+}
+
 /// A request's URL, as text, or empty.
-fn address_of(request: &NSURLRequest) -> String {
+pub(crate) fn address_of(request: &NSURLRequest) -> String {
     request
         .URL()
         .and_then(|url| url.absoluteString())
@@ -997,14 +1053,14 @@ fn host_in(address: &str) -> Option<String> {
 }
 
 /// The host a TLS challenge is for, lowercase.
-fn host_of(challenge: &NSURLAuthenticationChallenge) -> Option<String> {
+pub(crate) fn host_of(challenge: &NSURLAuthenticationChallenge) -> Option<String> {
     let space: Option<Retained<AnyObject>> = unsafe { msg_send![challenge, protectionSpace] };
     let host: Option<Retained<NSString>> = unsafe { msg_send![&*space?, host] };
     host.map(|host| host.to_string().to_ascii_lowercase())
 }
 
 /// The scheme of a request's URL, lowercase, or empty.
-fn scheme_of(request: &NSURLRequest) -> String {
+pub(crate) fn scheme_of(request: &NSURLRequest) -> String {
     request
         .URL()
         .and_then(|url| url.scheme())
@@ -1389,6 +1445,52 @@ impl BrowserController {
         self.ivars().looking_again.get()
     }
 
+    /// How this window answers the TLS challenges in its loads, for a
+    /// download it begins to keep.
+    pub fn trust(&self) -> Trust {
+        Trust {
+            pinner: self
+                .ivars()
+                .web
+                .borrow()
+                .as_ref()
+                .map(|web| web.pinner.clone()),
+            hooks: self.hooks(),
+        }
+    }
+
+    /// Whether this window refuses every download: an agent's tab does
+    /// (`control_macos`), whatever its agent was allowed, so that a program
+    /// writes nothing on this Mac by sending its tab to a file.
+    pub fn refuses_downloads(&self) -> bool {
+        self.window()
+            .is_some_and(|window| crate::control_macos::is_agents(&window))
+    }
+
+    /// A download refused in this agent's tab: in the main frame, the page
+    /// stays as it was, with no failure page, and the agent is told when it
+    /// next waits for the tab (`take_refused_download`). Logged, with nothing
+    /// of the address.
+    fn refuse_download(&self, main_frame: bool) {
+        if main_frame {
+            self.ivars().refused.set(true);
+            self.ivars().download_refused.set(true);
+        }
+        tracing::info!(main_frame, "refused a download in an agent's tab");
+    }
+
+    /// Whether what the main frame last went to was a file this agent's tab
+    /// refused to download; then not again, until it happens again.
+    pub fn take_refused_download(&self) -> bool {
+        self.ivars().download_refused.replace(false)
+    }
+
+    /// The agent asks for something new of its tab: a download refused
+    /// before is no longer the news.
+    pub fn forget_refused_download(&self) {
+        self.ivars().download_refused.set(false);
+    }
+
     /// The window's web view, routed through the proxy and pinned by this
     /// controller; none in a window that cannot browse, or once it closed.
     pub fn web_view(&self) -> Option<Retained<WKWebView>> {
@@ -1441,6 +1543,7 @@ impl BrowserController {
 
     /// Load `request`, as a page asked for it.
     pub fn load(&self, request: &NSURLRequest) {
+        self.forget_refused_download();
         if let Some(web) = &*self.ivars().web.borrow() {
             unsafe { web.view.loadRequest(request) };
         }
