@@ -34,7 +34,9 @@
 #      stapled ticket;
 #   5. ci/test-app.sh customer: opened by its path, as Finder opens it, it
 #      browses https pinned, with Syndeo's authority in no trust settings,
-#      quits with nothing left, and opens again; a reload measured;
+#      quits with nothing left, and opens again; a reload, by the sidebar's
+#      Reload, required to consult the origin through the proxy, whose
+#      counters are read around it in a tab opened from the command bar;
 #      then the trust settings, keychains and certificates unchanged;
 #   6. installed again over itself, the user's data kept, and opened once
 #      more (ci/test-app.sh customer again);
