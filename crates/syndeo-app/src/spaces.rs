@@ -390,9 +390,88 @@ pub fn hue_colors(hue: usize, dark: bool) -> ([f64; 3], [f64; 3]) {
     (deepen(from), deepen(to))
 }
 
+/// The angle the backdrop's gradient runs at, in degrees anticlockwise from
+/// left to right: from the top left down to the bottom right.
+pub const GRADIENT_ANGLE: f64 = -35.0;
+
+/// Where a gradient over a `width` by `height` view starts and ends, as Core
+/// Animation's `CAGradientLayer` takes them: in the unit square, y upwards,
+/// stretched over the view. Drawn at `angle` as
+/// `-[NSGradient drawInRect:angle:]` draws it, which is what the backdrop
+/// drew before it was a layer: from the line through the corner furthest
+/// back along the angle to the one through the corner furthest on, each
+/// line of one colour at right angles to the angle, in points. Core
+/// Animation works its gradient out in the unit square and then stretches
+/// it, which would tilt those lines on a view that is not square; so the end
+/// is moved to where, once stretched, they are at right angles again.
+pub fn gradient_ends(width: f64, height: f64, angle: f64) -> ((f64, f64), (f64, f64)) {
+    if width <= 0.0 || height <= 0.0 {
+        return ((0.0, 1.0), (1.0, 0.0));
+    }
+    let (dy, dx) = angle.to_radians().sin_cos();
+    // How far the gradient runs, in points, along the angle.
+    let length = width * dx.abs() + height * dy.abs();
+    let start = (
+        (width / 2.0 - length / 2.0 * dx) / width,
+        (height / 2.0 - length / 2.0 * dy) / height,
+    );
+    // How fast the gradient goes from one end to the other, per unit of the
+    // unit square across and up; the end is where that reaches 1.
+    let (gx, gy) = (width * dx / length, height * dy / length);
+    let squared = gx * gx + gy * gy;
+    (start, (start.0 + gx / squared, start.1 + gy / squared))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How far along the gradient (0 at its start, 1 at its end) a point of
+    /// the unit square is, as Core Animation works it out.
+    fn along(ends: ((f64, f64), (f64, f64)), point: (f64, f64)) -> f64 {
+        let ((sx, sy), (ex, ey)) = ends;
+        let (vx, vy) = (ex - sx, ey - sy);
+        ((point.0 - sx) * vx + (point.1 - sy) * vy) / (vx * vx + vy * vy)
+    }
+
+    #[test]
+    fn the_backdrop_runs_from_its_top_left_corner_to_its_bottom_right_as_nsgradient_draws_it() {
+        for (width, height) in [
+            (1200.0, 800.0),
+            (700.0, 1000.0),
+            (1440.0, 900.0),
+            (500.0, 500.0),
+        ] {
+            let ends = gradient_ends(width, height, GRADIENT_ANGLE);
+            let (dy, dx) = GRADIENT_ANGLE.to_radians().sin_cos();
+            let length = width * dx.abs() + height * dy.abs();
+            // As NSGradient has it: each corner as far along as it is along
+            // the angle, in points, from the top left.
+            let expected = |x: f64, y: f64| (x * dx + (y - height) * dy) / length;
+            for (x, y) in [
+                (0.0, height),
+                (width, 0.0),
+                (width, height),
+                (0.0, 0.0),
+                (width / 3.0, height / 4.0),
+            ] {
+                let got = along(ends, (x / width, y / height));
+                assert!(
+                    (got - expected(x, y)).abs() < 1e-9,
+                    "{width}x{height} at ({x}, {y}): {got}, not {}",
+                    expected(x, y)
+                );
+            }
+            assert!(
+                along(ends, (0.0, 1.0)).abs() < 1e-9,
+                "starts at the top left"
+            );
+            assert!(
+                (along(ends, (1.0, 0.0)) - 1.0).abs() < 1e-9,
+                "ends at the bottom right"
+            );
+        }
+    }
 
     #[test]
     fn the_default_is_one_space_called_personal() {

@@ -22,12 +22,13 @@
 //! while a page loads and gone once it has.
 //!
 //! AppKit's own controls and colours for the controls, which follow the
-//! system's appearance, light or dark, and its accent colour; the backdrop
-//! and the sidebar's rows are the two things drawn here. Nothing needs more
-//! than macOS 13.
+//! system's appearance, light or dark, and its accent colour; the backdrop,
+//! a gradient Core Animation draws, and the sidebar's rows are the two
+//! things of Syndeo's own here. Nothing needs more than macOS 13.
 
 use crate::address::Route;
 use crate::sidebar_macos::{self, EdgeSensor, Sidebar};
+use crate::{spaces, spaces_macos};
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, NSObject, ProtocolObject, Sel};
 use objc2::{
@@ -40,7 +41,9 @@ use objc2_app_kit::{
     NSTextFieldBezelStyle, NSTextFieldCell, NSTextFieldDelegate, NSView, NSWindow, NSWindowButton,
     NSWindowStyleMask, NSWindowTitleVisibility,
 };
+use objc2_core_graphics::CGColor;
 use objc2_foundation::{ns_string, NSArray, NSNumber, NSPoint, NSRect, NSSize, NSString, NSTimer};
+use objc2_quartz_core::{CAGradientLayer, CALayer};
 use objc2_web_kit::WKWebView;
 use std::cell::{Cell, RefCell};
 
@@ -67,20 +70,57 @@ const PROGRESS_EVERY: f64 = 1.0 / 30.0;
 
 // ---------------------------------------------------------- the backdrop
 
+pub struct BackdropIvars {
+    /// The space's hue, and whether the appearance was dark, that the
+    /// colours were last set for.
+    shown: Cell<Option<(usize, bool)>>,
+}
+
 define_class!(
     /// The window's backdrop, behind the page's card and under the title
     /// bar: a soft diagonal gradient, lavender into blush in light
-    /// appearance and the same hues deepened in dark. Nothing in it is
-    /// read by Accessibility: it is decoration.
+    /// appearance and the same hues deepened in dark, in the current
+    /// space's colours. Nothing in it is read by Accessibility: it is
+    /// decoration.
+    ///
+    /// Its layer is a `CAGradientLayer`, which Core Animation draws: there
+    /// is no bitmap of the window's size behind it, as there was when it
+    /// drew itself (42 MB a window at 1440 by 900 points on a Retina
+    /// display, kept while its tab was behind another). Its colours are set
+    /// on the layer, when the space or the appearance changes, and where
+    /// the gradient starts and ends when its size does.
     #[unsafe(super(NSView, objc2_app_kit::NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "SyndeoBackdrop"]
+    #[ivars = BackdropIvars]
     pub struct Backdrop;
 
     impl Backdrop {
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty: NSRect) {
-            sidebar_macos::fill_gradient(self, self.bounds(), None);
+        #[unsafe(method_id(makeBackingLayer))]
+        fn make_backing_layer(&self) -> Retained<CALayer> {
+            Retained::into_super(CAGradientLayer::layer())
+        }
+
+        #[unsafe(method(wantsUpdateLayer))]
+        fn wants_update_layer(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(updateLayer))]
+        fn update_layer(&self) {
+            self.paint();
+        }
+
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, size: NSSize) {
+            let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+            self.paint();
+        }
+
+        #[unsafe(method(viewDidChangeEffectiveAppearance))]
+        fn view_did_change_effective_appearance(&self) {
+            let _: () = unsafe { msg_send![super(self), viewDidChangeEffectiveAppearance] };
+            self.setNeedsDisplay(true);
         }
 
         #[unsafe(method(isOpaque))]
@@ -92,7 +132,43 @@ define_class!(
 
 impl Backdrop {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
-        unsafe { msg_send![Self::alloc(mtm), initWithFrame: frame] }
+        let this = Self::alloc(mtm).set_ivars(BackdropIvars {
+            shown: Cell::new(None),
+        });
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        // Layer-backed from the start, so that its layer is the gradient.
+        this.setWantsLayer(true);
+        this
+    }
+
+    /// Take the current space's colours, if it shows another's.
+    pub fn follow_space(&self) {
+        let hue = spaces_macos::read(|layout| layout.current_space().hue);
+        if self.ivars().shown.get() != Some((hue, sidebar_macos::is_dark(self))) {
+            self.paint();
+        }
+    }
+
+    /// Set the gradient's colours, the current space's in this appearance,
+    /// and where it starts and ends for the backdrop's size.
+    fn paint(&self) {
+        let layer: Option<Retained<CALayer>> = unsafe { msg_send![self, layer] };
+        let Some(layer) = layer.and_then(|l| l.downcast::<CAGradientLayer>().ok()) else {
+            return;
+        };
+        let dark = sidebar_macos::is_dark(self);
+        let hue = spaces_macos::read(|layout| layout.current_space().hue);
+        let (from, to) = spaces::hue_colors(hue, dark);
+        let colour = |c: [f64; 3]| CGColor::new_srgb(c[0], c[1], c[2], 1.0);
+        let (from, to) = (colour(from), colour(to));
+        let colours: [&AnyObject; 2] = [(*from).as_ref(), (*to).as_ref()];
+        let size = self.bounds().size;
+        let ((sx, sy), (ex, ey)) =
+            spaces::gradient_ends(size.width, size.height, spaces::GRADIENT_ANGLE);
+        unsafe { layer.setColors(Some(&NSArray::from_slice(&colours))) };
+        layer.setStartPoint(NSPoint::new(sx, sy));
+        layer.setEndPoint(NSPoint::new(ex, ey));
+        self.ivars().shown.set(Some((hue, dark)));
     }
 }
 
