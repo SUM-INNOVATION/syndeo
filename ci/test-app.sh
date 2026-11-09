@@ -32,7 +32,8 @@
 #     it); Back and Forward
 #     work, by the bar's button and by History > Forward; a file: address is
 #     refused with Syndeo's own page; File >
-#     New Tab opens a tab with the start page, beside the first in one window,
+#     New Tab opens the command bar; Return there, with nothing typed, opens a
+#     tab with the start page, beside the first in one window,
 #     and File's one enabled ⌘W item, whatever AppKit titles it (Close, or
 #     Close Tab once it has seen the tabs), closes that tab and no other,
 #     letting its window go and leaving the first as it was;
@@ -441,26 +442,34 @@ at() {
 page_text() { front | grep -E '^AX(StaticText|Heading)' | cut -f2,3 | tr '\t\n' '  ' | head -c 300; }
 controls() { printf 'Back %s, Forward %s' "$("$APPCTL" enabled "$PID" syndeo.back)" "$("$APPCTL" enabled "$PID" syndeo.forward)"; }
 
-# chrome WHEN: the front window's controls are its toolbar's, in the title
-# bar: Back, Forward, the address field and its Reload, each found by the
-# identifier it always had, and Reload saying Reload.
+# new_tab: File > New Tab, which opens the command bar over the window;
+# Return there with nothing typed opens a tab with the start page, as New
+# Tab once did straight away.
+new_tab() {
+  new_tab
+  wait_for 5 "$APPCTL" value "$PID" syndeo.command-bar >/dev/null 2>&1 || true
+  "$APPCTL" type "$PID" "" >/dev/null 2>&1 || true
+}
+
+# chrome WHEN: the front window's controls are in its sidebar: Back,
+# Forward, the address field and Reload, each found by the identifier it
+# always had, and Reload saying Reload.
 chrome() {
-  local id where
+  local id
   for id in syndeo.back syndeo.forward syndeo.address syndeo.reload; do
-    where="$("$APPCTL" in-toolbar "$PID" "$id" 2>&1)"
-    must "$([ "$where" = "in the toolbar" ] && echo yes)" "$id is in the window's toolbar ($1)" "${where:-no such control in the front window}"
+    must "$("$APPCTL" enabled "$PID" "$id" >/dev/null 2>&1 && echo yes)" "$id is in the front window ($1)" "no such control in the front window"
   done
   must "$("$APPCTL" describe "$PID" syndeo.reload | grep -q 'Reload' && echo yes)" "the address field's Reload says Reload ($1)" \
     "it says '$("$APPCTL" describe "$PID" syndeo.reload)'"
 }
 
 # route_words WHEN: the front window's page came through Syndeo, and the
-# address field's route, in the toolbar, says so: Through Syndeo, with its
+# address field's route says so: Through Syndeo, with its
 # help tag those words first, then what each route means.
 route_words() {
   local help
   must "$([ "$(bar)" = "$SYNDEO_LABEL" ] && echo yes)" "the address field's route says '$SYNDEO_LABEL' ($1)" "it says '$(bar)'"
-  must "$("$APPCTL" in-toolbar "$PID" syndeo.route >/dev/null 2>&1 && echo yes)" "and it is in the address field, in the toolbar ($1)"
+  must "$("$APPCTL" describe "$PID" syndeo.route >/dev/null 2>&1 && echo yes)" "and it is in the front window, in the address field ($1)"
   help="$("$APPCTL" describe "$PID" syndeo.route | cut -f2)"
   must "$([[ "$help" == "$SYNDEO_LABEL. How this page was reached."* ]] && echo yes)" \
     "and its help tag is its words, then what each route means ($1)" "help: '${help:-none}'"
@@ -1066,7 +1075,7 @@ browsing() {
   visit "file:///etc/passwd" "file:///etc/passwd" 'not file: ones' "a file: address is refused"
   must "$(page_says 'root:' && echo no || echo yes)" "and nothing of that file is shown"
 
-  choose File "New Tab"
+  new_tab
   if wait_for 15 grep -q 'a window opened open=2' "$log"; then ok "File > New Tab opens a second tab"; else bad "New Tab" "the app does not report two windows: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
   arrive "" 'Welcome to Syndeo' "the new tab shows the start page, with an empty address field"
   on_screen="$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')"
@@ -1222,7 +1231,7 @@ change() {
 # own, which is then closed, leaving the front tab's page, at ADDRESS and
 # saying PAGE, as it was. Sets STATS.
 stats_aside() {
-  choose File "New Tab"
+  new_tab
   arrive "" 'Welcome to Syndeo' "a tab of its own for the proxy's counters ($3)"
   stats_now "$3"
   close_tab "$3"
@@ -3046,7 +3055,7 @@ tab_memory() {
   printf 'Page C (%s), in one tab\n' "$TP/page-c.html" >>"$out"
   one="$(memory_now "$before" "$out")"
   for n in 2 3 4 5; do
-    choose File "New Tab"
+    new_tab
     arrive "" 'Welcome to Syndeo' "tab $n, to measure memory with, shows the start page"
     visit "$TP/page-c.html" "$TP/page-c.html" 'SYNDEO-PAGE-C' "the same page opens in tab $n"
   done
@@ -3086,7 +3095,7 @@ EOF
 # session kept on disk at SESSION; both are there before.
 tabs_cleared() {
   local session="$1"
-  choose File "New Tab"
+  new_tab
   arrive "" 'Welcome to Syndeo' "a tab to close before clearing"
   close_tab "a tab closed before clearing"
   must "$([ "$("$APPCTL" menu-enabled "$PID" History "Reopen Last Closed Tab")" = enabled ] && echo yes)" \
