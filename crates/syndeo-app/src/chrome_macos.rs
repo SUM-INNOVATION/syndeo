@@ -103,7 +103,12 @@ define_class!(
 
         #[unsafe(method(wantsUpdateLayer))]
         fn wants_update_layer(&self) -> bool {
-            true
+            false
+        }
+
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            sidebar_macos::fill_gradient(self, self.bounds(), None);
         }
 
         #[unsafe(method(updateLayer))]
