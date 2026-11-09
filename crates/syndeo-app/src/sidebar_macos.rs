@@ -4,10 +4,14 @@
 //! and the tabs below.
 //!
 //! Every tab is still a window of its own, tabbed with the others by AppKit
-//! (`tabs_macos`): the sidebar is a view of that tab group, drawn in each of
-//! its windows alike, so that choosing a tab, which brings its window to
-//! the front, changes nothing but which row is lit. AppKit's own tab bar is
-//! kept hidden (`tabs_macos::hide_tab_bar`).
+//! (`tabs_macos`): the sidebar is a view of that tab group, and only the
+//! window in front shows it, so only that window's sidebar holds the
+//! group's rows; the others hold none (`sidebar_model`). When another tab
+//! comes to the front, the rows, the favorites' tiles and the list's own
+//! lines move to its sidebar (`Sidebar::adopt`), and what changed is
+//! changed on them (`Sidebar::show`): a row is made once for its tab and
+//! kept while the tab is in the list. AppKit's own tab bar is kept hidden
+//! (`tabs_macos::hide_tab_bar`).
 //!
 //! - **Favorites** (`favorites`) are tiles, four to a row: the site's icon
 //!   when a tab of that site is open and has one, its initial otherwise.
@@ -32,9 +36,10 @@
 //! Nothing here fetches anything: icons are the ones each tab's badge has.
 //! To Accessibility each row is a button named for its tab, and the UI test
 //! finds the rows by `syndeo.sidebar-tab` and the tiles by
-//! `syndeo.favorite`.
+//! `syndeo.favorite`, in the window in front.
 
 use crate::favorites::{self, Favorite};
+use crate::sidebar_model::{self, Item};
 use crate::spaces::{Folder, Layout};
 use crate::spaces_macos::{self, SpaceBar};
 use objc2::rc::{Retained, Weak};
@@ -54,6 +59,7 @@ use objc2_foundation::{
     ns_string, NSArray, NSEdgeInsets, NSPoint, NSRect, NSSize, NSString, NSUserDefaults,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// The sidebar's width, open.
@@ -165,12 +171,70 @@ pub fn fill_gradient(view: &NSView, rect: NSRect, radius: Option<f64>) {
     }
 }
 
+/// An SF Symbol, if macOS has it.
+type Symbol = Option<Retained<NSImage>>;
+
+/// A folder's row, with the name and fold it was made with.
+type FolderLine = (Retained<FolderRow>, String, bool);
+
+thread_local! {
+    /// The SF Symbols the sidebar shows, each made once and shared by every
+    /// row that shows it.
+    static SYMBOLS: RefCell<HashMap<(&'static str, &'static str), Symbol>> =
+        RefCell::new(HashMap::new());
+    /// Rows, New Tab's included, that exist; and tabs' rows held by the
+    /// sidebars, which is one for each tab in the windows in front.
+    static ROWS_ALIVE: Cell<usize> = const { Cell::new(0) };
+    static ROWS_HELD: Cell<usize> = const { Cell::new(0) };
+}
+
 /// An SF Symbol, described for VoiceOver and Accessibility by `label`.
-fn symbol(name: &str, label: &str) -> Option<Retained<NSImage>> {
-    NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str(name),
-        Some(&NSString::from_str(label)),
-    )
+fn symbol(name: &'static str, label: &'static str) -> Option<Retained<NSImage>> {
+    SYMBOLS.with(|symbols| {
+        symbols
+            .borrow_mut()
+            .entry((name, label))
+            .or_insert_with(|| {
+                NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str(name),
+                    Some(&NSString::from_str(label)),
+                )
+            })
+            .clone()
+    })
+}
+
+/// How many rows exist, New Tab's included: measured, for the log.
+pub fn rows_alive() -> usize {
+    ROWS_ALIVE.with(Cell::get)
+}
+
+/// How many tabs' rows the sidebars hold between them.
+pub fn rows_held() -> usize {
+    ROWS_HELD.with(Cell::get)
+}
+
+fn held_more(by: usize) {
+    ROWS_HELD.with(|held| held.set(held.get() + by));
+}
+
+fn held_fewer(by: usize) {
+    ROWS_HELD.with(|held| held.set(held.get().saturating_sub(by)));
+}
+
+/// `view`, out of `stack` and out of its superview, but kept by whoever
+/// holds it.
+fn detach(stack: &NSStackView, view: &NSView) {
+    stack.removeArrangedSubview(view);
+    view.removeFromSuperview();
+}
+
+/// Everything in `stack`, out of it: the last first, so that nothing
+/// after each has to move up.
+fn detach_all(stack: &NSStackView) {
+    for view in stack.arrangedSubviews().to_vec().iter().rev() {
+        detach(stack, view);
+    }
 }
 
 /// Send `action` to `target`, from `sender`, as a control would.
@@ -246,18 +310,35 @@ pub fn favorites_write(space: u64, favorites: &[Favorite]) {
 pub struct RowIvars {
     /// The tab's window; none for the New Tab row.
     tab: RefCell<Option<Weak<NSWindow>>>,
+    /// The New Tab row, which never has Close.
+    new_tab: bool,
     title: RefCell<String>,
     active: Cell<bool>,
     hover: Cell<bool>,
     pinned: Cell<bool>,
+    /// Shown under its folder, set in.
+    in_folder: Cell<bool>,
+    /// What the icon shows: whether the page is loading, and the page's
+    /// icon, by its address.
+    shows: Cell<Option<(bool, usize)>>,
+    icon: Retained<NSImageView>,
+    label: Retained<NSTextField>,
+    /// Close, at the row's end: made the first time it is shown, for the
+    /// tab in front or a row pointed at.
     close: RefCell<Option<Retained<NSButton>>>,
+    /// The pin at the row's end, for a pinned tab.
+    pin: RefCell<Option<Retained<NSImageView>>>,
     menu_for: RefCell<Option<MenuFor>>,
-    /// The sidebar, told when the row is dragged: to the favorites, say.
-    sidebar: RefCell<Option<Weak<Sidebar>>>,
     /// Where the mouse went down, in the window, while it is down; and
     /// whether it has moved far enough since to be a drag.
     press: Cell<Option<NSPoint>>,
     dragging: Cell<bool>,
+}
+
+impl Drop for RowIvars {
+    fn drop(&mut self) {
+        ROWS_ALIVE.with(|alive| alive.set(alive.get().saturating_sub(1)));
+    }
 }
 
 define_class!(
@@ -310,10 +391,10 @@ define_class!(
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
             let ivars = self.ivars();
-            let (Some(press), Some(sidebar)) = (
-                ivars.press.get(),
-                ivars.sidebar.borrow().as_ref().and_then(Weak::load),
-            ) else {
+            let Some(press) = ivars.press.get() else {
+                return;
+            };
+            let Some(sidebar) = self.sidebar() else {
                 return;
             };
             let at = event.locationInWindow();
@@ -327,8 +408,12 @@ define_class!(
             sidebar.drag_moved(at);
         }
 
+        /// What a release does can change the sidebar, and so take this row
+        /// out of it: the row is kept until it returns, and nothing of it is
+        /// borrowed meanwhile.
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
+            let _keep = self.retain();
             let ivars = self.ivars();
             let was_drag = ivars.dragging.replace(false);
             ivars.press.set(None);
@@ -337,20 +422,19 @@ define_class!(
                 return;
             }
             let tab = ivars.tab.borrow().as_ref().and_then(Weak::load);
-            if let (Some(sidebar), Some(tab)) =
-                (ivars.sidebar.borrow().as_ref().and_then(Weak::load), tab)
-            {
+            let sidebar = self.sidebar();
+            if let (Some(sidebar), Some(tab)) = (sidebar, tab) {
                 sidebar.drag_ended(event.locationInWindow(), &tab);
             }
         }
 
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
+            let _keep = self.retain();
             let ivars = self.ivars();
-            let (Some(tab), Some(menu_for)) = (
-                ivars.tab.borrow().as_ref().and_then(Weak::load),
-                ivars.menu_for.borrow().clone(),
-            ) else {
+            let tab = ivars.tab.borrow().as_ref().and_then(Weak::load);
+            let menu_for = ivars.menu_for.borrow().clone();
+            let (Some(tab), Some(menu_for)) = (tab, menu_for) else {
                 return;
             };
             if let Some(menu) = menu_for(&tab) {
@@ -391,14 +475,19 @@ define_class!(
 
         #[unsafe(method(accessibilityPerformPress))]
         fn accessibility_perform_press(&self) -> bool {
+            let _keep = self.retain();
             self.choose();
             true
         }
 
-        /// Close, at the row's end.
+        /// Close, at the row's end. Closing the tab takes its row out of
+        /// the sidebar: the row is kept until this returns, and its window
+        /// is not borrowed from it meanwhile.
         #[unsafe(method(syndeoCloseRow:))]
         fn close_row(&self, _sender: Option<&AnyObject>) {
-            if let Some(tab) = self.ivars().tab.borrow().as_ref().and_then(Weak::load) {
+            let _keep = self.retain();
+            let tab = self.ivars().tab.borrow().as_ref().and_then(Weak::load);
+            if let Some(tab) = tab {
                 tab.performClose(None);
             }
         }
@@ -406,55 +495,22 @@ define_class!(
 );
 
 impl TabRow {
-    /// A row for `tab`, or for New Tab when there is none.
+    /// A row for `tab`, set in when it is `in_folder`; or for New Tab when
+    /// there is none.
     fn new(
         mtm: MainThreadMarker,
         width: f64,
-        tab: Option<&TabInfo>,
+        tab: Option<(&TabInfo, bool)>,
         menu_for: Option<MenuFor>,
-        sidebar: Option<Weak<Sidebar>>,
-        indent: f64,
     ) -> Retained<Self> {
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, ROW_HEIGHT));
-        let this = Self::alloc(mtm).set_ivars(RowIvars {
-            tab: RefCell::new(tab.map(|t| Weak::from_retained(&t.window))),
-            title: RefCell::new(tab.map_or("New Tab".to_string(), |t| t.title.clone())),
-            active: Cell::new(tab.is_some_and(|t| t.active)),
-            hover: Cell::new(false),
-            pinned: Cell::new(tab.is_some_and(|t| t.pinned)),
-            close: RefCell::new(None),
-            menu_for: RefCell::new(menu_for),
-            sidebar: RefCell::new(sidebar),
-            press: Cell::new(None),
-            dragging: Cell::new(false),
-        });
-        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
-        this.setTranslatesAutoresizingMaskIntoConstraints(false);
-        this.heightAnchor()
-            .constraintEqualToConstant(ROW_HEIGHT)
-            .setActive(true);
-        this.setAccessibilityIdentifier(Some(ns_string!("syndeo.sidebar-tab")));
-
         // The icon: the page's, a globe without one, an hourglass while
         // the page loads, and a plus for New Tab.
-        let image = match tab {
-            None => symbol("plus", "New Tab"),
-            Some(t) if t.loading => symbol("hourglass", "Loading"),
-            Some(t) => t.icon.clone().or_else(|| symbol("globe", "Page")),
-        };
         let icon = NSImageView::new(mtm);
-        icon.setImage(image.as_deref());
         icon.setImageScaling(NSImageScaling::ScaleProportionallyDown);
         icon.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
-        icon.setFrame(NSRect::new(
-            NSPoint::new(ROW_PAD + indent, (ROW_HEIGHT - ICON) / 2.0),
-            NSSize::new(ICON, ICON),
-        ));
-        this.addSubview(&icon);
-
         // The title, clipped at its end.
-        let label =
-            NSTextField::labelWithString(&NSString::from_str(&this.ivars().title.borrow()), mtm);
+        let label = NSTextField::labelWithString(&NSString::new(), mtm);
         label.setFont(Some(&NSFont::systemFontOfSize(14.0)));
         label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
         let colour = if tab.is_none() {
@@ -463,67 +519,195 @@ impl TabRow {
             NSColor::labelColor()
         };
         label.setTextColor(Some(&colour));
+        label.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable);
+        let this = Self::alloc(mtm).set_ivars(RowIvars {
+            tab: RefCell::new(None),
+            new_tab: tab.is_none(),
+            title: RefCell::new(String::new()),
+            active: Cell::new(false),
+            hover: Cell::new(false),
+            pinned: Cell::new(false),
+            in_folder: Cell::new(false),
+            shows: Cell::new(None),
+            icon: icon.clone(),
+            label: label.clone(),
+            close: RefCell::new(None),
+            pin: RefCell::new(None),
+            menu_for: RefCell::new(menu_for),
+            press: Cell::new(None),
+            dragging: Cell::new(false),
+        });
+        let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        ROWS_ALIVE.with(|alive| alive.set(alive.get() + 1));
+        this.setTranslatesAutoresizingMaskIntoConstraints(false);
+        this.heightAnchor()
+            .constraintEqualToConstant(ROW_HEIGHT)
+            .setActive(true);
+        this.setAccessibilityIdentifier(Some(ns_string!("syndeo.sidebar-tab")));
+        this.addSubview(&icon);
+        this.addSubview(&label);
+        this.place(false);
+        match tab {
+            None => {
+                *this.ivars().title.borrow_mut() = "New Tab".to_string();
+                label.setStringValue(ns_string!("New Tab"));
+                icon.setImage(symbol("plus", "New Tab").as_deref());
+            }
+            Some((tab, in_folder)) => this.update(tab, in_folder),
+        }
+        this
+    }
+
+    /// Show `tab` as it is now, set in when `in_folder`: changing only what
+    /// changed.
+    fn update(&self, tab: &TabInfo, in_folder: bool) {
+        let ivars = self.ivars();
+        *ivars.tab.borrow_mut() = Some(Weak::from_retained(&tab.window));
+        if *ivars.title.borrow() != tab.title {
+            *ivars.title.borrow_mut() = tab.title.clone();
+            ivars.label.setStringValue(&NSString::from_str(&tab.title));
+        }
+        let shows = (
+            tab.loading,
+            tab.icon
+                .as_ref()
+                .map_or(0, |i| Retained::as_ptr(i) as usize),
+        );
+        if ivars.shows.replace(Some(shows)) != Some(shows) {
+            let image = if tab.loading {
+                symbol("hourglass", "Loading")
+            } else {
+                tab.icon.clone().or_else(|| symbol("globe", "Page"))
+            };
+            ivars.icon.setImage(image.as_deref());
+        }
+        if ivars.in_folder.replace(in_folder) != in_folder {
+            self.place(in_folder);
+        }
+        let pinned = ivars.pinned.replace(tab.pinned) != tab.pinned;
+        if pinned {
+            self.show_pin(tab.pinned);
+        }
+        let active = ivars.active.replace(tab.active) != tab.active;
+        if pinned || active {
+            self.show_close();
+            self.setNeedsDisplay(true);
+        }
+    }
+
+    /// The icon and the title where they go, set in under a folder.
+    fn place(&self, in_folder: bool) {
+        let ivars = self.ivars();
+        let indent = if in_folder { FOLDER_INDENT } else { 0.0 };
+        ivars.icon.setFrame(NSRect::new(
+            NSPoint::new(ROW_PAD + indent, (ROW_HEIGHT - ICON) / 2.0),
+            NSSize::new(ICON, ICON),
+        ));
         let text_x = ROW_PAD + indent + ICON + 8.0;
-        let text_w = width - text_x - CLOSE - ROW_PAD;
-        label.setFrame(NSRect::new(
+        let text_w = self.bounds().size.width - text_x - CLOSE - ROW_PAD;
+        ivars.label.setFrame(NSRect::new(
             NSPoint::new(text_x, (ROW_HEIGHT - 18.0) / 2.0),
             NSSize::new(text_w.max(10.0), 18.0),
         ));
-        label.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewWidthSizable);
-        this.addSubview(&label);
+    }
 
-        // Close, or a pin, at the end.
-        if let Some(t) = tab {
-            let end = NSRect::new(
-                NSPoint::new(width - ROW_PAD - CLOSE, (ROW_HEIGHT - CLOSE) / 2.0),
-                NSSize::new(CLOSE, CLOSE),
-            );
-            if t.pinned {
-                let pin = NSImageView::new(mtm);
-                pin.setImage(symbol("pin.fill", "Pinned").as_deref());
-                pin.setContentTintColor(Some(&NSColor::tertiaryLabelColor()));
-                pin.setFrame(end);
-                pin.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewMinXMargin);
-                this.addSubview(&pin);
-            } else {
-                let image = symbol("xmark", "Close Tab").unwrap_or_default();
-                let target: &AnyObject = (*this).as_ref();
-                let close = unsafe {
-                    NSButton::buttonWithImage_target_action(
-                        &image,
-                        Some(target),
-                        Some(sel!(syndeoCloseRow:)),
-                        mtm,
-                    )
-                };
-                close.setBordered(false);
-                close.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
-                close.setToolTip(Some(ns_string!("Close Tab")));
-                close.setFrame(end);
-                close.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewMinXMargin);
-                close.setHidden(!t.active);
-                this.addSubview(&close);
-                *this.ivars().close.borrow_mut() = Some(close);
+    /// Where Close, or the pin, goes: the row's end.
+    fn end(&self) -> NSRect {
+        NSRect::new(
+            NSPoint::new(
+                self.bounds().size.width - ROW_PAD - CLOSE,
+                (ROW_HEIGHT - CLOSE) / 2.0,
+            ),
+            NSSize::new(CLOSE, CLOSE),
+        )
+    }
+
+    /// The pin at the row's end, for a pinned tab, or none.
+    fn show_pin(&self, pinned: bool) {
+        let ivars = self.ivars();
+        if !pinned {
+            if let Some(pin) = &*ivars.pin.borrow() {
+                pin.setHidden(true);
+            }
+            return;
+        }
+        if let Some(pin) = &*ivars.pin.borrow() {
+            pin.setHidden(false);
+            return;
+        }
+        let pin = NSImageView::new(self.mtm());
+        pin.setImage(symbol("pin.fill", "Pinned").as_deref());
+        pin.setContentTintColor(Some(&NSColor::tertiaryLabelColor()));
+        pin.setFrame(self.end());
+        pin.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewMinXMargin);
+        self.addSubview(&pin);
+        *ivars.pin.borrow_mut() = Some(pin);
+    }
+
+    /// Close, shown for the tab in front and a row pointed at, and never
+    /// for a pinned tab or New Tab; made the first time it is shown, as a
+    /// plain button, which costs a row half what one made with
+    /// `+buttonWithImage:target:action:` does.
+    fn show_close(&self) {
+        let ivars = self.ivars();
+        let wanted =
+            !ivars.new_tab && !ivars.pinned.get() && (ivars.hover.get() || ivars.active.get());
+        if let Some(close) = &*ivars.close.borrow() {
+            close.setHidden(!wanted);
+            return;
+        }
+        if !wanted {
+            return;
+        }
+        let close = NSButton::initWithFrame(NSButton::alloc(self.mtm()), self.end());
+        close.setImage(symbol("xmark", "Close Tab").as_deref());
+        close.setImagePosition(objc2_app_kit::NSCellImagePosition::ImageOnly);
+        close.setImageScaling(NSImageScaling::ScaleProportionallyDown);
+        close.setBordered(false);
+        let target: &AnyObject = self.as_ref();
+        unsafe {
+            close.setTarget(Some(target));
+            close.setAction(Some(sel!(syndeoCloseRow:)));
+        }
+        close.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+        close.setToolTip(Some(ns_string!("Close Tab")));
+        close.setAutoresizingMask(objc2_app_kit::NSAutoresizingMaskOptions::ViewMinXMargin);
+        self.addSubview(&close);
+        *ivars.close.borrow_mut() = Some(close);
+    }
+
+    /// The sidebar the row is in, if it is in one: the window in front's,
+    /// which can change.
+    fn sidebar(&self) -> Option<Retained<Sidebar>> {
+        // SAFETY: on the main thread, each superview is retained as it is
+        // read, and nothing changes the views in between.
+        let mut view = unsafe { self.superview() };
+        while let Some(v) = view {
+            match v.downcast::<Sidebar>() {
+                Ok(sidebar) => return Some(sidebar),
+                Err(v) => view = unsafe { v.superview() },
             }
         }
-        this
+        None
     }
 
     /// Bring the tab in front, or open a new one.
     fn choose(&self) {
         let tab = self.ivars().tab.borrow().as_ref().and_then(Weak::load);
         match tab {
-            Some(window) => window.makeKeyAndOrderFront(None),
+            Some(window) => {
+                window.makeKeyAndOrderFront(None);
+                // Its sidebar shows the rows before it is drawn, whether or
+                // not the application is active and the window became key.
+                crate::browser_macos::refresh_sidebars(&window);
+            }
             None => send(self.mtm(), sel!(newWindowForTab:), None, None),
         }
     }
 
     fn set_hover(&self, hover: bool) {
-        let ivars = self.ivars();
-        ivars.hover.set(hover);
-        if let Some(close) = &*ivars.close.borrow() {
-            close.setHidden(!(hover || ivars.active.get()) || ivars.pinned.get());
-        }
+        self.ivars().hover.set(hover);
+        self.show_close();
         self.setNeedsDisplay(true);
     }
 }
@@ -534,8 +718,6 @@ pub struct TileIvars {
     address: String,
     title: String,
     hover: Cell<bool>,
-    /// The window's controller, which opens the page and keeps the favorites.
-    target: Weak<AnyObject>,
 }
 
 define_class!(
@@ -576,9 +758,10 @@ define_class!(
 
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
+            let _keep = self.retain();
             let mtm = self.mtm();
             let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Favorite"));
-            let target = self.ivars().target.load();
+            let target = self.target();
             let me: &AnyObject = self.as_ref();
             let item = unsafe {
                 objc2_app_kit::NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -644,18 +827,12 @@ define_class!(
 );
 
 impl FavoriteTile {
-    fn new(
-        mtm: MainThreadMarker,
-        size: f64,
-        favorite: &FavoriteInfo,
-        target: Weak<AnyObject>,
-    ) -> Retained<Self> {
+    fn new(mtm: MainThreadMarker, size: f64, favorite: &FavoriteInfo) -> Retained<Self> {
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(size, size));
         let this = Self::alloc(mtm).set_ivars(TileIvars {
             address: favorite.favorite.address.clone(),
             title: favorite.favorite.title.clone(),
             hover: Cell::new(false),
-            target,
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -704,9 +881,18 @@ impl FavoriteTile {
         self.ivars().address.clone()
     }
 
+    /// The controller of the window the tile is in, which opens the page
+    /// and keeps the favorites: the window in front's, which can change.
+    fn target(&self) -> Option<Retained<AnyObject>> {
+        let delegate = self.window()?.delegate()?;
+        let object: &AnyObject = (*delegate).as_ref();
+        Some(object.retain())
+    }
+
     /// Open the page, in this tab.
     fn choose(&self) {
-        let target = self.ivars().target.load();
+        let _keep = self.retain();
+        let target = self.target();
         let me: &AnyObject = self.as_ref();
         send(
             self.mtm(),
@@ -778,6 +964,7 @@ define_class!(
 
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
+            let _keep = self.retain();
             let mtm = self.mtm();
             let id = self.ivars().id as isize;
             let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Folder"));
@@ -1050,6 +1237,26 @@ pub struct SidebarIvars {
     /// The content's distance from the sidebar's left, right, bottom and
     /// top: nothing beside the page, the panel's margins while floating.
     insets: RefCell<Vec<Retained<NSLayoutConstraint>>>,
+    /// It shows the tab group's tabs: its window is in front. Only then
+    /// does it hold anything below.
+    showing: Cell<bool>,
+    /// A row for each tab, by the address of the tab's window.
+    rows: RefCell<HashMap<usize, Retained<TabRow>>>,
+    /// The folders' rows, by id, with the name and fold each was made with.
+    folder_rows: RefCell<HashMap<u64, FolderLine>>,
+    /// The list's own lines: the space's name over the tabs (and its
+    /// words), the rule, and New Tab.
+    header: RefCell<Option<(Retained<NSView>, Retained<NSTextField>)>>,
+    rule: RefCell<Option<Retained<NSView>>>,
+    new_tab: RefCell<Option<Retained<TabRow>>>,
+    /// The favorites the tiles were made for: address, title and icon.
+    tiles_for: RefCell<Option<Vec<(String, String, usize)>>>,
+}
+
+impl Drop for SidebarIvars {
+    fn drop(&mut self) {
+        held_fewer(self.rows.get_mut().len());
+    }
 }
 
 define_class!(
@@ -1149,6 +1356,13 @@ impl Sidebar {
             spaces: spaces.clone(),
             nav_top: RefCell::new(None),
             insets: RefCell::new(Vec::new()),
+            showing: Cell::new(false),
+            rows: RefCell::new(HashMap::new()),
+            folder_rows: RefCell::new(HashMap::new()),
+            header: RefCell::new(None),
+            rule: RefCell::new(None),
+            new_tab: RefCell::new(None),
+            tiles_for: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -1423,26 +1637,181 @@ impl Sidebar {
         )
     }
 
-    /// Show `favorites` as tiles, `layout`'s spaces at the foot, and the
-    /// current space's `tabs` as rows: its folders and their tabs, the
-    /// pinned tabs in none, a rule, the rest, New Tab.
-    pub fn reload(&self, tabs: &[TabInfo], favorites: &[FavoriteInfo], layout: &Layout) {
+    /// Whether it shows the tab group's tabs, and holds what it shows.
+    pub fn is_showing(&self) -> bool {
+        self.ivars().showing.get()
+    }
+
+    /// Show the tab group's tabs, its window being in front: `items` in
+    /// order, each tab's row as `tabs` has it, keyed by the address of the
+    /// tab's window; `favorites` as tiles, and `layout`'s spaces at the foot.
+    /// A row is kept for its tab and changed in place; rows are made only
+    /// for tabs that have none, and let go only for tabs that are gone.
+    /// What was made and let go, in rows.
+    pub fn show(
+        &self,
+        items: &[Item<usize>],
+        tabs: &HashMap<usize, &TabInfo>,
+        favorites: &[FavoriteInfo],
+        layout: &Layout,
+    ) -> (usize, usize) {
         let mtm = self.mtm();
         let ivars = self.ivars();
-        let clear = |stack: &NSStackView| {
-            for view in stack.arrangedSubviews().iter() {
-                stack.removeArrangedSubview(&view);
-                view.removeFromSuperview();
-            }
-        };
+        ivars.showing.set(true);
+        self.show_favorites(favorites);
+        ivars.spaces.reload(layout);
 
-        clear(&ivars.favorites);
+        // The tabs' rows: those kept, those made, those let go.
+        let width = WIDTH - 2.0 * (SIDE - 2.0);
+        let want = sidebar_model::row_keys(items);
+        let have: Vec<usize> = ivars.rows.borrow().keys().copied().collect();
+        let diff = sidebar_model::diff_rows(&have, &want);
+        {
+            let mut rows = ivars.rows.borrow_mut();
+            for key in &diff.drop {
+                if let Some(row) = rows.remove(key) {
+                    detach(&ivars.list, &row);
+                }
+            }
+            let menu_for = ivars.menu_for.borrow().clone();
+            for key in &diff.make {
+                if let Some(tab) = tabs.get(key) {
+                    rows.insert(
+                        *key,
+                        TabRow::new(mtm, width, Some((tab, false)), menu_for.clone()),
+                    );
+                }
+            }
+        }
+        held_fewer(diff.drop.len());
+        held_more(diff.make.len());
+
+        // Every line, in order, each changed only where it changed.
+        let mut lines: Vec<Retained<NSView>> = Vec::with_capacity(items.len());
+        let mut folders: Vec<u64> = Vec::new();
+        for item in items {
+            match *item {
+                Item::Header => lines.push(self.header(layout)),
+                Item::Folder(id) => {
+                    if let Some(folder) = layout.folder(id) {
+                        folders.push(id);
+                        lines.push(Retained::into_super(self.folder_row(folder)));
+                    }
+                }
+                Item::Tab { key, in_folder } => {
+                    let row = ivars.rows.borrow().get(&key).cloned();
+                    if let (Some(row), Some(tab)) = (row, tabs.get(&key)) {
+                        row.update(tab, in_folder);
+                        lines.push(Retained::into_super(row));
+                    }
+                }
+                Item::Rule => lines.push(self.rule()),
+                Item::NewTab => lines.push(Retained::into_super(self.new_tab_row())),
+            }
+        }
+        ivars.folder_rows.borrow_mut().retain(|id, (row, _, _)| {
+            let kept = folders.contains(id);
+            if !kept {
+                detach(&ivars.list, row);
+            }
+            kept
+        });
+
+        // In the order wanted: arranged again only when that is not the
+        // order they are in, so that the list's subviews, which
+        // Accessibility reads in order, are in the order shown.
+        let now = ivars.list.arrangedSubviews();
+        let same = now.len() == lines.len()
+            && now.iter().zip(&lines).all(|(a, b)| std::ptr::eq(&*a, &**b));
+        if !same {
+            detach_all(&ivars.list);
+            for line in &lines {
+                ivars.list.addArrangedSubview(line);
+            }
+            if let Some((header, _)) = &*ivars.header.borrow() {
+                ivars
+                    .list
+                    .setCustomSpacing_afterView(SECTION_GAP - ROW_GAP, header);
+            }
+        }
+        (diff.make.len(), diff.drop.len())
+    }
+
+    /// Hold nothing: the window is behind another tab of its group, and
+    /// its sidebar is not seen. How many tabs' rows were let go.
+    pub fn empty(&self) -> usize {
+        let ivars = self.ivars();
+        ivars.showing.set(false);
+        detach_all(&ivars.list);
+        let dropped = ivars.rows.borrow_mut().drain().count();
+        held_fewer(dropped);
+        ivars.folder_rows.borrow_mut().clear();
+        ivars.header.borrow_mut().take();
+        ivars.rule.borrow_mut().take();
+        ivars.new_tab.borrow_mut().take();
+        self.clear_favorites();
+        ivars.spaces.clear();
+        dropped
+    }
+
+    /// Take what `from` holds, made while its window was in front: its
+    /// rows, folders, lines and tiles, for this one's window, which is in
+    /// front now; `from` holds nothing after. The rows are then shown as
+    /// they are (`show`), not made again.
+    pub fn adopt(&self, from: &Sidebar) {
+        if std::ptr::eq(self, from) {
+            return;
+        }
+        let (mine, theirs) = (self.ivars(), from.ivars());
+        self.empty();
+        detach_all(&theirs.list);
+        let lines = theirs.favorites.arrangedSubviews();
+        detach_all(&theirs.favorites);
+        for line in lines.iter() {
+            mine.favorites.addArrangedSubview(&line);
+        }
+        *mine.tiles_for.borrow_mut() = theirs.tiles_for.borrow_mut().take();
+        // The rows move from one sidebar to the other: held, still, once.
+        *mine.rows.borrow_mut() = theirs.rows.take();
+        *mine.folder_rows.borrow_mut() = theirs.folder_rows.take();
+        *mine.header.borrow_mut() = theirs.header.borrow_mut().take();
+        *mine.rule.borrow_mut() = theirs.rule.borrow_mut().take();
+        *mine.new_tab.borrow_mut() = theirs.new_tab.borrow_mut().take();
+        theirs.showing.set(false);
+        mine.showing.set(true);
+        // Nothing is pointed at in a window just brought to the front.
+        for row in mine.rows.borrow().values() {
+            if row.ivars().hover.get() {
+                row.set_hover(false);
+            }
+        }
+    }
+
+    /// The favorites as tiles, four to a line: made again only when they,
+    /// or an icon of theirs, changed.
+    fn show_favorites(&self, favorites: &[FavoriteInfo]) {
+        let mtm = self.mtm();
+        let ivars = self.ivars();
+        let want: Vec<(String, String, usize)> = favorites
+            .iter()
+            .map(|f| {
+                (
+                    f.favorite.address.clone(),
+                    f.favorite.title.clone(),
+                    f.icon.as_ref().map_or(0, |i| Retained::as_ptr(i) as usize),
+                )
+            })
+            .collect();
+        if ivars.tiles_for.borrow().as_ref() == Some(&want) {
+            return;
+        }
+        self.clear_favorites();
         let inner = WIDTH - 2.0 * SIDE;
         let tile = (inner - TILE_GAP * (TILES_PER_ROW as f64 - 1.0)) / TILES_PER_ROW as f64;
         for row in favorites.chunks(TILES_PER_ROW) {
             let tiles: Vec<Retained<FavoriteTile>> = row
                 .iter()
-                .map(|f| FavoriteTile::new(mtm, tile, f, ivars.target.clone()))
+                .map(|f| FavoriteTile::new(mtm, tile, f))
                 .collect();
             let views: Vec<&NSView> = tiles.iter().map(|t| -> &NSView { t }).collect();
             let line = NSStackView::stackViewWithViews(&NSArray::from_slice(&views), mtm);
@@ -1451,24 +1820,32 @@ impl Sidebar {
             line.setTranslatesAutoresizingMaskIntoConstraints(false);
             ivars.favorites.addArrangedSubview(&line);
         }
+        *ivars.tiles_for.borrow_mut() = Some(want);
+    }
 
-        ivars.spaces.reload(layout);
+    fn clear_favorites(&self) {
+        let ivars = self.ivars();
+        detach_all(&ivars.favorites);
+        ivars.tiles_for.borrow_mut().take();
+    }
 
-        clear(&ivars.list);
-        let menu_for = ivars.menu_for.borrow().clone();
-        let width = WIDTH - 2.0 * (SIDE - 2.0);
-        let me = || Some(Weak::from_retained(&self.retain()));
-        let row_for = |tab: &TabInfo, indent: f64| {
-            TabRow::new(mtm, width, Some(tab), menu_for.clone(), me(), indent)
-        };
-
-        // The current space's name, over its tabs.
+    /// The current space's name, over its tabs: made once, its words
+    /// changed when the space's are.
+    fn header(&self, layout: &Layout) -> Retained<NSView> {
+        let mtm = self.mtm();
         let space = layout.current_space();
         let heading = if space.icon.is_empty() {
             space.name.clone()
         } else {
             format!("{}  {}", space.icon, space.name)
         };
+        let mut slot = self.ivars().header.borrow_mut();
+        if let Some((header, name)) = &*slot {
+            if name.stringValue().to_string() != heading {
+                name.setStringValue(&NSString::from_str(&heading));
+            }
+            return header.clone();
+        }
         let name = NSTextField::labelWithString(&NSString::from_str(&heading), mtm);
         name.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, unsafe {
             objc2_app_kit::NSFontWeightSemibold
@@ -1487,64 +1864,67 @@ impl Sidebar {
             name.centerYAnchor()
                 .constraintEqualToAnchor(&header.centerYAnchor()),
         ]));
-        ivars.list.addArrangedSubview(&header);
-        ivars
-            .list
-            .setCustomSpacing_afterView(SECTION_GAP - ROW_GAP, &header);
+        *slot = Some((header.clone(), name));
+        header
+    }
 
-        // This space's tabs only: its folders and their tabs, the pinned
-        // tabs in no folder, a rule, then the rest.
-        let here: Vec<&TabInfo> = tabs.iter().filter(|t| t.space == space.id).collect();
-        let folders = layout.folders_of(space.id);
-        let in_folder = |tab: &TabInfo| {
-            tab.pinned
-                && tab
-                    .folder
-                    .is_some_and(|id| folders.iter().any(|f| f.id == id))
-        };
-        for folder in &folders {
-            let row = FolderRow::new(mtm, width, folder);
-            ivars.list.addArrangedSubview(&row);
-            if folder.collapsed {
-                continue;
+    /// The rule between the pinned tabs and the rest, with room above and
+    /// below it: made once.
+    fn rule(&self) -> Retained<NSView> {
+        let mtm = self.mtm();
+        let mut slot = self.ivars().rule.borrow_mut();
+        if let Some(around) = &*slot {
+            return around.clone();
+        }
+        let rule = NSBox::new(mtm);
+        rule.setBoxType(NSBoxType::Separator);
+        rule.setTranslatesAutoresizingMaskIntoConstraints(false);
+        let around = NSView::new(mtm);
+        around.setTranslatesAutoresizingMaskIntoConstraints(false);
+        around.addSubview(&rule);
+        NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+            around
+                .heightAnchor()
+                .constraintEqualToConstant(2.0 * SECTION_GAP),
+            rule.leadingAnchor()
+                .constraintEqualToAnchor_constant(&around.leadingAnchor(), ROW_PAD),
+            rule.trailingAnchor()
+                .constraintEqualToAnchor_constant(&around.trailingAnchor(), -ROW_PAD),
+            rule.centerYAnchor()
+                .constraintEqualToAnchor(&around.centerYAnchor()),
+        ]));
+        *slot = Some(around.clone());
+        around
+    }
+
+    /// New Tab, the last row: made once.
+    fn new_tab_row(&self) -> Retained<TabRow> {
+        let mut slot = self.ivars().new_tab.borrow_mut();
+        if let Some(row) = &*slot {
+            return row.clone();
+        }
+        let width = WIDTH - 2.0 * (SIDE - 2.0);
+        let row = TabRow::new(self.mtm(), width, None, None);
+        *slot = Some(row.clone());
+        row
+    }
+
+    /// `folder`'s row: made again only when its name or its fold changed.
+    fn folder_row(&self, folder: &Folder) -> Retained<FolderRow> {
+        let ivars = self.ivars();
+        let mut rows = ivars.folder_rows.borrow_mut();
+        if let Some((row, name, collapsed)) = rows.get(&folder.id) {
+            if *name == folder.name && *collapsed == folder.collapsed {
+                return row.clone();
             }
-            for tab in here
-                .iter()
-                .filter(|t| t.pinned && t.folder == Some(folder.id))
-            {
-                ivars.list.addArrangedSubview(&row_for(tab, FOLDER_INDENT));
-            }
+            detach(&ivars.list, row);
         }
-        let loose: Vec<&&TabInfo> = here.iter().filter(|t| t.pinned && !in_folder(t)).collect();
-        for tab in &loose {
-            ivars.list.addArrangedSubview(&row_for(tab, 0.0));
-        }
-        let unpinned: Vec<&&TabInfo> = here.iter().filter(|t| !t.pinned).collect();
-        if (!folders.is_empty() || !loose.is_empty()) && !unpinned.is_empty() {
-            // The rule, with room above and below it.
-            let rule = NSBox::new(mtm);
-            rule.setBoxType(NSBoxType::Separator);
-            rule.setTranslatesAutoresizingMaskIntoConstraints(false);
-            let around = NSView::new(mtm);
-            around.setTranslatesAutoresizingMaskIntoConstraints(false);
-            around.addSubview(&rule);
-            NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-                around
-                    .heightAnchor()
-                    .constraintEqualToConstant(2.0 * SECTION_GAP),
-                rule.leadingAnchor()
-                    .constraintEqualToAnchor_constant(&around.leadingAnchor(), ROW_PAD),
-                rule.trailingAnchor()
-                    .constraintEqualToAnchor_constant(&around.trailingAnchor(), -ROW_PAD),
-                rule.centerYAnchor()
-                    .constraintEqualToAnchor(&around.centerYAnchor()),
-            ]));
-            ivars.list.addArrangedSubview(&around);
-        }
-        for tab in &unpinned {
-            ivars.list.addArrangedSubview(&row_for(tab, 0.0));
-        }
-        let new_tab = TabRow::new(mtm, width, None, None, None, 0.0);
-        ivars.list.addArrangedSubview(&new_tab);
+        let width = WIDTH - 2.0 * (SIDE - 2.0);
+        let row = FolderRow::new(self.mtm(), width, folder);
+        rows.insert(
+            folder.id,
+            (row.clone(), folder.name.clone(), folder.collapsed),
+        );
+        row
     }
 }

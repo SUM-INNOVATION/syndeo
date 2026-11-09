@@ -39,6 +39,7 @@ use crate::chrome_macos::Ui;
 use crate::downloads_macos;
 use crate::favorites;
 use crate::sidebar_macos::{self, FavoriteInfo, FavoriteTile, TabInfo};
+use crate::sidebar_model::{self, Pending};
 use crate::tabs;
 use crate::tabs_macos::{self, Badge};
 use objc2::rc::{Retained, Weak};
@@ -52,7 +53,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     ns_string, NSError, NSKeyValueObservingOptions, NSNotification, NSNumber,
-    NSObjectNSKeyValueObserverRegistration, NSProcessInfo, NSRect, NSString,
+    NSObjectNSKeyValueObserverRegistration, NSProcessInfo, NSRect, NSRunLoop, NSString,
     NSURLAuthenticationChallenge, NSURLRequest, NSURL,
 };
 use objc2_web_kit::{
@@ -61,6 +62,7 @@ use objc2_web_kit::{
     WKWebViewConfiguration, WKWindowFeatures,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use syndeo_webkit::pin;
 
@@ -465,6 +467,10 @@ define_class!(
                 }
             }
             let window = notification.object().and_then(|object| object.downcast::<NSWindow>().ok());
+            let sidebar = sidebar_of(Some(self));
+            if let (Some(window), Some(sidebar)) = (&window, sidebar) {
+                hand_on(window, &sidebar);
+            }
             if let (Some(window), Some(badge)) = (&window, self.ivars().badge.borrow_mut().take()) {
                 badge.detach(window);
             }
@@ -487,6 +493,17 @@ define_class!(
                 self.go(&address);
             } else if self.ivars().icon_missed.get() && !self.ivars().loading.get() {
                 self.find_icon();
+            }
+        }
+
+        /// A tab came into sight, as AppKit put it in front of its group, or
+        /// went out of it, behind another: its group's sidebars follow,
+        /// whichever way AppKit chose the tab, key or not, so that the
+        /// window in front shows the rows and the others hold none.
+        #[unsafe(method(windowDidChangeOcclusionState:))]
+        fn window_did_change_occlusion_state(&self, _notification: &NSNotification) {
+            if let Some(window) = self.window() {
+                refresh_sidebars(&window);
             }
         }
 
@@ -814,6 +831,7 @@ define_class!(
             let tabs = tabs_macos::tabs_of(&window);
             if let Some(index) = tabs::chosen_tab(digit, tabs.len()) {
                 tabs[index].makeKeyAndOrderFront(None);
+                refresh_sidebars(&tabs[index]);
             }
         }
     }
@@ -842,20 +860,219 @@ pub fn controller_of(window: &NSWindow) -> Option<Retained<BrowserController>> {
         .map(|c| c.retain())
 }
 
-/// Show every sidebar in `window`'s tab group the group's tabs as they are
-/// now: titles, icons, which are pinned or loading, and which is in front.
+thread_local! {
+    /// Windows whose tab groups' sidebars are to be refreshed at the end of
+    /// this turn of the run loop; and those to refresh on the next turn.
+    static PENDING: RefCell<Pending<usize, Weak<NSWindow>>> = const { RefCell::new(Pending::new()) };
+    static SOON: RefCell<Pending<usize, Weak<NSWindow>>> = const { RefCell::new(Pending::new()) };
+    /// Refreshes put off because the window in front was closing, in a row.
+    static PUT_OFF: Cell<u32> = const { Cell::new(0) };
+}
+
+/// How many times in a row a group's refresh is put off while the window
+/// in front of it is closing, before it goes ahead without that window.
+const MOST_PUT_OFF: u32 = 20;
+
+/// A window, or a tab group, as a key: its address.
+fn key_of<T: Message>(object: &T) -> usize {
+    std::ptr::from_ref(object) as usize
+}
+
+/// The key of `window`'s tab group: the group's address, or the window's
+/// for a window in none.
+fn group_key(window: &NSWindow) -> usize {
+    window
+        .tabGroup()
+        .map_or_else(|| key_of(window), |group| key_of(&*group))
+}
+
+/// Show `window`'s tab group's tabs as they are now in the sidebar of the
+/// window in front of the group: titles, icons, which are pinned or
+/// loading, and which is in front. Asked for on every page's every step,
+/// it only marks the group: the refresh runs once, at the end of this turn
+/// of the run loop, before anything is drawn, for each group marked, however
+/// often (`refresh_pending`).
 pub fn refresh_sidebars(window: &NSWindow) {
-    tabs_macos::hide_tab_bar_now(window);
+    let weak = Weak::from_retained(&window.retain());
+    if PENDING.with(|pending| pending.borrow_mut().mark(key_of(window), weak)) {
+        let refresh = block2::RcBlock::new(refresh_pending);
+        unsafe { NSRunLoop::mainRunLoop().performBlock(&refresh) };
+    }
+}
+
+/// `refresh_sidebars`, on the next turn of the run loop: for when a window
+/// is leaving its group and is still counted in it.
+pub fn refresh_sidebars_soon(window: &NSWindow) {
+    let weak = Weak::from_retained(&window.retain());
+    if SOON.with(|soon| soon.borrow_mut().mark(key_of(window), weak)) {
+        let tick = block2::RcBlock::new(
+            move |_timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+                let soon = SOON.with(|soon| soon.borrow_mut().take());
+                for window in soon.iter().filter_map(Weak::load) {
+                    refresh_sidebars(&window);
+                }
+            },
+        );
+        unsafe {
+            objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_repeats_block(
+                0.0, false, &tick,
+            )
+        };
+    }
+}
+
+/// The refreshes asked for this turn: one for each tab group.
+fn refresh_pending() {
+    let asked: Vec<Retained<NSWindow>> = PENDING
+        .with(|pending| pending.borrow_mut().take())
+        .iter()
+        .filter_map(Weak::load)
+        .collect();
+    for window in &asked {
+        tabs_macos::hide_tab_bar_now(window);
+    }
+    let (mut made, mut dropped, mut handed) = (0, 0, 0);
+    let groups = sidebar_model::unique_by(asked, |w| group_key(w));
+    for window in &groups {
+        let (m, d, h) = refresh_group(window);
+        made += m;
+        dropped += d;
+        handed += usize::from(h);
+    }
+    if made + dropped + handed > 0 {
+        tracing::info!(
+            held = sidebar_macos::rows_held(),
+            alive = sidebar_macos::rows_alive(),
+            made,
+            dropped,
+            handed,
+            groups = groups.len(),
+            "sidebar rows"
+        );
+    }
+}
+
+/// The sidebar of `window`, if it is a browser window that has one.
+fn sidebar_of(controller: Option<&BrowserController>) -> Option<Retained<sidebar_macos::Sidebar>> {
+    controller.and_then(|c| c.ivars().ui.borrow().as_ref().map(|ui| ui.sidebar.clone()))
+}
+
+/// Refresh `window`'s tab group as `sidebar_model::plan_group` plans it:
+/// the window in front's sidebar takes the rows another of the group's
+/// holds, if it holds none, and shows the group's tabs, changed in place;
+/// every other window's sidebar holds nothing. The rows made and let go,
+/// and whether rows were handed over.
+fn refresh_group(window: &NSWindow) -> (usize, usize, bool) {
     let windows = tabs_macos::tabs_of(window);
-    let front = window.tabGroup().and_then(|group| group.selectedWindow());
+    let front = window
+        .tabGroup()
+        .and_then(|group| group.selectedWindow())
+        .filter(|f| windows.iter().any(|w| std::ptr::eq(&**w, &**f)))
+        .unwrap_or_else(|| window.retain());
+    let controllers: Vec<Option<Retained<BrowserController>>> =
+        windows.iter().map(|w| controller_of(w)).collect();
+    // The window in front is closing, and AppKit has not yet put another
+    // of the group's browser windows in front: put off, rather than empty
+    // every sidebar in the group.
+    let closing = controller_of(&front).is_none() && controllers.iter().any(Option::is_some);
+    if closing && PUT_OFF.with(Cell::get) < MOST_PUT_OFF {
+        PUT_OFF.with(|n| n.set(n.get() + 1));
+        refresh_sidebars_soon(window);
+        return (0, 0, false);
+    }
+    PUT_OFF.with(|n| n.set(0));
+    let sidebars: Vec<Option<Retained<sidebar_macos::Sidebar>>> = controllers
+        .iter()
+        .map(|c| sidebar_of(c.as_deref()))
+        .collect();
+    let keys: Vec<usize> = windows.iter().map(|w| key_of(&**w)).collect();
+    let holding: Vec<bool> = sidebars
+        .iter()
+        .map(|s| s.as_ref().is_some_and(|s| s.is_showing()))
+        .collect();
+    let plan = sidebar_model::plan_group(&keys, Some(key_of(&*front)), |k| {
+        keys.iter()
+            .position(|key| *key == k)
+            .is_some_and(|i| holding[i])
+    });
+    let at = |k: usize| keys.iter().position(|key| *key == k);
+    let mut handed = false;
+    if let (Some(to), Some(from)) = (
+        plan.front.and_then(at).and_then(|i| sidebars[i].as_ref()),
+        plan.from.and_then(at).and_then(|i| sidebars[i].as_ref()),
+    ) {
+        to.adopt(from);
+        handed = true;
+    }
+
+    let (mut made, mut dropped) = (0, 0);
+    let mut shown: Option<(Vec<TabInfo>, Vec<FavoriteInfo>, crate::spaces::Layout)> = None;
+    for (i, w) in windows.iter().enumerate() {
+        let Some(sidebar) = &sidebars[i] else {
+            continue;
+        };
+        if !plan.shows(keys[i]) {
+            dropped += sidebar.empty();
+            continue;
+        }
+        let (tabs, favorites, layout) =
+            shown.get_or_insert_with(|| tabs_now(&windows, &controllers, &front));
+        let by_key: HashMap<usize, &TabInfo> =
+            tabs.iter().map(|t| (key_of(&*t.window), t)).collect();
+        let listed: Vec<sidebar_model::Tab<usize>> = tabs
+            .iter()
+            .map(|t| sidebar_model::Tab {
+                key: key_of(&*t.window),
+                pinned: t.pinned,
+                space: t.space,
+                folder: t.folder,
+            })
+            .collect();
+        let items = sidebar_model::items(&listed, layout);
+        let (m, d) = sidebar.show(&items, &by_key, favorites, layout);
+        made += m;
+        dropped += d;
+        // The backdrop takes the current space's colours.
+        if let Some(backdrop) = w
+            .contentView()
+            .and_then(|view| view.downcast::<crate::chrome_macos::Backdrop>().ok())
+        {
+            backdrop.follow_space();
+        }
+    }
+    (made, dropped, handed)
+}
+
+/// `window` is closing. If its sidebar holds its group's rows, they go to
+/// another of the group's windows, for whichever AppKit puts in front next
+/// to take (`refresh_group`), rather than be made again; nothing of them is
+/// left with the window.
+fn hand_on(window: &NSWindow, sidebar: &sidebar_macos::Sidebar) {
+    if sidebar.is_showing() {
+        let heir = tabs_macos::tabs_of(window)
+            .iter()
+            .filter(|w| !std::ptr::eq(&***w, window))
+            .find_map(|w| sidebar_of(controller_of(w).as_deref()));
+        if let Some(heir) = heir {
+            heir.adopt(sidebar);
+        }
+    }
+    sidebar.empty();
+}
+
+/// The group's tabs as they are now, `front` the one in front; the current
+/// space's favorites, each with the icon of an open tab of its site, if one
+/// has one; and the spaces.
+fn tabs_now(
+    windows: &[Retained<NSWindow>],
+    controllers: &[Option<Retained<BrowserController>>],
+    front: &NSWindow,
+) -> (Vec<TabInfo>, Vec<FavoriteInfo>, crate::spaces::Layout) {
     let tabs: Vec<TabInfo> = windows
         .iter()
-        .filter_map(|w| {
-            let controller = controller_of(w)?;
-            let active = match &front {
-                Some(front) => std::ptr::eq(&**front, &**w),
-                None => true,
-            };
+        .zip(controllers)
+        .filter_map(|(w, controller)| {
+            let controller = controller.as_ref()?;
             let icon = controller
                 .ivars()
                 .badge
@@ -870,13 +1087,12 @@ pub fn refresh_sidebars(window: &NSWindow) {
                 icon,
                 pinned: controller.ivars().pinned.get(),
                 loading: controller.ivars().loading.get(),
-                active,
+                active: std::ptr::eq(front, &**w),
                 space: controller.ivars().space.get(),
                 folder: controller.ivars().folder.get(),
             })
         })
         .collect();
-    // A favorite's icon: an open tab of its site has one, or it has none.
     let favorites: Vec<FavoriteInfo> =
         sidebar_macos::favorites_read(crate::spaces_macos::current())
             .into_iter()
@@ -891,17 +1107,7 @@ pub fn refresh_sidebars(window: &NSWindow) {
             })
             .collect();
     let layout = crate::spaces_macos::read(Clone::clone);
-    for w in &windows {
-        if let Some(controller) = controller_of(w) {
-            if let Some(ui) = &*controller.ivars().ui.borrow() {
-                ui.sidebar.reload(&tabs, &favorites, &layout);
-            }
-        }
-        // The backdrop takes the current space's colour.
-        if let Some(content) = w.contentView() {
-            content.setNeedsDisplay(true);
-        }
-    }
+    (tabs, favorites, layout)
 }
 
 /// Where `window`'s page is, on screen, if it is a browser's.
@@ -918,22 +1124,6 @@ pub fn set_shaded(window: &NSWindow, shaded: bool) {
             ui.set_shaded(shaded);
         }
     }
-}
-
-/// `refresh_sidebars`, on the next turn of the run loop: for when a window
-/// is leaving its group and is still counted in it.
-pub fn refresh_sidebars_soon(window: &NSWindow) {
-    let weak = Weak::from_retained(&window.retain());
-    let tick = block2::RcBlock::new(
-        move |_timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
-            if let Some(window) = weak.load() {
-                refresh_sidebars(&window);
-            }
-        },
-    );
-    unsafe {
-        objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.0, false, &tick)
-    };
 }
 
 /// Whether `window`'s tab is pinned.
