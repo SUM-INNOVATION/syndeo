@@ -63,9 +63,12 @@
 //                                Sidebar (hide), back, forward, reload, address, its
 //                                route and Copy Link (copy), each favorite, folder
 //                                and tab row (row), New Tab (new-tab), downloads and
-//                                each space; AppKit's tab bar (tab-bar) and its tabs
-//                                (appkit-tab) if Accessibility has them; and an
-//                                agent's banner (indicator) and its stop; exits 1 if
+//                                each space; AppKit's tab bar (tab-bar, its tabs
+//                                appkit-tab) if it shows, tab-bar-hidden if
+//                                Accessibility keeps it but it does not; and an
+//                                agent's banner (indicator) and its stop, with a
+//                                "covered <part> by ..." line for either that a
+//                                click in its middle would not find; exits 1 if
 //                                there is no front window, or it does not say <text>
 //   appctl tabs <pid>            the front window's tabs, as its sidebar's rows have
 //                                them, in order, one title a line, the one in front
@@ -462,11 +465,19 @@ func layout(_ pid: Int32, _ window: AXUIElement) {
         "syndeo.agent-indicator": "indicator", "syndeo.agent-stop": "stop",
     ]
     line("window", window)
-    line("lights", asElement(attribute(window, kAXCloseButtonAttribute)))
+    for light in [kAXCloseButtonAttribute, kAXMinimizeButtonAttribute, kAXZoomButtonAttribute] {
+        line("lights", asElement(attribute(window, light)))
+    }
     for element in all(window, depth: 24, { _ in true }) {
         let id = identifier(element)
         if let part = named[id] {
             line(part, element)
+            // An agent's banner and its Stop: anything a click on them would
+            // find instead is over them.
+            if ["indicator", "stop"].contains(part), let box = frame(of: element),
+               let found = hit(pid, CGPoint(x: box.midX, y: box.midY)), !within(found, element) {
+                print("covered \(part) by \(role(found)) \(identifier(found)) \(described(found))")
+            }
         } else if id == "syndeo.sidebar-tab" {
             let icon = children(element).first { role($0) == "AXImage" }
             let isNewTab = icon.map(iconKind) == "new-tab"
