@@ -12,6 +12,7 @@
 #   ci/test-app.sh tabs <Syndeo.app>
 #   ci/test-app.sh downloads <Syndeo.app>
 #   ci/test-app.sh agent-downloads <Syndeo.app>
+#   ci/test-app.sh sidebar <Syndeo.app>
 #   ci/test-app.sh measure
 #
 # launch, which gates: open the app with `open`, never by running its
@@ -289,6 +290,37 @@
 # measures memory: the same page in one tab and in five, each tab past the
 # first opened from the command bar, sampled over the same interval; kept in
 # tabs-memory.txt. It removes the setting it made and the session.
+#
+# sidebar, which gates the sidebar's rows being made only in the window in
+# front of its tab group, and measures the app's memory with many tabs. On
+# pages this Mac serves (sidebar-1.html to sidebar-50.html, each titled
+# "Sidebar page I"), each asked for by another application, as `open -a`
+# asks, so that each opens in a tab of its own, in front, after the last;
+# after 10, 30 and 50 of them, every tab is visited in turn by pressing its
+# row in the sidebar of the window in front, as a person clicks it, and has
+# to come to the front. Then, with 30, it requires that:
+#   - the window in front lists every tab, in order, by its title, then New
+#     Tab, each by syndeo.sidebar-tab;
+#   - Accessibility finds no row in any other window it has: it has one
+#     window for each tab group, the tab in front's, so this cannot see the
+#     other tabs' windows, and the next checks are the ones that can;
+#   - the app holds one row for each tab between all its windows' sidebars,
+#     not one in each window (N, not N²), which it logs ("sidebar rows
+#     held=…") each time rows are made, let go or handed to the tab
+#     brought to the front; and the rows that exist, New Tab's included,
+#     are under twice that, a bound that tells N from N² and no measured
+#     limit;
+#   - each tab's row was made once, all told: none made again when a tab
+#     comes to the front;
+#   - the app's physical footprint (below) grew under
+#     $SIDEBAR_GROWTH MB from one tab to 30, each visited: what a bitmap of
+#     the window's size behind each tab's page, kept while it is behind
+#     another, would pass (see SIDEBAR_GROWTH for what was measured).
+# It measures, without gating, the app's physical footprint
+# (proc_pid_rusage's phys_footprint, what Activity Monitor calls Memory)
+# after 10, 30 and 50 tabs, each visited, with `footprint`'s categories for
+# each kept in sidebar-footprint-*.txt, and how long opening and visiting
+# took; all of it kept in sidebar.txt.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -1611,6 +1643,8 @@ mutant() {
     zoned-links-followed) intended='^a link to an IPv6 address with a zone' ;;
     reload-from-cache) intended="^the reload consulted the origin through Syndeo's proxy" ;;
     tabs-kept-after-clear) intended='^Clear Browsing Data forgets' ;;
+    sidebar-rows-in-every-window) intended='^sidebar (rows|memory):' ;;
+    backdrop-draws-bitmap) intended='^sidebar memory:' ;;
     websocket-headers-stripped) intended='^a WebSocket through Syndeo' ;;
     agent-approval-skipped) intended='^(approval|grants):' ;;
     agent-grant-unenforced) intended='^grants:' ;;
@@ -1648,6 +1682,7 @@ mutant() {
       agent-*) agents_mutant "$name" "$app" ;;
       direct-for-every-host | never-retry-direct) preloaded "$log" ;;
       download-*) downloads_checks "$log" ;;
+      sidebar-* | backdrop-*) sidebar_rounds "$app" "$log" "$SIDEBAR_GATE" ;;
       *) policy "$log" ;;
     esac
   fi
@@ -4118,6 +4153,165 @@ agent_downloads() {
   security dump-trust-settings >"$LOGS/trust-after-agent-downloads.txt" 2>&1 || true
   must "$(cmp -s "$LOGS/trust-before-agent-downloads.txt" "$LOGS/trust-after-agent-downloads.txt" && echo yes)" "the user's trust settings are as they were" \
     "$(diff "$LOGS/trust-before-agent-downloads.txt" "$LOGS/trust-after-agent-downloads.txt" | head -5)"
+}
+
+# ------------------------------------------------------------ the sidebar
+
+# How many tabs sidebar gates with, and the most it opens: the start
+# page's tab, and a page in each of the others.
+SIDEBAR_GATE=30
+SIDEBAR_MOST=50
+# The most the app's physical footprint may grow, in MB, from one tab to
+# SIDEBAR_GATE, each visited. Measured on macos-15 runners, whose window was
+# 1024 by 681 points at 1x: the sidebar's rows fixed and the backdrop a
+# CAGradientLayer, 61.4 (run 42542418306) and 59.5 (42542420916); the same,
+# with the backdrop drawing itself as it did before, a bitmap of the window
+# kept for every tab visited, 139.0 (42545865986, 2.7 MB a tab); PR #70 as
+# reviewed, 1012 or more (42542415907). Midway, with 39 MB either side.
+SIDEBAR_GROWTH=100
+# The footprint with one tab, which the growth is measured from.
+SIDEBAR_ONE=''
+
+# sidebar_pages: a page for each tab but the start page's, sidebar-1.html
+# on, served by the loopback origin, each titled "Sidebar page I".
+sidebar_pages() {
+  local i
+  origin || return 1
+  for i in $(seq 1 "$((SIDEBAR_MOST - 1))"); do
+    printf '<!doctype html><meta charset="utf-8"><title>Sidebar page %s</title><h1>SYNDEO-SIDEBAR-%s</h1>\n' "$i" "$i" >"$LOGS/origin/sidebar-$i.html"
+  done
+}
+
+# footprint_mb PID: the process's physical footprint, in MB: what Activity
+# Monitor calls its Memory (proc_pid_rusage's ri_phys_footprint), which
+# needs no task port, so it can be read for a hardened process.
+footprint_mb() {
+  python3 -I -c '
+import ctypes, sys
+class Usage(ctypes.Structure):
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [(name, ctypes.c_uint64) for name in (
+        "user_time", "system_time", "pkg_idle_wkups", "interrupt_wkups", "pageins",
+        "wired_size", "resident_size", "phys_footprint")] + [("rest", ctypes.c_uint64 * 48)]
+usage = Usage()
+if ctypes.CDLL("/usr/lib/libproc.dylib").proc_pid_rusage(int(sys.argv[1]), 4, ctypes.byref(usage)) != 0:
+    sys.exit(1)
+print("%.1f" % (usage.phys_footprint / 1048576))' "$1"
+}
+
+# sidebar_field LOG FIELD: FIELD (held, alive, made, …) of the last
+# "sidebar rows" line the app logged.
+sidebar_field() { plain_log "$1" | grep 'sidebar rows' | tail -n 1 | grep -oE "(^| )$2=[0-9]+" | cut -d= -f2; }
+# sidebar_made LOG: the rows the app says it made, all told.
+sidebar_made() { plain_log "$1" | grep 'sidebar rows' | grep -oE ' made=[0-9]+' | cut -d= -f2 | awk '{ s += $1 } END { print s + 0 }'; }
+# sidebar_titles N: the titles the window in front should list, with N
+# pages open: the start page's tab, the pages', and New Tab, each then "|".
+sidebar_titles() {
+  local i
+  printf 'Welcome to Syndeo|'
+  for i in $(seq 1 "$1"); do printf 'Sidebar page %s|' "$i"; done
+  printf 'New Tab|'
+}
+
+# sidebar_round APP LOG FROM TO: pages FROM to TO, each asked for by another
+# application, so each opens in a tab in front, TO + 1 tabs with the start
+# page's; then every tab visited by its row; then the rows checked, if that
+# is the gate's number of tabs; then the footprint.
+sidebar_round() {
+  local app="$1" log="$2" from="$3" to="$4" i want listed all held alive made started now grown missed=0 out="$LOGS/sidebar.txt"
+  started=$SECONDS
+  for i in $(seq "$from" "$to"); do
+    open -a "$app" "http://127.0.0.1:$ORIGIN_PORT/sidebar-$i.html" || bad "sidebar tabs: page $i" "open -a failed"
+  done
+  opens "$log" "$((to + 1))" "sidebar tabs: pages $from to $to each open in a tab: $((to + 1)) tabs"
+  if wait_for 60 sh -c '"$1" ids "$2" syndeo.sidebar-tab | cut -f2 | grep -qx "Sidebar page $3"' _ "$APPCTL" "$PID" "$to"; then
+    ok "sidebar tabs: the last, Sidebar page $to, has its row"
+  else
+    bad "sidebar tabs: the last, Sidebar page $to, has its row" "rows: $("$APPCTL" ids "$PID" syndeo.sidebar-tab | cut -f2 | tail -n 3 | tr '\n' '|')"
+  fi
+  printf '  MEASURE  sidebar: pages %s to %s opened in %s s\n' "$from" "$to" "$((SECONDS - started))" | tee -a "$out"
+  started=$SECONDS
+  for i in $(seq 1 "$((to + 1))"); do
+    if [ "$i" = 1 ]; then want='Welcome to Syndeo'; else want="Sidebar page $((i - 1))"; fi
+    if ! "$APPCTL" press-nth "$PID" syndeo.sidebar-tab "$i" >/dev/null; then
+      missed=$((missed + 1))
+      printf '    row %s, %s, could not be pressed: %s rows\n' "$i" "$want" "$("$APPCTL" ids "$PID" syndeo.sidebar-tab | wc -l | tr -d ' ')"
+    elif ! wait_for 15 sh -c '[ "$("$1" titles "$2" | head -n 1)" = "$3" ]' _ "$APPCTL" "$PID" "$want"; then
+      missed=$((missed + 1))
+      printf '    row %s did not bring %s to the front: %s is\n' "$i" "$want" "$("$APPCTL" titles "$PID" | head -n 1)"
+    fi
+  done
+  must "$([ "$missed" = 0 ] && echo yes)" "sidebar tabs: each of the $((to + 1)) tabs comes to the front by its row, in turn" "$missed did not"
+  printf '  MEASURE  sidebar: %s tabs visited in %s s\n' "$((to + 1))" "$((SECONDS - started))" | tee -a "$out"
+
+  if [ "$((to + 1))" = "$SIDEBAR_GATE" ]; then
+    want="$(sidebar_titles "$to")"
+    listed="$("$APPCTL" ids "$PID" syndeo.sidebar-tab | cut -f2 | tr '\n' '|')"
+    must "$([ "$listed" = "$want" ] && echo yes)" "sidebar tabs: the window in front lists the $((to + 1)) tabs in order, then New Tab" "it lists: $listed"
+    "$APPCTL" count-ids "$PID" syndeo.sidebar-tab >"$LOGS/sidebar-ax-windows.txt" 2>&1
+    all="$(awk -F'\t' '$1 == "total" { print $2 }' "$LOGS/sidebar-ax-windows.txt")"
+    must "$([ "$all" = "$((to + 2))" ] && echo yes)" "sidebar tabs: Accessibility finds those $((to + 2)) rows and no other, in every window it has" \
+      "$(tr '\t\n' ' ;' <"$LOGS/sidebar-ax-windows.txt")"
+    held="$(sidebar_field "$log" held)"
+    alive="$(sidebar_field "$log" alive)"
+    made="$(sidebar_made "$log")"
+    printf '  MEASURE  sidebar: %s tabs: rows held %s, existing %s, made %s all told\n' "$((to + 1))" "${held:-?}" "${alive:-?}" "$made" | tee -a "$out"
+    must "$([ "$held" = "$((to + 1))" ] && echo yes)" "sidebar rows: the app holds $((to + 1)) tabs' rows, one a tab, in the window in front alone, not one in each window" \
+      "it holds ${held:-none}; last: $(plain_log "$log" | grep 'sidebar rows' | tail -n 1)"
+    must "$([ -n "$alive" ] && [ "$alive" -lt "$((2 * (to + 1)))" ] && echo yes)" "sidebar rows: under $((2 * (to + 1))) rows exist, New Tab's included: N, not N²" "${alive:-none} exist"
+    must "$([ "$made" = "$((to + 1))" ] && echo yes)" "sidebar rows: each tab's row was made once, none again when a tab came to the front" "$made made"
+  fi
+
+  sleep 5
+  for i in 1 2 3; do
+    now="$(footprint_mb "$PID")"
+    printf '  MEASURE  sidebar memory: %s tabs, each visited: footprint %s MB (sample %s)\n' "$((to + 1))" "$now" "$i" | tee -a "$out"
+    [ "$i" = 3 ] || sleep 2
+  done
+  footprint -p "$PID" >"$LOGS/sidebar-footprint-$((to + 1)).txt" 2>&1 || true
+  if [ "$((to + 1))" = "$SIDEBAR_GATE" ]; then
+    grown="$(awk -v a="$SIDEBAR_ONE" -v b="$now" 'BEGIN { if (a == "" || b == "") exit 1; printf "%.1f", b - a }')"
+    must "$([ -n "$grown" ] && awk -v g="$grown" -v c="$SIDEBAR_GROWTH" 'BEGIN { exit !(g < c) }' && echo yes)" \
+      "sidebar memory: from one tab to $SIDEBAR_GATE, each visited, the app's footprint grew under $SIDEBAR_GROWTH MB: no bitmap of the window kept behind each tab" \
+      "it grew ${grown:-an unknown amount}, from ${SIDEBAR_ONE:-?} MB to ${now:-?} MB"
+  fi
+}
+
+# sidebar_rounds APP LOG LAST: from the start page alone, rounds to 10 tabs,
+# then to the gate's, then to LAST tabs.
+sidebar_rounds() {
+  local app="$1" log="$2" last="$3" out="$LOGS/sidebar.txt"
+  sidebar_pages || return 1
+  arrive "" 'Welcome to Syndeo' "sidebar tabs: the window shows the start page"
+  sleep 3
+  SIDEBAR_ONE="$(footprint_mb "$PID")"
+  printf '  MEASURE  sidebar memory: 1 tab: footprint %s MB\n' "$SIDEBAR_ONE" | tee -a "$out"
+  footprint -p "$PID" >"$LOGS/sidebar-footprint-1.txt" 2>&1 || true
+  sidebar_round "$app" "$log" 1 9
+  sidebar_round "$app" "$log" 10 "$((SIDEBAR_GATE - 1))"
+  [ "$last" -gt "$SIDEBAR_GATE" ] && sidebar_round "$app" "$log" "$SIDEBAR_GATE" "$((last - 1))"
+  return 0
+}
+
+# sidebar APP: see the top of this script.
+sidebar_test() {
+  local app log session="$HOME/Library/Application Support/Syndeo/session.txt"
+  [ -d "${1:-}" ] || { say "usage: $0 sidebar <Syndeo.app>"; exit 2; }
+  app="$(cd "$1" && pwd -P)"
+  no_app || { say "refusing: $ID is already running"; exit 2; }
+  printf '\nSyndeo.app, its sidebar and its memory with many tabs: %s\n' "$app"
+  : >"$LOGS/sidebar.txt"
+  # From no session, so that the start page's is the only tab.
+  rm -f "$session"
+  defaults delete "$ID" NSQuitAlwaysKeepsWindows >/dev/null 2>&1 || true
+  if started "$app" sidebar; then
+    helper_of "$app" sidebar
+    browses sidebar
+    log="$LOGS/app-sidebar.stderr"
+    sidebar_rounds "$app" "$log" "$SIDEBAR_MOST"
+  fi
+  stopped sidebar
+  origin_stop
+  rm -f "$session"
   printf '\n%d failed\n' "$fails"
   [ "$fails" = 0 ]
 }
@@ -4170,9 +4364,10 @@ case "${1:-}" in
   agents) shift; agents "$@" ;;
   looks) shift; looks "$@" ;;
   tabs) shift; tabs_test "$@" ;;
+  sidebar) shift; sidebar_test "$@" ;;
   preloaded) shift; preloaded_only "$@" ;;
   downloads) shift; downloads "$@" ;;
   agent-downloads) shift; agent_downloads "$@" ;;
   measure) measure ;;
-  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | looks <Syndeo.app> | agents <Syndeo.app> | tabs <Syndeo.app> | preloaded <Syndeo.app> | downloads <Syndeo.app> | agent-downloads <Syndeo.app> | measure"; exit 2 ;;
+  *) say "usage: $0 launch <Syndeo.app> | refuse <Syndeo.app> | mutant <name> <Syndeo.app> | routes <Syndeo.app> | customer <Syndeo.app> [again] | realtime <Syndeo.app> | looks <Syndeo.app> | agents <Syndeo.app> | tabs <Syndeo.app> | preloaded <Syndeo.app> | downloads <Syndeo.app> | agent-downloads <Syndeo.app> | measure | sidebar <Syndeo.app>"; exit 2 ;;
 esac

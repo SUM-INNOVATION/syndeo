@@ -312,7 +312,14 @@ pub struct BarIvars {
     dots: Retained<NSStackView>,
     /// Downloads, at the left: tinted while anything downloads.
     downloads: Retained<NSButton>,
+    /// What the dots and the downloads button were last made for: each
+    /// space's id, colour, name and emoji, the current space, and whether
+    /// anything was downloading.
+    shown: RefCell<Option<Shown>>,
 }
+
+/// See [`BarIvars::shown`].
+type Shown = (Vec<(u64, usize, String, String)>, u64, bool);
 
 define_class!(
     /// The switcher: the spaces' dots, then New Space and New Folder.
@@ -338,6 +345,7 @@ impl SpaceBar {
         let this = Self::alloc(mtm).set_ivars(BarIvars {
             dots: dots.clone(),
             downloads: downloads.clone(),
+            shown: RefCell::new(None),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -381,10 +389,24 @@ impl SpaceBar {
     }
 
     /// Show `layout`'s spaces, the current one ringed; and whether anything
-    /// is downloading, in the downloads button's tint.
+    /// is downloading, in the downloads button's tint. Made again only when
+    /// one of those changed.
     pub fn reload(&self, layout: &Layout) {
         let mtm = self.mtm();
         let busy = crate::downloads_macos::receiving() > 0;
+        let shown: Shown = (
+            layout
+                .spaces
+                .iter()
+                .map(|s| (s.id, s.hue, s.name.clone(), s.icon.clone()))
+                .collect(),
+            layout.current,
+            busy,
+        );
+        if self.ivars().shown.borrow().as_ref() == Some(&shown) {
+            return;
+        }
+        *self.ivars().shown.borrow_mut() = Some(shown);
         let downloads = &self.ivars().downloads;
         let (symbol, tint) = if busy {
             ("arrow.down.circle.fill", NSColor::controlAccentColor())
@@ -407,6 +429,17 @@ impl SpaceBar {
             let dot = SpaceDot::new(mtm, space, space.id == layout.current);
             dots.addArrangedSubview(&dot);
         }
+    }
+
+    /// No dots: the window is behind another tab, and its sidebar is not
+    /// seen. They are made again when it is in front.
+    pub fn clear(&self) {
+        let dots = &self.ivars().dots;
+        for view in dots.arrangedSubviews().iter() {
+            dots.removeArrangedSubview(&view);
+            view.removeFromSuperview();
+        }
+        self.ivars().shown.borrow_mut().take();
     }
 }
 

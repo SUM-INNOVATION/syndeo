@@ -329,7 +329,8 @@ jobs:
     # menu item would, and opened again; four mutants, each of which the
     # test has to catch (the other sixteen are macos-agents'); a copy whose proxy cannot start, which has to refuse
     # to browse; and the route bar against what WebKit does, the proxy's
-    # cache keeping nothing from this Mac, and Clear Browsing Data. Unsigned
+    # cache keeping nothing from this Mac, and Clear Browsing Data; and the
+    # sidebar's rows, made only in the window in front, one a tab. Unsigned
     # with a Developer ID, and with no secrets: a pull request never signs.
     # (Tabs, and its look in light and dark, run in macos-agents.) Then,
     # reported and not gated, how long
@@ -493,6 +494,20 @@ jobs:
           bash ci/test-pageload.sh "$PWD/dist/Syndeo.app/Contents/Helpers/syndeo-proxy" 5
           https://www.rust-lang.org/ measure-only:https://github.com/
 
+      # The sidebar, with 30 tabs, each opened as another application asks
+      # and each brought to the front by its row: the window in front lists
+      # them all, and the app holds one row for each tab, made once, between
+      # all its windows, not one in each window (N, not N²), which only the
+      # app can count, since Accessibility sees only the window in front of
+      # each tab group (ci/test-app.sh sidebar); and the app's physical
+      # footprint grew less, from one tab to 30, than a bitmap of the window
+      # kept behind each tab would make it, by a ceiling measured with
+      # margin. The footprint with 10, 30 and 50 tabs, each visited, and how
+      # long opening and visiting took, measured, kept in sidebar.txt.
+      - name: The sidebar's rows, one a tab in the window in front, and the app's memory with 10, 30 and 50 tabs
+        if: always()
+        run: bash ci/test-app.sh sidebar "$PWD/dist/Syndeo.app"
+
       - name: What this runner allows (measured, not a gate)
         if: always()
         run: bash ci/test-app.sh measure
@@ -561,9 +576,9 @@ jobs:
     # proxy and pinned, saying who controls them; reading, acting, a
     # screenshot, JavaScript only with its own leave; Stop and Revoke All;
     # MCP; and root refused. ci/test-app.sh agents says each check. Then an
-    # agent's tab downloading nothing; sixteen of the mutants (the agents'
-    # seven, eight of the application's and the downloads' one); and tabs
-    # and its look, light and dark.
+    # agent's tab downloading nothing; eighteen of the mutants (the agents'
+    # seven, eight of the application's, the downloads' one and the
+    # sidebar's two); and tabs and its look, light and dark.
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -613,10 +628,13 @@ jobs:
       # policy, the schemes another application may ask Syndeo to open, the
       # bar's rule for names, the refusal of a link to an IPv6 address with
       # a zone, a WebSocket carried rather than stripped of its Upgrade, and
-      # the hosts sent directly; an agent's tab refusing downloads; and a
+      # the hosts sent directly; an agent's tab refusing downloads; a
       # download's TLS challenges answered as its window's are, whose checks
-      # macos-app's downloads step runs too. Built, run and judged as
-      # macos-app's are.
+      # macos-app's downloads step runs too; and the sidebar's rows made in
+      # every window of a tab group, not the one in front alone, and the
+      # window's backdrop drawn as a bitmap of its size. These run here
+      # because this step runs whatever the steps before it did. Built, run
+      # and judged as macos-app's are.
       - name: Build each of its mutants, and require the test to catch it
         if: always()
         shell: bash
