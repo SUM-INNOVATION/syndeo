@@ -1273,7 +1273,7 @@ browsing() {
   else
     bad "File > New Tab opens the command bar" "no command bar shows: $("$APPCTL" titles "$PID" | tr '\n' '|')"
   fi
-  must "$("$APPCTL" bar "$PID" >"$LOGS/browse-bar.txt" 2>&1 && [ ! -s "$LOGS/browse-bar.txt" ] && "$APPCTL" bar-focused "$PID" >/dev/null 2>&1 && echo yes)" \
+  must "$("$APPCTL" bar "$PID" >"$LOGS/browse-bar.txt" 2>&1 && [ -z "$(cat "$LOGS/browse-bar.txt")" ] && "$APPCTL" bar-focused "$PID" >/dev/null 2>&1 && echo yes)" \
     "its field is empty, and has the keys" "it says '$(cat "$LOGS/browse-bar.txt")'; $("$APPCTL" bar-focused "$PID" 2>&1)"
   must "$([ "$(grep -c 'a window opened' "$log")" = "$opened" ] && echo yes)" "and it opens no tab by itself" "$(grep 'a window' "$log" | tail -n 2 | tr '\n' ' ')"
   "$APPCTL" bar-key "$PID" escape >/dev/null || bad "Escape in the command bar" "no command bar to press it in"
