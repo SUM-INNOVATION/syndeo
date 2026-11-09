@@ -39,15 +39,16 @@
 #     work, by the sidebar's button and by History > Forward; a file: address
 #     is refused with Syndeo's own page; File > New Tab opens the command bar
 #     over the page, its field empty and with the keys, and no tab; Escape
-#     puts it away, opening nothing; an address typed there and Return opens
-#     in a new tab beside the first, in one window, its row in the sidebar
-#     after the first's and in front, AppKit's tab bar still hidden; pressing
-#     the first tab's row shows that tab; in the command bar, what is typed
-#     suggests the open tab whose title has it, and choosing it brings that
-#     tab to the front, opening none; and File's one enabled ⌘W item,
-#     whatever AppKit titles it (Close, or Close Tab once it has seen the
-#     tabs), closes that tab and no other, letting its window go and leaving
-#     the first as it was;
+#     puts it away, opening nothing; Return there with nothing typed opens a
+#     tab with the start page, beside the first in one window, its row in
+#     the sidebar after the first's and in front, AppKit's tab bar still
+#     hidden; and File's one enabled ⌘W item, whatever AppKit titles it
+#     (Close, or Close Tab once it has seen the tabs), closes that tab and no
+#     other, letting its window go and leaving the first as it was; an
+#     address typed in the command bar and Return opens in a new tab;
+#     pressing the first tab's row shows that tab; what is typed in the
+#     command bar suggests the open tab whose title has it, and choosing it
+#     brings that tab to the front, opening none;
 #   - search: Syndeo > Settings… offers DuckDuckGo, Startpage, Brave Search,
 #     Google, Bing and Off, with DuckDuckGo chosen before anyone chooses, and
 #     keeps what is chosen; with Off, a word is refused with Syndeo's own page
@@ -1273,13 +1274,17 @@ browsing() {
   sleep 1
   must "$([ "$(grep -c 'a window opened' "$log")" = "$opened" ] && at "file:///etc/passwd" 'not file: ones' && echo yes)" \
     "and opens nothing, leaving the page as it was" "address field: '$(address)'; $(grep 'a window' "$log" | tail -n 2 | tr '\n' ' ')"
-  tab_page="http://example.com/?$FRESH-tab"
-  bar_open "$tab_page" "an address typed in the command bar opens, on Return, in a new tab"
-  must "$(grep -q 'a window opened open=2' "$log" && echo yes)" "a second tab" "the app does not report two windows: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"
-  arrive "$tab_page" "$EXAMPLE_BODY" "the new tab shows that page"
+
+  # Return there with nothing typed: a tab with the start page, as New Tab
+  # opened before there was a command bar.
+  choose File "New Tab"
+  wait_for 10 "$APPCTL" bar "$PID" || bad "File > New Tab, again" "no command bar shows"
+  "$APPCTL" bar-key "$PID" return >/dev/null || bad "Return in the command bar" "no command bar to press it in"
+  if wait_for 15 grep -q 'a window opened open=2' "$log"; then ok "File > New Tab, and Return in its empty command bar, opens a second tab"; else bad "New Tab" "the app does not report two windows: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
+  arrive "" 'Welcome to Syndeo' "the new tab shows the start page, with an empty address field"
   on_screen="$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')"
   must "$([ "$on_screen" = 1 ] && echo yes)" "the two are tabs of one window: one window on screen" "$on_screen on screen"
-  if wait_for 10 sh -c '"$1" tabs "$2" | tr "\n" "|" | grep -qE "^  [^|]+[|][*] Example Domain[|]\$"' _ "$APPCTL" "$PID"; then
+  if wait_for 10 sh -c '"$1" tabs "$2" | tr "\n" "|" | grep -qE "^  [^|]+[|][*] [^|]+[|]\$"' _ "$APPCTL" "$PID"; then
     ok "the sidebar has both tabs' rows, the new one after the first, in front"
   else
     bad "the sidebar has both tabs' rows, the new one after the first, in front" "tabs: $(tab_list)"
@@ -1288,7 +1293,21 @@ browsing() {
   "$APPCTL" titles "$PID" >"$LOGS/browse-tabs.txt" 2>&1
   "$APPCTL" front-tree "$PID" >"$LOGS/browse-two-tabs-tree.txt" 2>&1
   "$APPCTL" frames "$PID" >"$LOGS/browse-two-tabs-frames.txt" 2>&1
+  "$APPCTL" rows "$PID" >"$LOGS/browse-two-tabs-rows.txt" 2>&1
   "$APPCTL" menu-items "$PID" File >"$LOGS/browse-two-tabs-file-menu.txt" 2>&1
+  close_tab "with two tabs"
+  if wait_for 15 grep -q 'a window closed open=1' "$log"; then ok "it closes the tab in front, one window and no other, and the app lets it go"; else bad "Close" "the app does not report one window: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
+  arrive "file:///etc/passwd" 'not file: ones' "the first tab is in front again, as it was left"
+
+  # An address typed there: a new tab with that page.
+  tab_page="http://example.com/?$FRESH-tab"
+  bar_open "$tab_page" "an address typed in the command bar opens, on Return, in a new tab"
+  arrive "$tab_page" "$EXAMPLE_BODY" "the new tab shows that page"
+  if wait_for 10 sh -c '"$1" tabs "$2" | tr "\n" "|" | grep -qE "^  [^|]+[|][*] Example Domain[|]\$"' _ "$APPCTL" "$PID"; then
+    ok "its row is after the first tab's, in front, with its page's title"
+  else
+    bad "its row is after the first tab's, in front, with its page's title" "tabs: $(tab_list)"
+  fi
   # A tab by its row, and the command bar's suggestion of an open tab.
   "$APPCTL" tab-press "$PID" 1 || bad "pressing the first tab's row" "there is no such row: $(tab_list)"
   arrive "file:///etc/passwd" 'not file: ones' "pressing the first tab's row in the sidebar shows that tab"
@@ -1306,9 +1325,9 @@ browsing() {
   arrive "$tab_page" "$EXAMPLE_BODY" "choosing it brings that tab to the front"
   must "$([ "$(grep -c 'a window opened' "$log")" = "$opened" ] && ! "$APPCTL" bar "$PID" >/dev/null 2>&1 && echo yes)" \
     "and opens no tab, the command bar put away" "$(grep 'a window' "$log" | tail -n 2 | tr '\n' ' '); the bar: $("$APPCTL" bar "$PID" 2>&1)"
-  close_tab "with two tabs"
-  if wait_for 15 grep -q 'a window closed open=1' "$log"; then ok "it closes the tab in front, one window and no other, and the app lets it go"; else bad "Close" "the app does not report one window: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
-  arrive "file:///etc/passwd" 'not file: ones' "the first tab is in front again, as it was left"
+  close_tab "the tab the command bar opened"
+  opens "$log" 1 "it closes that tab, and the app lets it go"
+  arrive "file:///etc/passwd" 'not file: ones' "the first tab is in front again, as it was left, once more"
   must "$([ "$("$APPCTL" tabs "$PID" | grep -c .)" = 1 ] && echo yes)" "its row the one tab in the sidebar" "tabs: $(tab_list)"
   on_screen="$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')"
   must "$([ "$on_screen" = 1 ] && echo yes)" "and its window is still the one on screen" "$on_screen on screen"

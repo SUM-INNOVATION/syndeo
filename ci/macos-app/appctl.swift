@@ -325,10 +325,18 @@ struct Row {
     var isNewTab: Bool { icon == "new-tab" }
 }
 
-/// What a row's icon shows, by what Accessibility calls it: the symbols the
-/// sidebar draws say what they are; a page's own icon is called none of them.
-func iconKind(_ description: String) -> String {
-    switch description {
+/// What a row's icon shows: by the identifier the sidebar gives it, as the
+/// tab bar's badge had them, syndeo.tab-loading while its page loads and
+/// syndeo.tab-icon for the page's own icon; otherwise by what Accessibility
+/// calls it, as the symbols the sidebar draws say what they are, and a
+/// page's own icon is called none of them.
+func iconKind(_ icon: AXUIElement) -> String {
+    switch identifier(icon) {
+    case "syndeo.tab-loading": return "loading"
+    case "syndeo.tab-icon": return "own"
+    default: break
+    }
+    switch described(icon) {
     case "Loading": return "loading"
     case "Page": return "globe"
     case "New Tab": return "new-tab"
@@ -369,9 +377,9 @@ func sidebarRows(_ pid: Int32) -> [Row] {
             element: element,
             title: title,
             active: (attribute(element, kAXSelectedAttribute) as? Bool) == true,
-            pinned: images.dropFirst().contains { described($0) == "Pinned" },
+            pinned: images.dropFirst().contains { identifier($0) == "syndeo.tab-pinned" || described($0) == "Pinned" },
             folder: folder,
-            icon: icon.map { iconKind(described($0)) } ?? "none"))
+            icon: icon.map(iconKind) ?? "none"))
     }
     return rows
 }
@@ -461,7 +469,7 @@ func layout(_ window: AXUIElement) {
             line(part, element)
         } else if id == "syndeo.sidebar-tab" {
             let icon = children(element).first { role($0) == "AXImage" }
-            let isNewTab = icon.map { iconKind(described($0)) } == "new-tab"
+            let isNewTab = icon.map(iconKind) == "new-tab"
             line(isNewTab ? "new-tab" : "row", element, described(element))
         } else if role(element) == "AXWebArea" {
             line("page", element)
