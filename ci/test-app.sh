@@ -286,7 +286,11 @@
 #     are under twice that, a bound that tells N from N² and no measured
 #     limit;
 #   - each tab's row was made once, all told: none made again when a tab
-#     comes to the front.
+#     comes to the front;
+#   - the app's physical footprint (below) grew under
+#     $SIDEBAR_GROWTH MB from one tab to 30, each visited: what a bitmap of
+#     the window's size behind each tab's page, kept while it is behind
+#     another, would pass (see SIDEBAR_GROWTH for what was measured).
 # It measures, without gating, the app's physical footprint
 # (proc_pid_rusage's phys_footprint, what Activity Monitor calls Memory)
 # after 10, 30 and 50 tabs, each visited, with `footprint`'s categories for
@@ -1379,6 +1383,7 @@ mutant() {
     reload-from-cache) intended="^the reload consulted the origin through Syndeo's proxy" ;;
     tabs-kept-after-clear) intended='^Clear Browsing Data forgets' ;;
     sidebar-rows-in-every-window) intended='^sidebar (rows|memory):' ;;
+    backdrop-draws-bitmap) intended='^sidebar memory:' ;;
     websocket-headers-stripped) intended='^a WebSocket through Syndeo' ;;
     agent-approval-skipped) intended='^(approval|grants):' ;;
     agent-grant-unenforced) intended='^grants:' ;;
@@ -1411,7 +1416,7 @@ mutant() {
       websocket-headers-stripped) realtime_origin && rt_through_syndeo ;;
       agent-*) agents_mutant "$name" "$app" ;;
       direct-for-every-host | never-retry-direct) preloaded "$log" ;;
-      sidebar-*) sidebar_rounds "$app" "$log" "$SIDEBAR_GATE" ;;
+      sidebar-* | backdrop-*) sidebar_rounds "$app" "$log" "$SIDEBAR_GATE" ;;
       *) policy "$log" ;;
     esac
   fi
@@ -3417,6 +3422,16 @@ tabs_test() {
 # page's tab, and a page in each of the others.
 SIDEBAR_GATE=30
 SIDEBAR_MOST=50
+# The most the app's physical footprint may grow, in MB, from one tab to
+# SIDEBAR_GATE, each visited. Measured on macos-15 runners, whose window was
+# 1024 by 681 points at 1x: the sidebar's rows fixed and the backdrop a
+# CAGradientLayer, 61.4 (run 42542418306) and 59.5 (42542420916); the same,
+# with the backdrop drawing itself as it did before, a bitmap of the window
+# kept for every tab visited, 139.0 (42545865986, 2.7 MB a tab); PR #70 as
+# reviewed, 1012 or more (42542415907). Midway, with 39 MB either side.
+SIDEBAR_GROWTH=100
+# The footprint with one tab, which the growth is measured from.
+SIDEBAR_ONE=''
 
 # sidebar_pages: a page for each tab but the start page's, sidebar-1.html
 # on, served by the loopback origin, each titled "Sidebar page I".
@@ -3463,7 +3478,7 @@ sidebar_titles() {
 # page's; then every tab visited by its row; then the rows checked, if that
 # is the gate's number of tabs; then the footprint.
 sidebar_round() {
-  local app="$1" log="$2" from="$3" to="$4" i want listed all held alive made started missed=0 out="$LOGS/sidebar.txt"
+  local app="$1" log="$2" from="$3" to="$4" i want listed all held alive made started now grown missed=0 out="$LOGS/sidebar.txt"
   started=$SECONDS
   for i in $(seq "$from" "$to"); do
     open -a "$app" "http://127.0.0.1:$ORIGIN_PORT/sidebar-$i.html" || bad "sidebar tabs: page $i" "open -a failed"
@@ -3509,10 +3524,17 @@ sidebar_round() {
 
   sleep 5
   for i in 1 2 3; do
-    printf '  MEASURE  sidebar memory: %s tabs, each visited: footprint %s MB (sample %s)\n' "$((to + 1))" "$(footprint_mb "$PID")" "$i" | tee -a "$out"
+    now="$(footprint_mb "$PID")"
+    printf '  MEASURE  sidebar memory: %s tabs, each visited: footprint %s MB (sample %s)\n' "$((to + 1))" "$now" "$i" | tee -a "$out"
     [ "$i" = 3 ] || sleep 2
   done
   footprint -p "$PID" >"$LOGS/sidebar-footprint-$((to + 1)).txt" 2>&1 || true
+  if [ "$((to + 1))" = "$SIDEBAR_GATE" ]; then
+    grown="$(awk -v a="$SIDEBAR_ONE" -v b="$now" 'BEGIN { if (a == "" || b == "") exit 1; printf "%.1f", b - a }')"
+    must "$([ -n "$grown" ] && awk -v g="$grown" -v c="$SIDEBAR_GROWTH" 'BEGIN { exit !(g < c) }' && echo yes)" \
+      "sidebar memory: from one tab to $SIDEBAR_GATE, each visited, the app's footprint grew under $SIDEBAR_GROWTH MB: no bitmap of the window kept behind each tab" \
+      "it grew ${grown:-an unknown amount}, from ${SIDEBAR_ONE:-?} MB to ${now:-?} MB"
+  fi
 }
 
 # sidebar_rounds APP LOG LAST: from the start page alone, rounds to 10 tabs,
@@ -3522,7 +3544,8 @@ sidebar_rounds() {
   sidebar_pages || return 1
   arrive "" 'Welcome to Syndeo' "sidebar tabs: the window shows the start page"
   sleep 3
-  printf '  MEASURE  sidebar memory: 1 tab: footprint %s MB\n' "$(footprint_mb "$PID")" | tee -a "$out"
+  SIDEBAR_ONE="$(footprint_mb "$PID")"
+  printf '  MEASURE  sidebar memory: 1 tab: footprint %s MB\n' "$SIDEBAR_ONE" | tee -a "$out"
   footprint -p "$PID" >"$LOGS/sidebar-footprint-1.txt" 2>&1 || true
   sidebar_round "$app" "$log" 1 9
   sidebar_round "$app" "$log" 10 "$((SIDEBAR_GATE - 1))"
