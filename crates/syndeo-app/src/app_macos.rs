@@ -450,6 +450,20 @@ define_class!(
             }
         }
 
+        /// Return in an empty command bar: a new tab with the start page,
+        /// beside the window in front, as New Tab once opened straight away.
+        #[unsafe(method(syndeoOpenBlankTab:))]
+        fn open_blank_tab(&self, _sender: Option<&AnyObject>) {
+            match self.persons_front() {
+                Some(front) => {
+                    self.open_tab(&front, &front, Start::Page, Place::Front);
+                }
+                None => {
+                    self.open_window();
+                }
+            }
+        }
+
         /// A window's controller asking for the command bar over its window,
         /// the sender.
         #[unsafe(method(syndeoShowCommandBar:))]

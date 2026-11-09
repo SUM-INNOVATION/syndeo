@@ -8,7 +8,8 @@
 //! Under the field, as the person types, are suggestions: open tabs whose
 //! title or address matches, which Return brings to the front rather than
 //! opening again, and favorites, which it opens. Up and Down move among
-//! them; with none chosen, Return opens what was typed.
+//! them; with none chosen, Return opens what was typed, or, with nothing
+//! typed, a new tab with the start page.
 //!
 //! The glass is macOS's own, `NSGlassEffectView`, on a Mac that has it
 //! (macOS 26 and later); a translucent material stands in for it before
@@ -626,6 +627,18 @@ impl CommandBar {
             }
             None => {
                 if typed.trim().is_empty() {
+                    // Nothing typed: a new tab with the start page.
+                    if let Some(app) = app.as_deref() {
+                        let application =
+                            objc2_app_kit::NSApplication::sharedApplication(self.mtm());
+                        unsafe {
+                            application.sendAction_to_from(
+                                sel!(syndeoOpenBlankTab:),
+                                Some(app),
+                                None,
+                            )
+                        };
+                    }
                     return;
                 }
                 open_typed(self.mtm(), app.as_deref(), &field);
