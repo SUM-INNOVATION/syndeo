@@ -3675,11 +3675,16 @@ tabs_test() {
 #     origin's certificate as macOS does, and a trust setting on this runner
 #     waits for someone to allow it; see measure.);
 #   - its link marked for downloading, to a file of its own, saves that file
-#     in ~/Downloads byte for byte, on such a connection, and the app's log
-#     says the download's own TLS challenges were answered with Syndeo's
-#     authority, as its window's are, and none any other way;
+#     in ~/Downloads byte for byte, on such a connection: macOS does not
+#     trust Syndeo's authority on this runner, so the file arriving means
+#     Syndeo pinned that connection. No TLS challenge of the download's own
+#     is answered any other way. WebKit asks the window, not the download,
+#     about a link's connection (CI 42563110614), so which of the two
+#     answered is measured;
 #   - so does its link marked for downloading that redirects within its own
-#     origin;
+#     origin, and there the app's log says the download's own TLS challenges
+#     were answered with Syndeo's authority, as its window's are, at least
+#     once, and none any other way;
 #   - on an http page, a download redirected to an IPv6 address with a zone
 #     (lo0's own link-local address, where the origin answers) is refused:
 #     nothing is saved, and the origin does not hear of it; one redirected
@@ -3880,14 +3885,16 @@ dl_quarantine() {
   fi
 }
 
-# dl_file LOG TEXT PATH ORIGINAL WHAT: press the https page's link TEXT,
+# dl_file LOG TEXT PATH ORIGINAL WHAT OWN: press the https page's link TEXT,
 # which downloads PATH, whose bytes are ORIGINAL; require the file saved in
 # ~/Downloads byte for byte, the origin to have served PATH on a TLS
-# connection with a certificate not shown before, and the app's log to say
-# the download's own TLS challenges were answered with Syndeo's authority,
-# at least one, and none any other way. WHAT names the checks.
+# connection with a certificate not shown before, and none of the
+# download's own TLS challenges answered other than with Syndeo's
+# authority. OWN is "asked" when WebKit asks the download itself, and then
+# at least one of its challenges must have been answered so; otherwise how
+# many were is measured. WHAT names the checks.
 dl_file() {
-  local log="$1" text="$2" path="$3" original="$4" what="$5" saved name fresh ok_fresh answers vouched other
+  local log="$1" text="$2" path="$3" original="$4" what="$5" own="$6" saved name fresh ok_fresh answers vouched other
   dl_new >"$LOGS/downloads-new.txt"
   plain_log "$log" | grep -F "a download's TLS challenge answered" | LC_ALL=C sort >"$LOGS/downloads-answers-before.txt"
   dl_press "$log" "$text"
@@ -3902,9 +3909,16 @@ dl_file() {
   answers="$(grep -c . "$LOGS/downloads-answers.txt")"
   vouched="$(grep -c "vouched for, by Syndeo's authority" "$LOGS/downloads-answers.txt")"
   other=$((answers - vouched))
-  must "$([ "$vouched" -ge 1 ] && [ "$other" = 0 ] && echo yes)" \
-    "$what had its own TLS challenges answered with Syndeo's authority, as its window's are: $vouched, and $other any other way" \
-    "$(cut -c 1-200 "$LOGS/downloads-answers.txt" | tr '\n' '|')"
+  if [ "$own" = asked ]; then
+    must "$([ "$vouched" -ge 1 ] && [ "$other" = 0 ] && echo yes)" \
+      "$what had its own TLS challenges answered with Syndeo's authority, as its window's are: $vouched, and $other any other way" \
+      "$(cut -c 1-200 "$LOGS/downloads-answers.txt" | tr '\n' '|')"
+  else
+    must "$([ "$other" = 0 ] && echo yes)" \
+      "$what had none of its own TLS challenges answered other than with Syndeo's authority" \
+      "$(cut -c 1-200 "$LOGS/downloads-answers.txt" | tr '\n' '|')"
+    printf '  MEASURE  %s: the download itself was asked about its TLS %s time(s); the window answered the rest\n' "$what" "$vouched"
+  fi
   dl_quarantine "$(basename "$name")" "$name"
 }
 
@@ -3938,10 +3952,10 @@ EOF
   # The page's own files, each on a TLS connection of its own, with a
   # certificate the window has not been shown.
   dl_file "$log" "Download the file" "/payload-$t.bin" "$DL_DIR/payload-$t.bin" \
-    "downloads: a file an https page links for downloading"
+    "downloads: a file an https page links for downloading" window
   before="$(dl_count "$log" "a download's redirect allowed")"
   dl_file "$log" "Download by a redirect" "/second-$t.bin" "$DL_DIR/second-$t.bin" \
-    "downloads: a file an https page links through a redirect within its own origin"
+    "downloads: a file an https page links through a redirect within its own origin" asked
   printf '  MEASURE  a download redirected within its own origin: WebKit %s the download about it\n' \
     "$([ "$(dl_count "$log" "a download's redirect allowed")" -gt "$before" ] && echo asked || echo 'did not ask')"
 
