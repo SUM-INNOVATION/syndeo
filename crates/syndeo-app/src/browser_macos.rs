@@ -1117,6 +1117,15 @@ pub fn page_rect_on_screen(window: &NSWindow) -> Option<NSRect> {
     ui.as_ref().map(|ui| ui.page_rect_on_screen(window))
 }
 
+/// A banner across the top of `window`'s page, or none: see `Ui::set_banner`.
+pub fn set_banner(window: &NSWindow, view: Option<&NSView>) {
+    if let Some(controller) = controller_of(window) {
+        if let Some(ui) = &*controller.ivars().ui.borrow() {
+            ui.set_banner(view);
+        }
+    }
+}
+
 /// Glass over `window`'s page while the command bar shows, or not.
 pub fn set_shaded(window: &NSWindow, shaded: bool) {
     if let Some(controller) = controller_of(window) {
