@@ -472,9 +472,10 @@ controls() { printf 'Back %s, Forward %s' "$("$APPCTL" enabled "$PID" syndeo.bac
 #           bottom, New Tab the last; Downloads at its foot;
 #   route:  the route inside the address field, before Copy Link, beside
 #           the page;
-#   banner: an agent's banner below the title bar's traffic lights, above
-#           the page, and covered by none of the sidebar's controls or rows;
-#           with at least two tabs' rows.
+#   banner: an agent's banner, its words and its Stop, below the title
+#           bar's traffic lights, over none of the page, and neither over
+#           nor under any of the sidebar's controls or rows, or AppKit's tab
+#           bar if that shows; with at least two tabs' rows.
 placed() {
   python3 -I -c '
 import sys
@@ -544,16 +545,19 @@ elif mode == "route":
         sys.exit("the route is not beside the page: %r, %r" % (route, page))
     print("in order: in the address field, before Copy Link")
 elif mode == "banner":
-    need("indicator", "page", "address")
+    need("indicator", "stop", "page", "address")
     ind, page = parts["indicator"], parts["page"]
     if "lights" in parts and ind[1] < bottom(parts["lights"]) - 1:
         sys.exit("the banner is not below the title bar: %r, its traffic lights %r" % (ind, parts["lights"]))
-    if bottom(ind) > page[1] + 1:
-        sys.exit("the banner is over the page: %r, %r" % (ind, page))
-    for name in ("hide", "back", "forward", "reload", "address", "route", "copy", "favorite", "folder", "row", "new-tab", "downloads", "space"):
-        for b in many.get(name, []):
-            if overlap(ind, b):
-                sys.exit("the banner and the %s overlap: %r, %r" % (name, ind, b))
+    banner = [("its words", ind), ("its Stop", parts["stop"])]
+    for what, b in banner:
+        if overlap(b, page):
+            sys.exit("the banner is over the page: %s %r, the page %r" % (what, b, page))
+    for name in ("hide", "back", "forward", "reload", "address", "route", "copy", "favorite", "folder", "row", "new-tab", "downloads", "space", "tab-bar"):
+        for what, b in banner:
+            for c in many.get(name, []):
+                if overlap(b, c):
+                    sys.exit("the banner and the %s overlap: %s %r, the %s %r" % (name, what, b, name, c))
     rows = many.get("row", [])
     print("placed, with %d tabs in the sidebar" % len(rows))
 ' "$1" 2>&1
@@ -2457,9 +2461,10 @@ realtime() {
 #            authority in no trust settings;
 #   visible: its tabs say who controls them, with Stop, in a window of their
 #            own on screen;
-#   placed:  that banner below the title bar, above the page, and covered by
-#            none of the sidebar's controls or rows; and the route the agent
-#            reads what the address field says (agents_placed);
+#   placed:  that banner, and its Stop, below the title bar, over none of
+#            the page, and neither over nor under the sidebar's controls or
+#            rows; and the route the agent reads what the address field says
+#            (agents_placed);
 #   act:     on a page this test serves, the agent types into a field, clicks
 #            a button, submits a form, scrolls, follows a link and waits for
 #            the page, and goes back; a reference from another page is refused;
@@ -2893,9 +2898,10 @@ agents_off_again() {
 
 # agents_placed: in the agent's window, chosen, so in front, with two tabs of
 # its own, read from that window alone.
-#   placed:  the banner saying who controls its tabs is below the title bar,
-#            above the page, and covered by none of the sidebar's controls or
-#            its tabs' rows, as Accessibility has them (placed banner);
+#   placed:  the banner saying who controls its tabs, and its Stop, are below
+#            the title bar, over none of the page, and neither over nor under
+#            any of the sidebar's controls or its tabs' rows, as Accessibility
+#            has them (placed banner);
 #   placed:  the route the agent reads for its tab is what the address field
 #            says: its words, which for Through Syndeo are in its help tag
 #            alone, beside the symbol.
@@ -2909,7 +2915,7 @@ agents_placed() {
   printf '%s\n' "$frames" >"$LOGS/agent-frames.txt"
   verdict="$(printf '%s\n' "$frames" | placed banner)"
   must "$(printf '%s' "$verdict" | grep -q '^placed, with [2-9]' && echo yes)" \
-    "placed: the banner saying who controls an agent's tab is below the title bar, above the page, and covered by none of the sidebar's controls or its two tabs' rows" \
+    "placed: the banner saying who controls an agent's tab, and its Stop, are below the title bar, over none of the page, and neither over nor under the sidebar's controls or its two tabs' rows" \
     "$verdict; $(tr '\n' ';' <"$LOGS/agent-frames.txt")"
   agent "$out" "{\"cmd\":\"read\",\"tab\":${AGENT_T1:-1}}"
   must "$([ "$(answered "$out" result.route)" = "$(bar)" ] &&

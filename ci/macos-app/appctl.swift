@@ -450,7 +450,7 @@ func suggestions(_ bar: AXUIElement) -> [(kind: String, title: String, detail: S
 }
 
 /// Where the parts of `window` are, as "part x y width height" lines.
-func layout(_ window: AXUIElement) {
+func layout(_ pid: Int32, _ window: AXUIElement) {
     func line(_ part: String, _ element: AXUIElement?, _ extra: String = "") {
         guard let element, let box = frame(of: element) else { return }
         print("\(part) \(Int(box.minX)) \(Int(box.minY)) \(Int(box.width)) \(Int(box.height))\(extra.isEmpty ? "" : "\t" + extra)")
@@ -474,6 +474,10 @@ func layout(_ window: AXUIElement) {
         } else if role(element) == "AXWebArea" {
             line("page", element)
         } else if role(element) == "AXTabGroup" {
+            guard showing(pid, element) else {
+                line("tab-bar-hidden", element)
+                continue
+            }
             line("tab-bar", element)
             for tab in children(element) where role(tab) == "AXRadioButton" {
                 line("appkit-tab", tab, oneLine(attribute(tab, kAXTitleAttribute)))
@@ -487,19 +491,74 @@ func layout(_ window: AXUIElement) {
 }
 
 /// The menu open in pid now, if one is: a context menu, under the application.
-func openMenu(_ pid: Int32) -> (AXUIElement, [AXUIElement])? {
+/// The menu open in pid now, if one is: a context menu, under the application,
+/// or under the view it was opened from, in one of pid's windows; or, if
+/// `near` is where it was asked for, the one Accessibility finds just below
+/// and right of that point, where a context menu opens.
+func openMenu(_ pid: Int32, near point: CGPoint? = nil) -> (AXUIElement, [AXUIElement])? {
     let app = AXUIElementCreateApplication(pid)
+    func items(_ menu: AXUIElement) -> [AXUIElement]? {
+        // Not one of the menu bar's.
+        if let parent = asElement(attribute(menu, kAXParentAttribute)), role(parent) == "AXMenuBarItem" { return nil }
+        let found = children(menu).filter { role($0) == "AXMenuItem" }
+        return found.isEmpty ? nil : found
+    }
     for _ in 0..<30 {
-        for menu in all(app, depth: 3, { (attribute($0, kAXRoleAttribute) as? String) == "AXMenu" }) {
-            // Not one of the menu bar's.
-            if let parent = asElement(attribute(menu, kAXParentAttribute)),
-               (attribute(parent, kAXRoleAttribute) as? String) == "AXMenuBarItem" { continue }
-            let items = children(menu).filter { (attribute($0, kAXRoleAttribute) as? String) == "AXMenuItem" }
-            if !items.isEmpty { return (menu, items) }
+        var menus = all(app, depth: 3, { role($0) == "AXMenu" })
+        for window in windows(of: pid) {
+            menus += all(window, depth: 24, { role($0) == "AXMenu" })
+        }
+        if let point {
+            for (dx, dy) in [(14.0, 10.0), (40.0, 10.0), (14.0, 30.0)] {
+                var at = hit(pid, CGPoint(x: point.x + dx, y: point.y + dy))
+                for _ in 0..<4 {
+                    guard let now = at else { break }
+                    if role(now) == "AXMenu" { menus.append(now); break }
+                    at = asElement(attribute(now, kAXParentAttribute))
+                }
+            }
+        }
+        for menu in menus {
+            if let found = items(menu) { return (menu, found) }
         }
         usleep(100_000)
     }
     return nil
+}
+
+/// Whether `element` is `ancestor`, or inside it.
+func within(_ element: AXUIElement, _ ancestor: AXUIElement) -> Bool {
+    var at: AXUIElement? = element
+    for _ in 0..<24 {
+        guard let now = at else { return false }
+        if CFEqual(now, ancestor) { return true }
+        at = asElement(attribute(now, kAXParentAttribute))
+    }
+    return false
+}
+
+/// What Accessibility finds at `point` on screen among pid's windows, as a
+/// click there would.
+func hit(_ pid: Int32, _ point: CGPoint) -> AXUIElement? {
+    var found: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(AXUIElementCreateApplication(pid), Float(point.x), Float(point.y), &found) == .success else {
+        return nil
+    }
+    return found
+}
+
+/// Whether AppKit's tab bar `bar` shows, as a person sees it: a click in
+/// the middle of one of its tabs lands on it. Hidden, the bar keeps its
+/// place in Accessibility's tree, its frame and all, while the title bar
+/// gives it no room; a click there finds what is under it instead.
+func showing(_ pid: Int32, _ bar: AXUIElement) -> Bool {
+    let tabs = children(bar).filter { role($0) == "AXRadioButton" }
+    for tab in tabs.isEmpty ? [bar] : tabs {
+        guard let box = frame(of: tab), box.width > 0, box.height > 0,
+              let found = hit(pid, CGPoint(x: box.midX, y: box.midY)) else { continue }
+        if within(found, bar) { return true }
+    }
+    return false
 }
 
 /// The virtual key code of `key` on a US keyboard, as the runner has.
@@ -740,7 +799,7 @@ case "frames" where args.count == 3 || args.count == 4:
         print("the front window, \(oneLine(attribute(window, kAXTitleAttribute))), does not say \(args[3])")
         exit(1)
     }
-    layout(window)
+    layout(pid, window)
 case "window-text" where args.count == 4:
     guard let pid = Int32(args[2]) else { exit(2) }
     for window in windows(of: pid) {
@@ -762,11 +821,18 @@ case "rows" where args.count == 3:
 case "tab-bar" where args.count == 3:
     guard let pid = Int32(args[2]), let window = frontWindow(of: pid) else { exit(2) }
     let bars = all(window, depth: 24) { role($0) == "AXTabGroup" }
-    guard bars.isEmpty else {
-        print("shown, with \(bars.flatMap { children($0) }.filter { role($0) == "AXRadioButton" }.count) tabs")
+    let tabs = bars.flatMap { children($0) }.filter { role($0) == "AXRadioButton" }
+    if let shown = bars.first(where: { showing(pid, $0) }) {
+        print("shown, with \(children(shown).filter { role($0) == "AXRadioButton" }.count) tabs, at \(frame(of: shown).map { "\($0)" } ?? "?")")
         exit(1)
     }
-    print("hidden")
+    if bars.isEmpty {
+        print("hidden: not there")
+    } else {
+        let landed = tabs.compactMap { frame(of: $0) }.compactMap { hit(pid, CGPoint(x: $0.midX, y: $0.midY)) }
+            .map { "\(role($0)) \(identifier($0))" }
+        print("hidden: Accessibility keeps it, with \(tabs.count) tabs, but a click on them lands on: \(landed.joined(separator: ", "))")
+    }
 case "new-tab-row" where args.count == 3:
     guard let pid = Int32(args[2]) else { exit(2) }
     guard let row = sidebarRows(pid).last(where: { $0.isNewTab }) else { print("no New Tab row"); exit(1) }
@@ -909,8 +975,9 @@ case "tab-menu" where args.count == 4 || args.count == 5:
         exit(1)
     }
     // Left of the middle, on its title, away from the row's Close or pin.
-    click(CGPoint(x: box.minX + box.width * 0.4, y: box.midY), .right, [])
-    guard let (menu, items) = openMenu(pid) else { print("no menu opened"); exit(1) }
+    let point = CGPoint(x: box.minX + box.width * 0.4, y: box.midY)
+    click(point, .right, [])
+    guard let (menu, items) = openMenu(pid, near: point) else { print("no menu opened"); exit(1) }
     for item in items {
         print(oneLine(attribute(item, kAXTitleAttribute)))
     }
