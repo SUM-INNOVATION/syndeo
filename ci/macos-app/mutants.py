@@ -83,6 +83,11 @@ back.
   retried directly. https://github.com, on macOS 15's HSTS preload list,
   must then be seen not opening, the bar not saying Direct, and the log not
   saying a host was sent directly.
+- sidebar-rows-in-every-window: every window of a tab group shows the
+  group's rows in its sidebar, the one in front and every one behind it,
+  as the sidebar did before it showed them only in front: a row for each
+  tab in each window, N² for N tabs. With 30 tabs the app must then be seen
+  holding more than one row a tab, and making rows again.
 
 Each mutant runs in exactly one CI job: macos-agents runs the agent-*
 mutants, beside its gate, and those in MACOS_AGENTS; macos-app runs the
@@ -99,6 +104,7 @@ SETTINGS = "crates/syndeo-app/src/settings_macos.rs"
 PROXY = "crates/syndeo-proxy/src/main.rs"
 CONTROL = "crates/syndeo-app/src/control_macos.rs"
 APP = "crates/syndeo-app/src/app_macos.rs"
+SIDEBAR_MODEL = "crates/syndeo-app/src/sidebar_model.rs"
 
 MUTANTS = {
     "no-pinning-delegate": [
@@ -304,6 +310,13 @@ MUTANTS = {
             "Some(refusal) if !retried && false => AfterFailure::RetryDirect(refusal),",
         ),
     ],
+    "sidebar-rows-in-every-window": [
+        (
+            SIDEBAR_MODEL,
+            "        self.front == Some(window)\n",
+            "        self.front == Some(window) || self.front.is_some()\n",
+        ),
+    ],
 }
 
 
@@ -312,6 +325,8 @@ MUTANTS = {
 # direct-for-every-host 124, websocket-headers-stripped 104,
 # no-navigation-policy 102, zoned-links-followed 98, asked-any-scheme 96,
 # never-retry-direct 94 and direct-for-every-name 87; 843 s of the 1061.
+# And the sidebar's, which macos-agents runs whatever its earlier steps did,
+# while macos-app's mutants wait on its launch passing.
 MACOS_AGENTS = {
     "no-pinning-delegate",
     "direct-for-every-host",
@@ -321,6 +336,7 @@ MACOS_AGENTS = {
     "asked-any-scheme",
     "never-retry-direct",
     "direct-for-every-name",
+    "sidebar-rows-in-every-window",
 }
 
 JOBS = ("macos-app", "macos-agents")
