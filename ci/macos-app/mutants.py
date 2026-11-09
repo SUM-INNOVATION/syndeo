@@ -280,16 +280,23 @@ MUTANTS = {
             "        // The tab browses in its window's own web view: routed through the\n"
             "        // proxy and pinned to its authority, as every window's is.\n"
             "        let Some(view) = controller.web_view() else {\n",
-            "        let view = Some(unsafe {\n"
-            "            WKWebView::initWithFrame_configuration(\n"
-            "                WKWebView::alloc(self.mtm),\n"
-            "                window.frame(),\n"
-            "                &objc2_web_kit::WKWebViewConfiguration::new(self.mtm),\n"
-            "            )\n"
+            # The proxied web view is swapped for a plain one where it sits,
+            # in the page's card, so the window keeps its sidebar and the
+            # agent's banner: only the routing is taken out.
+            "        let view = controller.web_view().map(|proxied| {\n"
+            "            let plain = unsafe {\n"
+            "                WKWebView::initWithFrame_configuration(\n"
+            "                    WKWebView::alloc(self.mtm),\n"
+            "                    proxied.frame(),\n"
+            "                    &objc2_web_kit::WKWebViewConfiguration::new(self.mtm),\n"
+            "                )\n"
+            "            };\n"
+            "            plain.setAutoresizingMask(proxied.autoresizingMask());\n"
+            "            if let Some(parent) = unsafe { proxied.superview() } {\n"
+            "                parent.replaceSubview_with(&proxied, &plain);\n"
+            "            }\n"
+            "            plain\n"
             "        });\n"
-            "        if let Some(plain) = &view {\n"
-            "            window.setContentView(Some(plain));\n"
-            "        }\n"
             "        let Some(view) = view else {\n",
         ),
         (

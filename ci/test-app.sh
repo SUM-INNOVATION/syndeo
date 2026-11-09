@@ -21,10 +21,16 @@
 #   - its one child is the proxy, from this bundle's Contents/Helpers, and no
 #     keystore process exists;
 #   - its window holds a web view and no error;
-#   - its controls are its toolbar's, in the title bar: Back, Forward, the
-#     address field and its Reload, each by the identifier it always had;
-#     and the address field's route, there, says Through Syndeo for a page
-#     that came through the proxy, with its help tag those words first;
+#   - its controls are its sidebar's, beside the page, in this order: Hide
+#     Sidebar, Back, Forward and Reload across its top, the address field
+#     below them with Copy Link at its end, the tabs' rows, New Tab the last,
+#     and Downloads at its foot, each by the identifier it always had or by
+#     what it says; AppKit's own tab bar is hidden; and the address field's
+#     route, in it, says Through Syndeo for a page that came through the
+#     proxy, with its help tag those words first;
+#   - ⌘S hides the sidebar, the page taking its room, and shows it again as
+#     it was; whether the route still shows anywhere while it is hidden is
+#     measured, not gated;
 #   - its menus have the usual shortcuts, read from the menu items;
 #   - in it, as a person uses it — File > Open Location…, then the address
 #     typed as keystrokes and Return: an address opens and shows the page's
@@ -32,13 +38,19 @@
 #     answers, rises for it (example.com, with a query of this instance's
 #     own, so that no copy WebKit cached for another instance stands in for
 #     it); Back and Forward
-#     work, by the bar's button and by History > Forward; a file: address is
-#     refused with Syndeo's own page; File >
-#     New Tab opens the command bar; Return there, with nothing typed, opens a
-#     tab with the start page, beside the first in one window,
-#     and File's one enabled ⌘W item, whatever AppKit titles it (Close, or
-#     Close Tab once it has seen the tabs), closes that tab and no other,
-#     letting its window go and leaving the first as it was;
+#     work, by the sidebar's button and by History > Forward; a file: address
+#     is refused with Syndeo's own page; File > New Tab opens the command bar
+#     over the page, its field empty and with the keys, and no tab; Escape
+#     puts it away, opening nothing; Return there with nothing typed opens a
+#     tab with the start page, beside the first in one window, its row in
+#     the sidebar after the first's and in front, AppKit's tab bar still
+#     hidden; and File's one enabled ⌘W item, whatever AppKit titles it
+#     (Close, or Close Tab once it has seen the tabs), closes that tab and no
+#     other, letting its window go and leaving the first as it was; an
+#     address typed in the command bar and Return opens in a new tab;
+#     pressing the first tab's row shows that tab; what is typed in the
+#     command bar suggests the open tab whose title has it, and choosing it
+#     brings that tab to the front, opening none;
 #   - search: Syndeo > Settings… offers DuckDuckGo, Startpage, Brave Search,
 #     Google, Bing and Off, with DuckDuckGo chosen before anyone chooses, and
 #     keeps what is chosen; with Off, a word is refused with Syndeo's own page
@@ -103,8 +115,8 @@
 # asked to quit, it exits with its proxy. Then opened again, and all of that
 # again. With `again`, after a reinstall: one opening, the same checks. It
 # made no keystore changes.
-# In the first opening, Reload: a fresh https page, then the bar's Reload,
-# pressed as a person presses it. The address and the page have to stay the
+# In the first opening, Reload: a fresh https page, then the sidebar's
+# Reload, pressed as a person presses it. The address and the page have to stay the
 # page's. The reload has to consult the origin through Syndeo's proxy:
 # - the proxy's revalidations or misses rise, whether the origin then
 #   answers 304 or a new page;
@@ -112,6 +124,7 @@
 #   more than its revalidations, and it serves nothing stale.
 # A reload the proxy answered from its cache, even with a miss beside it for
 # something else, fails. The proxy's counters are read in a tab of their own,
+# opened from the command bar (File > New Tab, the proxy's page typed there),
 # then closed, so they bracket the reload and nothing else. No exact count is
 # required, since what a page loads and how its server marks it can vary.
 # Kept in reload.txt too.
@@ -231,23 +244,27 @@
 # tabs, which gates tabs, from no kept session and with macOS's own "keep
 # windows" setting as the runner has it, on pages this Mac serves, reached
 # through Syndeo by a public name for 127.0.0.1:
+# The tabs are read as a person sees them, from the sidebar's rows in the
+# window in front: in order, which is in front, pinned, icon and loading.
 #   - History > Reopen Last Closed Tab is ⇧⌘T and View > Show All Tabs ⇧⌘\;
-#     View has Show Tab Bar and Show All Tabs, once each; with tabs showing,
+#     View has Show Tab Bar and Show All Tabs, once each; with several tabs,
 #     File has AppKit's
 #     Close Other Tabs, once; Window has Duplicate Tab and Pin Tab, and
 #     History Reopen All Windows from Last Session and Recently Closed;
-#   - the window takes its title from its page, and so does its tab;
+#   - the window takes its title from its page, and so does its tab's row;
 #   - with the mouse, as a person clicks: ⌘-click and a middle-click on a
 #     link each open it in a tab behind the page, which stays in front, the
 #     tabs after it in the order they were opened, with their pages' titles;
 #     ⇧⌘-click opens one in front, right after the page; each tab's page came
 #     through Syndeo; ⌘-click on a file: link opens no tab, leaves the page
-#     and shows nothing of the file;
-#   - ⌘1, ⌘2 and ⌘3 show those tabs, and ⌘9 the last;
-#   - a tab shows the icon its page names, and that it is loading, until its
-#     page has arrived;
+#     and shows nothing of the file; AppKit's own tab bar stays hidden;
+#   - ⌘1, ⌘2 and ⌘3 show those tabs, and ⌘9 the last; pressing a tab's row
+#     shows that tab;
+#   - a tab's row shows the icon its page names, a globe for a page that
+#     names none, and that it is loading, until its page has arrived;
 #   - Window > Duplicate Tab opens the page again in front, right after it,
-#     with its history; Window > Pin Tab puts the tab first, marked; a secondary click on a tab
+#     with its history; Window > Pin Tab puts the tab first, its row
+#     marked with a pin; a secondary click on a tab's row
 #     opens Syndeo's menu for it, Unpin Tab for a pinned one, and its
 #     Duplicate Tab duplicates that tab;
 #   - File > Close Other Tabs closes all but the pinned one, which says no to
@@ -269,9 +286,9 @@
 #     Reopen Last Closed Tab and Reopen All Windows from Last Session are not
 #     offered, Recently Closed is empty, and the session file is gone.
 # It measures, without gating, memory per tab, as README's Memory section
-# measures memory: the same page in one tab and in five, sampled over the
-# same interval; kept in tabs-memory.txt. It removes the setting it made and
-# the session.
+# measures memory: the same page in one tab and in five, each tab past the
+# first opened from the command bar, sampled over the same interval; kept in
+# tabs-memory.txt. It removes the setting it made and the session.
 #
 # measure, which only reports: what this runner allows a test to do —
 # Accessibility, Apple Events to System Events, and whether a user-domain
@@ -334,6 +351,8 @@ keystore_item() { security find-generic-password -s com.sum.syndeo.keystore >/de
 CANNOT_BROWSE="Syndeo can't open websites right now."
 # This instance's query for example.com (see started).
 FRESH=''
+# The log of the application started last (see started).
+APP_LOG=''
 # Arguments started hands the application through open, after --args when
 # set: none, unless a check says otherwise.
 OPEN_ARGS=()
@@ -356,6 +375,7 @@ EXAMPLE_BODY='This domain is for use in documentation examples'
 started() {
   local app="$1" round="$2" children image windows pids='' until
   PID='' HELPER=''
+  APP_LOG="$LOGS/app-$round.stderr"
   # This instance's own query for example.com: random, and nothing else.
   # WebKit's cache persists from one instance to the next, so a page another
   # instance opened could otherwise be shown without this one fetching it.
@@ -450,34 +470,139 @@ at() {
 page_text() { front | grep -E '^AX(StaticText|Heading)' | cut -f2,3 | tr '\t\n' '  ' | head -c 300; }
 controls() { printf 'Back %s, Forward %s' "$("$APPCTL" enabled "$PID" syndeo.back)" "$("$APPCTL" enabled "$PID" syndeo.forward)"; }
 
-# new_tab: File > New Tab, which opens the command bar over the window;
-# Return there with nothing typed opens a tab with the start page, as New
-# Tab once did straight away.
-new_tab() {
-  choose File "New Tab"
-  wait_for 5 "$APPCTL" value "$PID" syndeo.command-bar >/dev/null 2>&1 || true
-  "$APPCTL" type "$PID" "" >/dev/null 2>&1 || true
+# placed MODE: judge the front window's parts, as appctl frames prints them
+# on stdin; prints a verdict, which starts with "in order" or "placed" when
+# all is as MODE requires:
+#   order:  the sidebar's controls beside the page, left of it, in this
+#           order: Hide Sidebar, Back, Forward and Reload in a row across
+#           its top, left to right; the address field below them, with Copy
+#           Link at its trailing end; the tabs' rows below that, top to
+#           bottom, New Tab the last; Downloads at its foot;
+#   route:  the route inside the address field, before Copy Link, beside
+#           the page;
+#   banner: an agent's banner, its words and its Stop, across the top of
+#           the page: above it, within its width, and over none of it;
+#           neither over nor under the traffic lights, any of the sidebar's
+#           controls or rows, or AppKit's tab bar if that shows; and nothing
+#           over either, as a click in its middle finds it; with at least
+#           two tabs' rows.
+placed() {
+  python3 -I -c '
+import sys
+mode = sys.argv[1]
+parts, many, covered = {}, {}, []
+for line in sys.stdin:
+    name, _, rest = line.rstrip("\n").partition(" ")
+    if name == "covered":
+        covered.append(rest)
+        continue
+    box = rest.split("\t")[0].split()
+    if len(box) != 4:
+        continue
+    box = [int(v) for v in box]
+    many.setdefault(name, []).append(box)
+    parts.setdefault(name, box)
+def need(*names):
+    missing = [n for n in names if n not in parts]
+    if missing:
+        sys.exit("missing: " + " ".join(missing) + "; found: " + " ".join(sorted(parts)))
+def right(b): return b[0] + b[2]
+def bottom(b): return b[1] + b[3]
+def middle(b): return (b[0] + b[2] / 2, b[1] + b[3] / 2)
+def inside(b, outer):
+    x, y = middle(b)
+    return outer[0] <= x <= right(outer) and outer[1] <= y <= bottom(outer)
+def overlap(a, b):
+    return a[0] < right(b) and b[0] < right(a) and a[1] < bottom(b) and b[1] < bottom(a)
+if mode == "order":
+    need("page", "hide", "back", "forward", "reload", "address", "copy", "new-tab", "downloads")
+    page = parts["page"]
+    rows = many.get("row", [])
+    if not rows:
+        sys.exit("no tab rows")
+    controls = [(n, b) for n in ("hide", "back", "forward", "reload", "address", "copy", "new-tab", "downloads") for b in many[n]]
+    controls += [("row", b) for b in rows]
+    for name, b in controls:
+        if right(b) > page[0] + 1:
+            sys.exit("%s is not beside the page, left of it: %r, the page %r" % (name, b, page))
+    nav = [parts[n] for n in ("hide", "back", "forward", "reload")]
+    for (a, b), names in zip(zip(nav, nav[1:]), ("hide back", "back forward", "forward reload")):
+        if not (a[0] < b[0] and abs(middle(a)[1] - middle(b)[1]) <= 4):
+            sys.exit("not in a row, left to right: %s %r %r" % (names, a, b))
+    addr = parts["address"]
+    if addr[1] < max(bottom(b) for b in nav) - 1:
+        sys.exit("the address field is not below Back, Forward and Reload: %r" % (addr,))
+    copy = parts["copy"]
+    if not (inside(copy, addr) and middle(copy)[0] > middle(addr)[0]):
+        sys.exit("Copy Link is not at the end of the address field: %r, %r" % (copy, addr))
+    if rows[0][1] < bottom(addr) - 1:
+        sys.exit("the first row is not below the address field: %r, %r" % (rows[0], addr))
+    for a, b in zip(rows, rows[1:]):
+        if b[1] <= a[1]:
+            sys.exit("the rows are not top to bottom: %r, %r" % (a, b))
+    new = parts["new-tab"]
+    if new[1] <= rows[-1][1]:
+        sys.exit("New Tab is not the last row: %r, %r" % (new, rows[-1]))
+    down = parts["downloads"]
+    if down[1] < bottom(new) - 1:
+        sys.exit("Downloads is not at the foot, below New Tab: %r, %r" % (down, new))
+    print("in order, with %d tab rows" % len(rows))
+elif mode == "route":
+    need("page", "address", "route", "copy")
+    route, addr, copy, page = parts["route"], parts["address"], parts["copy"], parts["page"]
+    if not inside(route, addr):
+        sys.exit("the route is not in the address field: %r, %r" % (route, addr))
+    if right(route) > copy[0] + 1:
+        sys.exit("the route is not before Copy Link: %r, %r" % (route, copy))
+    if right(route) > page[0] + 1:
+        sys.exit("the route is not beside the page: %r, %r" % (route, page))
+    print("in order: in the address field, before Copy Link")
+elif mode == "banner":
+    need("indicator", "stop", "page", "address")
+    ind, page = parts["indicator"], parts["page"]
+    banner = [("its words", ind), ("its Stop", parts["stop"])]
+    for what, b in banner:
+        if overlap(b, page):
+            sys.exit("the banner is over the page: %s %r, the page %r" % (what, b, page))
+        if bottom(b) > page[1] + 1 or b[0] < page[0] - 1 or right(b) > right(page) + 1:
+            sys.exit("the banner is not across the top of the page: %s %r, the page %r" % (what, b, page))
+    if covered:
+        sys.exit("the banner is covered: " + "; ".join(covered))
+    for name in ("lights", "hide", "back", "forward", "reload", "address", "route", "copy", "favorite", "folder", "row", "new-tab", "downloads", "space", "tab-bar"):
+        for what, b in banner:
+            for c in many.get(name, []):
+                if overlap(b, c):
+                    sys.exit("the banner and the %s overlap: %s %r, the %s %r" % (name, what, b, name, c))
+    rows = many.get("row", [])
+    print("placed, with %d tabs in the sidebar" % len(rows))
+' "$1" 2>&1
 }
 
-# chrome WHEN: the front window's controls are in its sidebar: Back,
-# Forward, the address field and Reload, each found by the identifier it
-# always had, and Reload saying Reload.
+# chrome WHEN: the front window's controls are its sidebar's, beside the
+# page, in the order `placed order` says, each found by the identifier it
+# always had or by what it says; Reload says Reload; and AppKit's own tab
+# bar is hidden.
 chrome() {
-  local id
-  for id in syndeo.back syndeo.forward syndeo.address syndeo.reload; do
-    must "$("$APPCTL" enabled "$PID" "$id" >/dev/null 2>&1 && echo yes)" "$id is in the front window ($1)" "no such control in the front window"
-  done
-  must "$("$APPCTL" describe "$PID" syndeo.reload | grep -q 'Reload' && echo yes)" "the address field's Reload says Reload ($1)" \
+  local frames verdict
+  frames="$("$APPCTL" frames "$PID" 2>&1)"
+  printf '%s\n' "$frames" >"$LOGS/chrome-$1.txt"
+  verdict="$(printf '%s\n' "$frames" | placed order)"
+  must "$(printf '%s' "$verdict" | grep -q '^in order' && echo yes)" \
+    "the controls are in the sidebar, beside the page, in this order: Hide Sidebar, Back, Forward, Reload; the address field, with Copy Link; the tabs' rows, New Tab last; Downloads ($1)" \
+    "$verdict; $(tr '\n' ';' <"$LOGS/chrome-$1.txt")"
+  must "$("$APPCTL" describe "$PID" syndeo.reload | grep -q 'Reload' && echo yes)" "the sidebar's Reload says Reload ($1)" \
     "it says '$("$APPCTL" describe "$PID" syndeo.reload)'"
+  must "$("$APPCTL" tab-bar "$PID" >/dev/null 2>&1 && echo yes)" "AppKit's own tab bar is hidden ($1)" "$("$APPCTL" tab-bar "$PID" 2>&1)"
 }
 
 # route_words WHEN: the front window's page came through Syndeo, and the
-# address field's route says so: Through Syndeo, with its
+# address field's route, in the sidebar, says so: Through Syndeo, with its
 # help tag those words first, then what each route means.
 route_words() {
-  local help
+  local help verdict
   must "$([ "$(bar)" = "$SYNDEO_LABEL" ] && echo yes)" "the address field's route says '$SYNDEO_LABEL' ($1)" "it says '$(bar)'"
-  must "$("$APPCTL" describe "$PID" syndeo.route >/dev/null 2>&1 && echo yes)" "and it is in the front window, in the address field ($1)"
+  verdict="$("$APPCTL" frames "$PID" 2>&1 | placed route)"
+  must "$(printf '%s' "$verdict" | grep -q '^in order' && echo yes)" "and it is in the address field, in the sidebar ($1)" "$verdict"
   help="$("$APPCTL" describe "$PID" syndeo.route | cut -f2)"
   must "$([[ "$help" == "$SYNDEO_LABEL. How this page was reached."* ]] && echo yes)" \
     "and its help tag is its words, then what each route means ($1)" "help: '${help:-none}'"
@@ -523,6 +648,30 @@ close_tab() {
   fi
 }
 
+# bar_open TEXT WHAT: File > New Tab, which shows the command bar over the
+# page, then TEXT typed there and Return, as a person would; WHAT is that the
+# app then reports one more window, the new tab, within 15 s. Returns
+# non-zero if it does not.
+bar_open() {
+  local opened
+  opened="$(grep -c 'a window opened' "$APP_LOG")"
+  choose File "New Tab"
+  if ! wait_for 10 "$APPCTL" bar "$PID"; then
+    bad "$2" "File > New Tab showed no command bar: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+    return 1
+  fi
+  if ! "$APPCTL" bar-type "$PID" "$1" >/dev/null; then
+    bad "$2" "nothing could be typed in the command bar"
+    return 1
+  fi
+  if wait_for 15 opened_since "$APP_LOG" "$opened"; then
+    ok "$2"
+  else
+    bad "$2" "the app reports no new window: $(grep 'a window' "$APP_LOG" | tail -n 2 | tr '\n' ' ')"
+    return 1
+  fi
+}
+
 # The app's log, its proxy's lines included, without terminal colours.
 plain_log() { perl -pe 's/\e\[[0-9;]*m//g' "$1"; }
 
@@ -549,6 +698,7 @@ File|Open Location…|L
 File|Close|W
 View|Reload Page|R
 View|Stop Loading|.
+View|Toggle Sidebar|S
 History|Back|[
 History|Forward|]
 EOF
@@ -1062,9 +1212,47 @@ asked_launch() {
   stopped "$round"
 }
 
+# sidebar_toggles WHEN: on a page that came through Syndeo, ⌘S hides the
+# sidebar: none of its controls or rows is left in the window, and the page
+# takes its room, reaching further left; ⌘S again shows it as it was, the
+# page beside it where it was, and the route saying Through Syndeo again.
+# Whether the route still shows anywhere while the sidebar is hidden is
+# measured, not gated.
+sidebar_toggles() {
+  local before hidden after left_before left_hidden left_after
+  before="$("$APPCTL" frames "$PID" 2>&1)"
+  printf '%s\n' "$before" >"$LOGS/sidebar-$1-shown.txt"
+  left_before="$(printf '%s\n' "$before" | awk '$1 == "page" {print $2; exit}')"
+  press_keys s cmd
+  wait_for 5 sh -c '! "$1" value "$2" syndeo.address' _ "$APPCTL" "$PID" || true
+  sleep 1
+  hidden="$("$APPCTL" frames "$PID" 2>&1)"
+  printf '%s\n' "$hidden" >"$LOGS/sidebar-$1-hidden.txt"
+  left_hidden="$(printf '%s\n' "$hidden" | awk '$1 == "page" {print $2; exit}')"
+  must "$(! printf '%s\n' "$hidden" | grep -qE '^(hide|back|forward|reload|address|copy|row|new-tab|downloads) ' &&
+    [ -n "$left_before" ] && [ -n "$left_hidden" ] && [ "$left_hidden" -lt "$left_before" ] && echo yes)" \
+    "⌘S hides the sidebar, its controls and rows with it, and the page takes its room ($1)" \
+    "the page's left edge ${left_before:-?} then ${left_hidden:-?}; left in the window: $(printf '%s\n' "$hidden" | cut -d' ' -f1 | sort | uniq -c | tr '\n' ' ')"
+  if printf '%s\n' "$hidden" | grep -q '^route ' || "$APPCTL" value "$PID" syndeo.route >/dev/null 2>&1; then
+    printf '  MEASURE  with the sidebar hidden, the route still shows: %s\n' "$("$APPCTL" value "$PID" syndeo.route 2>&1)"
+  else
+    printf '  MEASURE  with the sidebar hidden, the window shows no route: it went with the address field (%s)\n' "$1"
+  fi
+  press_keys s cmd
+  wait_for 5 "$APPCTL" value "$PID" syndeo.address || true
+  sleep 1
+  after="$("$APPCTL" frames "$PID" 2>&1)"
+  printf '%s\n' "$after" >"$LOGS/sidebar-$1-shown-again.txt"
+  left_after="$(printf '%s\n' "$after" | awk '$1 == "page" {print $2; exit}')"
+  must "$(printf '%s\n' "$after" | placed order | grep -q '^in order' && [ "$left_after" = "$left_before" ] && echo yes)" \
+    "⌘S again shows the sidebar as it was, the page beside it ($1)" \
+    "the page's left edge ${left_before:-?} then ${left_after:-?}; $(printf '%s\n' "$after" | placed order)"
+  must "$(bar_is "$SYNDEO_LABEL" && echo yes)" "and the route in it says '$SYNDEO_LABEL' again ($1)" "it says '$(bar)'"
+}
+
 # Browse as a person would, in the first window and a tab beside it.
 browsing() {
-  local app="$1" round=browse log on_screen have before
+  local app="$1" round=browse log on_screen have before opened tab_page
   say "browse: addresses, Back and Forward, refusals, a tab, privacy, https, a page's own links"
   started "$app" "$round" || return
   helper_of "$app" "$round"
@@ -1075,25 +1263,91 @@ browsing() {
   chrome "$round"
   plain_http
   route_words "$round"
+  sidebar_toggles "$round"
   "$APPCTL" press "$PID" syndeo.back || bad "Back" "no Back button to press in the front window"
-  arrive "http://example.com/?$FRESH" "$EXAMPLE_BODY" "the bar's Back button goes back"
+  arrive "http://example.com/?$FRESH" "$EXAMPLE_BODY" "the sidebar's Back button goes back"
   choose History Forward
   arrive "http://syndeo.local/stats" 'requests [1-9]' "History > Forward goes forward"
   searching "$log"
   visit "file:///etc/passwd" "file:///etc/passwd" 'not file: ones' "a file: address is refused"
   must "$(page_says 'root:' && echo no || echo yes)" "and nothing of that file is shown"
 
-  new_tab
-  if wait_for 15 grep -q 'a window opened open=2' "$log"; then ok "File > New Tab opens a second tab"; else bad "New Tab" "the app does not report two windows: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
+  # New Tab: the command bar over the page, and no tab until something is
+  # typed there.
+  opened="$(grep -c 'a window opened' "$log")"
+  choose File "New Tab"
+  if wait_for 10 "$APPCTL" bar "$PID"; then
+    ok "File > New Tab opens the command bar"
+  else
+    bad "File > New Tab opens the command bar" "no command bar shows: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+  must "$("$APPCTL" bar "$PID" >"$LOGS/browse-bar.txt" 2>&1 && [ -z "$(cat "$LOGS/browse-bar.txt")" ] && "$APPCTL" bar-focused "$PID" >/dev/null 2>&1 && echo yes)" \
+    "its field is empty, and has the keys" "it says '$(cat "$LOGS/browse-bar.txt")'; $("$APPCTL" bar-focused "$PID" 2>&1)"
+  must "$([ "$(grep -c 'a window opened' "$log")" = "$opened" ] && echo yes)" "and it opens no tab by itself" "$(grep 'a window' "$log" | tail -n 2 | tr '\n' ' ')"
+  "$APPCTL" bar-key "$PID" escape >/dev/null || bad "Escape in the command bar" "no command bar to press it in"
+  if wait_for 5 sh -c '! "$1" bar "$2"' _ "$APPCTL" "$PID"; then
+    ok "Escape puts the command bar away"
+  else
+    bad "Escape puts the command bar away" "it still shows, saying '$("$APPCTL" bar "$PID")'"
+  fi
+  sleep 1
+  must "$([ "$(grep -c 'a window opened' "$log")" = "$opened" ] && at "file:///etc/passwd" 'not file: ones' && echo yes)" \
+    "and opens nothing, leaving the page as it was" "address field: '$(address)'; $(grep 'a window' "$log" | tail -n 2 | tr '\n' ' ')"
+
+  # Return there with nothing typed: a tab with the start page, as New Tab
+  # opened before there was a command bar.
+  choose File "New Tab"
+  wait_for 10 "$APPCTL" bar "$PID" || bad "File > New Tab, again" "no command bar shows"
+  "$APPCTL" bar-key "$PID" return >/dev/null || bad "Return in the command bar" "no command bar to press it in"
+  if wait_for 15 grep -q 'a window opened open=2' "$log"; then ok "File > New Tab, and Return in its empty command bar, opens a second tab"; else bad "New Tab" "the app does not report two windows: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
   arrive "" 'Welcome to Syndeo' "the new tab shows the start page, with an empty address field"
   on_screen="$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')"
   must "$([ "$on_screen" = 1 ] && echo yes)" "the two are tabs of one window: one window on screen" "$on_screen on screen"
+  if wait_for 10 sh -c '"$1" tabs "$2" | tr "\n" "|" | grep -qE "^  [^|]+[|][*] [^|]+[|]\$"' _ "$APPCTL" "$PID"; then
+    ok "the sidebar has both tabs' rows, the new one after the first, in front"
+  else
+    bad "the sidebar has both tabs' rows, the new one after the first, in front" "tabs: $(tab_list)"
+  fi
+  must "$("$APPCTL" tab-bar "$PID" >/dev/null 2>&1 && echo yes)" "with two tabs, AppKit's own tab bar stays hidden" "$("$APPCTL" tab-bar "$PID" 2>&1)"
   "$APPCTL" titles "$PID" >"$LOGS/browse-tabs.txt" 2>&1
   "$APPCTL" front-tree "$PID" >"$LOGS/browse-two-tabs-tree.txt" 2>&1
+  "$APPCTL" frames "$PID" >"$LOGS/browse-two-tabs-frames.txt" 2>&1
+  "$APPCTL" rows "$PID" >"$LOGS/browse-two-tabs-rows.txt" 2>&1
   "$APPCTL" menu-items "$PID" File >"$LOGS/browse-two-tabs-file-menu.txt" 2>&1
   close_tab "with two tabs"
   if wait_for 15 grep -q 'a window closed open=1' "$log"; then ok "it closes the tab in front, one window and no other, and the app lets it go"; else bad "Close" "the app does not report one window: $(grep 'a window' "$log" | tail -n 3 | tr '\n' ' ')"; fi
   arrive "file:///etc/passwd" 'not file: ones' "the first tab is in front again, as it was left"
+
+  # An address typed there: a new tab with that page.
+  tab_page="http://example.com/?$FRESH-tab"
+  bar_open "$tab_page" "an address typed in the command bar opens, on Return, in a new tab"
+  arrive "$tab_page" "$EXAMPLE_BODY" "the new tab shows that page"
+  if wait_for 10 sh -c '"$1" tabs "$2" | tr "\n" "|" | grep -qE "^  [^|]+[|][*] Example Domain[|]\$"' _ "$APPCTL" "$PID"; then
+    ok "its row is after the first tab's, in front, with its page's title"
+  else
+    bad "its row is after the first tab's, in front, with its page's title" "tabs: $(tab_list)"
+  fi
+  # A tab by its row, and the command bar's suggestion of an open tab.
+  "$APPCTL" tab-press "$PID" 1 || bad "pressing the first tab's row" "there is no such row: $(tab_list)"
+  arrive "file:///etc/passwd" 'not file: ones' "pressing the first tab's row in the sidebar shows that tab"
+  opened="$(grep -c 'a window opened' "$log")"
+  choose File "New Tab"
+  wait_for 10 "$APPCTL" bar "$PID" || bad "File > New Tab, again" "no command bar shows"
+  "$APPCTL" bar-type-only "$PID" "Example" >/dev/null || bad "typing in the command bar" "nothing could be typed in it"
+  if wait_for 5 sh -c '"$1" bar-suggestions "$2" | cut -f1,2 | grep -qx "Switch to tab	Example Domain"' _ "$APPCTL" "$PID"; then
+    ok "what is typed in the command bar suggests the open tab whose title has it, to switch to"
+  else
+    bad "what is typed in the command bar suggests the open tab whose title has it, to switch to" \
+      "suggestions: $("$APPCTL" bar-suggestions "$PID" 2>&1 | tr '\t\n' ' |')"
+  fi
+  "$APPCTL" bar-pick "$PID" "Example Domain" >"$LOGS/browse-bar-pick.txt" 2>&1 || bad "choosing the suggestion" "$(cat "$LOGS/browse-bar-pick.txt")"
+  arrive "$tab_page" "$EXAMPLE_BODY" "choosing it brings that tab to the front"
+  must "$([ "$(grep -c 'a window opened' "$log")" = "$opened" ] && ! "$APPCTL" bar "$PID" >/dev/null 2>&1 && echo yes)" \
+    "and opens no tab, the command bar put away" "$(grep 'a window' "$log" | tail -n 2 | tr '\n' ' '); the bar: $("$APPCTL" bar "$PID" 2>&1)"
+  close_tab "the tab the command bar opened"
+  opens "$log" 1 "it closes that tab, and the app lets it go"
+  arrive "file:///etc/passwd" 'not file: ones' "the first tab is in front again, as it was left, once more"
+  must "$([ "$("$APPCTL" tabs "$PID" | grep -c .)" = 1 ] && echo yes)" "its row the one tab in the sidebar" "tabs: $(tab_list)"
   on_screen="$("$APPCTL" windows "$PID" | wc -l | tr -d ' ')"
   must "$([ "$on_screen" = 1 ] && echo yes)" "and its window is still the one on screen" "$on_screen on screen"
   must "$(alive "$PID" && [ "$(pgrep -P "$PID" | tr -d '\n')" = "$HELPER" ] && echo yes)" "the app and its proxy run on (pids $PID, $HELPER)"
@@ -1236,11 +1490,10 @@ change() {
 }
 
 # stats_aside ADDRESS PAGE WHEN: the proxy's counters, read in a tab of their
-# own, which is then closed, leaving the front tab's page, at ADDRESS and
-# saying PAGE, as it was. Sets STATS.
+# own, opened from the command bar, which is then closed, leaving the front
+# tab's page, at ADDRESS and saying PAGE, as it was. Sets STATS.
 stats_aside() {
-  new_tab
-  arrive "" 'Welcome to Syndeo' "a tab of its own for the proxy's counters ($3)"
+  bar_open "http://syndeo.local/stats" "a tab of its own for the proxy's counters, from the command bar ($3)"
   stats_now "$3"
   close_tab "$3"
   arrive "$1" "$2" "the page's tab in front again, as it was ($3)"
@@ -1259,15 +1512,15 @@ reload_gate() {
     if wait_for 5 sh -c '"$1" describe "$2" syndeo.reload | grep -q "Stop"' _ "$APPCTL" "$PID"; then stop_seen=yes; fi
     if wait_for 30 sh -c '"$1" describe "$2" syndeo.reload | grep -q "Reload"' _ "$APPCTL" "$PID"; then reloaded=yes; fi
   fi
-  must "$pressed" "the bar's Reload is pressed" "no Reload button to press in the front window"
+  must "$pressed" "the sidebar's Reload is pressed" "no Reload button to press in the front window"
   arrive "$at" "$EXAMPLE_BODY" "after Reload, the address is still the page's, and the page shows its own text"
   stats_aside "$at" "$EXAMPLE_BODY" "after Reload"
   b="$STATS"
   alone="$(cached_alone "$a" "$b")"
   if { rose revalidations "$a" "$b" || rose misses "$a" "$b"; } && [ "$alone" = 0 ]; then consulted=yes; fi
   {
-    printf 'a fresh https page, then the bar'"'"'s Reload\n  before: %s\n  after:  %s\n  change: %s\n' "$a" "$b" "$(change "$a" "$b")"
-    printf 'Reload pressed: %s; the bar showed Stop then: %s; it read Reload again within 30 s: %s\n' "$pressed" "$stop_seen" "$reloaded"
+    printf 'a fresh https page, then the sidebar'"'"'s Reload\n  before: %s\n  after:  %s\n  change: %s\n' "$a" "$b" "$(change "$a" "$b")"
+    printf 'Reload pressed: %s; it showed Stop then: %s; it read Reload again within 30 s: %s\n' "$pressed" "$stop_seen" "$reloaded"
     printf 'answers from the cache alone (hits beyond revalidations, and stale): %s\n' "$alone"
     printf 'the origin consulted through the proxy (revalidations or misses rose, and nothing from the cache alone): %s\n' "$consulted"
   } >"$out"
@@ -2230,9 +2483,10 @@ realtime() {
 #            authority in no trust settings;
 #   visible: its tabs say who controls them, with Stop, in a window of their
 #            own on screen;
-#   placed:  that bar across the top of the page, beside the sidebar, and
-#            the route the agent reads what the address field says
-#            (agents_placed);
+#   placed:  that banner, and its Stop, across the top of the page, over
+#            none of it, neither over nor under the sidebar's controls or
+#            rows, and covered by nothing; and the route the agent reads what
+#            the address field says (agents_placed);
 #   act:     on a page this test serves, the agent types into a field, clicks
 #            a button, submits a form, scrolls, follows a link and waits for
 #            the page, and goes back; a reference from another page is refused;
@@ -2664,10 +2918,13 @@ agents_off_again() {
   must "$([ "$st" = 3 ] && [ "$(code_of "$out")" = off ] && echo yes)" "off: and a client cannot reach Syndeo" "exit $st: $(head -c 200 "$out")"
 }
 
-# agents_placed: in the agent's window, chosen, with two tabs of its own.
-#   placed:  the bar saying who controls its tabs is across the top of the
-#            page, beside the sidebar and right of its address field, and
-#            overlaps none of the sidebar's tabs, as Accessibility has them;
+# agents_placed: in the agent's window, chosen, so in front, with two tabs of
+# its own, read from that window alone.
+#   placed:  the banner saying who controls its tabs, and its Stop, are
+#            across the top of the page, over none of it, neither over nor
+#            under the traffic lights or any of the sidebar's controls or its
+#            tabs' rows, and covered by nothing, as Accessibility has them
+#            (placed banner);
 #   placed:  the route the agent reads for its tab is what the address field
 #            says: its words, which for Through Syndeo are in its help tag
 #            alone, beside the symbol.
@@ -2679,38 +2936,9 @@ agents_placed() {
   sleep 1
   frames="$("$APPCTL" frames "$PID" 'Controlled by “ci-agent”' 2>&1)"
   printf '%s\n' "$frames" >"$LOGS/agent-frames.txt"
-  verdict="$(printf '%s\n' "$frames" | python3 -I -c '
-import sys
-parts = {}
-tabs = []
-for line in sys.stdin:
-    name, *box = line.split()
-    if len(box) != 4:
-        continue
-    box = [int(v) for v in box]
-    if name == "tab":
-        tabs.append(box)
-    else:
-        parts[name] = box
-missing = [p for p in ("indicator", "address", "page") if p not in parts]
-if missing:
-    sys.exit("missing: " + " ".join(missing))
-ind, addr, page = parts["indicator"], parts["address"], parts["page"]
-top, bottom = ind[1], ind[1] + ind[3]
-# The bar is across the top of the card that holds the page, beside the
-# sidebar with the address field and the tabs: right of the field, above
-# the page, and over none of the tabs.
-if ind[0] < addr[0] + addr[2]:
-    sys.exit("the bar is not beside the sidebar, right of the address field: %r, %r" % (ind, addr))
-if bottom > page[1] + 1:
-    sys.exit("the bar is over the page: %r, %r" % (ind, page))
-for tab in tabs:
-    if tab[0] < ind[0] + ind[2] and tab[0] + tab[2] > ind[0] and tab[1] < bottom and tab[1] + tab[3] > top:
-        sys.exit("the bar overlaps a tab: %r, %r" % (ind, tab))
-print("placed, with %d tabs in the sidebar" % len(tabs))
-' 2>&1)"
-  must "$(printf '%s' "$verdict" | grep -q '^placed, with [2-9].* in the sidebar' && echo yes)" \
-    "placed: the bar saying who controls an agent's tab is across the top of its page, beside the sidebar, and covered by neither" \
+  verdict="$(printf '%s\n' "$frames" | placed banner)"
+  must "$(printf '%s' "$verdict" | grep -q '^placed, with [2-9]' && echo yes)" \
+    "placed: the banner saying who controls an agent's tab, and its Stop, are across the top of the page, over none of it, neither over nor under the sidebar's controls or its two tabs' rows, and covered by nothing" \
     "$verdict; $(tr '\n' ';' <"$LOGS/agent-frames.txt")"
   agent "$out" "{\"cmd\":\"read\",\"tab\":${AGENT_T1:-1}}"
   must "$([ "$(answered "$out" result.route)" = "$(bar)" ] &&
@@ -3025,8 +3253,18 @@ opens() {
     bad "$3" "the app says it has $(open_now "$1") open, not $2"
   fi
 }
-# The front window's tabs, as tabs prints them, on one line: "* Title|  Title|".
+# The front window's tabs, its sidebar's rows, as tabs prints them, on one
+# line: "* Title|  Title|".
 tab_list() { "$APPCTL" tabs "$PID" | tr '\n' '|'; }
+# row_shows FRONT TITLE COLUMN WANT: a row of the front window's sidebar, the
+# one in front if FRONT is "front", any if "-", titled TITLE, has WANT in
+# appctl rows' COLUMN (2 pinned, 3 folder, 4 icon).
+row_shows() {
+  "$APPCTL" rows "$PID" | awk -F'\t' -v front="$1" -v title="$2" -v column="$3" -v want="$4" \
+    '(front == "-" || $1 == front) && $5 == title && $column == want { found = 1 } END { exit !found }'
+}
+# The front window's sidebar rows, as rows prints them, on one line.
+row_list() { "$APPCTL" rows "$PID" | tr '\t\n' ' |'; }
 route_is() { [ "$("$APPCTL" value "$PID" syndeo.route)" = "$1" ]; }
 # press_keys KEY KEYS: KEY pressed holding KEYS, as appctl keys does.
 press_keys() { "$APPCTL" keys "$PID" "$1" "$2" || bad "$2+$1" "pid $PID could not be brought to the front"; }
@@ -3077,9 +3315,8 @@ tab_memory() {
   printf 'Page C (%s), in one tab\n' "$TP/page-c.html" >>"$out"
   one="$(memory_now "$before" "$out")"
   for n in 2 3 4 5; do
-    new_tab
-    arrive "" 'Welcome to Syndeo' "tab $n, to measure memory with, shows the start page"
-    visit "$TP/page-c.html" "$TP/page-c.html" 'SYNDEO-PAGE-C' "the same page opens in tab $n"
+    bar_open "$TP/page-c.html" "tab $n, to measure memory with, opens from the command bar"
+    arrive "$TP/page-c.html" 'SYNDEO-PAGE-C' "the same page opens in tab $n"
   done
   sleep 5
   printf 'the same page, in five tabs\n' >>"$out"
@@ -3117,8 +3354,8 @@ EOF
 # session kept on disk at SESSION; both are there before.
 tabs_cleared() {
   local session="$1"
-  new_tab
-  arrive "" 'Welcome to Syndeo' "a tab to close before clearing"
+  bar_open "http://syndeo.local/stats" "a tab to close before clearing, opened from the command bar"
+  arrive "http://syndeo.local/stats" 'requests [0-9]+' "it shows its page"
   close_tab "a tab closed before clearing"
   must "$([ "$("$APPCTL" menu-enabled "$PID" History "Reopen Last Closed Tab")" = enabled ] && echo yes)" \
     "before clearing, History > Reopen Last Closed Tab is offered"
@@ -3196,7 +3433,7 @@ tabbing() {
   sleep 2
   arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "behind: the page clicked on stays in front, as it was"
   if wait_for 15 sh -c '[ "$("$1" tabs "$2" | tr "\n" "|")" = "* Tabs test|  Page A|" ]' _ "$APPCTL" "$PID"; then
-    ok "and the tab behind it is after it, with its page's title, Page A"
+    ok "and the tab behind it is after it, its row with its page's title, Page A"
   else
     bad "⌘-click's tab" "tabs: $(tab_list)"
   fi
@@ -3220,13 +3457,14 @@ tabbing() {
   else
     bad "a tab opened in front goes right after its page" "tabs: $(tab_list)"
   fi
-  # The menus as AppKit has them with tabs showing, which is when it adds
+  must "$("$APPCTL" tab-bar "$PID" >/dev/null 2>&1 && echo yes)" "with four tabs, AppKit's own tab bar stays hidden" "$("$APPCTL" tab-bar "$PID" 2>&1)"
+  # The menus as AppKit has them with several tabs, which is when it adds
   # its own items.
   for items in File View Window History; do
     "$APPCTL" menu-dump "$PID" "$items" >"$LOGS/tabs-menu-$items-with-tabs.txt" 2>&1
   done
   must "$([ "$(grep -c "^Close Other Tabs$(printf '\t')" "$LOGS/tabs-menu-File-with-tabs.txt")" = 1 ] && echo yes)" \
-    "with tabs showing, File has AppKit's Close Other Tabs, once" "$(tr '\t\n' ' |' <"$LOGS/tabs-menu-File-with-tabs.txt")"
+    "with several tabs, File has AppKit's Close Other Tabs, once" "$(tr '\t\n' ' |' <"$LOGS/tabs-menu-File-with-tabs.txt")"
   must "$([ "$(grep -c "^Show All Tabs$(printf '\t')" "$LOGS/tabs-menu-View-with-tabs.txt")" = 1 ] && echo yes)" \
     "and View one Show All Tabs" "$(tr '\t\n' ' |' <"$LOGS/tabs-menu-View-with-tabs.txt")"
 
@@ -3242,20 +3480,36 @@ tabbing() {
   show_tab 2 "$TP/page-c.html" 'SYNDEO-PAGE-C' "⌘2 shows the second tab"
   show_tab 3 "$TP/page-a.html" 'SYNDEO-PAGE-A' "⌘3 shows the third, the ⌘-click's"
   must "$(route_is 'Through Syndeo' && echo yes)" "which came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
-  if wait_for 15 "$APPCTL" ids "$PID" syndeo.tab-icon; then
-    ok "its tab shows the icon Page A names: $("$APPCTL" ids "$PID" syndeo.tab-icon | head -n 1 | tr '\t' ' ')"
+  if wait_for 15 row_shows front 'Page A' 4 own; then
+    ok "its row in the sidebar shows the icon Page A names"
   else
-    bad "its tab shows the icon Page A names" "no syndeo.tab-icon; the app: $(grep "a page's icon" "$log" | tail -n 2 | tr '\n' ' ')"
+    bad "its row in the sidebar shows the icon Page A names" "rows: $(row_list); the app: $(grep "a page's icon" "$log" | tail -n 2 | tr '\n' ' ')"
   fi
-  "$APPCTL" front-tree "$PID" >"$LOGS/tabs-bar-tree.txt" 2>&1
+  must "$(row_shows - 'Page B' 4 globe && echo yes)" "and Page B's row, a page that names no icon, a globe" "rows: $(row_list)"
+  "$APPCTL" front-tree "$PID" >"$LOGS/tabs-sidebar-tree.txt" 2>&1
+  "$APPCTL" rows "$PID" >"$LOGS/tabs-sidebar-rows.txt" 2>&1
+  "$APPCTL" tab-press "$PID" 2 || bad "pressing the second tab's row" "there is no such row: $(tab_list)"
+  if wait_for 15 at "$TP/page-c.html" 'SYNDEO-PAGE-C'; then
+    ok "pressing the second tab's row in the sidebar shows that tab"
+  else
+    bad "pressing the second tab's row in the sidebar shows that tab" "address field: '$(address)'; tabs: $(tab_list)"
+  fi
 
   show_tab 1 "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "⌘1 shows the first tab again"
   "$APPCTL" click-web "$PID" "Slow link" cmd+shift left || bad "⇧⌘-click on Slow link" "no Slow link to click"
   opens "$log" 5 "⇧⌘-click on a slow page opens a tab in front"
-  if wait_for 6 "$APPCTL" ids "$PID" syndeo.tab-loading; then ok "its tab shows it loading"; else bad "its tab shows it loading" "no syndeo.tab-loading"; fi
-  "$APPCTL" id-tree "$PID" >"$LOGS/tabs-loading-ids.txt" 2>&1
+  if wait_for 6 sh -c '"$1" rows "$2" | awk -F"\t" "\$1 == \"front\" && \$4 == \"loading\" { found = 1 } END { exit !found }"' _ "$APPCTL" "$PID"; then
+    ok "its row in the sidebar shows it loading"
+  else
+    bad "its row in the sidebar shows it loading" "rows: $(row_list)"
+  fi
+  "$APPCTL" rows "$PID" >"$LOGS/tabs-loading-rows.txt" 2>&1
   arrive "$TP/slow.html" 'SYNDEO-SLOW-PAGE' "the slow page arrives"
-  if wait_for 10 sh -c '! "$1" ids "$2" syndeo.tab-loading' _ "$APPCTL" "$PID"; then ok "and its tab stops showing it loading"; else bad "its tab stops showing it loading" "still loading"; fi
+  if wait_for 10 sh -c '! "$1" rows "$2" | cut -f4 | grep -qx loading' _ "$APPCTL" "$PID"; then
+    ok "and its row stops showing it loading"
+  else
+    bad "its row stops showing it loading" "rows: $(row_list)"
+  fi
 
   show_tab 1 "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "⌘1 shows the first tab, to duplicate"
   choose Window "Duplicate Tab"
@@ -3273,7 +3527,11 @@ tabbing() {
   else
     bad "a pinned tab goes first" "tabs: $(tab_list)"
   fi
-  if wait_for 5 "$APPCTL" ids "$PID" syndeo.tab-pinned; then ok "marked pinned in the tab bar"; else bad "a pinned tab is marked" "no syndeo.tab-pinned"; fi
+  if wait_for 5 sh -c '"$1" rows "$2" | head -n 1 | cut -f1,2,5 | grep -qx "front	pinned	Tabs test"' _ "$APPCTL" "$PID"; then
+    ok "its row marked pinned, with a pin"
+  else
+    bad "a pinned tab's row is marked" "rows: $(row_list)"
+  fi
 
   items="$("$APPCTL" tab-menu "$PID" 1 | tr '\n' '|')"
   must "$(printf '%s' "|$items" | grep -qF '|Unpin Tab|' && echo yes)" "a pinned tab's own menu offers Unpin Tab" "$items"
@@ -3281,7 +3539,7 @@ tabbing() {
   printf '%s\n' "$items" >"$LOGS/tabs-tab-menu.txt"
   must "$(for want in 'Duplicate Tab' 'Pin Tab' 'Close Tab' 'Close Other Tabs' 'Move Tab to New Window' 'Show All Tabs'; do
       printf '%s' "|$items" | grep -qF "|$want|" || exit 1; done && echo yes)" \
-    "a secondary click on a tab opens its own menu: Duplicate, Pin, Close, Close Other Tabs, Move to New Window, Show All" "$items"
+    "a secondary click on a tab's row opens its own menu: Duplicate, Pin, Close, Close Other Tabs, Move to New Window, Show All" "$items"
   "$APPCTL" tab-menu "$PID" 2 "Duplicate Tab" >/dev/null || bad "the tab's menu > Duplicate Tab" "it could not be pressed"
   opens "$log" 7 "its Duplicate Tab duplicates that tab"
   arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "in front"
@@ -3367,7 +3625,7 @@ tabs_test() {
     else
       bad "the pinned tab, opened again" "tabs: $(tab_list)"
     fi
-    must "$(wait_for 5 "$APPCTL" ids "$PID" syndeo.tab-pinned && echo yes)" "marked pinned"
+    must "$(wait_for 5 sh -c '"$1" rows "$2" | head -n 1 | cut -f2,5 | grep -qx "pinned	Tabs test"' _ "$APPCTL" "$PID" && echo yes)" "marked pinned" "rows: $(row_list)"
     press_keys 1 cmd
     arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "the pinned tab opens its page when it is shown"
     choose History "Reopen All Windows from Last Session"
