@@ -88,6 +88,12 @@ back.
   as the sidebar did before it showed them only in front: a row for each
   tab in each window, N² for N tabs. With 30 tabs the app must then be seen
   holding more than one row a tab, and making rows again.
+- backdrop-draws-bitmap: the window's backdrop is a plain layer-backed view
+  that draws its gradient itself, as it was before it was a CAGradientLayer:
+  a bitmap of the window's size, kept while its tab is behind another. With
+  30 tabs, each visited, the app's footprint must then be seen growing past
+  ci/test-app.sh's SIDEBAR_GROWTH (it grew 139.0 MB, against 61.4 and 59.5
+  without it, in CI 42545865986, 42542418306 and 42542420916).
 
 Each mutant runs in exactly one CI job: macos-agents runs the agent-*
 mutants, beside its gate, and those in MACOS_AGENTS; macos-app runs the
@@ -105,6 +111,7 @@ PROXY = "crates/syndeo-proxy/src/main.rs"
 CONTROL = "crates/syndeo-app/src/control_macos.rs"
 APP = "crates/syndeo-app/src/app_macos.rs"
 SIDEBAR_MODEL = "crates/syndeo-app/src/sidebar_model.rs"
+CHROME = "crates/syndeo-app/src/chrome_macos.rs"
 
 MUTANTS = {
     "no-pinning-delegate": [
@@ -317,6 +324,29 @@ MUTANTS = {
             "        self.front == Some(window) || self.front.is_some()\n",
         ),
     ],
+    "backdrop-draws-bitmap": [
+        (
+            CHROME,
+            "        #[unsafe(method_id(makeBackingLayer))]\n"
+            "        fn make_backing_layer(&self) -> Retained<CALayer> {\n"
+            "            Retained::into_super(CAGradientLayer::layer())\n"
+            "        }\n"
+            "\n"
+            "        #[unsafe(method(wantsUpdateLayer))]\n"
+            "        fn wants_update_layer(&self) -> bool {\n"
+            "            true\n"
+            "        }\n",
+            "        #[unsafe(method(wantsUpdateLayer))]\n"
+            "        fn wants_update_layer(&self) -> bool {\n"
+            "            false\n"
+            "        }\n"
+            "\n"
+            "        #[unsafe(method(drawRect:))]\n"
+            "        fn draw_rect(&self, _dirty: NSRect) {\n"
+            "            sidebar_macos::fill_gradient(self, self.bounds(), None);\n"
+            "        }\n",
+        ),
+    ],
 }
 
 
@@ -337,6 +367,7 @@ MACOS_AGENTS = {
     "never-retry-direct",
     "direct-for-every-name",
     "sidebar-rows-in-every-window",
+    "backdrop-draws-bitmap",
 }
 
 JOBS = ("macos-app", "macos-agents")
