@@ -36,8 +36,7 @@
 //! Nothing here fetches anything: icons are the ones each tab's badge has.
 //! To Accessibility each row is a button named for its tab, selected while
 //! its tab is in front, and the UI test finds the rows by
-//! `syndeo.sidebar-tab` and the tiles by `syndeo.favorite`, in the window in
-//! front.
+//! `syndeo.sidebar-tab` and the tiles by `syndeo.favorite`.
 
 use crate::favorites::{self, Favorite};
 use crate::sidebar_model::{self, Item};
