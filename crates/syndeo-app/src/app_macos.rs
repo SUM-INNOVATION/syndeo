@@ -450,6 +450,20 @@ define_class!(
             }
         }
 
+        /// Return in an empty command bar: a new tab with the start page,
+        /// beside the window in front, as New Tab once opened straight away.
+        #[unsafe(method(syndeoOpenBlankTab:))]
+        fn open_blank_tab(&self, _sender: Option<&AnyObject>) {
+            match self.persons_front() {
+                Some(front) => {
+                    self.open_tab(&front, &front, Start::Page, Place::Front);
+                }
+                None => {
+                    self.open_window();
+                }
+            }
+        }
+
         /// A window's controller asking for the command bar over its window,
         /// the sender.
         #[unsafe(method(syndeoShowCommandBar:))]
@@ -1974,6 +1988,22 @@ pub fn run(install: InstallDir) -> Result<()> {
     Ok(())
 }
 
+/// A menu item's tag, when `sender` is one.
+fn menu_tag(sender: Option<&AnyObject>) -> Option<isize> {
+    sender
+        .and_then(|s| s.downcast_ref::<NSMenuItem>())
+        .map(|item| item.tag())
+}
+
+/// The space a menu item's tag names, or the current space for an item
+/// with none (the menu bar's).
+fn tag_or_current(sender: Option<&AnyObject>) -> u64 {
+    menu_tag(sender)
+        .and_then(|tag| u64::try_from(tag).ok())
+        .filter(|id| *id > 0)
+        .unwrap_or_else(spaces_macos::current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2382,20 +2412,4 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
             Path::new("/Users/someone/Library/Application Support/Syndeo/proxy/syndeo-ca.pem")
         );
     }
-}
-
-/// A menu item's tag, when `sender` is one.
-fn menu_tag(sender: Option<&AnyObject>) -> Option<isize> {
-    sender
-        .and_then(|s| s.downcast_ref::<NSMenuItem>())
-        .map(|item| item.tag())
-}
-
-/// The space a menu item's tag names, or the current space for an item
-/// with none (the menu bar's).
-fn tag_or_current(sender: Option<&AnyObject>) -> u64 {
-    menu_tag(sender)
-        .and_then(|tag| u64::try_from(tag).ok())
-        .filter(|id| *id > 0)
-        .unwrap_or_else(spaces_macos::current)
 }
