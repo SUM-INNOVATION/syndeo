@@ -552,6 +552,10 @@ case "frames" where args.count == 4:
             line("tab", tab)
         }
     }
+    // The sidebar's rows, one per tab, where the tabs are now.
+    for row in all(window, depth: 16, { (attribute($0, "AXIdentifier") as? String) == "syndeo.sidebar-tab" }) {
+        line("tab", row)
+    }
 case "window-text" where args.count == 4:
     guard let pid = Int32(args[2]) else { exit(2) }
     for window in windows(of: pid) {
