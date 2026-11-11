@@ -393,6 +393,12 @@ impl SpaceBar {
     /// one of those changed.
     pub fn reload(&self, layout: &Layout) {
         let mtm = self.mtm();
+        // The downloads are the person's: an agent's window does not show
+        // them (`downloads_macos::show` refuses there too).
+        let agents = self
+            .window()
+            .is_some_and(|window| crate::control_macos::is_agents(&window));
+        self.ivars().downloads.setHidden(agents);
         let busy = crate::downloads_macos::receiving() > 0;
         let shown: Shown = (
             layout

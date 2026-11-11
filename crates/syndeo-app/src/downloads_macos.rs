@@ -11,8 +11,9 @@
 //! The downloads button in the sidebar's switcher shows a popover with the
 //! list: each download's name, how far it has got, Show in Finder once it
 //! is done or Cancel while it is not; and Open Downloads Folder and Clear
-//! for the list as a whole. The button is tinted while anything downloads.
-//! A download a page started by itself, after its one automatic download,
+//! for the list as a whole. The button is tinted while anything downloads,
+//! and hidden in an agent's window, which never shows the person's
+//! downloads. A download a page started by itself, after its one automatic download,
 //! never begins, and the list shows it blocked (`blocked`), one row for the
 //! page however often it tries.
 //!
@@ -487,8 +488,15 @@ fn tag_of(sender: Option<&AnyObject>) -> Option<u64> {
 
 // ------------------------------------------------------------ the popover
 
-/// Show the downloads, in a popover from `from`.
+/// Show the downloads, in a popover from `from`; but never in an agent's
+/// window, whose sidebar has no downloads button: they are the person's.
 pub fn show(mtm: MainThreadMarker, from: &NSView) {
+    if from
+        .window()
+        .is_some_and(|window| crate::control_macos::is_agents(&window))
+    {
+        return;
+    }
     let popover = POPOVER.with(|slot| {
         slot.borrow_mut()
             .get_or_insert_with(|| {
