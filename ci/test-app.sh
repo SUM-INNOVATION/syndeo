@@ -3784,7 +3784,9 @@ tabs_test() {
 #   - a link marked for downloading that it clicks is refused, and its wait
 #     says so;
 #   - nothing is saved in ~/Downloads, no download began, and the log says
-#     each was refused in an agent's tab, with nothing of their addresses.
+#     each was refused in an agent's tab, with nothing of their addresses;
+#   - the agent's window, in front, has no Downloads button in its sidebar:
+#     the person's downloads are not shown there.
 # ~/Downloads is put back as it was, which is gated, as are the trust
 # settings.
 DOWNLOADS="$HOME/Downloads"
@@ -4137,8 +4139,8 @@ dl_record() {
   if [ -n "$lines" ]; then printf '%s\n' "$lines" | sed 's/^/             /'; else printf '             (nothing in the log)\n'; fi
 }
 
-# dl_list WHEN: the downloads list, as its popover shows it, kept in the logs.
-dl_list() {
+# dl_popover WHEN: the downloads list, as its popover shows it, kept in the logs.
+dl_popover() {
   "$APPCTL" downloads-list "$PID" >"$LOGS/downloads-list-$1.txt" 2>&1 || true
   cat "$LOGS/downloads-list-$1.txt"
 }
@@ -4257,7 +4259,7 @@ EOF
   must "$(dl_saved_is "$DL_DIR/auto-1-$t.bin" >/dev/null && [ "$n" -ge 2 ] && echo yes)" \
     "downloads: a page that tries three automatic downloads on load saves one, its first, and the log says the others were refused as automatic ($n)" \
     "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_after "$log" "$mark" | grep -E "$DL_DECIDED" | sed -E 's/^[^ ]+ +//' | cut -c 1-160 | tr '\n' '|')"
-  must "$(dl_list blocked | grep -qxF "$blocked" && echo yes)" \
+  must "$(dl_popover blocked | grep -qxF "$blocked" && echo yes)" \
     "downloads: a page that tries three automatic downloads on load: the downloads list shows them blocked, saying \"Blocked: this page tried to download more files\"" \
     "the list: $(tr '\n\t' '| ' <"$LOGS/downloads-list-blocked.txt" | head -c 400)"
   dl_record "(b, b2, c) on a page the person opened, in order: a script's click() on a link marked for downloading, a MouseEvent the script made up, its address set to a file" "$log" "$mark"
@@ -4343,7 +4345,7 @@ EOF
   printf '  MEASURE  a download still coming in, in ~/Downloads: %s; the origin was asked for it %s time(s)\n' \
     "$(dl_since "$LOGS/downloads-before-slow.txt" | while IFS= read -r f; do printf '%s, %s bytes so far; ' "$f" "$(wc -c <"$DOWNLOADS/$f" | tr -d ' ')"; done)" \
     "$(dl_heard "/slow-$t.bin")"
-  listed="$(dl_list before-clear)"
+  listed="$(dl_popover before-clear)"
   # The finished one by its name, the one coming in by how far it has got:
   # "N of M".
   must "$([ -n "$kept" ] && printf '%s\n' "$listed" | grep -qxF "syndeo.download-name${tab}$kept" &&
@@ -4370,7 +4372,7 @@ EOF
     "the origin $([ "$stopped" = yes ] && echo 'saw it stop' || echo 'did not see it stop'); new in ~/Downloads since: $(dl_new | LC_ALL=C comm -13 "$LOGS/downloads-before-slow.txt" - | tr '\n' '|'); the app: $(dl_said "$log")"
   must "$([ -n "$kept" ] && cmp -s "$DOWNLOADS/$kept" "$DL_DIR/kept-$t.bin" && echo yes)" \
     "downloads: Clear Browsing Data leaves the files already downloaded in ~/Downloads, byte for byte" "$(ls -l "$DOWNLOADS/$kept" 2>&1)"
-  listed="$(dl_list after-clear)"
+  listed="$(dl_popover after-clear)"
   must "$(printf '%s\n' "$listed" | grep -q '^syndeo.downloads-none' && ! printf '%s\n' "$listed" | grep -q '^syndeo.download-' && echo yes)" \
     "downloads: Clear Browsing Data empties the downloads list: it says nothing has been downloaded" \
     "the list: $(printf '%s' "$listed" | tr '\n\t' '| ' | head -c 400)"
@@ -4422,7 +4424,7 @@ downloads() {
 # agents_downloads LOG: agent-downloads' checks, with agents on and ci-agent
 # allowed for the session, in the application whose log is LOG.
 agents_downloads() {
-  local log="$1" t page out st tab link begun refused
+  local log="$1" t page out st tab link begun refused frames
   dl_origin || return 1
   t="$(token)"
   head -c 100000 /dev/urandom >"$DL_DIR/agent-$t.bin"
@@ -4440,6 +4442,16 @@ EOF
   tab="$(answered "$out" result.tab)"
   must "$([ -n "$tab" ] && [ "$(answered "$out" result.title)" = 'Agent downloads' ] && echo yes)" \
     "agent: a page with a file to download opens in a tab of the agent's" "$(head -c 300 "$out")"
+  # Its window in front: no Downloads button in its sidebar.
+  agent "$LOGS/agent-dl-select.json" "{\"cmd\":\"select\",\"tab\":${tab:-1}}"
+  "$APPCTL" activate "$PID" >/dev/null || true
+  sleep 1
+  frames="$("$APPCTL" frames "$PID" 'Controlled by “ci-agent”' 2>&1)"
+  printf '%s\n' "$frames" >"$LOGS/agent-dl-frames.txt"
+  must "$(printf '%s\n' "$frames" | grep -q '^page ' && printf '%s\n' "$frames" | grep -q '^indicator ' &&
+    ! printf '%s\n' "$frames" | grep -q '^downloads ' && echo yes)" \
+    "agent downloads: the agent's window has no Downloads button in its sidebar, the person's downloads not being its to see" \
+    "$(tr '\n' ';' <"$LOGS/agent-dl-frames.txt" | head -c 400)"
 
   out="$LOGS/agent-dl-goto.json"
   agent "$out" "{\"cmd\":\"goto\",\"tab\":${tab:-1},\"url\":\"http://127.0.0.1:$DL_HTTP/agent-$t.bin?t=$t\"}"
