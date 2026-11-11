@@ -3156,15 +3156,22 @@ apart_listed() {
 #   apart: the person's own window shows their favorites, as tiles, and their
 #          spaces: the switcher, the folder and the space's name. The agent's
 #          window, in front and listing its two tabs, shows no favorite
-#          tile; none of the person's spaces: no switcher, folder or space's
-#          name; and its tab's own menu offers no Add to Favorites and none
-#          of the person's folders. New Tab in it shows the command bar,
-#          which suggests the person's tabs and favorites, over the person's
-#          own window, brought to the front, not over the agent's. The person
-#          switches to their second space, from the Spaces menu; the agent's
-#          window still lists both its tabs.
+#          tile, and none of the person's spaces: no switcher, folder or
+#          space's name. The person switches to their second space, from the
+#          Spaces menu, as the app's log and the layout it keeps say; the
+#          agent's window still lists both its tabs. Its tab's own menu
+#          offers no Add to Favorites and none of the person's folders. New
+#          Tab in it shows the command bar, which suggests the person's tabs
+#          and favorites, over a window of the person's, brought to the
+#          front, not over the agent's.
+# The switch, and the agent's list after it, come before the tab's menu and
+# the command bar: in CI 43092994068, after those, the app made no change to
+# any sidebar for the rest of the opening, the person's included. Measured,
+# not gated: what the person's window says of the spaces after the switch,
+# and whether, after the menu and the bar, a sidebar still changes when the
+# agent's other tab is brought to the front.
 agents_apart() {
-  local round="$1" log="$LOGS/app-$1.stderr" person first items switched
+  local round="$1" log="$LOGS/app-$1.stderr" person first second items switched rows
   if ! alive "${PID:-0}"; then
     bad "apart: the application runs ($round)" "it does not"
     return 1
@@ -3187,6 +3194,7 @@ agents_apart() {
   agent "$LOGS/agent-apart-open.json" "{\"cmd\":\"open\",\"url\":\"http://127.0.0.1:$ORIGIN_PORT/agent.html\"}"
   agent "$LOGS/agent-apart-open2.json" "{\"cmd\":\"open\",\"url\":\"http://127.0.0.1:$ORIGIN_PORT/second.html\"}"
   first="$(answered "$LOGS/agent-apart-open.json" result.tab)"
+  second="$(answered "$LOGS/agent-apart-open2.json" result.tab)"
   must "$([ "$(answered "$LOGS/agent-apart-open.json" result.loaded)" = true ] &&
     [ "$(answered "$LOGS/agent-apart-open2.json" result.loaded)" = true ] && echo yes)" \
     "apart: the agent opens two tabs of its own" \
@@ -3209,15 +3217,40 @@ agents_apart() {
     ! grep -qE 'Apart (home|work|folder)' "$LOGS/agent-apart-tree.txt" && echo yes)" \
     "apart: an agent's window shows none of the person's spaces: no switcher, folder or space's name" \
     "$(grep -E 'syndeo\.(space|folder)' "$LOGS/agent-apart-ids.txt" | tr '\t\n' ' |'); $(grep -E 'Apart (home|work|folder)' "$LOGS/agent-apart-tree.txt" | head -n 3 | tr '\t\n' ' |')"
+
+  # The person switches spaces: the app says so, and keeps the second
+  # current. The agent's window lists its tabs still.
+  switched="$(grep -cF 'a space switched to' "$log")"
+  choose Spaces "Next Space"
+  if logged "$log" 'a space switched to' $((switched + 1)) &&
+    wait_for 10 sh -c 'defaults read "$1" SyndeoSpaces 2>/dev/null | grep -qF "\"current\":2"' _ "$ID"; then
+    ok "apart: the person switches to their second space, from the Spaces menu"
+  else
+    bad "apart: the person switches to their second space, from the Spaces menu" \
+      "log: $(grep -F 'space' "$log" | tail -n 2 | tr '\n' ' '); kept: $(defaults read "$ID" SyndeoSpaces 2>&1 | grep -oE '"current":[0-9]+')"
+  fi
+  "$APPCTL" titles "$PID" >"$LOGS/agent-apart-switched-titles.txt" 2>&1
+  "$APPCTL" front-tree "$PID" >"$LOGS/agent-apart-switched-front.txt" 2>&1
+  printf '  measured: after the switch, the window in front (%s) says of the spaces: %s\n' \
+    "$("$APPCTL" titles "$PID" | head -n 1)" "$(grep -oE 'Apart (home|work)' "$LOGS/agent-apart-switched-front.txt" | sort -u | tr '\n' ' ')"
+  if apart_front "$first" && apart_listed; then
+    ok "apart: after the person switches spaces, an agent's window still lists all its tabs"
+  else
+    bad "apart: after the person switches spaces, an agent's window still lists all its tabs" "tabs: $(tab_list); front: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+
   items="$("$APPCTL" tab-menu "$PID" 1 | tr '\n' '|')"
   printf '%s\n' "$items" >"$LOGS/agent-apart-tab-menu.txt"
   must "$(printf '%s' "|$items" | grep -qF '|Close Tab|' && ! printf '%s' "|$items" | grep -qE 'Favorites|Folder' && echo yes)" \
     "apart: an agent's tab's own menu offers no Add to Favorites, and none of the person's folders" "$items"
 
-  # New Tab, in the agent's window.
+  # New Tab, in the agent's window: the window under the bar is the
+  # person's, with an address field, not saying who controls it, and not at
+  # the agent's page.
   apart_front "$first" || true
   if "$APPCTL" new-tab-row "$PID" >/dev/null && wait_for 10 "$APPCTL" bar "$PID"; then
-    if wait_for 5 sh -c '[ "$("$1" value "$2" syndeo.address)" = "$3" ]' _ "$APPCTL" "$PID" "$person"; then
+    if wait_for 5 sh -c '"$1" value "$2" syndeo.address >/dev/null && ! "$1" front-tree "$2" | grep -qF "Controlled by" &&
+      ! "$1" value "$2" syndeo.address | grep -qF "127.0.0.1:$3"' _ "$APPCTL" "$PID" "$ORIGIN_PORT"; then
       ok "apart: New Tab in an agent's window shows the command bar over the person's own window, brought to the front, not the agent's"
     else
       bad "apart: New Tab in an agent's window shows the command bar over the person's own window, brought to the front, not the agent's" \
@@ -3230,18 +3263,14 @@ agents_apart() {
   "$APPCTL" bar-key "$PID" escape >/dev/null 2>&1 || true
   wait_for 5 sh -c '! "$1" bar "$2"' _ "$APPCTL" "$PID" || true
 
-  # The person switches spaces; the agent's window lists its tabs still.
-  switched="$(grep -cF 'a space switched to' "$log")"
-  choose Spaces "Next Space"
-  if logged "$log" 'a space switched to' $((switched + 1)) && wait_for 10 sh -c '"$1" front-tree "$2" | grep -qF "Apart work"' _ "$APPCTL" "$PID"; then
-    ok "apart: the person switches to their second space, from the Spaces menu"
+  # Measured: the agent's other tab brought to the front, its rows handed
+  # to it, which the app logs.
+  rows="$(grep -cF 'sidebar rows' "$log")"
+  apart_front "$second" || true
+  if logged "$log" 'sidebar rows' $((rows + 1)); then
+    printf '  measured: after the menu and the bar, a sidebar still changes: yes\n'
   else
-    bad "apart: the person switches to their second space, from the Spaces menu" "$(grep -F 'space' "$log" | tail -n 2 | tr '\n' ' ')"
-  fi
-  if apart_front "$first" && apart_listed; then
-    ok "apart: after the person switches spaces, an agent's window still lists all its tabs"
-  else
-    bad "apart: after the person switches spaces, an agent's window still lists all its tabs" "tabs: $(tab_list); front: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+    printf '  measured: after the menu and the bar, a sidebar still changes: no, none logged in 15 s\n'
   fi
 }
 

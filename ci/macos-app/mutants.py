@@ -432,6 +432,9 @@ MUTANTS = {
 # 26m13s, download-challenge-unpinned 105 s of it).
 # And the sidebar's, which macos-agents runs whatever its earlier steps did,
 # while macos-app's mutants wait on its launch passing.
+# And favorites-in-agent-windows, by measured times: in CI 43092994068 it
+# took 61 s in macos-app, which took 53m (43m without the ten minutes its
+# logs' upload spent retrying) against macos-agents' 48m (38m).
 MACOS_AGENTS = {
     "no-pinning-delegate",
     "direct-for-every-host",
@@ -444,6 +447,7 @@ MACOS_AGENTS = {
     "download-challenge-unpinned",
     "sidebar-rows-in-every-window",
     "backdrop-draws-bitmap",
+    "favorites-in-agent-windows",
 }
 
 JOBS = ("macos-app", "macos-agents")
