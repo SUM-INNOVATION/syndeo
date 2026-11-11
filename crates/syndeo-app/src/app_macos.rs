@@ -1535,7 +1535,9 @@ impl AppDelegate {
     }
 
     /// Make `id` the current space, and bring one of its tabs to the
-    /// front, or open one when it has none.
+    /// front, or open one when it has none. Every window's sidebar follows:
+    /// the one in front shows the space's name, its tabs and New Tab, and
+    /// every other window's says which space is current, not the last.
     fn switch_space(&self, id: u64) {
         if !spaces_macos::change(|layout| layout.switch_to(id)) {
             return;
@@ -1548,14 +1550,12 @@ impl AppDelegate {
             .into_iter()
             .find(|w| controller_of(w).is_some_and(|c| c.space() == id));
         match in_space {
-            Some(window) => {
-                window.makeKeyAndOrderFront(None);
-                crate::browser_macos::refresh_sidebars(&window);
-            }
+            Some(window) => window.makeKeyAndOrderFront(None),
             None => {
                 self.open_tab(&front, &front, Start::Page, Place::Front);
             }
         }
+        self.refresh_spaces();
         tracing::info!(space = id, "a space switched to");
     }
 
