@@ -3157,19 +3157,21 @@ apart_listed() {
 #          spaces: the switcher, the folder and the space's name. The agent's
 #          window, in front and listing its two tabs, shows no favorite
 #          tile, and none of the person's spaces: no switcher, folder or
-#          space's name. The person switches to their second space, from the
-#          Spaces menu, as the app's log and the layout it keeps say; the
-#          agent's window still lists both its tabs. Its tab's own menu
-#          offers no Add to Favorites and none of the person's folders. New
-#          Tab in it shows the command bar, which suggests the person's tabs
-#          and favorites, over a window of the person's, brought to the
-#          front, not over the agent's.
-# The switch, and the agent's list after it, come before the tab's menu and
-# the command bar: in CI 43092994068, after those, the app made no change to
-# any sidebar for the rest of the opening, the person's included. Measured,
-# not gated: what the person's window says of the spaces after the switch,
-# and whether, after the menu and the bar, a sidebar still changes when the
-# agent's other tab is brought to the front.
+#          space's name; its tab's own menu offers no Add to Favorites and
+#          none of the person's folders. The person switches to their second
+#          space, from the Spaces menu, as the app's log and the layout it
+#          keeps say; the agent's window still lists both its tabs. New Tab
+#          in it shows the command bar, which suggests the person's tabs and
+#          favorites, over a window of the person's, brought to the front,
+#          not over the agent's.
+# The tab's menu comes before the switch, while the agent's window has rows
+# to open it from, whatever a mutant does to them after. The switch is read
+# from the app's log and kept layout: in CI 43092994068 and 43101278032 the
+# person's window in front after it, the new tab of the second space, never
+# showed that space's name. Measured, not gated: how many rows that window
+# lists then, and what it says of the spaces; and whether, after the menu
+# and the bar, a sidebar still changes when the agent's other tab is
+# brought to the front.
 agents_apart() {
   local round="$1" log="$LOGS/app-$1.stderr" person first second items switched rows
   if ! alive "${PID:-0}"; then
@@ -3218,6 +3220,11 @@ agents_apart() {
     "apart: an agent's window shows none of the person's spaces: no switcher, folder or space's name" \
     "$(grep -E 'syndeo\.(space|folder)' "$LOGS/agent-apart-ids.txt" | tr '\t\n' ' |'); $(grep -E 'Apart (home|work|folder)' "$LOGS/agent-apart-tree.txt" | head -n 3 | tr '\t\n' ' |')"
 
+  items="$("$APPCTL" tab-menu "$PID" 1 | tr '\n' '|')"
+  printf '%s\n' "$items" >"$LOGS/agent-apart-tab-menu.txt"
+  must "$(printf '%s' "|$items" | grep -qF '|Close Tab|' && ! printf '%s' "|$items" | grep -qE 'Favorites|Folder' && echo yes)" \
+    "apart: an agent's tab's own menu offers no Add to Favorites, and none of the person's folders" "$items"
+
   # The person switches spaces: the app says so, and keeps the second
   # current. The agent's window lists its tabs still.
   switched="$(grep -cF 'a space switched to' "$log")"
@@ -3231,18 +3238,14 @@ agents_apart() {
   fi
   "$APPCTL" titles "$PID" >"$LOGS/agent-apart-switched-titles.txt" 2>&1
   "$APPCTL" front-tree "$PID" >"$LOGS/agent-apart-switched-front.txt" 2>&1
-  printf '  measured: after the switch, the window in front (%s) says of the spaces: %s\n' \
-    "$("$APPCTL" titles "$PID" | head -n 1)" "$(grep -oE 'Apart (home|work)' "$LOGS/agent-apart-switched-front.txt" | sort -u | tr '\n' ' ')"
+  printf '  measured: after the switch, the window in front (%s) has %s sidebar rows and says of the spaces: %s\n' \
+    "$("$APPCTL" titles "$PID" | head -n 1)" "$("$APPCTL" rows "$PID" | grep -c .)" \
+    "$(grep -oE 'Apart (home|work)' "$LOGS/agent-apart-switched-front.txt" | sort -u | tr '\n' ' ')"
   if apart_front "$first" && apart_listed; then
     ok "apart: after the person switches spaces, an agent's window still lists all its tabs"
   else
     bad "apart: after the person switches spaces, an agent's window still lists all its tabs" "tabs: $(tab_list); front: $("$APPCTL" titles "$PID" | tr '\n' '|')"
   fi
-
-  items="$("$APPCTL" tab-menu "$PID" 1 | tr '\n' '|')"
-  printf '%s\n' "$items" >"$LOGS/agent-apart-tab-menu.txt"
-  must "$(printf '%s' "|$items" | grep -qF '|Close Tab|' && ! printf '%s' "|$items" | grep -qE 'Favorites|Folder' && echo yes)" \
-    "apart: an agent's tab's own menu offers no Add to Favorites, and none of the person's folders" "$items"
 
   # New Tab, in the agent's window: the window under the bar is the
   # person's, with an address field, not saying who controls it, and not at
