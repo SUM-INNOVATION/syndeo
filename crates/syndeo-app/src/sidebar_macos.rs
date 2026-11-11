@@ -230,8 +230,9 @@ fn held_fewer(by: usize) {
     ROWS_HELD.with(|held| held.set(held.get().saturating_sub(by)));
 }
 
-/// `view`, out of `stack` and out of its superview, but kept by whoever
-/// holds it.
+/// `view`, which `stack` arranges, out of it and out of its superview, but
+/// kept by whoever holds it. Only for a view `stack` arranges: NSStackView
+/// raises an exception for any other (`sidebar_model::take_out`).
 fn detach(stack: &NSStackView, view: &NSView) {
     stack.removeArrangedSubview(view);
     view.removeFromSuperview();
@@ -1741,16 +1742,45 @@ impl Sidebar {
         self.show_favorites(if shows.favorites { favorites } else { &[] });
         ivars.spaces.reload(layout, shows.spaces);
 
+        // What the list arranges now. Rows and folders handed over from the
+        // sidebar of the window that was in front (`adopt`) are in no list
+        // until they are shown below, and only what it arranges is taken out
+        // of it (`sidebar_model::take_out`): AppKit raises an exception
+        // otherwise, which stopped this halfway after a space switch.
+        let arranged: Vec<usize> = ivars
+            .list
+            .arrangedSubviews()
+            .iter()
+            .map(|line| Retained::as_ptr(&line) as usize)
+            .collect();
+        let rows_listed: Vec<usize> = ivars
+            .rows
+            .borrow()
+            .iter()
+            .filter(|(_, row)| arranged.contains(&(Retained::as_ptr(row) as usize)))
+            .map(|(key, _)| *key)
+            .collect();
+        let folders_listed: Vec<u64> = ivars
+            .folder_rows
+            .borrow()
+            .iter()
+            .filter(|(_, (row, _, _))| arranged.contains(&(Retained::as_ptr(row) as usize)))
+            .map(|(id, _)| *id)
+            .collect();
+
         // The tabs' rows: those kept, those made, those let go.
         let width = WIDTH - 2.0 * (SIDE - 2.0);
         let want = sidebar_model::row_keys(items);
         let have: Vec<usize> = ivars.rows.borrow().keys().copied().collect();
         let diff = sidebar_model::diff_rows(&have, &want);
+        let out = sidebar_model::take_out(&diff.drop, &rows_listed);
         {
             let mut rows = ivars.rows.borrow_mut();
             for key in &diff.drop {
                 if let Some(row) = rows.remove(key) {
-                    detach(&ivars.list, &row);
+                    if out.contains(key) {
+                        detach(&ivars.list, &row);
+                    }
                 }
             }
             let menu_for = ivars.menu_for.borrow().clone();
@@ -1775,7 +1805,9 @@ impl Sidebar {
                 Item::Folder(id) => {
                     if let Some(folder) = layout.folder(id) {
                         folders.push(id);
-                        lines.push(Retained::into_super(self.folder_row(folder)));
+                        lines.push(Retained::into_super(
+                            self.folder_row(folder, &folders_listed),
+                        ));
                     }
                 }
                 Item::Tab { key, in_folder } => {
@@ -1789,9 +1821,17 @@ impl Sidebar {
                 Item::NewTab => lines.push(Retained::into_super(self.new_tab_row())),
             }
         }
+        let gone: Vec<u64> = ivars
+            .folder_rows
+            .borrow()
+            .keys()
+            .copied()
+            .filter(|id| !folders.contains(id))
+            .collect();
+        let out = sidebar_model::take_out(&gone, &folders_listed);
         ivars.folder_rows.borrow_mut().retain(|id, (row, _, _)| {
             let kept = folders.contains(id);
-            if !kept {
+            if out.contains(id) {
                 detach(&ivars.list, row);
             }
             kept
@@ -1808,10 +1848,13 @@ impl Sidebar {
             for line in &lines {
                 ivars.list.addArrangedSubview(line);
             }
+            // After the space's name, when the list has it.
             if let Some((header, _)) = &*ivars.header.borrow() {
-                ivars
-                    .list
-                    .setCustomSpacing_afterView(SECTION_GAP - ROW_GAP, header);
+                if lines.iter().any(|line| std::ptr::eq(&**line, &**header)) {
+                    ivars
+                        .list
+                        .setCustomSpacing_afterView(SECTION_GAP - ROW_GAP, header);
+                }
             }
         }
         (diff.make.len(), diff.drop.len())
@@ -1990,15 +2033,19 @@ impl Sidebar {
         row
     }
 
-    /// `folder`'s row: made again only when its name or its fold changed.
-    fn folder_row(&self, folder: &Folder) -> Retained<FolderRow> {
+    /// `folder`'s row: made again only when its name or its fold changed,
+    /// the old one taken out of the list if the list arranges it, as
+    /// `listed` says.
+    fn folder_row(&self, folder: &Folder, listed: &[u64]) -> Retained<FolderRow> {
         let ivars = self.ivars();
         let mut rows = ivars.folder_rows.borrow_mut();
         if let Some((row, name, collapsed)) = rows.get(&folder.id) {
             if *name == folder.name && *collapsed == folder.collapsed {
                 return row.clone();
             }
-            detach(&ivars.list, row);
+            if !sidebar_model::take_out(&[folder.id], listed).is_empty() {
+                detach(&ivars.list, row);
+            }
         }
         let width = WIDTH - 2.0 * (SIDE - 2.0);
         let row = FolderRow::new(self.mtm(), width, folder);
