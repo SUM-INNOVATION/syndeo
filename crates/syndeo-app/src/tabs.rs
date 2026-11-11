@@ -3,11 +3,13 @@
 //! that were closed and can be opened again, where a pinned tab goes, and
 //! the session kept from one launch to the next.
 //!
-//! The session holds the address and title of each open tab, and whether it
-//! is pinned, in the order they were in, window by window; nothing else of a
-//! page. It is read back only as addresses that typing would open
-//! (`address::interpret`), so a damaged or altered file opens nothing a
-//! window could not.
+//! The session holds the address and title of each open tab, whether it is
+//! pinned, and the space and folder it is in, in the order they were in,
+//! window by window; nothing else of a page. It is read back only as
+//! addresses that typing would open (`address::interpret`), so a damaged or
+//! altered file opens nothing a window could not. Its `tab` lines are as
+//! Syndeo 0.2.1 reads them, so that one opens every tab again after a
+//! downgrade (`Session::to_text`).
 
 use crate::address::{self, Search, Typed};
 use std::collections::VecDeque;
@@ -259,27 +261,35 @@ impl Session {
     }
 
     /// As the file has it: a header, then for each window a `window` line
-    /// with the index of its tab in front, then a `tab` line for each tab,
-    /// fields apart by tabs: `pinned` or `-`, the address, the title.
+    /// with the index of its tab in front, then for each tab a `tab` line
+    /// and a `place` line, fields apart by tabs:
+    ///
+    /// ```text
+    /// syndeo-session 1
+    /// window  <the index of the tab in front>
+    /// tab     <pinned or ->  <address>  <title>
+    /// place   <space>  <folder, or ->
+    /// ```
+    ///
+    /// A `tab` line has exactly those four fields, which is all Syndeo
+    /// 0.2.1 reads one as: given a fifth, it dropped the tab, and every tab
+    /// with it. The space and folder are on a line of their own, after it,
+    /// which 0.2.1 leaves alone, as it does any line it does not know.
     pub fn to_text(&self) -> String {
         let mut text = format!("{SESSION_HEADER}\n");
         for window in &self.windows {
             text.push_str(&format!("window\t{}\n", window.selected));
             for tab in &window.tabs {
-                // The space and folder follow, as `key=value` fields a
-                // reader that does not know them can leave alone.
-                let mut line = format!(
-                    "tab\t{}\t{}\t{}\tspace={}",
+                text.push_str(&format!(
+                    "tab\t{}\t{}\t{}\n",
                     if tab.pinned { "pinned" } else { "-" },
                     one_line(&tab.address),
-                    one_line(&tab.title),
-                    tab.space
-                );
-                if let Some(folder) = tab.folder {
-                    line.push_str(&format!("\tfolder={folder}"));
-                }
-                line.push('\n');
-                text.push_str(&line);
+                    one_line(&tab.title)
+                ));
+                let folder = tab
+                    .folder
+                    .map_or_else(|| "-".to_string(), |f| f.to_string());
+                text.push_str(&format!("place\t{}\t{folder}\n", tab.space));
             }
         }
         text
@@ -288,15 +298,23 @@ impl Session {
     /// Read back from the file's text: nothing from a file that is not a
     /// session, and of one, only lines as [`Session::to_text`] writes them,
     /// tabs whose address is [`savable`], and no more than a bounded number
-    /// of windows and tabs.
+    /// of windows and tabs. A `place` line places the tab on the line just
+    /// before it, and no other. Also read: a file 0.2.1 wrote, whose tabs
+    /// are all in the first space; and one written before the `place` line,
+    /// by builds of 0.3.0 in the making, whose `tab` lines had `space=` and
+    /// `folder=` fields after the title.
     pub fn from_text(text: &str) -> Self {
         let mut lines = text.lines();
         if lines.next() != Some(SESSION_HEADER) {
             return Self::default();
         }
         let mut session = Self::default();
+        // The tab the line before put in a window, which a `place` line
+        // places.
+        let mut placeable = false;
         for line in lines {
             let fields: Vec<&str> = line.split('\t').collect();
+            let was_placeable = std::mem::replace(&mut placeable, false);
             match fields.as_slice() {
                 ["window", selected] => {
                     if session.windows.len() == SESSION_WINDOWS {
@@ -323,7 +341,18 @@ impl Session {
                                 space: field("space=").unwrap_or(crate::spaces::FIRST_SPACE),
                                 folder: field("folder=").filter(|_| pinned),
                             });
+                            placeable = true;
                         }
+                    }
+                }
+                ["place", space, folder] if was_placeable => {
+                    let tab = session
+                        .windows
+                        .last_mut()
+                        .and_then(|window| window.tabs.last_mut());
+                    if let (Some(tab), Ok(space)) = (tab, space.parse::<u64>()) {
+                        tab.space = space;
+                        tab.folder = folder.parse::<u64>().ok().filter(|_| tab.pinned);
                     }
                 }
                 _ => {}
@@ -528,6 +557,236 @@ mod tests {
         let read = Session::from_text(odd);
         assert_eq!(read.windows[0].tabs[0].space, 2);
         assert_eq!(read.windows[0].tabs[0].folder, None);
+    }
+
+    /// Syndeo 0.2.1's reader of the session file, exactly as it is at the
+    /// tag v0.2.1 (85db8ab9), in crates/syndeo-app/src/tabs.rs:
+    /// `Session::from_text`, from line 280, and the `Session::kept` it ends
+    /// with, from line 218, with 0.2.1's types and limits; only rustfmt's
+    /// indentation is this module's. `savable`, which `kept` calls, is
+    /// unchanged since that tag, and is the one above.
+    mod v0_2_1 {
+        use super::super::savable;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct SavedTab {
+            pub address: String,
+            pub title: String,
+            pub pinned: bool,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, Default)]
+        pub struct SavedWindow {
+            pub tabs: Vec<SavedTab>,
+            pub selected: usize,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, Default)]
+        pub struct Session {
+            pub windows: Vec<SavedWindow>,
+        }
+
+        const SESSION_HEADER: &str = "syndeo-session 1";
+        const SESSION_WINDOWS: usize = 50;
+        const SESSION_TABS: usize = 500;
+
+        impl Session {
+            pub fn kept(mut self) -> Self {
+                for window in &mut self.windows {
+                    let selected = window.tabs.get(window.selected).cloned();
+                    window.tabs.retain(|tab| savable(&tab.address));
+                    window.selected = selected
+                        .and_then(|tab| window.tabs.iter().position(|kept| *kept == tab))
+                        .unwrap_or(0);
+                }
+                self.windows.retain(|window| !window.tabs.is_empty());
+                self
+            }
+
+            pub fn from_text(text: &str) -> Self {
+                let mut lines = text.lines();
+                if lines.next() != Some(SESSION_HEADER) {
+                    return Self::default();
+                }
+                let mut session = Self::default();
+                for line in lines {
+                    let fields: Vec<&str> = line.split('\t').collect();
+                    match fields.as_slice() {
+                        ["window", selected] => {
+                            if session.windows.len() == SESSION_WINDOWS {
+                                break;
+                            }
+                            session.windows.push(SavedWindow {
+                                tabs: Vec::new(),
+                                selected: selected.parse().unwrap_or(0),
+                            });
+                        }
+                        ["tab", pin, address, title] if *pin == "pinned" || *pin == "-" => {
+                            if let Some(window) = session.windows.last_mut() {
+                                if window.tabs.len() < SESSION_TABS {
+                                    window.tabs.push(SavedTab {
+                                        address: (*address).to_string(),
+                                        title: (*title).to_string(),
+                                        pinned: *pin == "pinned",
+                                    });
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for window in &mut session.windows {
+                    if window.selected >= window.tabs.len() {
+                        window.selected = 0;
+                    }
+                }
+                session.kept()
+            }
+        }
+    }
+
+    /// Tabs in every arrangement a session can have: pinned or not, in the
+    /// first space and others, in a folder or none, in two windows.
+    fn placed_session() -> Session {
+        let mut in_folder = tab("https://a.test/pinned", "Pinned, in a folder", true);
+        in_folder.space = 4;
+        in_folder.folder = Some(9);
+        let mut pinned = tab("https://b.test/", "Pinned", true);
+        pinned.space = 2;
+        let mut elsewhere = tab("http://127.0.0.1:8080/x?y=z", "In another space", false);
+        elsewhere.space = 2;
+        Session {
+            windows: vec![
+                SavedWindow {
+                    tabs: vec![
+                        in_folder,
+                        pinned,
+                        tab("https://c.test/", "Loose", false),
+                        elsewhere,
+                    ],
+                    selected: 3,
+                },
+                SavedWindow {
+                    tabs: vec![tab("https://d.test/", "Another window", false)],
+                    selected: 0,
+                },
+            ],
+        }
+    }
+
+    /// The downgrade #70's review found: the uninstaller keeps Application
+    /// Support, and 0.2.1, given a `tab` line with a fifth field, dropped
+    /// every tab, pinned ones too, then wrote the file again without them.
+    /// Of what is written now, 0.2.1's own reader opens every tab, with its
+    /// address, title and pin, and each window's tab in front.
+    #[test]
+    fn syndeo_0_2_1_reads_every_tab_of_a_session_written_now() {
+        let session = placed_session();
+        let text = session.to_text();
+        for line in text.lines().filter(|line| line.starts_with("tab\t")) {
+            assert_eq!(line.split('\t').count(), 4, "{line:?}");
+        }
+        let old = v0_2_1::Session::from_text(&text);
+        assert_eq!(old.windows.len(), session.windows.len());
+        for (read, written) in old.windows.iter().zip(&session.windows) {
+            assert_eq!(read.selected, written.selected);
+            let as_written: Vec<v0_2_1::SavedTab> = written
+                .tabs
+                .iter()
+                .map(|tab| v0_2_1::SavedTab {
+                    address: tab.address.clone(),
+                    title: tab.title.clone(),
+                    pinned: tab.pinned,
+                })
+                .collect();
+            assert_eq!(read.tabs, as_written);
+        }
+        let pinned = old
+            .windows
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .filter(|t| t.pinned);
+        assert_eq!(
+            pinned.count(),
+            2,
+            "the pinned tabs, which 0.2.1 opens at every launch, among them"
+        );
+        // What this test exists for, seen failing: the interim layout,
+        // which 0.2.1 read as no tabs at all.
+        let interim = "syndeo-session 1\nwindow\t0\ntab\tpinned\thttps://a.test/\tA\tspace=1\n";
+        assert!(v0_2_1::Session::from_text(interim).windows.is_empty());
+    }
+
+    #[test]
+    fn a_session_reads_back_with_each_tabs_space_and_folder() {
+        let session = placed_session();
+        let text = session.to_text();
+        assert!(
+            text.contains("tab\tpinned\thttps://a.test/pinned\tPinned, in a folder\nplace\t4\t9\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("tab\t-\thttps://c.test/\tLoose\nplace\t1\t-\n"),
+            "{text}"
+        );
+        assert_eq!(Session::from_text(&text), session);
+    }
+
+    /// What builds of this version wrote before the `place` line: the space
+    /// and folder as `key=value` fields after the title.
+    #[test]
+    fn a_session_written_with_space_and_folder_fields_still_reads() {
+        let interim = "syndeo-session 1\nwindow\t1\n\
+                       tab\tpinned\thttps://a.test/\tA\tspace=7\tfolder=12\n\
+                       tab\t-\thttps://b.test/\tB\tspace=7\n\
+                       tab\t-\thttps://c.test/\tC\tspace=2\tfolder=3\n";
+        let mut a = tab("https://a.test/", "A", true);
+        a.space = 7;
+        a.folder = Some(12);
+        let mut b = tab("https://b.test/", "B", false);
+        b.space = 7;
+        let mut c = tab("https://c.test/", "C", false);
+        c.space = 2;
+        assert_eq!(
+            Session::from_text(interim),
+            Session {
+                windows: vec![SavedWindow {
+                    tabs: vec![a, b, c],
+                    selected: 1
+                }]
+            }
+        );
+    }
+
+    /// A `place` line places the tab on the line just before it and no
+    /// other: not after a window line, after a tab line that was not read,
+    /// or after another place line; one that cannot be read places nothing;
+    /// and a folder is only a pinned tab's.
+    #[test]
+    fn a_place_line_places_only_the_tab_just_before_it() {
+        let text = "syndeo-session 1\n\
+                    place\t5\t5\n\
+                    window\t0\n\
+                    place\t5\t5\n\
+                    tab\tpinned\thttps://a.test/\tA\n\
+                    place\t3\t8\n\
+                    place\t6\t6\n\
+                    tab\tmaybe\thttps://x.test/\tX\n\
+                    place\t6\t6\n\
+                    tab\t-\thttps://b.test/\tB\n\
+                    place\tnone\t-\n\
+                    tab\t-\thttps://c.test/\tC\n\
+                    place\t2\t4\n";
+        let read = Session::from_text(text);
+        let placed: Vec<(&str, u64, Option<u64>)> = read.windows[0]
+            .tabs
+            .iter()
+            .map(|t| (t.title.as_str(), t.space, t.folder))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![("A", 3, Some(8)), ("B", 1, None), ("C", 2, None)]
+        );
     }
 
     #[test]
