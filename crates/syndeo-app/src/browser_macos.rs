@@ -952,10 +952,24 @@ fn refresh_pending() {
     let (mut made, mut dropped, mut handed) = (0, 0, 0);
     let groups = sidebar_model::unique_by(asked, |w| group_key(w));
     for window in &groups {
-        let (m, d, h) = refresh_group(window);
-        made += m;
-        dropped += d;
-        handed += usize::from(h);
+        // An exception AppKit raises, as NSStackView does when told to take
+        // out a view it does not arrange, would otherwise unwind out of this
+        // block to NSApplication, which reports it to the system's log alone:
+        // the sidebar left half shown, and nothing in this log (CI
+        // 43092994068). Caught here, it is logged, and the other groups are
+        // still refreshed.
+        match objc2::exception::catch(std::panic::AssertUnwindSafe(|| refresh_group(window))) {
+            Ok((m, d, h)) => {
+                made += m;
+                dropped += d;
+                handed += usize::from(h);
+            }
+            Err(exception) => {
+                let reason =
+                    exception.map_or_else(|| "no reason given".to_string(), |e| e.to_string());
+                tracing::warn!(%reason, "a sidebar refresh failed");
+            }
+        }
     }
     if made + dropped + handed > 0 {
         tracing::info!(
