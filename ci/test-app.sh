@@ -271,7 +271,8 @@
 #     with its history; Window > Pin Tab puts the tab first, its row
 #     marked with a pin; a secondary click on a tab's row
 #     opens Syndeo's menu for it, Unpin Tab for a pinned one, and its
-#     Duplicate Tab duplicates that tab;
+#     Duplicate Tab duplicates that tab; a Control-click on a row, which
+#     macOS makes a secondary click, opens the same menu, choosing no tab;
 #   - File > Close Other Tabs closes all but the pinned one, which says no to
 #     closing, and this one;
 #     History > Recently Closed lists them by title; ⇧⌘T opens the last one
@@ -3606,7 +3607,7 @@ show_tab() {
 # tab's own menu, Close Other Tabs, Reopen Last Closed Tab and Recently
 # Closed, and Show All Tabs.
 tabbing() {
-  local log="$1" list last_closed items before
+  local log="$1" list last_closed items control_items before
   visit "$TP/tabs.html" "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "a page with links opens, by a public name"
   must "$(route_is 'Through Syndeo' && echo yes)" "and came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
   if wait_for 10 sh -c '[ "$("$1" titles "$2" | head -n 1)" = "Tabs test" ]' _ "$APPCTL" "$PID"; then
@@ -3727,6 +3728,13 @@ tabbing() {
   must "$(for want in 'Duplicate Tab' 'Pin Tab' 'Close Tab' 'Close Other Tabs' 'Move Tab to New Window' 'Show All Tabs'; do
       printf '%s' "|$items" | grep -qF "|$want|" || exit 1; done && echo yes)" \
     "a secondary click on a tab's row opens its own menu: Duplicate, Pin, Close, Close Other Tabs, Move to New Window, Show All" "$items"
+  # Control-click, on a tab behind: the same menu, and no tab chosen.
+  list="$(tab_list)"
+  control_items="$("$APPCTL" tab-menu-control "$PID" 3 | tr '\n' '|')"
+  sleep 1
+  must "$([ "$control_items" = "$items" ] && [ "$(tab_list)" = "$list" ] && echo yes)" \
+    "a Control-click on a tab's row, which macOS makes a secondary click, opens the same menu, and chooses no tab" \
+    "menu: $control_items; tabs before: $list; after: $(tab_list)"
   "$APPCTL" tab-menu "$PID" 2 "Duplicate Tab" >/dev/null || bad "the tab's menu > Duplicate Tab" "it could not be pressed"
   opens "$log" 7 "its Duplicate Tab duplicates that tab"
   arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "in front"

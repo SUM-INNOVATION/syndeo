@@ -134,6 +134,11 @@
 //                                each item of the menu it opens, one a line, then press
 //                                <title>, or close it choosing nothing; exits 1 if no menu
 //                                opened, or there is no such item
+//   appctl tab-menu-control <pid> <index>   the same, by a Control-click on the row, the
+//                                primary button pressed with Control held, which macOS
+//                                makes a secondary click: print each item of the menu it
+//                                opens, one a line, and close it choosing nothing; exits 1
+//                                if no menu opened
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -1018,6 +1023,23 @@ case "tab-menu" where args.count == 4 || args.count == 5:
             exit(1)
         }
         exit(AXUIElementPerformAction(item, kAXPressAction as CFString) == .success ? 0 : 1)
+    }
+    if AXUIElementPerformAction(menu, kAXCancelAction as CFString) != .success {
+        key(pid, 53, "\u{1b}")
+    }
+case "tab-menu-control" where args.count == 4:
+    guard let pid = Int32(args[2]), let index = Int(args[3]), activate(pid) else { exit(1) }
+    let tabs = tabRows(pid)
+    guard index >= 1, index <= tabs.count, let box = frame(of: tabs[index - 1].element) else {
+        print("no tab \(args[3]) of \(tabs.count)")
+        exit(1)
+    }
+    // Where tab-menu clicks: on its title, away from the row's Close or pin.
+    let point = CGPoint(x: box.minX + box.width * 0.4, y: box.midY)
+    click(point, .left, .maskControl)
+    guard let (menu, items) = openMenu(pid, near: point) else { print("no menu opened"); exit(1) }
+    for item in items {
+        print(oneLine(attribute(item, kAXTitleAttribute)))
     }
     if AXUIElementPerformAction(menu, kAXCancelAction as CFString) != .success {
         key(pid, 53, "\u{1b}")

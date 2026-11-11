@@ -67,6 +67,28 @@ pub fn shows(owner: Owner) -> Shows {
     }
 }
 
+/// What pressing a row or a tile of the sidebar with the primary button
+/// does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Press {
+    /// What a click there does: choose the tab, open the favorite, fold or
+    /// open the folder.
+    Usual,
+    /// Open its own menu, as a secondary click does.
+    Menu,
+}
+
+/// What a primary press does, `control` held or not: with Control, which
+/// macOS makes a secondary click, the row's or tile's own menu; otherwise
+/// what a click does.
+pub fn press(control: bool) -> Press {
+    if control {
+        Press::Menu
+    } else {
+        Press::Usual
+    }
+}
+
 /// A tab, as the sidebar's list needs it: `key` stands for its window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tab<K> {
@@ -338,6 +360,12 @@ mod tests {
             },
             "no favorite to see or load, and no space, folder or space's name"
         );
+    }
+
+    #[test]
+    fn a_control_click_is_a_secondary_click() {
+        assert_eq!(press(true), Press::Menu, "Control-click opens the menu");
+        assert_eq!(press(false), Press::Usual);
     }
 
     #[test]

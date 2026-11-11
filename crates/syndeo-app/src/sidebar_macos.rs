@@ -25,7 +25,9 @@
 //!   and is not closed from the sidebar.
 //! - **New Tab** is the last row, always.
 //! - **A secondary click** on a row opens the tab's own menu, the one the
-//!   application gives (`menu_for`).
+//!   application gives (`menu_for`); a Control-click, which macOS makes a
+//!   secondary click, does too, on a row, a favorite's tile or a folder
+//!   (`sidebar_model::press`).
 //! - **Hidden**, the sidebar comes back over the page while the pointer is
 //!   at the window's left edge (`EdgeSensor`), as a floating panel, and
 //!   goes again when the pointer leaves it. The panel is drawn
@@ -44,7 +46,7 @@
 //! `syndeo.sidebar-tab` and the tiles by `syndeo.favorite`.
 
 use crate::favorites::{self, Favorite};
-use crate::sidebar_model::{self, Item, Owner, Shows};
+use crate::sidebar_model::{self, Item, Owner, Press, Shows};
 use crate::spaces::{Folder, Layout};
 use crate::spaces_macos::{self, SpaceBar};
 use objc2::rc::{Retained, Weak};
@@ -55,10 +57,11 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAccessibility, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSApplication,
-    NSBezierPath, NSBox, NSBoxType, NSButton, NSClipView, NSColor, NSEvent, NSFont, NSGradient,
-    NSImage, NSImageScaling, NSImageView, NSLayoutAttribute, NSLayoutConstraint, NSLineBreakMode,
-    NSMenu, NSScrollView, NSStackView, NSTextAlignment, NSTextField, NSTrackingArea,
-    NSTrackingAreaOptions, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
+    NSBezierPath, NSBox, NSBoxType, NSButton, NSClipView, NSColor, NSEvent, NSEventModifierFlags,
+    NSFont, NSGradient, NSImage, NSImageScaling, NSImageView, NSLayoutAttribute,
+    NSLayoutConstraint, NSLineBreakMode, NSMenu, NSScrollView, NSStackView, NSTextAlignment,
+    NSTextField, NSTrackingArea, NSTrackingAreaOptions, NSUserInterfaceLayoutOrientation, NSView,
+    NSWindow,
 };
 use objc2_foundation::{
     ns_string, NSArray, NSEdgeInsets, NSPoint, NSRect, NSSize, NSString, NSUserDefaults,
@@ -274,6 +277,16 @@ fn track(view: &NSView) {
     view.addTrackingArea(&area);
 }
 
+/// What a primary press with `event`'s keys does: with Control, the menu a
+/// secondary click opens (`sidebar_model::press`).
+fn press_of(event: &NSEvent) -> Press {
+    sidebar_model::press(
+        event
+            .modifierFlags()
+            .contains(NSEventModifierFlags::Control),
+    )
+}
+
 // ------------------------------------------------------------ favorites kept
 
 /// The defaults key the favorites are kept under, as `favorites::render`.
@@ -387,10 +400,16 @@ define_class!(
 
         /// A press chooses the tab when it is let go, unless it became a
         /// drag: dragged up to the favorites, the tab's page is added there.
+        /// With Control, it opens the tab's menu, as a secondary click does.
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
-            self.ivars().press.set(Some(event.locationInWindow()));
             self.ivars().dragging.set(false);
+            if press_of(event) == Press::Menu {
+                self.ivars().press.set(None);
+                self.show_menu(event);
+                return;
+            }
+            self.ivars().press.set(Some(event.locationInWindow()));
         }
 
         #[unsafe(method(mouseDragged:))]
@@ -421,7 +440,10 @@ define_class!(
             let _keep = self.retain();
             let ivars = self.ivars();
             let was_drag = ivars.dragging.replace(false);
-            ivars.press.set(None);
+            // A Control-click's, whose menu was shown, chooses nothing.
+            if ivars.press.take().is_none() {
+                return;
+            }
             if !was_drag {
                 self.choose();
                 return;
@@ -435,16 +457,7 @@ define_class!(
 
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
-            let _keep = self.retain();
-            let ivars = self.ivars();
-            let tab = ivars.tab.borrow().as_ref().and_then(Weak::load);
-            let menu_for = ivars.menu_for.borrow().clone();
-            let (Some(tab), Some(menu_for)) = (tab, menu_for) else {
-                return;
-            };
-            if let Some(menu) = menu_for(&tab) {
-                NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
-            }
+            self.show_menu(event);
         }
 
         #[unsafe(method(mouseEntered:))]
@@ -506,6 +519,20 @@ define_class!(
 );
 
 impl TabRow {
+    /// The tab's own menu, for a secondary click or a Control-click.
+    fn show_menu(&self, event: &NSEvent) {
+        let _keep = self.retain();
+        let ivars = self.ivars();
+        let tab = ivars.tab.borrow().as_ref().and_then(Weak::load);
+        let menu_for = ivars.menu_for.borrow().clone();
+        let (Some(tab), Some(menu_for)) = (tab, menu_for) else {
+            return;
+        };
+        if let Some(menu) = menu_for(&tab) {
+            NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+        }
+    }
+
     /// A row for `tab`, set in when it is `in_folder`; or for New Tab when
     /// there is none.
     fn new(
@@ -773,32 +800,18 @@ define_class!(
             true
         }
 
+        /// A press opens the favorite; with Control, its menu.
         #[unsafe(method(mouseDown:))]
-        fn mouse_down(&self, _event: &NSEvent) {
-            self.choose();
+        fn mouse_down(&self, event: &NSEvent) {
+            match press_of(event) {
+                Press::Menu => self.show_menu(event),
+                Press::Usual => self.choose(),
+            }
         }
 
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
-            let _keep = self.retain();
-            let mtm = self.mtm();
-            let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Favorite"));
-            let target = self.target();
-            let me: &AnyObject = self.as_ref();
-            let item = unsafe {
-                objc2_app_kit::NSMenuItem::initWithTitle_action_keyEquivalent(
-                    objc2_app_kit::NSMenuItem::alloc(mtm),
-                    ns_string!("Remove from Favorites"),
-                    Some(sel!(syndeoRemoveFavorite:)),
-                    &NSString::new(),
-                )
-            };
-            unsafe {
-                item.setTarget(target.as_deref());
-                item.setRepresentedObject(Some(me));
-            }
-            menu.addItem(&item);
-            NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+            self.show_menu(event);
         }
 
         #[unsafe(method(mouseEntered:))]
@@ -849,6 +862,29 @@ define_class!(
 );
 
 impl FavoriteTile {
+    /// The favorite's menu: Remove from Favorites.
+    fn show_menu(&self, event: &NSEvent) {
+        let _keep = self.retain();
+        let mtm = self.mtm();
+        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Favorite"));
+        let target = self.target();
+        let me: &AnyObject = self.as_ref();
+        let item = unsafe {
+            objc2_app_kit::NSMenuItem::initWithTitle_action_keyEquivalent(
+                objc2_app_kit::NSMenuItem::alloc(mtm),
+                ns_string!("Remove from Favorites"),
+                Some(sel!(syndeoRemoveFavorite:)),
+                &NSString::new(),
+            )
+        };
+        unsafe {
+            item.setTarget(target.as_deref());
+            item.setRepresentedObject(Some(me));
+        }
+        menu.addItem(&item);
+        NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+    }
+
     fn new(mtm: MainThreadMarker, size: f64, favorite: &FavoriteInfo) -> Retained<Self> {
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(size, size));
         let this = Self::alloc(mtm).set_ivars(TileIvars {
@@ -978,34 +1014,20 @@ define_class!(
             true
         }
 
+        /// A press folds the folder or opens it; with Control, its menu.
         #[unsafe(method(mouseDown:))]
-        fn mouse_down(&self, _event: &NSEvent) {
+        fn mouse_down(&self, event: &NSEvent) {
+            if press_of(event) == Press::Menu {
+                self.show_menu(event);
+                return;
+            }
             let me: &AnyObject = self.as_ref();
             send(self.mtm(), sel!(syndeoToggleFolder:), None, Some(me));
         }
 
         #[unsafe(method(rightMouseDown:))]
         fn right_mouse_down(&self, event: &NSEvent) {
-            let _keep = self.retain();
-            let mtm = self.mtm();
-            let id = self.ivars().id as isize;
-            let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Folder"));
-            for (title, action) in [
-                ("Rename Folder…", sel!(syndeoRenameFolder:)),
-                ("Delete Folder", sel!(syndeoDeleteFolder:)),
-            ] {
-                let item = unsafe {
-                    objc2_app_kit::NSMenuItem::initWithTitle_action_keyEquivalent(
-                        objc2_app_kit::NSMenuItem::alloc(mtm),
-                        &NSString::from_str(title),
-                        Some(action),
-                        &NSString::new(),
-                    )
-                };
-                item.setTag(id);
-                menu.addItem(&item);
-            }
-            NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+            self.show_menu(event);
         }
 
         #[unsafe(method(mouseEntered:))]
@@ -1039,6 +1061,30 @@ define_class!(
 );
 
 impl FolderRow {
+    /// The folder's menu: Rename Folder… and Delete Folder.
+    fn show_menu(&self, event: &NSEvent) {
+        let _keep = self.retain();
+        let mtm = self.mtm();
+        let id = self.ivars().id as isize;
+        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Folder"));
+        for (title, action) in [
+            ("Rename Folder…", sel!(syndeoRenameFolder:)),
+            ("Delete Folder", sel!(syndeoDeleteFolder:)),
+        ] {
+            let item = unsafe {
+                objc2_app_kit::NSMenuItem::initWithTitle_action_keyEquivalent(
+                    objc2_app_kit::NSMenuItem::alloc(mtm),
+                    &NSString::from_str(title),
+                    Some(action),
+                    &NSString::new(),
+                )
+            };
+            item.setTag(id);
+            menu.addItem(&item);
+        }
+        NSMenu::popUpContextMenu_withEvent_forView(&menu, event, self);
+    }
+
     fn new(mtm: MainThreadMarker, width: f64, folder: &Folder) -> Retained<Self> {
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, ROW_HEIGHT));
         let this = Self::alloc(mtm).set_ivars(FolderIvars {
