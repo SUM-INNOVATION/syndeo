@@ -110,6 +110,16 @@ tell the check taken out from the check in place.
   30 tabs, each visited, the app's footprint must then be seen growing past
   ci/test-app.sh's SIDEBAR_GROWTH (it grew 139.0 MB, against 61.4 and 59.5
   without it, in CI 42545865986, 42542418306 and 42542420916).
+- favorites-in-agent-windows: an agent's window shows the person's
+  favorites, as the person's windows do, and offers to add to them: tiles
+  in its sidebar, which load the person's page in the agent's tab, where
+  the agent can read it, and Add to Favorites in its tab's menu. Both must
+  then be seen in the agent's window while the person has favorites.
+- agent-tabs-follow-spaces: an agent's window lists only the tabs of the
+  space current when the person looks, as the person's windows do. Its tabs,
+  in the space current when it opened them, must then be seen gone from its
+  sidebar once the person switches spaces: with AppKit's tab bar hidden,
+  out of the person's sight.
 
 Each mutant runs in exactly one CI job: macos-agents runs the agent-*
 mutants, beside its gate, and those in MACOS_AGENTS; macos-app runs the
@@ -391,6 +401,20 @@ MUTANTS = {
             "        fn draw_rect(&self, _dirty: NSRect) {\n"
             "            sidebar_macos::fill_gradient(self, self.bounds(), None);\n"
             "        }\n",
+        ),
+    ],
+    "favorites-in-agent-windows": [
+        (
+            SIDEBAR_MODEL,
+            "        favorites: persons,\n",
+            "        favorites: true,\n",
+        ),
+    ],
+    "agent-tabs-follow-spaces": [
+        (
+            SIDEBAR_MODEL,
+            "        .filter(|t| !shows.spaces || t.space == space)\n",
+            "        .filter(|t| t.space == space)\n",
         ),
     ],
 }

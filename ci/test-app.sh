@@ -159,7 +159,11 @@
 # agent-downloads-allowed, agent-downloads' checks (agent downloads:), after
 # the prompt; for download-challenge-unpinned, downloads' files arriving
 # over TLS connections of their own, their challenges answered with
-# Syndeo's authority (downloads:). Any other failure is a failure.
+# Syndeo's authority (downloads:). For favorites-in-agent-windows and
+# agent-tabs-follow-spaces, with the person's favorites and spaces written
+# first, an agent's window showing no favorite tile and its tab's menu
+# offering no Add to Favorites, and its tabs still listed after the person
+# switches spaces (apart:). Any other failure is a failure.
 #
 # agents, which gates programs on this Mac driving Syndeo with the person's
 # leave: see the section of that name below.
@@ -1655,6 +1659,8 @@ mutant() {
     direct-for-every-host) intended='^(https://example\.com stays Through Syndeo|and nothing was sent directly for it)$' ;;
     never-retry-direct) intended='^(on macOS [0-9]+, https://github\.com, on macOS.s HSTS preload list, opens|and the bar says Direct — not cached by Syndeo|and the log says it sent a host directly)' ;;
     agent-downloads-allowed) intended='^agent downloads:' ;;
+    favorites-in-agent-windows) intended='^apart: an agent.s (window shows no favorite tiles|tab.s own menu offers no Add to Favorites)' ;;
+    agent-tabs-follow-spaces) intended='^apart: after the person switches spaces, an agent.s window still lists all its tabs$' ;;
     download-challenge-unpinned) intended='^downloads: a file an https page links ' ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
@@ -1667,6 +1673,9 @@ mutant() {
     mkdir -p "$(dirname "$session")"
     printf 'syndeo-session 1\nwindow\t0\ntab\t-\thttps://example.com/\tExample Domain\n' >"$session"
   fi
+  # The person's favorites and spaces, for those an agent's window has to
+  # show none of, and ignore.
+  case "$name" in favorites-in-agent-windows | agent-tabs-follow-spaces) apart_defaults ;; esac
   if started "$app" "mutant-$name"; then
     helper_of "$app" "mutant-$name"
     browses "mutant-$name"
@@ -1679,7 +1688,7 @@ mutant() {
       reload-from-cache) reload_gate ;;
       tabs-kept-after-clear) tabs_cleared "$session" ;;
       websocket-headers-stripped) realtime_origin && rt_through_syndeo ;;
-      agent-*) agents_mutant "$name" "$app" ;;
+      agent-* | favorites-in-agent-windows) agents_mutant "$name" "$app" ;;
       direct-for-every-host | never-retry-direct) preloaded "$log" ;;
       download-*) downloads_checks "$log" ;;
       sidebar-* | backdrop-*) sidebar_rounds "$app" "$log" "$SIDEBAR_GATE" ;;
@@ -1693,6 +1702,7 @@ mutant() {
   stopped "mutant-$name"
   dl_put_back
   defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
+  case "$name" in favorites-in-agent-windows | agent-tabs-follow-spaces) apart_forget ;; esac
   # What it kept, which a clear would have forgotten.
   [ "$name" = tabs-kept-after-clear ] && rm -f "$session"
   printf '\n'
@@ -2540,7 +2550,10 @@ realtime() {
 #            the session sends hosts directly, and its wait ends on the page
 #            loaded again (agents_direct);
 #   off:     turned off, the socket is gone and a client cannot reach Syndeo.
-# Then a round of an agent's tabs beside the person's (agents_tabs).
+# Then a round of an agent's tabs beside the person's (agents_tabs); and,
+# the person having favorites and two spaces, nothing of theirs in an agent's
+# window, which lists its tabs whatever space the person is in (apart:,
+# agents_apart).
 # Nothing of any address an agent opened is in a log. The trust settings are
 # as they were, no keystore was made, and the setting is removed again.
 AGENT_BIN='' AGENT_SOCK='' AGENT_T1='' AGENT_T2='' AGENT_BG=''
@@ -3102,11 +3115,145 @@ agents_tabs() {
   rm -f "$session"
 }
 
+# The person's favorites and spaces, as the app keeps them in its defaults,
+# written before it opens (apart_defaults) and taken away again once it has
+# quit (apart_forget): two spaces, the first current, with a folder in it,
+# and a favorite in each.
+APART_SPACES='{"spaces":[{"id":1,"name":"Apart home","hue":0,"icon":""},{"id":2,"name":"Apart work","hue":1,"icon":""}],"folders":[{"id":3,"name":"Apart folder","space":1,"collapsed":false}],"current":1,"next_id":4}'
+apart_defaults() {
+  defaults write "$ID" SyndeoSpaces -string "$APART_SPACES"
+  defaults write "$ID" SyndeoFavorites.1 -string '[{"address":"https://example.org/","title":"Apart favorite"}]'
+  defaults write "$ID" SyndeoFavorites.2 -string '[{"address":"https://example.net/","title":"Apart favorite two"}]'
+}
+apart_forget() {
+  local key
+  for key in SyndeoSpaces SyndeoFavorites.1 SyndeoFavorites.2; do
+    defaults delete "$ID" "$key" >/dev/null 2>&1 || true
+  done
+}
+
+# apart_front TAB: the agent chooses its tab TAB, and the app is brought to
+# the front: whether the window in front is then the agent's, saying who
+# controls it, within 10 s.
+apart_front() {
+  agent "$LOGS/agent-apart-select.json" "{\"cmd\":\"select\",\"tab\":${1:-1}}"
+  "$APPCTL" activate "$PID" >/dev/null || true
+  wait_for 10 sh -c '"$1" front-tree "$2" | grep -qF "$3"' _ "$APPCTL" "$PID" 'Controlled by “ci-agent”'
+}
+
+# apart_listed: within 10 s, the window in front lists the agent's two tabs
+# in its sidebar's rows, by their titles, and no other.
+apart_listed() {
+  wait_for 10 sh -c '[ "$("$1" tabs "$2" | cut -c 3- | LC_ALL=C sort | tr "\n" "|")" = "Agent test|Second|" ]' _ "$APPCTL" "$PID"
+}
+
+# agents_apart ROUND: nothing of the person's in an agent's window, and its
+# tabs listed whatever space the person is in (#70's review), in an
+# application already running as ROUND, opened after apart_defaults, with
+# agents on. The person opens a page; the agent, allowed for the session,
+# opens two tabs of its own.
+#   apart: the person's own window shows their favorites, as tiles, and their
+#          spaces: the switcher, the folder and the space's name. The agent's
+#          window, in front and listing its two tabs, shows no favorite
+#          tile; none of the person's spaces: no switcher, folder or space's
+#          name; and its tab's own menu offers no Add to Favorites and none
+#          of the person's folders. New Tab in it shows the command bar,
+#          which suggests the person's tabs and favorites, over the person's
+#          own window, brought to the front, not over the agent's. The person
+#          switches to their second space, from the Spaces menu; the agent's
+#          window still lists both its tabs.
+agents_apart() {
+  local round="$1" log="$LOGS/app-$1.stderr" person first items switched
+  if ! alive "${PID:-0}"; then
+    bad "apart: the application runs ($round)" "it does not"
+    return 1
+  fi
+  origin || return 1
+  person="http://example.com/?apart$FRESH"
+  visit "$person" "$person" "$EXAMPLE_BODY" "apart: the person's own page opens in their window"
+  if wait_for 10 "$APPCTL" ids "$PID" syndeo.favorite && "$APPCTL" ids "$PID" syndeo.space >/dev/null &&
+    "$APPCTL" ids "$PID" syndeo.folder >/dev/null && front | grep -qF 'Apart home'; then
+    ok "apart: the person's own window shows their favorites, as tiles, and their spaces: the switcher, the folder and the space's name"
+  else
+    bad "apart: the person's own window shows their favorites, as tiles, and their spaces: the switcher, the folder and the space's name" \
+      "$("$APPCTL" id-tree "$PID" | tr '\t\n' ' |' | head -c 600)"
+  fi
+
+  agent_bg "$LOGS/agent-apart-first.json" '{"cmd":"status"}'
+  wait_for 30 showing "$ASKING" || bad "apart: the agent is asked about" "no prompt"
+  press_in "$ASKING" allow-session || bad "apart: Allow for This Session is pressed" "no such button"
+  finished "$AGENT_BG" || bad "apart: the agent is allowed for the session" "$(head -c 200 "$LOGS/agent-apart-first.json")"
+  agent "$LOGS/agent-apart-open.json" "{\"cmd\":\"open\",\"url\":\"http://127.0.0.1:$ORIGIN_PORT/agent.html\"}"
+  agent "$LOGS/agent-apart-open2.json" "{\"cmd\":\"open\",\"url\":\"http://127.0.0.1:$ORIGIN_PORT/second.html\"}"
+  first="$(answered "$LOGS/agent-apart-open.json" result.tab)"
+  must "$([ "$(answered "$LOGS/agent-apart-open.json" result.loaded)" = true ] &&
+    [ "$(answered "$LOGS/agent-apart-open2.json" result.loaded)" = true ] && echo yes)" \
+    "apart: the agent opens two tabs of its own" \
+    "$(head -c 200 "$LOGS/agent-apart-open.json"); $(head -c 200 "$LOGS/agent-apart-open2.json")"
+
+  # Its window in front, its sidebar shown: what would be there is.
+  if apart_front "$first" && apart_listed; then
+    ok "apart: the agent's window, chosen, is in front, listing its two tabs"
+  else
+    bad "apart: the agent's window, chosen, is in front, listing its two tabs" "tabs: $(tab_list); titles: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+  sleep 1
+  "$APPCTL" id-tree "$PID" >"$LOGS/agent-apart-ids.txt" 2>&1
+  "$APPCTL" count-ids "$PID" syndeo.favorite >"$LOGS/agent-apart-favorites.txt" 2>&1
+  "$APPCTL" front-tree "$PID" >"$LOGS/agent-apart-tree.txt" 2>&1
+  must "$("$APPCTL" ids "$PID" syndeo.favorite >/dev/null 2>&1 && echo no || echo yes)" \
+    "apart: an agent's window shows no favorite tiles, though the person has favorites" \
+    "$("$APPCTL" ids "$PID" syndeo.favorite | tr '\t\n' ' |')"
+  must "$(! "$APPCTL" ids "$PID" syndeo.space >/dev/null 2>&1 && ! "$APPCTL" ids "$PID" syndeo.folder >/dev/null 2>&1 &&
+    ! grep -qE 'Apart (home|work|folder)' "$LOGS/agent-apart-tree.txt" && echo yes)" \
+    "apart: an agent's window shows none of the person's spaces: no switcher, folder or space's name" \
+    "$(grep -E 'syndeo\.(space|folder)' "$LOGS/agent-apart-ids.txt" | tr '\t\n' ' |'); $(grep -E 'Apart (home|work|folder)' "$LOGS/agent-apart-tree.txt" | head -n 3 | tr '\t\n' ' |')"
+  items="$("$APPCTL" tab-menu "$PID" 1 | tr '\n' '|')"
+  printf '%s\n' "$items" >"$LOGS/agent-apart-tab-menu.txt"
+  must "$(printf '%s' "|$items" | grep -qF '|Close Tab|' && ! printf '%s' "|$items" | grep -qE 'Favorites|Folder' && echo yes)" \
+    "apart: an agent's tab's own menu offers no Add to Favorites, and none of the person's folders" "$items"
+
+  # New Tab, in the agent's window.
+  apart_front "$first" || true
+  if "$APPCTL" new-tab-row "$PID" >/dev/null && wait_for 10 "$APPCTL" bar "$PID"; then
+    if wait_for 5 sh -c '[ "$("$1" value "$2" syndeo.address)" = "$3" ]' _ "$APPCTL" "$PID" "$person"; then
+      ok "apart: New Tab in an agent's window shows the command bar over the person's own window, brought to the front, not the agent's"
+    else
+      bad "apart: New Tab in an agent's window shows the command bar over the person's own window, brought to the front, not the agent's" \
+        "the window in front says '$(address)'; titles: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+    fi
+  else
+    bad "apart: New Tab in an agent's window shows the command bar over the person's own window, brought to the front, not the agent's" \
+      "no command bar shows: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+  "$APPCTL" bar-key "$PID" escape >/dev/null 2>&1 || true
+  wait_for 5 sh -c '! "$1" bar "$2"' _ "$APPCTL" "$PID" || true
+
+  # The person switches spaces; the agent's window lists its tabs still.
+  switched="$(grep -cF 'a space switched to' "$log")"
+  choose Spaces "Next Space"
+  if logged "$log" 'a space switched to' $((switched + 1)) && wait_for 10 sh -c '"$1" front-tree "$2" | grep -qF "Apart work"' _ "$APPCTL" "$PID"; then
+    ok "apart: the person switches to their second space, from the Spaces menu"
+  else
+    bad "apart: the person switches to their second space, from the Spaces menu" "$(grep -F 'space' "$log" | tail -n 2 | tr '\n' ' ')"
+  fi
+  if apart_front "$first" && apart_listed; then
+    ok "apart: after the person switches spaces, an agent's window still lists all its tabs"
+  else
+    bad "apart: after the person switches spaces, an agent's window still lists all its tabs" "tabs: $(tab_list); front: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+}
+
 # agents_mutant NAME APP: the part of agents that mutant NAME has to fail,
 # with what it needs before it; the application is running.
 agents_mutant() {
   agent_paths "$2"
   case "$1" in
+    agent-tabs-follow-spaces | favorites-in-agent-windows)
+      agents_on
+      agents_apart "mutant-$1"
+      return
+      ;;
     agent-tabs-*)
       agents_tabs "$2" "mutant-$1"
       return
@@ -3177,13 +3324,18 @@ agents() {
     must "$([ ! -e "$AGENT_SOCK" ] && echo yes)" "after quitting, no socket is left" "$(ls -la "$AGENT_SOCK" 2>&1)"
   fi
   printf '\nagents, and the tabs Syndeo has\n'
+  # The person has favorites and spaces, which an agent's windows show none
+  # of (agents_apart, in the opening agents_tabs leaves running).
+  apart_defaults
   if started "$app" agents-tabs; then
     helper_of "$app" agents-tabs
     browses agents-tabs
     agents_tabs "$app" agents-tabs
+    agents_apart agents-tabs-again
     origin_stop
     stopped agents-tabs-again
   fi
+  apart_forget
   printf '\nwhat it left\n'
   must "$([ ! -e "$home/.keystore" ] && [ "$keystore_before" = absent ] && [ "$(keystore_item)" = absent ] && echo yes)" "no keystore, and no keychain item for one"
   security dump-trust-settings >"$LOGS/trust-after-agents.txt" 2>&1 || true
