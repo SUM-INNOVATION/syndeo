@@ -408,6 +408,23 @@ pub fn download_may_follow(scheme: &str, address: &str) -> bool {
     may_load(scheme, has_zone(address), true)
 }
 
+/// Whether a download may come from an address with this scheme, begun by
+/// a window's main frame: the web's own, as a page may ([`may_load`] in the
+/// main frame), but not `about:`, which is Syndeo's own pages; and `blob:`
+/// and `data:`, which a page makes for a file it generates, such as an
+/// export. Never a local file or any other scheme, and nothing naming an
+/// IPv6 host with a zone (`zoned`, from [`has_zone`]). Only the main frame
+/// downloads at all (`downloads::Gate`), so a frame inside a page never
+/// downloads from these either.
+pub fn may_download(scheme: &str, zoned: bool) -> bool {
+    let scheme = scheme.to_ascii_lowercase();
+    match scheme.as_str() {
+        "blob" | "data" => !zoned,
+        "about" => false,
+        _ => may_load(&scheme, zoned, true),
+    }
+}
+
 /// `NSURLErrorSecureConnectionFailed`.
 pub const SECURE_CONNECTION_FAILED: isize = -1200;
 
@@ -1065,6 +1082,31 @@ mod tests {
             ("javascript", "javascript:alert(1)"),
         ] {
             assert!(!download_may_follow(refused.0, refused.1), "{refused:?}");
+        }
+    }
+
+    /// A download comes from where a page may, Syndeo's own pages aside,
+    /// and from a page's own files.
+    #[test]
+    fn a_download_comes_from_the_web_or_a_page_s_own_files() {
+        for allowed in ["http", "https", "HTTPS", "blob", "data", "Data"] {
+            assert!(may_download(allowed, false), "{allowed}");
+            assert!(!may_download(allowed, true), "{allowed}, zoned");
+        }
+        for refused in [
+            "file",
+            "about",
+            "javascript",
+            "ftp",
+            "mailto",
+            "x-apple-data-detectors",
+            "",
+        ] {
+            assert!(!may_download(refused, false), "{refused}");
+        }
+        // Every web scheme a download may come from is one a page may.
+        for scheme in ["http", "https"] {
+            assert!(may_download(scheme, false) && allowed_in_main_frame(scheme));
         }
     }
 

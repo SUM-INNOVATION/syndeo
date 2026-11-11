@@ -12,6 +12,20 @@
 //! list: each download's name, how far it has got, Show in Finder once it
 //! is done or Cancel while it is not; and Open Downloads Folder and Clear
 //! for the list as a whole. The button is tinted while anything downloads.
+//! A download a page started by itself, after its one automatic download,
+//! never begins, and the list shows it blocked (`blocked`), one row for the
+//! page however often it tries.
+//!
+//! A download's name is the server's suggestion made safe
+//! (`downloads::safe_name`: no path, no control, format or separator
+//! characters, at most 255 bytes) and unique: nothing already at that path,
+//! not even a link to nothing, and no download still coming in that is to
+//! be saved there.
+//!
+//! Clear Browsing Data cancels every download still coming in, removes
+//! what it had written, and empties the list (`forget_all`). Files already
+//! saved in ~/Downloads stay: they are the person's, not browsing data.
+//! Cancel does the same for one download.
 //!
 //! Downloaded files are quarantined, as a browser's are, through the
 //! bundle's `LSFileQuarantineEnabled`.
@@ -41,10 +55,10 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSBezelStyle, NSButton, NSColor, NSControlSize, NSFont, NSLayoutAttribute, NSLayoutConstraint,
-    NSLineBreakMode, NSPopover, NSPopoverBehavior, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSStackView, NSTextField, NSUserInterfaceLayoutOrientation, NSView, NSViewController,
-    NSWorkspace,
+    NSAccessibility, NSBezelStyle, NSButton, NSColor, NSControlSize, NSFont, NSLayoutAttribute,
+    NSLayoutConstraint, NSLineBreakMode, NSPopover, NSPopoverBehavior, NSProgressIndicator,
+    NSProgressIndicatorStyle, NSStackView, NSTextField, NSUserInterfaceLayoutOrientation, NSView,
+    NSViewController, NSWorkspace,
 };
 use objc2_foundation::{
     ns_string, NSArray, NSEdgeInsets, NSError, NSPoint, NSProgress, NSRect, NSRectEdge, NSSize,
@@ -111,6 +125,72 @@ pub fn adopt(mtm: MainThreadMarker, download: &WKDownload, from: &BrowserControl
     tracing::info!(download = id, "a download begun");
     tick_while_receiving(mtm);
     changed(mtm);
+}
+
+/// A download a page started by itself was refused, after its one
+/// automatic download: the page's blocked row, `row`, if it is still in the
+/// list, or a new one named `name`. The row's id.
+pub fn blocked(mtm: MainThreadMarker, name: &str, row: Option<u64>) -> u64 {
+    let (id, new) = LIST.with(|list| {
+        let mut list = list.borrow_mut();
+        match row.filter(|&id| list.is_blocked(id)) {
+            Some(id) => (id, false),
+            None => (list.block(name), true),
+        }
+    });
+    if new {
+        changed(mtm);
+    }
+    id
+}
+
+/// Clear Browsing Data: every download still coming in is cancelled, as
+/// every window's loading is stopped, and what it had written removed; and
+/// the list is emptied, of what finished, failed, was blocked or refused,
+/// as well. Files already saved in ~/Downloads stay: they are the person's
+/// now, not browsing data, and nothing here deletes one.
+pub fn forget_all(mtm: MainThreadMarker) {
+    let active = ACTIVE.with(|active| std::mem::take(&mut *active.borrow_mut()));
+    for download in &active {
+        cancel(&download.download, path_of(download.id));
+    }
+    let listed = LIST.with(|list| {
+        let mut list = list.borrow_mut();
+        let listed = list.items().len();
+        list.clear_all();
+        listed
+    });
+    tracing::info!(
+        cancelled = active.len(),
+        listed,
+        "downloads cleared: those coming in cancelled, and the list emptied"
+    );
+    changed(mtm);
+}
+
+/// Where download `id` is being saved, once that is decided.
+fn path_of(id: u64) -> Option<PathBuf> {
+    LIST.with(|list| list.borrow().get(id).and_then(|d| d.path.clone()))
+}
+
+/// Cancel a download still coming in, and once WebKit has stopped it,
+/// remove what it had written at `path`, where this module placed it: a
+/// file of its own, never one that was there before (`unique_path`). Only a
+/// plain file: never a folder or a link.
+fn cancel(download: &WKDownload, path: Option<PathBuf>) {
+    let stopped = block2::RcBlock::new(move |_resume: *mut objc2_foundation::NSData| {
+        let Some(path) = &path else { return };
+        let partial = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file());
+        if partial {
+            match std::fs::remove_file(path) {
+                Ok(()) => tracing::info!("a cancelled download's partial file removed"),
+                Err(err) => {
+                    tracing::warn!("a cancelled download's partial file stayed: {}", err.kind())
+                }
+            }
+        }
+    });
+    unsafe { download.cancel(Some(&stopped)) };
 }
 
 /// How many downloads are still coming in.
@@ -225,7 +305,10 @@ define_class!(
             };
             let dir = folder();
             let name = downloads::safe_name(&suggested.to_string());
-            let path = downloads::unique_path(&dir, &name, |p| p.exists());
+            let path = LIST.with(|list| {
+                let list = list.borrow();
+                downloads::unique_path(&dir, &name, |p| downloads::taken(p) || list.reserved(p))
+            });
             let total = u64::try_from(response.expectedContentLength())
                 .ok()
                 .filter(|t| *t > 0);
@@ -358,7 +441,7 @@ define_class!(
                     .map(|a| a.download.clone())
             });
             if let Some(download) = download {
-                unsafe { download.cancel(None) };
+                cancel(&download, path_of(id));
             }
             LIST.with(|list| list.borrow_mut().cancel(id));
             forget_active(id);
@@ -527,6 +610,7 @@ fn build(mtm: MainThreadMarker) -> Retained<NSView> {
 
     let title = label(mtm, "Downloads", 13.0, false);
     title.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+    title.setAccessibilityIdentifier(Some(ns_string!("syndeo.downloads")));
     let clear = button(mtm, "Clear", sel!(syndeoClearDownloads:), None);
     let open = button(mtm, "Open Folder", sel!(syndeoOpenDownloadsFolder:), None);
     stack.addArrangedSubview(&across(&title, &[&clear, &open]));
@@ -534,6 +618,7 @@ fn build(mtm: MainThreadMarker) -> Retained<NSView> {
     let items: Vec<downloads::Download> = LIST.with(|list| list.borrow().items().to_vec());
     if items.is_empty() {
         let none = label(mtm, "Nothing downloaded yet.", 12.0, true);
+        none.setAccessibilityIdentifier(Some(ns_string!("syndeo.downloads-none")));
         stack.addArrangedSubview(&none);
     }
     for item in &items {
@@ -556,12 +641,14 @@ fn build(mtm: MainThreadMarker) -> Retained<NSView> {
             objc2_app_kit::NSFontWeightMedium
         })));
         name.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+        name.setAccessibilityIdentifier(Some(ns_string!("syndeo.download-name")));
         name.widthAnchor()
             .constraintLessThanOrEqualToConstant(inner)
             .setActive(true);
         row.addArrangedSubview(&name);
 
         let detail = label(mtm, &downloads::describe(item), 11.0, true);
+        detail.setAccessibilityIdentifier(Some(ns_string!("syndeo.download-detail")));
         let action: Option<Retained<NSButton>> = match item.state {
             State::Receiving => Some(button(
                 mtm,
