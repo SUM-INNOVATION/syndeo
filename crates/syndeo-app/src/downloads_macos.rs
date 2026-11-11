@@ -489,12 +489,13 @@ fn tag_of(sender: Option<&AnyObject>) -> Option<u64> {
 // ------------------------------------------------------------ the popover
 
 /// Show the downloads, in a popover from `from`; but never in an agent's
-/// window, whose sidebar has no downloads button: they are the person's.
+/// window, whose sidebar has no downloads button: they are the person's
+/// (`sidebar_model::shows`).
 pub fn show(mtm: MainThreadMarker, from: &NSView) {
-    if from
+    let owner = from
         .window()
-        .is_some_and(|window| crate::control_macos::is_agents(&window))
-    {
+        .map(|window| crate::control_macos::owner_of(&window));
+    if owner.is_some_and(|owner| !crate::sidebar_model::shows(owner).downloads) {
         return;
     }
     let popover = POPOVER.with(|slot| {

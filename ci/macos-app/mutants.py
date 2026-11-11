@@ -122,6 +122,16 @@ tell the check taken out from the check in place.
   30 tabs, each visited, the app's footprint must then be seen growing past
   ci/test-app.sh's SIDEBAR_GROWTH (it grew 139.0 MB, against 61.4 and 59.5
   without it, in CI 42545865986, 42542418306 and 42542420916).
+- favorites-in-agent-windows: an agent's window shows the person's
+  favorites, as the person's windows do, and offers to add to them: tiles
+  in its sidebar, which load the person's page in the agent's tab, where
+  the agent can read it, and Add to Favorites in its tab's menu. Both must
+  then be seen in the agent's window while the person has favorites.
+- agent-tabs-follow-spaces: an agent's window lists only the tabs of the
+  space current when the person looks, as the person's windows do. Its tabs,
+  in the space current when it opened them, must then be seen gone from its
+  sidebar once the person switches spaces: with AppKit's tab bar hidden,
+  out of the person's sight.
 
 Each mutant runs in exactly one CI job: macos-agents runs the agent-*
 mutants, beside its gate, and those in MACOS_AGENTS; macos-app runs the
@@ -448,6 +458,20 @@ MUTANTS = {
             "        }\n",
         ),
     ],
+    "favorites-in-agent-windows": [
+        (
+            SIDEBAR_MODEL,
+            "        favorites: persons,\n",
+            "        favorites: true,\n",
+        ),
+    ],
+    "agent-tabs-follow-spaces": [
+        (
+            SIDEBAR_MODEL,
+            "        .filter(|t| !shows.spaces || t.space == space)\n",
+            "        .filter(|t| t.space == space)\n",
+        ),
+    ],
 }
 
 
@@ -463,15 +487,18 @@ MUTANTS = {
 # 26m13s, download-challenge-unpinned 105 s of it).
 # And the sidebar's, which macos-agents runs whatever its earlier steps did,
 # while macos-app's mutants wait on its launch passing.
-# And the window's rule for downloads' three, each running only the checks
-# meant to catch it (test-app.sh's dl_frames, dl_automatic or dl_clear).
-# CI 43100625418 took 59 s for downloads-kept-after-clear in macos-app, which
-# then took 43m03s, its downloads step 134 s, to macos-agents' 38m10s; so it
-# runs here, where CI 43107749350 took 75 s for it, and macos-app 42m26s to
-# macos-agents' 45m11s on a slower runner (every mutant of its 10 to 30 s
-# slower than in 43100625418). subframe-downloads-allowed and
-# automatic-downloads-unlimited then ran all of dl_policy, 102 s and 110 s;
-# they now run only their own part of it.
+# And favorites-in-agent-windows, by measured times: in CI 43092994068 it
+# took 61 s in macos-app, which took 53m (43m without the ten minutes its
+# logs' upload spent retrying) against macos-agents' 48m (38m).
+# And two of the window's rule for downloads' three, each running only the
+# checks meant to catch it (test-app.sh's dl_frames and dl_automatic): they
+# ran all of dl_policy, 97 s and 101 s, in CI 43100625418, and 102 s and
+# 110 s in 43107749350 on a slower runner, whose macos-agents took 45m11s
+# with downloads-kept-after-clear too (75 s), to macos-app's 42m26s. With
+# #75's two (CI 43109023131: macos-app 39m32s, macos-agents 39m12s, the
+# downloads step 51 s before it gated the rule), downloads-kept-after-clear
+# (dl_clear, 59 s in macos-app in 43100625418) runs in macos-app, whose
+# downloads step the rule's checks make 85 s longer.
 MACOS_AGENTS = {
     "no-pinning-delegate",
     "direct-for-every-host",
@@ -486,7 +513,7 @@ MACOS_AGENTS = {
     "backdrop-draws-bitmap",
     "subframe-downloads-allowed",
     "automatic-downloads-unlimited",
-    "downloads-kept-after-clear",
+    "favorites-in-agent-windows",
 }
 
 JOBS = ("macos-app", "macos-agents")
