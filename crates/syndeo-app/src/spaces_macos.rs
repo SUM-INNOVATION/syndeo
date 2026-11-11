@@ -312,9 +312,11 @@ pub struct BarIvars {
     dots: Retained<NSStackView>,
     /// Downloads, at the left: tinted while anything downloads.
     downloads: Retained<NSButton>,
+    /// New Space and New Folder, at the right.
+    buttons: Retained<NSStackView>,
     /// What the dots and the downloads button were last made for: each
-    /// space's id, colour, name and emoji, the current space, and whether
-    /// anything was downloading.
+    /// space's id, colour, name and emoji (none where the spaces are not
+    /// shown), the current space, and whether anything was downloading.
     shown: RefCell<Option<Shown>>,
 }
 
@@ -342,16 +344,6 @@ impl SpaceBar {
             "Downloads",
             sel!(syndeoShowDownloads:),
         );
-        let this = Self::alloc(mtm).set_ivars(BarIvars {
-            dots: dots.clone(),
-            downloads: downloads.clone(),
-            shown: RefCell::new(None),
-        });
-        let this: Retained<Self> = unsafe { msg_send![super(this), init] };
-        this.setTranslatesAutoresizingMaskIntoConstraints(false);
-        this.addSubview(&downloads);
-        this.addSubview(&dots);
-
         let new_space = small_button(mtm, "plus.circle", "New Space", sel!(syndeoNewSpace:));
         let new_folder = small_button(
             mtm,
@@ -364,6 +356,16 @@ impl SpaceBar {
         right.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
         right.setSpacing(2.0);
         right.setTranslatesAutoresizingMaskIntoConstraints(false);
+        let this = Self::alloc(mtm).set_ivars(BarIvars {
+            dots: dots.clone(),
+            downloads: downloads.clone(),
+            buttons: right.clone(),
+            shown: RefCell::new(None),
+        });
+        let this: Retained<Self> = unsafe { msg_send![super(this), init] };
+        this.setTranslatesAutoresizingMaskIntoConstraints(false);
+        this.addSubview(&downloads);
+        this.addSubview(&dots);
         this.addSubview(&right);
 
         NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
@@ -388,25 +390,29 @@ impl SpaceBar {
         this
     }
 
-    /// Show `layout`'s spaces, the current one ringed; and whether anything
-    /// is downloading, in the downloads button's tint. Made again only when
+    /// Show `layout`'s spaces, the current one ringed, with New Space and
+    /// New Folder; or, where `spaces` is false, as in an agent's window,
+    /// which ignores them, none of them. And whether anything is
+    /// downloading, in the downloads button's tint. Made again only when
     /// one of those changed.
-    pub fn reload(&self, layout: &Layout) {
+    pub fn reload(&self, layout: &Layout, spaces: bool) {
         let mtm = self.mtm();
         let busy = crate::downloads_macos::receiving() > 0;
         let shown: Shown = (
             layout
                 .spaces
                 .iter()
+                .filter(|_| spaces)
                 .map(|s| (s.id, s.hue, s.name.clone(), s.icon.clone()))
                 .collect(),
-            layout.current,
+            if spaces { layout.current } else { 0 },
             busy,
         );
         if self.ivars().shown.borrow().as_ref() == Some(&shown) {
             return;
         }
         *self.ivars().shown.borrow_mut() = Some(shown);
+        self.ivars().buttons.setHidden(!spaces);
         let downloads = &self.ivars().downloads;
         let (symbol, tint) = if busy {
             ("arrow.down.circle.fill", NSColor::controlAccentColor())
@@ -425,7 +431,7 @@ impl SpaceBar {
             dots.removeArrangedSubview(&view);
             view.removeFromSuperview();
         }
-        for space in &layout.spaces {
+        for space in layout.spaces.iter().filter(|_| spaces) {
             let dot = SpaceDot::new(mtm, space, space.id == layout.current);
             dots.addArrangedSubview(&dot);
         }

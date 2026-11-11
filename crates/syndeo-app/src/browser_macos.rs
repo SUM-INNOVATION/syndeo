@@ -644,9 +644,15 @@ define_class!(
             tracing::info!("the page's address copied");
         }
 
-        /// A favorite's tile: its page, in this tab.
+        /// A favorite's tile: its page, in this tab; never in an agent's,
+        /// which shows no favorite (`sidebar_model::shows`), so that none of
+        /// the person's pages loads where an agent can read it.
         #[unsafe(method(syndeoOpenFavorite:))]
         fn open_favorite(&self, sender: Option<&AnyObject>) {
+            if !self.shows().favorites {
+                tracing::info!("a favorite refused in an agent's tab");
+                return;
+            }
             if let Some(tile) = sender.and_then(|s| s.downcast_ref::<FavoriteTile>()) {
                 self.go(&tile.address());
             }
@@ -704,9 +710,12 @@ define_class!(
         }
 
         /// A tab's row dragged to the favorites: this tab's page, added, if
-        /// it is not one already.
+        /// it is not one already; never an agent's tab's.
         #[unsafe(method(syndeoAddFavorite:))]
         fn add_favorite(&self, _sender: Option<&AnyObject>) {
+            if !self.shows().favorites {
+                return;
+            }
             let address = self.ivars().shown.borrow().clone();
             let title = self
                 .window()
@@ -723,9 +732,12 @@ define_class!(
         }
 
         /// A tab's menu > Add to Favorites, or Remove from Favorites: this
-        /// tab's page.
+        /// tab's page; not offered for an agent's tab.
         #[unsafe(method(syndeoToggleFavorite:))]
         fn toggle_favorite(&self, _sender: Option<&AnyObject>) {
+            if !self.shows().favorites {
+                return;
+            }
             let address = self.ivars().shown.borrow().clone();
             let title = self.window().map(|w| w.title().to_string()).unwrap_or_default();
             let mut kept = sidebar_macos::favorites_read(crate::spaces_macos::current());
@@ -1011,6 +1023,10 @@ fn refresh_group(window: &NSWindow) -> (usize, usize, bool) {
         handed = true;
     }
 
+    // An agent's tab group shows nothing of the person's, and all its tabs.
+    let owner =
+        sidebar_model::Owner::of_group(windows.iter().map(|w| crate::control_macos::owner_of(w)));
+    let shows = sidebar_model::shows(owner);
     let (mut made, mut dropped) = (0, 0);
     let mut shown: Option<(Vec<TabInfo>, Vec<FavoriteInfo>, crate::spaces::Layout)> = None;
     for (i, w) in windows.iter().enumerate() {
@@ -1022,7 +1038,7 @@ fn refresh_group(window: &NSWindow) -> (usize, usize, bool) {
             continue;
         }
         let (tabs, favorites, layout) =
-            shown.get_or_insert_with(|| tabs_now(&windows, &controllers, &front));
+            shown.get_or_insert_with(|| tabs_now(&windows, &controllers, &front, shows));
         let by_key: HashMap<usize, &TabInfo> =
             tabs.iter().map(|t| (key_of(&*t.window), t)).collect();
         let listed: Vec<sidebar_model::Tab<usize>> = tabs
@@ -1034,8 +1050,8 @@ fn refresh_group(window: &NSWindow) -> (usize, usize, bool) {
                 folder: t.folder,
             })
             .collect();
-        let items = sidebar_model::items(&listed, layout);
-        let (m, d) = sidebar.show(&items, &by_key, favorites, layout);
+        let items = sidebar_model::items(&listed, layout, shows);
+        let (m, d) = sidebar.show(&items, &by_key, favorites, layout, shows);
         made += m;
         dropped += d;
         // The backdrop takes the current space's colours.
@@ -1068,11 +1084,13 @@ fn hand_on(window: &NSWindow, sidebar: &sidebar_macos::Sidebar) {
 
 /// The group's tabs as they are now, `front` the one in front; the current
 /// space's favorites, each with the icon of an open tab of its site, if one
-/// has one; and the spaces.
+/// has one, where `shows` has them, and none for an agent's group; and the
+/// spaces.
 fn tabs_now(
     windows: &[Retained<NSWindow>],
     controllers: &[Option<Retained<BrowserController>>],
     front: &NSWindow,
+    shows: sidebar_model::Shows,
 ) -> (Vec<TabInfo>, Vec<FavoriteInfo>, crate::spaces::Layout) {
     let tabs: Vec<TabInfo> = windows
         .iter()
@@ -1102,6 +1120,7 @@ fn tabs_now(
     let favorites: Vec<FavoriteInfo> =
         sidebar_macos::favorites_read(crate::spaces_macos::current())
             .into_iter()
+            .filter(|_| shows.favorites)
             .map(|favorite| {
                 let host = favorites::host(&favorite.address);
                 let icon = host.and_then(|host| {
@@ -1406,6 +1425,15 @@ impl BrowserController {
         self.ivars().folder.get()
     }
 
+    /// What this tab's sidebar shows and offers of the person's: nothing in
+    /// an agent's tab (`sidebar_model::shows`), nor in a window that is gone.
+    pub fn shows(&self) -> sidebar_model::Shows {
+        let owner = self.window().map_or(sidebar_model::Owner::Agent, |window| {
+            crate::control_macos::owner_of(&window)
+        });
+        sidebar_model::shows(owner)
+    }
+
     /// Put the tab in a folder, pinning it if it is not, or take it out.
     pub fn set_folder(&self, folder: Option<u64>) {
         self.ivars().folder.set(folder);
@@ -1570,6 +1598,9 @@ impl BrowserController {
             item.setTitle(&NSString::from_str(title));
         }
         if action == Some(sel!(syndeoToggleFavorite:)) {
+            if !self.shows().favorites {
+                return false;
+            }
             let address = self.ivars().shown.borrow().clone();
             let kept = sidebar_macos::favorites_read(crate::spaces_macos::current())
                 .iter()

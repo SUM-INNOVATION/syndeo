@@ -17,8 +17,13 @@
 //!   window is (routed through the proxy and pinned to its authority), in
 //!   windows of its own. Each says, below its toolbar, who is in control,
 //!   with Stop, which disconnects the agent and takes back everything it was
-//!   allowed; its tabs become the person's. The person's own tabs are never
-//!   shown to an agent.
+//!   allowed; its tabs become the person's, in the space the person is in.
+//!   The person's own tabs are never shown to an agent, and nothing of the
+//!   person's is in an agent's windows: no favorite, to see or to load in
+//!   its tab, no space or folder, and no command bar, which suggests the
+//!   person's tabs and favorites (`sidebar_model::shows`). Those windows
+//!   ignore the spaces: every tab of the agent's is listed in its window's
+//!   sidebar whatever space the person is in.
 //! - **Nothing else.** Settings, Clear Browsing Data, cookies, storage, the
 //!   proxy's controls and the keystore have no request. An agent's tabs
 //!   download nothing (`browser_macos`): a file its tab is sent is refused,
@@ -196,6 +201,16 @@ pub fn is_agents(window: &NSWindow) -> bool {
             .any(|t| t.window.load().is_some_and(|w| std::ptr::eq(&*w, window)))
     })
     .unwrap_or(false)
+}
+
+/// Whose `window` is, as its sidebar shows it: an agent's tab, or the
+/// person's.
+pub fn owner_of(window: &NSWindow) -> crate::sidebar_model::Owner {
+    if is_agents(window) {
+        crate::sidebar_model::Owner::Agent
+    } else {
+        crate::sidebar_model::Owner::Person
+    }
 }
 
 /// Whether the person turned agents on.
@@ -1086,7 +1101,9 @@ impl Control {
 
     // ------------------------------------------------------------- tabs
 
-    /// The agent's tabs become the person's: no indicator, and out of its reach.
+    /// The agent's tabs become the person's: no indicator, and out of its
+    /// reach; in the space the person is in, where they see them, with the
+    /// sidebar the person's windows have.
     fn release_tabs(&self, key: &AgentKey) {
         let released: Vec<Tab> = {
             let mut tabs = self.tabs.borrow_mut();
@@ -1100,6 +1117,8 @@ impl Control {
         for tab in released {
             if let Some(window) = tab.window.load() {
                 crate::browser_macos::set_banner(&window, None);
+                tab.controller.set_space(crate::spaces_macos::current());
+                crate::browser_macos::refresh_sidebars(&window);
             }
             tab.indicator.removeFromParentViewController();
         }
@@ -1168,6 +1187,8 @@ impl Control {
                 _stop: stop,
             },
         );
+        // Its sidebar, as an agent's window's: nothing of the person's.
+        crate::browser_macos::refresh_sidebars(window);
         id
     }
 
@@ -1356,6 +1377,9 @@ impl Control {
         };
         let number = self.agents.borrow().get(key).map_or(0, |a| a.number);
         window.setTabbingIdentifier(&tabbing(number));
+        // The command bar, with the person's tabs and favorites, is put away
+        // rather than left floating over the agent's tab now in front.
+        crate::command_bar_macos::put_away();
         match self.window_of(key) {
             Some(beside) => {
                 beside.addTabbedWindow_ordered(&window, NSWindowOrderingMode::Above);
@@ -1653,7 +1677,11 @@ fn run(
     };
 }
 
-/// A picture of the tab's page, as PNG.
+/// A picture of the tab's page, as PNG: what the tab's web view shows of its
+/// page, as WebKit draws it (`takeSnapshotWithConfiguration`), and nothing
+/// else. Not the window: none of its sidebar, its controls or the banner
+/// saying who controls it, and no other window over it, such as the command
+/// bar; and an agent's window shows nothing of the person's in any case.
 fn screenshot(tab: u64, view: &WKWebView, reply: Reply) {
     let reply = Cell::new(Some(reply));
     let handler = block2::RcBlock::new(move |image: *mut NSImage, error: *mut NSError| {

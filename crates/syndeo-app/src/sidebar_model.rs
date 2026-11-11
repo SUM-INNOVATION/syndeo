@@ -16,8 +16,56 @@
 //! - **At most once a turn.** Whatever asks for a refresh only marks the
 //!   group (`Pending`); the refresh runs once, at the end of the run loop's
 //!   turn, for each group marked, however many times it was.
+//! - **An agent's windows are its own** (`Owner`, `shows`). Nothing of the
+//!   person's is in them: no favorite, to see or to load in the agent's tab,
+//!   and no space, folder or space's name. And they ignore spaces: every one
+//!   of the agent's tabs is listed whatever space the person is in, so that
+//!   the person always sees them.
 
 use crate::spaces::Layout;
+
+/// Whose tab group a sidebar lists: the person's, or an agent's
+/// (`control_macos`), whose windows are its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    Person,
+    Agent,
+}
+
+impl Owner {
+    /// The owner of a tab group whose windows are `owners`': an agent's if
+    /// any of them is, since nothing of the person's may be shown where an
+    /// agent's tab is.
+    pub fn of_group(owners: impl IntoIterator<Item = Owner>) -> Owner {
+        if owners.into_iter().any(|owner| owner == Owner::Agent) {
+            Owner::Agent
+        } else {
+            Owner::Person
+        }
+    }
+}
+
+/// What a window's sidebar shows besides its tabs, and offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shows {
+    /// The person's favorites: shown as tiles, chosen to load in the tab,
+    /// and added to by dragging a tab's row there or from the tab's menu.
+    pub favorites: bool,
+    /// The person's spaces: the current space's name over its tabs, its
+    /// folders, the spaces' switcher at the foot, and only that space's tabs
+    /// listed. Without them, every tab of the group is listed, in no folder.
+    pub spaces: bool,
+}
+
+/// What a sidebar in a window of `owner`'s shows: everything in the
+/// person's; in an agent's, neither the person's favorites nor their spaces.
+pub fn shows(owner: Owner) -> Shows {
+    let persons = owner == Owner::Person;
+    Shows {
+        favorites: persons,
+        spaces: persons,
+    }
+}
 
 /// A tab, as the sidebar's list needs it: `key` stands for its window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +80,7 @@ pub struct Tab<K> {
 /// One line of the sidebar's list, top to bottom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Item<K> {
-    /// The current space's name, over its tabs.
+    /// The current space's name, over its tabs; not in an agent's window.
     Header,
     /// A folder of the current space, by its id.
     Folder(u64),
@@ -48,17 +96,31 @@ pub enum Item<K> {
 /// each followed by its tabs unless it is folded; the pinned tabs in no
 /// folder; a rule, when there are both pinned and other tabs; the rest, in
 /// the order their windows are in; and New Tab.
-pub fn items<K: Copy>(tabs: &[Tab<K>], layout: &Layout) -> Vec<Item<K>> {
+///
+/// Without the spaces (`Shows::spaces`), as in an agent's window: every tab,
+/// whatever space is current, with no space's name and no folder; the
+/// pinned tabs, a rule, the rest and New Tab.
+pub fn items<K: Copy>(tabs: &[Tab<K>], layout: &Layout, shows: Shows) -> Vec<Item<K>> {
     let space = layout.current_space().id;
-    let here: Vec<&Tab<K>> = tabs.iter().filter(|t| t.space == space).collect();
-    let folders = layout.folders_of(space);
+    let here: Vec<&Tab<K>> = tabs
+        .iter()
+        .filter(|t| !shows.spaces || t.space == space)
+        .collect();
+    let folders = if shows.spaces {
+        layout.folders_of(space)
+    } else {
+        Vec::new()
+    };
     let in_folder = |tab: &Tab<K>| {
         tab.pinned
             && tab
                 .folder
                 .is_some_and(|id| folders.iter().any(|f| f.id == id))
     };
-    let mut items = vec![Item::Header];
+    let mut items = Vec::new();
+    if shows.spaces {
+        items.push(Item::Header);
+    }
     for folder in &folders {
         items.push(Item::Folder(folder.id));
         if folder.collapsed {
@@ -251,6 +313,94 @@ mod tests {
         }
     }
 
+    fn persons() -> Shows {
+        shows(Owner::Person)
+    }
+
+    fn agents() -> Shows {
+        shows(Owner::Agent)
+    }
+
+    #[test]
+    fn an_agents_window_shows_nothing_of_the_persons() {
+        assert_eq!(
+            persons(),
+            Shows {
+                favorites: true,
+                spaces: true
+            }
+        );
+        assert_eq!(
+            agents(),
+            Shows {
+                favorites: false,
+                spaces: false
+            },
+            "no favorite to see or load, and no space, folder or space's name"
+        );
+    }
+
+    #[test]
+    fn a_group_with_an_agents_tab_is_the_agents() {
+        use Owner::{Agent, Person};
+        assert_eq!(Owner::of_group([Person, Person]), Person);
+        assert_eq!(Owner::of_group([Agent, Agent]), Agent);
+        assert_eq!(Owner::of_group([Person, Agent, Person]), Agent);
+        assert_eq!(Owner::of_group([]), Person);
+    }
+
+    /// The regression (#70's review): an agent's tabs were listed by the
+    /// current space, so the person switching spaces hid them from its
+    /// window, whose tab bar is hidden. Now every one is listed, whatever
+    /// space is current, and none of the person's folders or space's name.
+    #[test]
+    fn an_agents_tabs_are_all_listed_whatever_space_is_current() {
+        let mut layout = layout();
+        layout.folders = vec![Folder {
+            id: 7,
+            name: "Read".into(),
+            space: 1,
+            collapsed: false,
+        }];
+        // Made while the first space was current, and one in the second.
+        let tabs = vec![
+            tab(1, false),
+            Tab {
+                space: 2,
+                ..tab(2, false)
+            },
+            Tab {
+                folder: Some(7),
+                ..tab(3, true)
+            },
+        ];
+        let all = vec![
+            Item::Tab {
+                key: 3,
+                in_folder: false,
+            },
+            Item::Rule,
+            Item::Tab {
+                key: 1,
+                in_folder: false,
+            },
+            Item::Tab {
+                key: 2,
+                in_folder: false,
+            },
+            Item::NewTab,
+        ];
+        for current in [1, 2] {
+            layout.current = current;
+            assert_eq!(items(&tabs, &layout, agents()), all, "in space {current}");
+        }
+        // The person's, by contrast, are the current space's alone.
+        layout.current = 2;
+        assert_eq!(row_keys(&items(&tabs, &layout, persons())), vec![2]);
+        layout.current = 1;
+        assert_eq!(row_keys(&items(&tabs, &layout, persons())), vec![3, 1]);
+    }
+
     #[test]
     fn the_list_is_the_spaces_folders_pinned_tabs_a_rule_the_rest_and_new_tab() {
         let mut layout = layout();
@@ -292,7 +442,7 @@ mod tests {
             tab(6, false),
         ];
         assert_eq!(
-            items(&tabs, &layout),
+            items(&tabs, &layout, persons()),
             vec![
                 Item::Header,
                 Item::Folder(7),
@@ -323,9 +473,12 @@ mod tests {
     fn no_rule_without_pinned_tabs_and_new_tab_alone_without_tabs() {
         let layout = layout();
         let tabs = vec![tab(1, false), tab(2, false)];
-        assert_eq!(row_keys(&items(&tabs, &layout)), vec![1, 2]);
-        assert!(!items(&tabs, &layout).contains(&Item::Rule));
-        assert_eq!(items::<u32>(&[], &layout), vec![Item::Header, Item::NewTab]);
+        assert_eq!(row_keys(&items(&tabs, &layout, persons())), vec![1, 2]);
+        assert!(!items(&tabs, &layout, persons()).contains(&Item::Rule));
+        assert_eq!(
+            items::<u32>(&[], &layout, persons()),
+            vec![Item::Header, Item::NewTab]
+        );
     }
 
     #[test]
@@ -342,7 +495,7 @@ mod tests {
             ..tab(1, true)
         }];
         assert_eq!(
-            items(&tabs, &layout),
+            items(&tabs, &layout, persons()),
             vec![
                 Item::Header,
                 Item::Tab {
@@ -415,7 +568,7 @@ mod tests {
     impl Sidebars {
         fn refresh(&mut self, windows: &[u32], front: u32, layout: &Layout) -> usize {
             let tabs: Vec<Tab<u32>> = windows.iter().map(|w| tab(*w, false)).collect();
-            let want = row_keys(&items(&tabs, layout));
+            let want = row_keys(&items(&tabs, layout, persons()));
             let plan = plan_group(windows, Some(front), |w| {
                 self.rows.get(&w).is_some_and(|r| !r.is_empty())
             });

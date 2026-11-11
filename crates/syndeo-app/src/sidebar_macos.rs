@@ -33,13 +33,18 @@
 //!   which the sensor and the sidebar tell through `syndeoPeekSidebar:` and
 //!   `syndeoUnpeekSidebar:`, sent to the window's controller.
 //!
+//! An agent's window (`control_macos`) shows none of the person's
+//! favorites, and offers no way to add one, nor any of their spaces: no
+//! switcher, folder or space's name, and every one of the agent's tabs is
+//! listed, whatever space is current (`sidebar_model::shows`).
+//!
 //! Nothing here fetches anything: icons are the ones each tab's badge has.
 //! To Accessibility each row is a button named for its tab, selected while
 //! its tab is in front, and the UI test finds the rows by
 //! `syndeo.sidebar-tab` and the tiles by `syndeo.favorite`.
 
 use crate::favorites::{self, Favorite};
-use crate::sidebar_model::{self, Item};
+use crate::sidebar_model::{self, Item, Owner, Shows};
 use crate::spaces::{Folder, Layout};
 use crate::spaces_macos::{self, SpaceBar};
 use objc2::rc::{Retained, Weak};
@@ -1268,6 +1273,9 @@ pub struct SidebarIvars {
     new_tab: RefCell<Option<Retained<TabRow>>>,
     /// The favorites the tiles were made for: address, title and icon.
     tiles_for: RefCell<Option<Vec<(String, String, usize)>>>,
+    /// What it shows besides the tabs, as its tab group's owner allows:
+    /// nothing of the person's until it is first shown.
+    shows: Cell<Shows>,
 }
 
 impl Drop for SidebarIvars {
@@ -1380,6 +1388,7 @@ impl Sidebar {
             rule: RefCell::new(None),
             new_tab: RefCell::new(None),
             tiles_for: RefCell::new(None),
+            shows: Cell::new(sidebar_model::shows(Owner::Agent)),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         this.setTranslatesAutoresizingMaskIntoConstraints(false);
@@ -1514,11 +1523,12 @@ impl Sidebar {
         this
     }
 
-    /// A tab's row is being dragged: show where it can be dropped.
+    /// A tab's row is being dragged: show where it can be dropped. Not to
+    /// the favorites in an agent's window, which has none.
     fn drag_began(&self) {
         let hint = &self.ivars().hint;
         hint.set_active(false);
-        hint.setHidden(false);
+        hint.setHidden(!self.ivars().shows.get().favorites);
     }
 
     /// The dragged row is at `at`, in the window.
@@ -1582,8 +1592,12 @@ impl Sidebar {
         }
     }
 
-    /// Whether `at`, in the window, is over the drop hint.
+    /// Whether `at`, in the window, is over the drop hint, which shows only
+    /// where the favorites do.
     fn over_hint(&self, at: NSPoint) -> bool {
+        if !self.ivars().shows.get().favorites {
+            return false;
+        }
         let point = self.convertPoint_fromView(at, None);
         let frame = self.ivars().hint.frame();
         point.x >= frame.origin.x
@@ -1661,7 +1675,8 @@ impl Sidebar {
 
     /// Show the tab group's tabs, its window being in front: `items` in
     /// order, each tab's row as `tabs` has it, keyed by the address of the
-    /// tab's window; `favorites` as tiles, and `layout`'s spaces at the foot.
+    /// tab's window; `favorites` as tiles, and `layout`'s spaces at the foot,
+    /// as far as `shows` allows: in an agent's window, neither.
     /// A row is kept for its tab and changed in place; rows are made only
     /// for tabs that have none, and let go only for tabs that are gone.
     /// What was made and let go, in rows.
@@ -1671,12 +1686,14 @@ impl Sidebar {
         tabs: &HashMap<usize, &TabInfo>,
         favorites: &[FavoriteInfo],
         layout: &Layout,
+        shows: Shows,
     ) -> (usize, usize) {
         let mtm = self.mtm();
         let ivars = self.ivars();
         ivars.showing.set(true);
-        self.show_favorites(favorites);
-        ivars.spaces.reload(layout);
+        ivars.shows.set(shows);
+        self.show_favorites(if shows.favorites { favorites } else { &[] });
+        ivars.spaces.reload(layout, shows.spaces);
 
         // The tabs' rows: those kept, those made, those let go.
         let width = WIDTH - 2.0 * (SIDE - 2.0);
@@ -1794,6 +1811,7 @@ impl Sidebar {
         *mine.header.borrow_mut() = theirs.header.borrow_mut().take();
         *mine.rule.borrow_mut() = theirs.rule.borrow_mut().take();
         *mine.new_tab.borrow_mut() = theirs.new_tab.borrow_mut().take();
+        mine.shows.set(theirs.shows.get());
         theirs.showing.set(false);
         mine.showing.set(true);
         // Nothing is pointed at in a window just brought to the front.

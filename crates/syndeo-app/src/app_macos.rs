@@ -581,7 +581,9 @@ define_class!(
                 .map(|(_, c)| c.clone())
                 .collect();
             for controller in controllers {
-                if controller.space() == id {
+                // An agent's tabs are in no space of the person's, and
+                // moved between none.
+                if controller.space() == id && controller.shows().spaces {
                     controller.set_space(home);
                 }
             }
@@ -1317,10 +1319,13 @@ impl AppDelegate {
         *self.ivars().tab_clicks.borrow_mut() = monitor;
     }
 
-    /// A tab's context menu: for `window`'s tab, if it is a browser's.
+    /// A tab's context menu: for `window`'s tab, if it is a browser's. For
+    /// an agent's tab, nothing of the person's: no Add to Favorites, and
+    /// none of their folders (`sidebar_model::shows`).
     fn tab_menu(&self, window: &NSWindow) -> Option<Retained<NSMenu>> {
         let mtm = self.mtm();
         let controller = controller_of(window)?;
+        let shows = controller.shows();
         let to_tab: &AnyObject = controller.as_ref();
         let to_window: &AnyObject = window.as_ref();
         let to_app: &AnyObject = self.as_ref();
@@ -1361,18 +1366,25 @@ impl AppDelegate {
             NSMenuItem::separatorItem(mtm),
             tabs_macos::item(mtm, "Show All Tabs", sel!(toggleTabOverview:), Some(to_app)),
         ] {
+            if entry.action() == Some(sel!(syndeoToggleFavorite:)) && !shows.favorites {
+                continue;
+            }
             menu.addItem(&entry);
         }
         // This space's folders, to move the tab into, after the favorites
         // item; and out of its folder, if it is in one.
-        let folders: Vec<crate::spaces::Folder> = spaces_macos::read(|layout| {
-            layout
-                .folders_of(layout.current)
-                .into_iter()
-                .cloned()
-                .collect()
-        });
-        let mut at = 3;
+        let folders: Vec<crate::spaces::Folder> = if shows.spaces {
+            spaces_macos::read(|layout| {
+                layout
+                    .folders_of(layout.current)
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+        } else {
+            Vec::new()
+        };
+        let mut at = if shows.favorites { 3 } else { 2 };
         if !folders.is_empty() {
             let into = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Move to Folder"));
             for folder in &folders {
@@ -1390,7 +1402,7 @@ impl AppDelegate {
             menu.insertItem_atIndex(&holder, at);
             at += 1;
         }
-        if controller.folder().is_some() {
+        if controller.folder().is_some() && shows.spaces {
             menu.insertItem_atIndex(
                 &tabs_macos::item(
                     mtm,
@@ -1437,15 +1449,28 @@ impl AppDelegate {
     }
 
     /// The command bar over `over`, suggesting from the open tabs and the
-    /// favorites.
+    /// favorites: the person's, so never over an agent's window. Asked for
+    /// there, it shows over the person's own window in front, brought to the
+    /// front; with none, a window of theirs opens, as New Tab with no window
+    /// opens one.
     fn show_command_bar(&self, over: &NSWindow) {
+        let over = if control_macos::is_agents(over) {
+            let Some(front) = self.persons_front() else {
+                self.open_window();
+                return;
+            };
+            front.makeKeyAndOrderFront(None);
+            front
+        } else {
+            over.retain()
+        };
         let me = Weak::from_retained(&self.retain());
         let suggest: command_bar_macos::Suggest = Rc::new(move |typed| {
             me.load()
                 .map(|app| app.suggestions(typed))
                 .unwrap_or_default()
         });
-        command_bar_macos::show(self.mtm(), over, self.as_ref(), suggest);
+        command_bar_macos::show(self.mtm(), &over, self.as_ref(), suggest);
     }
 
     /// What the command bar suggests for `typed`: the person's open tabs

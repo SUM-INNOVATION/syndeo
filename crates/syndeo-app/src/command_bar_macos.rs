@@ -23,6 +23,12 @@
 //! address field's is.
 //!
 //! One bar at a time: asking again while it shows just brings it back.
+//!
+//! Never over an agent's window, whose tabs are its own: its suggestions are
+//! the person's tabs and favorites. New Tab there shows the bar over the
+//! person's own window, brought to the front (`app_macos`), and an agent's
+//! tab brought to the front while the bar shows puts the bar away
+//! (`put_away`).
 
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
@@ -412,6 +418,13 @@ pub fn show(mtm: MainThreadMarker, over: &NSWindow, app: &AnyObject, suggest: Su
     bar.ivars().window.makeKeyAndOrderFront(None);
     let field: &NSView = &bar.ivars().field;
     bar.ivars().window.makeFirstResponder(Some(field));
+}
+
+/// Put the bar away, if it shows, with nothing opened: for an agent's tab
+/// coming to the front, which the bar, floating above every window, would
+/// otherwise be over.
+pub fn put_away() {
+    dismiss();
 }
 
 /// Put the bar away, if it shows.
