@@ -36,7 +36,7 @@
 //! a window that cannot browse has no controller with a web view to do them,
 //! so they are disabled there.
 //!
-//! The controls themselves, the window's toolbar, are `chrome_macos`'s.
+//! The controls themselves, in the window's sidebar, are `chrome_macos`'s.
 
 use crate::address::{self, Route, Search, Typed};
 use crate::chrome_macos::Ui;
@@ -2032,8 +2032,8 @@ impl BrowserController {
     }
 }
 
-/// The window's content, `webview` under the toolbar's controls, which send
-/// to `controller`: see `chrome_macos`.
+/// The window's content, `webview` beside the sidebar's controls, which
+/// send to `controller`: see `chrome_macos`.
 pub fn browser_content(
     mtm: MainThreadMarker,
     frame: NSRect,

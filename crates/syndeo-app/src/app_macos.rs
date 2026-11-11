@@ -2354,6 +2354,22 @@ yJpRaKsz2Azv7maKpleZREReLU9u1UnLsw==
         }
     }
 
+    /// The start page says where to type an address: the address field is
+    /// in the sidebar, at the left, not above the page as it was before the
+    /// sidebar.
+    #[test]
+    fn the_start_page_says_where_the_address_field_is() {
+        let page = start_page(Search::DuckDuckGo);
+        assert!(
+            page.contains(
+                "Type a web address in the address field, at the top of the sidebar on the \
+                 left, such as <b>example.com</b>, and press Return."
+            ),
+            "{page}"
+        );
+        assert!(!page.contains("field above"), "{page}");
+    }
+
     /// The start page says, in so many words and where every new window and
     /// tab shows it, that WebRTC goes around Syndeo: measured in CI
     /// 39198465745, where a page's STUN went from WebKit's own networking

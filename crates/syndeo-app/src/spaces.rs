@@ -2,8 +2,9 @@
 //! tabs with a colour of its own, one of which is current, and a folder
 //! is a named group of pinned tabs within a space. Plain Rust: what is
 //! kept, as JSON, and nothing of how it is shown (`sidebar_macos`) or
-//! stored (`spaces_macos`, in the application's defaults). Favorites are
-//! not a space's: they are shared by all of them (`favorites`).
+//! stored (`spaces_macos`, in the application's defaults). Each space has
+//! favorites of its own (`favorites`), kept under the space's id
+//! (`sidebar_macos::favorites_read`).
 
 use serde_json::{json, Value};
 

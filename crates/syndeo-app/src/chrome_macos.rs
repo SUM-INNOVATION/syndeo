@@ -5,21 +5,21 @@
 //! title bar lets show through. There is no toolbar: the title bar holds
 //! only the window's traffic lights, over the sidebar's top.
 //!
-//! - **Back and Forward**, and Hide Sidebar, are buttons across the
-//!   sidebar's top, at its right, clear of the traffic lights.
+//! - **Hide Sidebar, Back, Forward and Reload**, which is Stop while a page
+//!   loads, are buttons across the sidebar's top, at its right, clear of
+//!   the traffic lights.
 //! - **The address field** is a pill below them, as wide as the sidebar.
-//!   Inside it, at its trailing end, are the page's route and Reload, which
-//!   is Stop while a page loads; along its bottom edge is the page's
-//!   loading progress.
+//!   Inside it, at its trailing end, are the page's route and Copy Link;
+//!   along its bottom edge is the page's loading progress.
 //! - **The route** (`address::Route`) is a symbol. Its words are its help
 //!   tag, and are shown beside it too for the two routes Syndeo does not
 //!   cache, Direct and Local, so that those are never left to a help tag.
 //!   Accessibility reads the words, whichever is shown.
 //!
 //! Every control keeps the accessibility identifier `ci/test-app.sh` drives
-//! it by: `syndeo.back`, `syndeo.forward`, `syndeo.address`, `syndeo.route`
-//! and `syndeo.reload`; and the loading progress is `syndeo.progress`, there
-//! while a page loads and gone once it has.
+//! it by: `syndeo.back`, `syndeo.forward`, `syndeo.address`, `syndeo.route`,
+//! `syndeo.reload` and `syndeo.copy`; and the loading progress is
+//! `syndeo.progress`, there while a page loads and gone once it has.
 //!
 //! AppKit's own controls and colours for the controls, which follow the
 //! system's appearance, light or dark, and its accent colour; the backdrop,
