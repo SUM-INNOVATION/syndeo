@@ -56,11 +56,32 @@ from Launchpad, or with Spotlight. Its first window shows a start page with
 the essentials of what follows: how pages are reached, what WebRTC does,
 secure pages, searching, and clearing browsing data.
 
-The window is a Mac browser's: one toolbar in the title bar, with Back and
-Forward, and the address field at its centre. Inside the address field, at
-its end, are the page's route (below) and Reload, which is Stop while a page
-loads; the page's loading progress runs along its bottom edge. Light and
-dark appearance follow the Mac's.
+The window has no toolbar. Its tabs are down its left side, in a sidebar,
+and the page is beside them, inset with rounded corners, over a gradient in
+the current space's colours (below). The title bar holds only the window's
+traffic lights, at the sidebar's top, and AppKit's own tab bar is kept
+hidden. Light and dark appearance follow the Mac's. From the top, the
+sidebar has:
+
+- **Hide Sidebar, Back, Forward and Reload**, in a row across its top.
+  Reload is Stop while a page loads.
+- **The address field**, a pill as wide as the sidebar. Inside it, at its
+  end, are the page's route (below) and Copy Link, which puts the page's
+  address on the clipboard. The page's loading progress runs along its
+  bottom edge.
+- **The current space's favorites**, as tiles (below).
+- **The tabs**, as rows, under the space's emoji and name, with New Tab
+  always the last row (below).
+- **At its foot**, the downloads button at the left (below), each space's
+  emoji in the middle, and New Space and New Folder at the right.
+
+**Hiding the sidebar.** View > Toggle Sidebar (⌘S), or Hide Sidebar, gives
+the page the whole window, and the traffic lights go with the sidebar.
+While it is hidden, the sidebar comes back over the page as a floating
+panel when the pointer reaches the window's left edge, and goes again when
+the pointer leaves it; ⌘S puts it back beside the page. The address field
+goes with it, and so does the route: see
+[How each page is reached](#how-each-page-is-reached).
 
 Type in the address field and press Return:
 
@@ -71,42 +92,56 @@ Type in the address field and press Return:
   refused;
 - anything else, words with spaces included, is a search (below).
 
-The menus are a Mac application's. File has New Tab (⌘T), New Window (⌘N),
-Open Location… (⌘L) and Close (⌘W); View has Reload Page (⌘R) and Stop
-Loading (⌘.); History has Back (⌘[) and Forward (⌘]). Closing the last
-window leaves Syndeo running, as Mac applications do, until you quit it (⌘Q).
+The menus are a Mac application's, with a Spaces menu of Syndeo's own.
+File has New Tab (⌘T), which opens the command bar (below), New Window
+(⌘N), Open Location… (⌘L) and Close (⌘W); View has Toggle Sidebar (⌘S),
+Reload Page (⌘R) and Stop Loading (⌘.); Spaces has New Space…, New Folder…,
+Next Space (⌥⌘→), Previous Space (⌥⌘←), Rename Space… and Delete Space;
+History has Back (⌘[) and Forward (⌘]). Closing the last window leaves
+Syndeo running, as Mac applications do, until you quit it (⌘Q).
 
 ### Tabs
 
-Tabs are the ones macOS draws, with what a browser adds to them:
+Each tab is still a window of its own, which macOS groups with the others
+as it groups any application's tabs. The sidebar shows them, and AppKit's
+own tab bar is kept hidden. What a browser adds:
 
+- **The sidebar's rows.** The current space's tabs (below) are listed under
+  its emoji and name: its folders first, each with its tabs set in under
+  it, then the pinned tabs in no folder, a rule, and the rest, in the order
+  of the window's tabs. New Tab is always the last row, and opens the
+  command bar. A row shows its page's title, an hourglass while the page
+  loads, and the icon the page names, or a globe for a page that names
+  none. Syndeo fetches that icon through the page itself, so through its
+  proxy like everything else on the page; it does not ask a site for
+  `/favicon.ico` when the page names no icon. The row of the tab in front
+  is lit. It, or a row you point at, has Close at its end; a pinned tab's
+  row has a pin there instead.
 - **Opening links in tabs.** ⌘-click a link, or click it with the middle
   button, to open it in a new tab behind the one you are on; add ⇧ to open
   it in front. ⌘⌥-click opens it in a new window. A link to an address no
   window may show (`file:` and the rest) opens nothing, as clicking it does.
-- **Choosing a tab.** ⌘1 to ⌘8 show that tab, and ⌘9 the last. Window >
-  Show Next Tab and Show Previous Tab, and the tab bar itself, work as in
-  any Mac application.
-- **The tab bar** shows each tab's page title, an hourglass while its page
-  loads, and the icon the page names. Syndeo fetches that icon through the
-  page itself, so through its proxy like everything else on the page; it does
-  not ask a site for `/favicon.ico` when the page names no icon.
-- **A tab's own menu.** Control-click or right-click a tab for Duplicate Tab,
-  Pin Tab, Close Tab, Close Other Tabs, Move Tab to New Window and Show All
-  Tabs. Duplicate Tab and Pin Tab are in the Window menu too, and Close Other
-  Tabs in File (⌥⌘W, with ⌥ held).
-- **Pinned tabs** stay first in their window and come back every time Syndeo
-  opens. A pinned tab closes only when it is the tab in front (⌘W), or from
-  its own menu's Close Tab: Close Other Tabs, and closing its window, leave it
-  open.
+- **Choosing a tab.** Click its row. ⌘1 to ⌘8 show that tab, and ⌘9 the
+  last, and Window > Show Next Tab and Show Previous Tab work as in any Mac
+  application. These count every tab of the window, in every space (below).
+- **A tab's own menu.** Right-click a tab's row for Duplicate Tab, Pin Tab,
+  Add to Favorites, Move to Folder and Remove from Folder where they apply,
+  Close Tab, Close Other Tabs, Move Tab to New Window and Show All Tabs.
+  Duplicate Tab and Pin Tab are in the Window menu too, and Close Other Tabs
+  in File (⌥⌘W, with ⌥ held).
+- **Pinned tabs** stay first in their window and in the sidebar, and come
+  back every time Syndeo opens. A pinned tab closes only when it is the tab
+  in front (⌘W), or from its own menu's Close Tab: Close Other Tabs, and
+  closing its window, leave it open.
 - **Closed tabs.** History > Reopen Last Closed Tab (⇧⌘T) opens the last tab
   you closed again, with its back and forward history; History > Recently
   Closed lists the last 25 by title. They are kept in memory only, until
   Syndeo quits.
 - **Show All Tabs** (View, `⇧⌘\`) is macOS's overview of a window's tabs.
-- **Tabs after a relaunch.** When Syndeo quits, it keeps the address and
-  title of each open tab, and which are pinned, in
-  `~/Library/Application Support/Syndeo/session.txt`, readable by you alone.
+- **Tabs after a relaunch.** When Syndeo quits, it keeps each open tab's
+  address and title, whether it is pinned, and its space and folder, in
+  `~/Library/Application Support/Syndeo/session.txt`, readable by you
+  alone.
   If macOS is set to keep windows when an application quits (System
   Settings > Desktop & Dock > "Close windows when quitting an application"
   off), every tab comes back when Syndeo opens again; otherwise pinned tabs
@@ -122,12 +157,95 @@ open; anything else another application asks for, a file included, is
 refused in a tab of its own with the words typing it gets, and is never
 searched for. Its log names each such address by its scheme alone.
 
+### Favorites, spaces and folders
+
+**Favorites** are pages kept as tiles under the address field, four to a
+row, up to twelve. Each space has its own. A tile shows the icon of its site
+when a tab of that site is open in the window and its page names one, and
+the site's initial otherwise. Click a tile to open its page in the tab in
+front; right-click it for Remove from Favorites. To add a tab's page, drag
+its row up onto the favorites, where an outline says Add to Favorites while
+you drag, or choose Add to Favorites in the tab's own menu, which says
+Remove from Favorites for a page that is one already. Only an `http` or
+`https` page can be a favorite.
+
+**Spaces** divide your tabs into sets, each with a name, an emoji and a
+colour of its own. Syndeo starts with one, Personal (🏠). The sidebar lists
+the current space's tabs and favorites only, under its emoji and name, and
+the window's backdrop takes its colours. Every window has the same current
+space.
+
+- **Switching.** Click a space's emoji at the sidebar's foot, where the
+  current one is lit, or choose Spaces > Next Space (⌥⌘→) or Previous Space
+  (⌥⌘←), which go round. Switching brings one of that space's tabs in the
+  window to the front, or, if it has none there, opens a new tab in that
+  space with the start page. A new tab goes in the current space.
+- **Making one.** New Space, the plus at the sidebar's foot, or Spaces > New
+  Space…, asks for an emoji, with Pick… for macOS's emoji palette, and a
+  name. The space takes the next colour along and becomes current. Up to
+  twelve.
+- **Changing one.** Right-click a space's emoji to rename it or change its
+  emoji, choose its colour from eight, or delete it; Spaces > Rename Space…
+  and Delete Space act on the current one. Deleting a space deletes its
+  folders, and moves its tabs to the first space left, in no folder. The
+  last space cannot be deleted.
+
+**Folders** are named groups of pinned tabs within a space, listed first in
+the sidebar, each with its tabs set in under it. New Folder, the folder at
+the sidebar's foot, or Spaces > New Folder…, asks for a name, and makes one
+in the current space; up to fifty, in all. Drag a tab's row onto a folder's
+row, or choose Move to Folder in the tab's own menu, to put the tab in it,
+which pins the tab; Remove from Folder takes it out, still pinned. Click a
+folder's row to fold it shut, or open it again; right-click it to rename or
+delete it. A folder deleted leaves its tabs pinned, in no folder.
+
+Spaces divide the sidebar, not the window: a window's tabs are still one of
+macOS's tab groups. ⌘1 to ⌘9, Show Next Tab and Show Previous Tab, and Show
+All Tabs count every tab of the window, in every space, and can bring to the
+front a tab the sidebar does not list, leaving the current space as it was.
+Close Other Tabs closes every other tab of the window that is not pinned, in
+every space.
+
+**Where they are kept.** In Syndeo's preferences,
+`~/Library/Preferences/com.sum.syndeo.plist`, as JSON text: the spaces and
+folders, with their names, emoji and colours, under `SyndeoSpaces`; and each
+space's favorites under `SyndeoFavorites.<n>`, `<n>` being the `id` that
+`SyndeoSpaces` gives the space, `SyndeoFavorites.1` for the first. Each
+favorite is its page's full address and the title the page had when it was
+added. They are not browsing data: Clear Browsing Data leaves them as they
+are, and so does the uninstaller. A space deleted leaves its
+`SyndeoFavorites.<n>` behind, unused. To delete them, see
+[Removing it](#removing-it).
+
+### The command bar
+
+File > New Tab (⌘T), and New Tab at the end of the sidebar's tabs, open the
+command bar rather than a tab: a field over the middle of the page, with the
+page under glass and dimmed, and the sidebar as it was. Type an address, or
+words to search for, and press Return: it opens in a new tab beside the one
+in front, read as the address field reads what is typed. Return with
+nothing typed opens a new tab with the start page. Escape, or a click
+anywhere else, puts it away and opens nothing. With none of your windows
+open, New Tab opens a window instead.
+
+As you type, up to six suggestions appear under the field: first your open
+tabs whose title or address has what you typed, which it brings to the
+front rather than open again; then your favorites that do, from every space,
+which it opens in a new tab. Up and Down choose one, and Return or a click
+takes it; with none chosen, Return opens what you typed.
+
+**The suggestions come from this Mac alone**: from the tabs open in your
+windows, never an agent's, and the favorites Syndeo keeps. Nothing is sent
+anywhere while you type. Words are searched for only when you press Return,
+with the search engine chosen in Settings (below).
+
 ### How each page is reached
 
 **Not every request goes through Syndeo.** The address field says how each
-page was reached, by a symbol at its end. For the usual route, Through
-Syndeo, it is the symbol alone, with its words in its help tag: point at it.
-For the two routes Syndeo does not cache, the words are beside the symbol:
+page was reached, by a symbol near its end, before Copy Link. For the usual
+route, Through Syndeo, it is the symbol alone, with its words in its help
+tag: point at it. For the two routes Syndeo does not cache, the words are
+beside the symbol:
 
 | The address field says | For | What happens |
 | --- | --- | --- |
@@ -142,13 +260,20 @@ redirect by the address it leads to. WebRTC takes none of these routes
 WebKit makes; which sites macOS refuses through the proxy, and why, is in
 [Known gaps](#known-gaps).
 
+**While the sidebar is hidden, the route is not shown.** The address field
+is in the sidebar, and goes with it: nothing in the window says how its page
+was reached until the sidebar is shown again, or peeks back over the page.
+CI measured that, with the sidebar hidden, no route was left in the window.
+
 ### Searching
 
-Syndeo > Settings… (⌘,) chooses where words typed in the address field go:
-DuckDuckGo (the default), Startpage, Brave Search, Google, Bing, or Off. They
-are sent when you press Return, and only then: Syndeo makes no suggestions,
-so nothing is sent while you type. With search Off, words are sent nowhere,
-and the window says so. A choice applies at once, in every window.
+Syndeo > Settings… (⌘,) chooses where words typed in the address field or
+the command bar go: DuckDuckGo (the default), Startpage, Brave Search,
+Google, Bing, or Off. They are sent when you press Return, and only then.
+Nothing is sent while you type: the address field suggests nothing, and the
+command bar's suggestions are your own open tabs and favorites, on this Mac
+(above). With search Off, words are sent nowhere, and the window says so. A
+choice applies at once, in every window.
 
 ### Clear Browsing Data
 
@@ -160,8 +285,8 @@ Settings says when both are done; if Syndeo's cache could not be emptied, it
 says so, and how to try again.
 
 It also forgets recently closed tabs and the tabs kept from when Syndeo last
-quit (above). It leaves the search engine chosen, and Syndeo's certificate
-authority (below), as they are.
+quit (above). It leaves the search engine chosen, your favorites, spaces and
+folders, and Syndeo's certificate authority (below), as they are.
 
 ### WebSockets and WebRTC
 
@@ -211,6 +336,53 @@ are left as they are, and no password is asked for. No other application on
 the Mac accepts it. Anyone who could read its private key could impersonate
 any site to Syndeo's windows, and to nothing else. A window that cannot pin
 it shows no web page at all, and says why.
+
+### Downloads
+
+**Syndeo.app downloads files; v0.2.1 and earlier did not.** In those, a
+file a page sent was refused, nothing was saved, and the window said that
+Syndeo does not download files. Now, in your windows, a response a window
+cannot show as a page, and a link marked for downloading, become a download:
+
+- **Saved in `~/Downloads`**, which is made if it is not there, with
+  nothing asked. Its name is the one WebKit suggests, from the server or the
+  link, made safe: anything up to its last `/` or `\` is taken off, and so
+  are its control characters, spaces at either end and dots at its start,
+  so that it is never hidden; a name left empty is `download`. A name
+  already taken there gets a number before its extension, as
+  `report 2.pdf`.
+- **Quarantined**, as a browser's downloads are: Syndeo.app declares
+  `LSFileQuarantineEnabled`, and each file it saves is marked with
+  `com.apple.quarantine`. On CI, each file downloaded had it, naming Syndeo
+  (measured, not gated).
+- **Pinned, as its window's pages are.** A download comes on a connection
+  of its own, and each TLS challenge it meets there is answered as its
+  window answers its pages': pinned to Syndeo's authority, or, for a host
+  the session sends directly, with macOS's own checks. That holds after its
+  window has closed. On CI, files an `https` page on the runner's own
+  loopback linked arrived byte for byte, each on a TLS connection of its
+  own with a certificate the window had not been shown, issued by Syndeo's
+  authority, which macOS does not trust there: so their arriving shows that
+  Syndeo pinned them.
+- **Only where a window may go.** A download redirected to an address no
+  window may open, such as a `file:` address or an IPv6 address with a
+  zone, saves nothing. WebKit asks a download only about a redirect within
+  its own origin, which goes ahead; a redirect to another origin it makes a
+  navigation of the window instead, under the window's own rules, or stops
+  itself. On CI, the zone was refused by the window's rules, and the
+  `file:` address by WebKit; and a link marked for downloading that
+  redirected to another site opened that site's page in the window, saving
+  nothing (measured, not gated).
+- **Never in an agent's tab.** A file an agent's tab is sent is refused,
+  nothing is saved, and the agent is told that downloads are not allowed
+  for agents (below).
+
+The downloads button, at the left of the sidebar's foot, is tinted while
+anything downloads, and shows the downloads in a popover, newest first: each
+one's name and how far it has got, with Cancel while it comes in, and Show
+in Finder once it is done. Clear forgets those that are over, and Open
+Folder opens `~/Downloads`. The list is kept in memory only, until Syndeo
+quits, and once more than 50 are listed, the oldest that are over fall off.
 
 ### No keys
 
@@ -279,28 +451,29 @@ Each kind of access is allowed on its own:
   A program asks for it separately, and you are asked separately.
 
 **In the open, and only in its own tabs.** A program opens its pages in tabs
-of its own, in windows of their own. Each says, below its toolbar, which
-program controls it, and offers **Stop**. Stop disconnects the program and
-takes back everything it was allowed, and its tabs become yours. A program
-never sees your own tabs. Its pages are opened as yours are: through
-Syndeo's proxy, pinned to Syndeo's authority, and only `http` and `https`
-addresses. It cannot reach Settings, Clear Browsing Data, cookies or storage
-except as a page in its tab could, the proxy's controls or anything else of
-Syndeo's. A program's tabs download nothing: a file one is sent is
-refused, nothing is saved, and the program is told that downloads are not
-allowed for agents. Agent Access lists what each program is allowed, and
-**Revoke** and **Revoke All** take it back. Turning agents off disconnects
-every program, and takes back everything.
+of its own, in windows of their own. Each says, in a banner across the top
+of its page, which program controls it, and offers **Stop**. Stop
+disconnects the program and takes back everything it was allowed, and its
+tabs become yours. A program never sees your own tabs. Its pages are
+opened as yours are: through Syndeo's proxy, pinned to Syndeo's authority,
+and only `http` and `https` addresses. It cannot reach Settings, Clear
+Browsing Data, cookies or storage except as a page in its tab could, the
+proxy's controls or anything else of Syndeo's. A program's tabs download
+nothing: a file one is sent is refused, nothing is saved, and the program
+is told that downloads are not allowed for agents. Agent Access lists what
+each program is allowed, and **Revoke** and **Revoke All** take it back.
+Turning agents off disconnects every program, and takes back everything.
 
-A program's tabs are kept apart from yours. They are not part of the
-session Syndeo keeps when it quits, and they are not offered again in
-History > Recently Closed. ⌘1 to ⌘9 and Show All Tabs work within the window
-in front, yours or a program's. A tab you open from a program's window (New
-Tab, Duplicate Tab) is yours, and opens beside your own windows. A
-program's tabs are routed exactly as yours are, including the hosts Syndeo
-sends directly for the session. The route it is told is the one its tab's
-bar shows, and when its window loads a page again by itself, the program
-waits for that page.
+A program's tabs are kept apart from yours. Their rows are in the sidebar
+of its own windows, never in yours, and none of yours are in its. They are
+not part of the session Syndeo keeps when it quits, and they are not
+offered again in History > Recently Closed. ⌘1 to ⌘9 and Show All Tabs work
+within the window in front, yours or a program's. A tab you open from a
+program's window (New Tab, Duplicate Tab) is yours, and opens beside your
+own windows. A program's tabs are routed exactly as yours are, including
+the hosts Syndeo sends directly for the session. The route it is told is
+the one its tab's address field shows, and when its window loads a page
+again by itself, the program waits for that page.
 
 **Only your own programs, and nothing on the network.** While agents are on,
 Syndeo listens on a Unix socket, `control.sock`, in
@@ -363,7 +536,7 @@ Syndeo, and WebKit and macOS for it, keep it in your home folder:
 | Where | What |
 | --- | --- |
 | `~/Library/Application Support/Syndeo` | Syndeo's cache, and its certificate authority with its private key |
-| `~/Library/Preferences/com.sum.syndeo.plist` | the search engine chosen |
+| `~/Library/Preferences/com.sum.syndeo.plist` | the search engine chosen, whether agents are allowed, and your spaces, folders and favorites (`SyndeoSpaces` and `SyndeoFavorites.<n>`) |
 | `~/Library/WebKit/com.sum.syndeo`, `~/Library/Caches/com.sum.syndeo`, `~/Library/HTTPStorages/com.sum.syndeo` and `~/Library/HTTPStorages/com.sum.syndeo.binarycookies` | WebKit's website data: cookies, website storage and its cache |
 | `~/Library/Saved Application State/com.sum.syndeo.savedState` | what macOS keeps of Syndeo's windows |
 
@@ -377,9 +550,21 @@ rm -rf ~/Library/Application\ Support/Syndeo \
 defaults delete com.sum.syndeo
 ```
 
-Syndeo.app put nothing in your keychain or trust settings, so there is
-nothing there to undo. The command-line tools, and their `~/.syndeo`, are
-separate, and removing the application touches neither.
+To delete only your spaces, folders and favorites, and keep the rest, quit
+Syndeo, list Syndeo's preferences, and delete `SyndeoSpaces` and each
+`SyndeoFavorites.<n>` listed:
+
+```sh
+defaults read com.sum.syndeo
+defaults delete com.sum.syndeo SyndeoSpaces
+defaults delete com.sum.syndeo SyndeoFavorites.1   # and each other one listed
+```
+
+Files Syndeo downloaded are in `~/Downloads`, and are yours: neither way of
+removing it touches them. Syndeo.app put nothing in your keychain or trust
+settings, so there is nothing there to undo. The command-line tools, and
+their `~/.syndeo`, are separate, and removing the application touches
+neither.
 
 ### The installer package, in detail
 
@@ -508,6 +693,27 @@ separate, and removing the application touches neither.
   - opened, browsed, its last window closed and a window opened again, and
     quit; its search settings kept; an `https` page opened, pinned to
     Syndeo's authority, with that authority in no trust settings;
+  - its sidebar, beside the page: Hide Sidebar, Back, Forward and Reload
+    across its top, the address field with the route and Copy Link in it,
+    the tabs' rows with New Tab the last, and Downloads at its foot, in that
+    order, with AppKit's tab bar hidden; and ⌘S hiding it, the page taking
+    its room, and showing it again as it was;
+  - the command bar: File > New Tab opening it, and no tab; Escape putting
+    it away; Return opening what was typed in a new tab, or, with nothing
+    typed, the start page; and an open tab suggested for what is typed,
+    and brought to the front when chosen, opening no other;
+  - tabs, read from the sidebar's rows as a person sees them: links opened
+    in tabs with ⌘, ⇧⌘ and the middle button, ⌘1 to ⌘9, a row pressed, a
+    row's own menu by a right-click, Duplicate Tab, Pin Tab, Close Other
+    Tabs, Recently Closed and Show All Tabs; the session kept at quit and
+    opened again; and Clear Browsing Data forgetting closed tabs and the
+    session;
+  - the sidebar with 30 tabs: one row for each tab, held by the window in
+    front alone and each made once, not one in each window; and the app's
+    physical footprint growing less than 100 MB from one tab to 30, each
+    brought to the front, a ceiling midway between what was measured with
+    the backdrop a gradient layer (59.5 and 61.4 MB) and with it a bitmap
+    of the window (139.0 MB);
   - a Syndeo.app whose proxy cannot start, which has to refuse to browse;
   - the address field's route against what WebKit actually does, what the
     proxy caches, and Clear Browsing Data;
@@ -517,20 +723,29 @@ separate, and removing the application touches neither.
   - agents driving it, on a runner of their own: off until turned on; the
     prompt, answered by presses as you would answer it, before anything is
     done; allowed, denied, once and for the session; their pages through
-    Syndeo's proxy in tabs saying who controls them; reading, clicking,
-    typing, scrolling and a screenshot; JavaScript only with its own leave;
-    Stop and Revoke All; MCP; a connection from another user refused; and
-    beside the person's tabs: none of the agent's in the session kept at quit
-    or in Recently Closed, ⌘1 to ⌘9 within the window in front, and none of
-    the person's in the agent's list; and nothing downloaded in an agent's
-    tab, the agent told so;
-  - downloads in your window: files an `https` page links, saved byte for
-    byte, each on a TLS connection of its own, with a certificate the window
-    has not seen, pinned to Syndeo's authority as the window's pages are;
-    and nothing saved from a download redirected where a window may not go;
-  - twenty mutants, each the application with one safeguard taken out, every
-    one of which the test has to catch;
-  - its controls in its toolbar and browsing, in light and in dark
+    Syndeo's proxy in tabs saying who controls them, in a banner across the
+    top of the page, over none of it and covered by nothing; reading,
+    clicking, typing, scrolling and a screenshot; JavaScript only with its
+    own leave; Stop and Revoke All; MCP; a connection from another user
+    refused; and beside the person's tabs: none of the agent's in the
+    session kept at quit or in Recently Closed, ⌘1 to ⌘9 within the window
+    in front, and none of the person's in the agent's list; and, in an
+    agent's tab, its goto to a file and its click on a link marked for
+    downloading both refused, the agent told so, and no download begun or
+    file saved;
+  - downloads in your window: files an `https` page links, directly and
+    through a redirect within its origin, saved byte for byte, each on a TLS
+    connection of its own, with a certificate the window has not seen,
+    pinned to Syndeo's authority as the window's pages are; nothing saved
+    from a download redirected to an IPv6 address with a zone, or to a
+    `file:` address; and nothing of a download's address in the app's log
+    or its proxy's;
+  - twenty-two mutants, each the application with one safeguard taken out,
+    every one of which the test has to catch: among them an agent's tab
+    allowed to download, a download's TLS challenges left to macOS, the
+    sidebar's rows made in every window of a tab group, and the backdrop
+    drawn as a bitmap of the window;
+  - its controls in its sidebar and browsing, in light and in dark
     appearance, with pictures of each kept with the run's logs.
 - **Checked by hand, for every signed release:** on an existing Mac and
   account, an administrator's included, installing by opening the package in
@@ -542,9 +757,15 @@ separate, and removing the application touches neither.
   check before the release's tag (see [Releasing](#releasing)), not
   something a pull request waits on. A clean environment is CI's to cover:
   the first install on a pristine runner and the customer's journey above.
-- **What was not tested:** the refusal of Intel Macs and of macOS before 13,
-  which rests on the package's metadata alone, with no such runners to try
-  it on.
+- **What was not tested:**
+  - the refusal of Intel Macs and of macOS before 13, which rests on the
+    package's metadata alone, with no such runners to try it on;
+  - in the application: favorites, spaces and folders, and dragging a tab
+    onto them; the command bar's suggestions of favorites; the sidebar
+    peeking back from the window's left edge; and Copy Link's copy. The
+    rules of favorites, spaces and folders, and the order of the sidebar's
+    rows, are tested in plain Rust (`favorites.rs`, `spaces.rs` and
+    `sidebar_model.rs`), apart from the running app.
 
 ## The command-line tools
 
@@ -1014,13 +1235,13 @@ Same page, same interval, both sides sampled rather than snapshotted:
 
 **Per tab, in Syndeo.app.** Each tab is a web view of its own, with a
 WebContent process of its own. With the same small page through Syndeo in
-one tab and then in five, sampled four times over the same interval on a CI
-runner (`ci/test-app.sh tabs`, run 39695773041):
+one tab and then in five, the resident memory sampled four times over the
+same interval on a CI runner (`ci/test-app.sh tabs`, run 42754034455):
 
 | Syndeo.app | one tab | five tabs | each tab past the first |
 | --- | --- | --- | --- |
-| the app's own process | 68 MB | 77 MB | +2.2 MB |
-| WebContent | 35 MB, 1 process | 180 MB, 5 processes | +36.5 MB, 1 process |
+| the app's own process | 69 MB | 82 MB | +3.2 MB |
+| WebContent | 36 MB, 1 process | 161 MB, 5 processes | +31.2 MB, 1 process |
 
 A heavier page costs its WebContent process what it costs Safari (above).
 
@@ -1028,6 +1249,24 @@ The engine costs what Safari's engine costs, because it *is* Safari's engine;
 the difference is the host process, where ours is smaller. Safari's fixed
 overhead is amortised across its other tabs and ours is not, so past roughly a
 dozen tabs the comparison turns around.
+
+**The sidebar, with many tabs.** Each tab's window has a sidebar, but only
+the window in front of its tab group holds rows: one for each tab, made
+once, and handed to whichever tab comes to the front, so 30 tabs make 30
+rows, not 30 in each of 30 windows. The window's backdrop is a gradient
+layer Core Animation draws, with no bitmap of the window kept behind each
+tab. The app's own process, by its physical footprint (what Activity
+Monitor calls its Memory), with a small page in each tab, each tab brought
+to the front by its row, in a window of 1024 by 681 points on a CI runner
+(`ci/test-app.sh sidebar`, run 42754034455):
+
+| Syndeo.app | 1 tab | 10 tabs | 30 tabs | 50 tabs |
+| --- | --- | --- | --- | --- |
+| the app's own process | 25.0 MB | 40.8 MB | 89.7 MB | 155.4 MB |
+
+With the backdrop drawing itself instead, into a bitmap of the window kept
+behind each tab, the same footprint grew 139.0 MB from one tab to 30 (run
+42545865986), against 64.7 MB here.
 
 Getting this right took three attempts and produced two published numbers that
 were wrong, both in our favour, from two mistakes worth naming:
@@ -1434,6 +1673,20 @@ this is a set of honest limits rather than work waiting to be done:
   cached. macOS matches a host sent directly as a domain, so the names under
   it go directly too. Nothing about it is written anywhere, and the log says
   that a host was sent directly, never which.
+- While Syndeo.app's sidebar is hidden, its route is not shown: the address
+  field is in the sidebar, and goes with it, so nothing in the window says
+  how its page was reached until the sidebar is shown again or peeks back.
+  Measured on CI: with the sidebar hidden, no route was left in the window.
+- Spaces divide the sidebar, not the window. ⌘1 to ⌘9, Show Next Tab, Show
+  Previous Tab and Show All Tabs count every tab of the window, in every
+  space, and can bring to the front a tab the sidebar does not list; Close
+  Other Tabs closes every other unpinned tab of the window, in every space.
+- A download that the server sends in answer to a POST, or to any method
+  but GET, HEAD, OPTIONS and TRACE, fails past 64 MiB when it comes through
+  Syndeo's proxy: the proxy holds such a response whole, and past
+  `max_body_bytes`, 64 MiB, refuses it and answers 502 instead (see
+  [Read a page from the terminal](#read-a-page-from-the-terminal)). A
+  download by GET streams through, however large.
 - The proxy's cache is not partitioned by site, in Syndeo.app or behind
   `syndeo-webkit`, and Syndeo.app has one browsing profile for every site.
 - Syndeo.app has no keystore: no keys, identities or signing.
@@ -1466,7 +1719,7 @@ both say so where you would meet them:
 cargo test --workspace
 ```
 
-About 475 on macOS and 455 on Linux, where the Seatbelt, keychain and WebKit
+About 700 on macOS and 650 on Linux, where the Seatbelt, keychain and WebKit
 tests do not run. Two macOS tests drive the real WebKit data store and a
 throwaway keychain, and run only where `SYNDEO_WEBKIT_UI_TEST=1` and
 `SYNDEO_KEYCHAIN_TEST=1` are set, as CI's macOS runner sets them. The RFC 9111 conformance suite,
