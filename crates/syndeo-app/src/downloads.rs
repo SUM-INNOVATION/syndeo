@@ -397,6 +397,30 @@ pub enum Verdict {
 /// Whether WebKit reports a navigation as a person's click:
 /// `WKNavigationAction.buttonNumber`, the mask of mouse buttons pressed,
 /// which WebKit leaves empty unless a trusted mouse event caused it.
+///
+/// Measured on macOS 15, CI 43100625418 (ci/test-app.sh downloads, which
+/// logs every navigation action), for each way a download begins, as
+/// navigationType, buttonNumber, the frame that began it and the frame it
+/// is for, and shouldPerformDownload; modifierFlags was 0 in every one:
+/// - a person's click with the mouse on a link marked for downloading:
+///   link, 1, main, main, yes;
+/// - on a plain link to a file (a response): link, 1, main, main, no;
+/// - a link marked for downloading pressed through Accessibility (AXPress,
+///   as VoiceOver presses it): link, 1, main, main, yes;
+/// - a script's `click()` on such a link, on load: link, 0, main, main,
+///   yes;
+/// - a click the script made up as a `MouseEvent` and dispatched: link, 0,
+///   main, main, yes;
+/// - the page's address set to a file, on load: other, 0, main, main, no;
+/// - a meta refresh to a file: other, 0, main, main, no;
+/// - each of `click()`, its address and a meta refresh in a hidden frame
+///   from another origin: link or other, 0, inner, inner.
+///
+/// So buttonNumber tells the person's click from a page's, and a page
+/// cannot make one up; navigationType cannot (a script's `click()` is a
+/// link too). What it does not see, a download a page starts from the
+/// person's click on a button, or from Return or Space, the window's own
+/// watch for the person's acts in the page covers ([`Gate::person_acted`]).
 pub fn clicked(buttons: isize) -> bool {
     buttons != 0
 }

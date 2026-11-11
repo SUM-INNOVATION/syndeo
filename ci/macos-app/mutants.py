@@ -463,10 +463,12 @@ MUTANTS = {
 # 26m13s, download-challenge-unpinned 105 s of it).
 # And the sidebar's, which macos-agents runs whatever its earlier steps did,
 # while macos-app's mutants wait on its launch passing.
-# And two of the window's rule for downloads, subframe-downloads-allowed and
-# automatic-downloads-unlimited, which run its checks alone (test-app.sh's
-# dl_policy); downloads-kept-after-clear, which runs Clear Browsing Data's
-# alone (dl_clear), stays in macos-app.
+# And the window's rule for downloads' three, each running only the checks
+# meant to catch it (test-app.sh's dl_policy or dl_clear): CI 43100625418
+# took 97 s for subframe-downloads-allowed and 101 s for
+# automatic-downloads-unlimited, here, and 59 s for downloads-kept-after-
+# clear in macos-app, which then took 43m03s, its downloads step 134 s, to
+# macos-agents' 38m10s; so that one runs here too.
 MACOS_AGENTS = {
     "no-pinning-delegate",
     "direct-for-every-host",
@@ -481,6 +483,7 @@ MACOS_AGENTS = {
     "backdrop-draws-bitmap",
     "subframe-downloads-allowed",
     "automatic-downloads-unlimited",
+    "downloads-kept-after-clear",
 }
 
 JOBS = ("macos-app", "macos-agents")
