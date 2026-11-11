@@ -464,11 +464,14 @@ MUTANTS = {
 # And the sidebar's, which macos-agents runs whatever its earlier steps did,
 # while macos-app's mutants wait on its launch passing.
 # And the window's rule for downloads' three, each running only the checks
-# meant to catch it (test-app.sh's dl_policy or dl_clear): CI 43100625418
-# took 97 s for subframe-downloads-allowed and 101 s for
-# automatic-downloads-unlimited, here, and 59 s for downloads-kept-after-
-# clear in macos-app, which then took 43m03s, its downloads step 134 s, to
-# macos-agents' 38m10s; so that one runs here too.
+# meant to catch it (test-app.sh's dl_frames, dl_automatic or dl_clear).
+# CI 43100625418 took 59 s for downloads-kept-after-clear in macos-app, which
+# then took 43m03s, its downloads step 134 s, to macos-agents' 38m10s; so it
+# runs here, where CI 43107749350 took 75 s for it, and macos-app 42m26s to
+# macos-agents' 45m11s on a slower runner (every mutant of its 10 to 30 s
+# slower than in 43100625418). subframe-downloads-allowed and
+# automatic-downloads-unlimited then ran all of dl_policy, 102 s and 110 s;
+# they now run only their own part of it.
 MACOS_AGENTS = {
     "no-pinning-delegate",
     "direct-for-every-host",

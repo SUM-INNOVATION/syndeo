@@ -159,12 +159,13 @@
 # agent-downloads-allowed, agent-downloads' checks (agent downloads:), after
 # the prompt; for download-challenge-unpinned, downloads' files arriving
 # over TLS connections of their own, their challenges answered with
-# Syndeo's authority (downloads:). For subframe-downloads-allowed and
-# automatic-downloads-unlimited, the window's rule for downloads alone
-# (downloads: a hidden cross-origin iframe, and downloads: a page that tries
-# three automatic downloads); for downloads-kept-after-clear, Clear Browsing
-# Data and the downloads alone (downloads: Clear Browsing Data). Any other
-# failure is a failure.
+# Syndeo's authority (downloads:). For subframe-downloads-allowed, the
+# window's rule's hidden frames alone (downloads: a hidden cross-origin
+# iframe); for automatic-downloads-unlimited, its page trying three automatic
+# downloads, and what the person asks for there, alone (downloads: a page
+# that tries three automatic downloads); for downloads-kept-after-clear,
+# Clear Browsing Data and the downloads alone (downloads: Clear Browsing
+# Data). Any other failure is a failure.
 #
 # agents, which gates programs on this Mac driving Syndeo with the person's
 # leave: see the section of that name below.
@@ -1693,7 +1694,8 @@ mutant() {
       agent-*) agents_mutant "$name" "$app" ;;
       direct-for-every-host | never-retry-direct) preloaded "$log" ;;
       download-*) dl_original "$log" ;;
-      subframe-downloads-allowed | automatic-downloads-unlimited) dl_origin && dl_policy "$log" "$(token)" ;;
+      subframe-downloads-allowed) dl_origin && dl_frames "$log" "$(token)" ;;
+      automatic-downloads-unlimited) dl_origin && dl_automatic "$log" "$(token)" ;;
       downloads-kept-after-clear) dl_origin && dl_clear "$log" "$(token)" ;;
       sidebar-* | backdrop-*) sidebar_rounds "$app" "$log" "$SIDEBAR_GATE" ;;
       *) policy "$log" ;;
@@ -4172,35 +4174,20 @@ dl_how() {
 # over http with T in their addresses, in the application running as PID,
 # whose log is LOG; see the top of this section.
 dl_policy() {
-  local log="$1" t="$2" page mark frames saved n f begun="$SECONDS"
-  local blocked=$'syndeo.download-detail\tBlocked: this page tried to download more files'
-  for f in auto-1 auto-2 auto-3 person plain pressed meta frame-b frame-c frame-d; do
+  local begun="$SECONDS"
+  dl_frames "$1" "$2"
+  dl_automatic "$1" "$2"
+  dl_meta "$1" "$2"
+  printf '  MEASURE  the window'"'"'s rule for downloads: its checks took %s s\n' "$((SECONDS - begun))"
+}
+
+# dl_frames LOG T: dl_policy's hidden frames from another origin, which
+# subframe-downloads-allowed runs alone.
+dl_frames() {
+  local log="$1" t="$2" page mark frames saved n f
+  for f in frame-b frame-c frame-d; do
     head -c 20000 /dev/urandom >"$DL_DIR/$f-$t.bin"
   done
-  cat >"$DL_DIR/auto-$t.html" <<EOF
-<!doctype html><meta charset="utf-8"><title>Automatic downloads</title>
-<h1>SYNDEO-AUTOMATIC-PAGE</h1>
-<p><a id="one" href="/auto-1-$t.bin?t=$t" download="syndeo-auto-1-$t.bin">first</a>
-<a id="two" href="/auto-2-$t.bin?t=$t" download="syndeo-auto-2-$t.bin">second</a></p>
-<p><a href="/person-$t.bin?t=$t" download="syndeo-person-$t.bin">Download it yourself</a></p>
-<p><a href="/plain-$t.bin?t=$t">A file by a plain link</a></p>
-<p><a href="/pressed-$t.bin?t=$t" download="syndeo-pressed-$t.bin">Press it to download</a></p>
-<script>
-addEventListener('load', function () {
-  document.getElementById('one').click();
-  setTimeout(function () {
-    document.getElementById('two').dispatchEvent(new MouseEvent('click',
-      { bubbles: true, cancelable: true, view: window, button: 0, buttons: 1, detail: 1 }));
-  }, 800);
-  setTimeout(function () { location.href = '/auto-3-$t.bin?t=$t'; }, 1600);
-});
-</script>
-EOF
-  cat >"$DL_DIR/meta-$t.html" <<EOF
-<!doctype html><meta charset="utf-8"><title>A meta refresh</title>
-<meta http-equiv="refresh" content="1; url=/meta-$t.bin?t=$t">
-<h1>SYNDEO-META-PAGE</h1>
-EOF
   cat >"$DL_DIR/frame-b-$t.html" <<EOF
 <!doctype html><meta charset="utf-8"><title>b</title>
 <a id="f" href="/frame-b-$t.bin?t=$t" download="syndeo-frame-b-$t.bin">f</a>
@@ -4243,6 +4230,36 @@ EOF
   must "$([ -z "$saved" ] && [ "$n" -ge 1 ] && [ "$(dl_count_after "$log" "$frames" 'a download allowed: ')" = 0 ] && echo yes)" \
     "downloads: a hidden cross-origin iframe that tries to download on load saves nothing, by a script's click(), its own address or a meta refresh; the log says each that reached the window was refused as a frame's ($n)" \
     "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_after "$log" "$frames" | grep -E "$DL_DECIDED" | sed -E 's/^[^ ]+ +//' | cut -c 1-160 | tr '\n' '|')"
+}
+
+# dl_automatic LOG T: dl_policy's page trying three automatic downloads, and
+# what the person asks for on it, which automatic-downloads-unlimited runs
+# alone.
+dl_automatic() {
+  local log="$1" t="$2" page mark saved n f
+  local blocked=$'syndeo.download-detail\tBlocked: this page tried to download more files'
+  for f in auto-1 auto-2 auto-3 person plain pressed; do
+    head -c 20000 /dev/urandom >"$DL_DIR/$f-$t.bin"
+  done
+  cat >"$DL_DIR/auto-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>Automatic downloads</title>
+<h1>SYNDEO-AUTOMATIC-PAGE</h1>
+<p><a id="one" href="/auto-1-$t.bin?t=$t" download="syndeo-auto-1-$t.bin">first</a>
+<a id="two" href="/auto-2-$t.bin?t=$t" download="syndeo-auto-2-$t.bin">second</a></p>
+<p><a href="/person-$t.bin?t=$t" download="syndeo-person-$t.bin">Download it yourself</a></p>
+<p><a href="/plain-$t.bin?t=$t">A file by a plain link</a></p>
+<p><a href="/pressed-$t.bin?t=$t" download="syndeo-pressed-$t.bin">Press it to download</a></p>
+<script>
+addEventListener('load', function () {
+  document.getElementById('one').click();
+  setTimeout(function () {
+    document.getElementById('two').dispatchEvent(new MouseEvent('click',
+      { bubbles: true, cancelable: true, view: window, button: 0, buttons: 1, detail: 1 }));
+  }, 800);
+  setTimeout(function () { location.href = '/auto-3-$t.bin?t=$t'; }, 1600);
+});
+</script>
+EOF
 
   # A page trying three automatic downloads as it loads: a script's click()
   # on a link marked for downloading, a click it makes up as a MouseEvent,
@@ -4291,6 +4308,17 @@ EOF
   printf '  MEASURE  (a) a link marked for downloading pressed through Accessibility (AXPress, as VoiceOver presses it), on that page: %s\n' \
     "$([ -n "$(dl_since "$LOGS/downloads-new.txt")" ] && echo 'saved' || echo 'nothing saved')"
   dl_record "(a) pressed through Accessibility" "$log" "$mark"
+}
+
+# dl_meta LOG T: dl_policy's meta refresh to a file, measured.
+dl_meta() {
+  local log="$1" t="$2" page mark
+  head -c 20000 /dev/urandom >"$DL_DIR/meta-$t.bin"
+  cat >"$DL_DIR/meta-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>A meta refresh</title>
+<meta http-equiv="refresh" content="1; url=/meta-$t.bin?t=$t">
+<h1>SYNDEO-META-PAGE</h1>
+EOF
 
   # A meta refresh to a file, on a page the person opened: measured.
   dl_new >"$LOGS/downloads-new.txt"
@@ -4302,7 +4330,6 @@ EOF
   printf '  MEASURE  (d) a meta refresh to a file, on a page the person opened: %s\n' \
     "$([ -n "$(dl_since "$LOGS/downloads-new.txt")" ] && echo 'saved, as its one automatic download' || echo 'nothing saved')"
   dl_record "(d) a meta refresh to a file" "$log" "$mark"
-  printf '  MEASURE  the window'"'"'s rule for downloads: its checks took %s s\n' "$((SECONDS - begun))"
 }
 
 # dl_slow_stopped PATH: the origin logged that the client went away before
