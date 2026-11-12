@@ -3,6 +3,184 @@
 The release workflow reads the section matching the tag and puts it in the
 release notes, so a heading here is `## <version>` and nothing else.
 
+## 0.3.0
+
+Syndeo.app gets a new interface, with the tabs down a sidebar,
+favorites, spaces and folders, and a command bar. It also downloads files,
+which v0.2.1 and earlier refused. An agent's windows stay apart from yours.
+Updates for security advisories in wasmtime and zstd are included. The package
+installs and upgrades Syndeo.app as 0.2.1's did; the command-line tools are
+unchanged.
+
+**Before you upgrade**
+
+- **Quit Syndeo before installing.** The package refuses while Syndeo.app or
+  its helper runs, as before. It upgrades 0.2.0 and 0.2.1 in place and
+  leaves your data as it is: CI installs each of those published packages,
+  then this one over it.
+- **Syndeo.app now downloads files**, to `~/Downloads`, under the rule
+  below. v0.2.1 and earlier refused every download.
+- **Favorites, spaces and folders are kept in Syndeo's preferences**
+  (`SyndeoSpaces` and `SyndeoFavorites.<n>` in `com.sum.syndeo`), as page
+  addresses and titles. Clear Browsing Data leaves them, as it leaves the
+  search engine, and so does the uninstaller; the README says how to delete
+  them.
+- **Going back to 0.2.1 keeps your tabs.** The kept session adds each tab's
+  space and folder on a line of its own, which 0.2.1 leaves alone, so 0.2.1
+  opens every tab again, with no spaces or folders.
+
+**The sidebar** ([#70](https://github.com/SUM-INNOVATION/syndeo/pull/70))
+
+- **The window has no toolbar.** The tabs are down its left side and the
+  page beside them, inset over a gradient in the current space's colours.
+  AppKit's own tab bar is kept hidden.
+- **From the top, the sidebar holds:**
+  - Hide Sidebar, Back, Forward and Reload;
+  - the address field, with the page's route and Copy Link at its end, and
+    the loading progress along its bottom edge;
+  - the space's favorites;
+  - the tabs as rows under the space's emoji and name, with New Tab last;
+  - at its foot, the downloads button, the spaces' emoji, and New Space and
+    New Folder.
+- **A row** shows its page's title, an hourglass while it loads, and its
+  icon or a globe.
+  - Right-click or Control-click it for the tab's menu.
+  - The tab in front is lit.
+  - Pinned tabs and folders come first.
+- **⌘S hides the sidebar,** giving the page the whole window; it peeks back
+  over the page at the window's left edge. The route goes with it while it
+  is hidden.
+
+**Favorites, spaces and folders**
+
+- **Favorites:** up to twelve tiles per space.
+  - Add one by dragging a tab's row onto them, or from the tab's menu.
+  - A click opens the favorite in the tab in front.
+- **Spaces:** named sets of tabs, each with an emoji and a colour, up to
+  twelve.
+  - Switch by clicking an emoji, or with Spaces > Next and Previous Space
+    (⌥⌘→, ⌥⌘←).
+  - Every window's sidebar follows a switch.
+  - A space with no tab in the window opens one with the start page.
+- **Folders:** named groups of pinned tabs within a space, up to fifty,
+  which fold shut.
+- **Spaces divide the sidebar, not the window.** ⌘1 to ⌘9, Show All Tabs and
+  Close Other Tabs act on every tab of the window.
+
+**The command bar**
+
+- **⌘T and New Tab open a field over the page,** rather than a tab.
+  - Return opens what you typed in a new tab, read as the address field reads
+    it, or the start page when nothing is typed.
+  - Escape puts it away.
+- **Up to six suggestions:** your open tabs to switch to, then your
+  favorites from every space.
+  - **They come from this Mac alone.** Nothing is sent while you type, and
+    words are searched for only on Return, with the search engine chosen.
+  - Never an agent's tab.
+
+**Downloads**
+
+- **Where files go:**
+  - **Saved in `~/Downloads`,** under a name made safe:
+    - no path;
+    - no control or Unicode format characters, so a bidirectional override
+      cannot show `invoice<U+202E>fdp.command` as a PDF;
+    - at most 255 bytes;
+    - numbered rather than ever replacing a file, a link or a download still
+      coming in.
+  - **Quarantined.** Syndeo.app declares `LSFileQuarantineEnabled`, and CI
+    found `com.apple.quarantine` on each file downloaded.
+  - **Pinned as its window's pages are.** A download's own TLS challenges
+    are answered with Syndeo's authority, or, for a host the session sends
+    directly, with macOS's checks.
+  - **Only where a window may go.** A redirect to a `file:` address or an
+    IPv6 address with a zone saves nothing.
+- **The window's rule:**
+  - **Frames:** only the page itself downloads, so a frame inside it cannot.
+  - **Schemes:** only from `http` and `https`, and from `blob:` and `data:`
+    links marked for downloading.
+  - **What you ask for always begins:**
+    - a link you click, with the mouse or VoiceOver;
+    - a download your click, Return or Space in the page starts;
+    - a file an address you type leads to.
+  - **A page may download by itself once per page you open.** Further tries
+    show as "Blocked: this page tried to download more files" in the
+    downloads list, and a page that reloads itself earns no more.
+  - **Telling your click from a script's:** WebKit's `buttonNumber`, which
+    a page cannot set (measured in CI 43100625418).
+- **The downloads list:**
+  - **The downloads button** lists downloads in memory, with progress,
+    Cancel and Show in Finder; Cancel removes what was written.
+  - **Clear Browsing Data** cancels downloads still coming in, removes what
+    they had written, and empties the list. Files already saved stay.
+- **Never in an agent's tab.** The agent is told that downloads are not
+  allowed for agents, and its window has no downloads button.
+
+**Agents' windows, apart from yours**
+
+- **What an agent's window shows:** none of your favorites, spaces, folders
+  or downloads. It lists every one of the agent's own tabs whatever space
+  is current, so switching spaces never hides them.
+- **The command bar** never shows over an agent's window.
+- **An agent's pictures** are of its tab's page alone, never the sidebar or
+  another window.
+- **Stop:** the agent's tabs become yours, in the current space.
+
+**Memory**
+
+- **Sidebar rows exist only in the front window,** in place, refreshed at
+  most once per moment for each window's tabs.
+- **The backdrop is a gradient layer,** not a bitmap of the window.
+- **Measured on CI:** the app's own footprint was 21.2, 36.4, 86.0 and
+  144.5 MB at 1, 10, 30 and 50 tabs. CI holds its growth from 1 tab to 30
+  under 100 MB.
+
+**Security**
+
+- **wasmtime 48.0.7 → 48.0.8,** with its cranelift and pulley crates, for
+  RUSTSEC-2026-0422, RUSTSEC-2026-0423 and RUSTSEC-2026-0424. Only the agent's
+  tools run on wasmtime.
+- **zstd 0.13.3 → 0.13.4, zstd-safe 7.3.0 → 7.4.0 and zstd-sys 2.1.0 →
+  2.1.2,** for RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403 and
+  RUSTSEC-2026-0410. Syndeo's cache uses zstd, in the proxy and the
+  command-line tools.
+- **async-executor 1.14.0 → 1.14.1,** since 1.14.0 was yanked. It is
+  reached only through `syndeo-ui`'s screen reader support on Linux, not
+  Syndeo.app.
+
+**What was and was not tested**
+
+- **Every pull request**, on disposable runners, as for 0.2.1, and now also:
+  - the sidebar's controls in order, with AppKit's tab bar hidden, and ⌘S;
+  - the command bar opening, putting itself away, opening an address, and
+    switching to an open tab;
+  - tabs read and chosen from the sidebar's rows;
+  - each space operation leaving every window's sidebar right;
+  - 30 tabs holding one row each, with the footprint's growth under 100 MB;
+  - downloads: a frame refused, a page's automatic downloads limited, your
+    clicks downloading, redirects refused, and Clear Browsing Data with a
+    download in flight;
+  - an agent's tab refusing downloads, and its window showing none of your
+    favorites, spaces or downloads;
+  - Control-click opening a row's menu;
+  - the published 0.2.0 and 0.2.1 packages installed, and this one over
+    each, with the person's files and preferences kept byte for byte;
+  - twenty-eight mutants, each the application with one safeguard taken
+    out, every one caught.
+- **Measured, not gated:**
+  - whether a downloaded file is quarantined;
+  - what a download redirected to another site becomes;
+  - whether the route shows while the sidebar is hidden.
+- **Not tested:**
+  - favorites, spaces and folders made through the interface, which CI
+    writes into the preferences instead;
+  - a download a page starts from your click on a button, or from Return
+    or Space;
+  - the sidebar's peek;
+  - macOS 13 and 14;
+  - passkeys and password AutoFill, which no build can use yet.
+
 ## 0.2.1
 
 Syndeo.app becomes more of a browser: tabs as a browser has them, pages that
