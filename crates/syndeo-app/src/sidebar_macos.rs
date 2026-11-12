@@ -1740,7 +1740,7 @@ impl Sidebar {
         ivars.showing.set(true);
         ivars.shows.set(shows);
         self.show_favorites(if shows.favorites { favorites } else { &[] });
-        ivars.spaces.reload(layout, shows.spaces);
+        ivars.spaces.reload(layout, shows);
 
         // What the list arranges now. Rows and folders handed over from the
         // sidebar of the window that was in front (`adopt`) are in no list

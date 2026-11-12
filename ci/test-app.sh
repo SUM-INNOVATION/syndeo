@@ -163,10 +163,16 @@
 # agent-tabs-follow-spaces, with the person's favorites and spaces written
 # first, an agent's window showing no favorite tile and its tab's menu
 # offering no Add to Favorites, and its tabs still listed after the person
-# switches spaces (apart:). For spaces-take-out-unlisted, with the sidebar's
-# two spaces written first and no session, sidebar's spaces check, to its
-# first failure: what each space shows after Next Space, Previous Space,
-# its emoji and Delete Space (spaces:). Any other failure is a failure.
+# switches spaces (apart:). For subframe-downloads-allowed, the window's
+# rule's hidden frames alone (downloads: a hidden cross-origin iframe); for
+# automatic-downloads-unlimited, its page trying three automatic downloads,
+# and what the person asks for there, alone (downloads: a page that tries
+# three automatic downloads); for downloads-kept-after-clear, Clear Browsing
+# Data and the downloads alone (downloads: Clear Browsing Data). For
+# spaces-take-out-unlisted, with the sidebar's two spaces written first and
+# no session, sidebar's spaces check, to its first failure: what each space
+# shows after Next Space, Previous Space, its emoji and Delete Space
+# (spaces:). Any other failure is a failure.
 #
 # agents, which gates programs on this Mac driving Syndeo with the person's
 # leave: see the section of that name below.
@@ -403,6 +409,9 @@ APP_LOG=''
 # Arguments started hands the application through open, after --args when
 # set: none, unless a check says otherwise.
 OPEN_ARGS=()
+# Environment started gives the application, as open's --env options:
+# none, unless a check says otherwise.
+OPEN_ENV=()
 
 # What example.com's page itself says. Its <title> is "Example Domain", and
 # the window takes its title from the page through its controller, so that is
@@ -428,9 +437,9 @@ started() {
   # instance opened could otherwise be shown without this one fetching it.
   FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
   if [ -n "${3:-}" ]; then
-    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" -a "$app" "$3" || { bad "open ($round)" "open failed"; return 1; }
+    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" ${OPEN_ENV[@]+"${OPEN_ENV[@]}"} -a "$app" "$3" || { bad "open ($round)" "open failed"; return 1; }
   else
-    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" ${OPEN_ARGS[@]+"${OPEN_ARGS[@]}"} || { bad "open ($round)" "open failed"; return 1; }
+    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" ${OPEN_ENV[@]+"${OPEN_ENV[@]}"} "$app" ${OPEN_ARGS[@]+"${OPEN_ARGS[@]}"} || { bad "open ($round)" "open failed"; return 1; }
   fi
   until=$((SECONDS + 30))
   while :; do
@@ -1674,6 +1683,9 @@ mutant() {
     agent-tabs-follow-spaces) intended='^apart: after the person switches spaces, an agent.s window still lists all its tabs$' ;;
     spaces-take-out-unlisted) intended='^spaces: ' ;;
     download-challenge-unpinned) intended='^downloads: a file an https page links ' ;;
+    subframe-downloads-allowed) intended='^downloads: a hidden cross-origin iframe ' ;;
+    automatic-downloads-unlimited) intended='^downloads: a page that tries three automatic downloads ' ;;
+    downloads-kept-after-clear) intended='^downloads: Clear Browsing Data ' ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
   # What a mutant that downloads saves in ~/Downloads is removed again.
@@ -1708,7 +1720,10 @@ mutant() {
       websocket-headers-stripped) realtime_origin && rt_through_syndeo ;;
       agent-* | favorites-in-agent-windows) agents_mutant "$name" "$app" ;;
       direct-for-every-host | never-retry-direct) preloaded "$log" ;;
-      download-*) downloads_checks "$log" ;;
+      download-*) dl_original "$log" ;;
+      subframe-downloads-allowed) dl_origin && dl_frames "$log" "$(token)" ;;
+      automatic-downloads-unlimited) dl_origin && dl_automatic "$log" "$(token)" ;;
+      downloads-kept-after-clear) dl_origin && dl_clear "$log" "$(token)" ;;
       sidebar-* | backdrop-*) sidebar_rounds "$app" "$log" "$SIDEBAR_GATE" ;;
       spaces-*) sidebar_spaces "$app" "$log" first ;;
       *) policy "$log" ;;
@@ -3939,8 +3954,36 @@ tabs_test() {
 #     (lo0's own link-local address, where the origin answers) is refused:
 #     nothing is saved, and the origin does not hear of it; one redirected
 #     to a file: address saves nothing;
+#   - the window's rule for downloads, on http pages of this Mac's
+#     (dl_policy):
+#     - a hidden frame from another origin (localhost, in a page of
+#       127.0.0.1's) that tries to download as it loads, by a script's
+#       click() on a link marked for downloading, by setting its own address
+#       to a file, or by a meta refresh to one, saves nothing, and the log
+#       says each that reached the window was refused as a frame's;
+#     - a page that tries three automatic downloads as it loads (a script's
+#       click(), a click it makes up as a MouseEvent, its address set to a
+#       file) saves one, its first; the log says the others were refused as
+#       automatic, and the downloads list shows them blocked: "Blocked: this
+#       page tried to download more files";
+#     - on that page, a person's click with the mouse on a link marked for
+#       downloading, and on a plain link to a file, each saves its file;
+#   - Clear Browsing Data (dl_clear), with one download finished and one
+#     still coming in (a slow file, which the downloads list is first seen
+#     to show beside the finished one): the one coming in is cancelled, the
+#     origin seeing it stop, and nothing of it is left in ~/Downloads; the
+#     finished file stays, byte for byte; and the downloads list says
+#     nothing has been downloaded;
 #   - nothing of a download's address is in the app's log or its proxy's.
-# Measured, not gated: whether each file saved has com.apple.quarantine,
+# Measured, not gated: what WebKit says of each navigation and how the
+# window decided each download, for each way a download begins (a person's
+# click, a press through Accessibility, a script's click() on load, a
+# MouseEvent made up, an address set to a file, a meta refresh, and each of
+# those in a hidden frame), the app logging every navigation at debug for
+# this mode; whether a meta refresh to a file downloads, as a page's one
+# automatic download; whether a download still coming in has its file in
+# ~/Downloads yet; how long the rule's checks and Clear Browsing Data's
+# take. And whether each file saved has com.apple.quarantine,
 # and what it says; whether WebKit asked the download about its redirect
 # within its own origin; what a download redirected to another origin
 # becomes; and which refused the zone and the file: address, the
@@ -3958,7 +4001,9 @@ tabs_test() {
 #   - a link marked for downloading that it clicks is refused, and its wait
 #     says so;
 #   - nothing is saved in ~/Downloads, no download began, and the log says
-#     each was refused in an agent's tab, with nothing of their addresses.
+#     each was refused in an agent's tab, with nothing of their addresses;
+#   - the agent's window, in front, has no Downloads button in its sidebar:
+#     the person's downloads are not shown there.
 # ~/Downloads is put back as it was, which is gated, as are the trust
 # settings.
 DOWNLOADS="$HOME/Downloads"
@@ -4112,12 +4157,14 @@ dl_said() { plain_log "$1" | grep -iE 'download' | tail -n 4 | cut -c 1-220 | tr
 # dl_count LOG TEXT: how many of LOG's lines have TEXT.
 dl_count() { plain_log "$1" | grep -cF "$2"; }
 
-# dl_press LOG TEXT: press the page's link TEXT, as a click would, and wait
-# up to 45 s for a download to end, as LOG says.
+# dl_press LOG TEXT: click the page's link TEXT with the mouse, as a person
+# does, whose downloads the window's rule always lets begin (a press through
+# Accessibility is measured in dl_policy), and wait up to 45 s for a
+# download to end, as LOG says.
 dl_press() {
   local ended
   ended="$(dl_ended "$1")"
-  "$APPCTL" press-web "$PID" "$2" || bad "download page: its link '$2' is pressed" "no such link: $(page_text)"
+  "$APPCTL" click-web "$PID" "$2" none left || bad "download page: its link '$2' is clicked" "no such link: $(page_text)"
   wait_for 45 dl_more "$1" "$ended" || true
 }
 
@@ -4172,12 +4219,12 @@ dl_file() {
   dl_quarantine "$(basename "$name")" "$name"
 }
 
-# downloads_checks LOG: downloads' checks, in the application running as PID,
-# whose log is LOG; see the top of this section.
-downloads_checks() {
-  local log="$1" t z s page saved before stopped refused
-  dl_origin tls || return 1
-  t="$(token)"; z="$(token)"; s="$(token)"
+# dl_links LOG T Z S: the files an https page links for downloading, and
+# the redirects no window may follow, in the application running as PID,
+# whose log is LOG, with the origin running over https; T, Z and S are the
+# tokens in their addresses. See the top of this section.
+dl_links() {
+  local log="$1" t="$2" z="$3" s="$4" page saved before stopped refused
   head -c 300000 /dev/urandom >"$DL_DIR/payload-$t.bin"
   head -c 200000 /dev/urandom >"$DL_DIR/second-$t.bin"
   head -c 1000 /dev/urandom >"$DL_DIR/zoned-$t.bin"
@@ -4249,9 +4296,331 @@ EOF
     "$(if [ "$(dl_count "$log" "refused a download's redirect")" -gt "$before" ]; then echo "the download's own redirect check"
     elif [ "$(plain_log "$log" | grep -c 'refused a page in a window scheme=file')" -gt "$refused" ]; then echo "the window's navigation policy, WebKit having made the redirect a navigation"
     else echo "WebKit, asking neither: $(dl_said "$log")"; fi)"
+}
 
-  must "$(! grep -qE "$t|$z|$s" "$log" && echo yes)" "downloads: nothing of a download's address is in the app's log or its proxy's" \
-    "$(grep -cE "$t|$z|$s" "$log") lines"
+# dl_unlogged LOG PATTERN: nothing matching PATTERN, the tokens in the
+# addresses downloaded from, is in LOG, the app's log and its proxy's.
+dl_unlogged() {
+  must "$(! grep -qE "$2" "$1" && echo yes)" "downloads: nothing of a download's address is in the app's log or its proxy's" \
+    "$(grep -cE "$2" "$1") lines"
+}
+
+# dl_original LOG: the checks download-challenge-unpinned is caught by, as
+# they were before the window's rule for downloads: the files an https page
+# links, the redirects, and nothing of their addresses logged.
+dl_original() {
+  local log="$1" t z s
+  dl_origin tls || return 1
+  t="$(token)"; z="$(token)"; s="$(token)"
+  dl_links "$log" "$t" "$z" "$s"
+  dl_unlogged "$log" "$t|$z|$s"
+}
+
+# downloads_checks LOG: downloads' checks, in the application running as PID,
+# whose log is LOG; see the top of this section.
+downloads_checks() {
+  local log="$1" t z s
+  dl_origin tls || return 1
+  t="$(token)"; z="$(token)"; s="$(token)"
+  dl_links "$log" "$t" "$z" "$s"
+  dl_policy "$log" "$t"
+  dl_clear "$log" "$t"
+  dl_unlogged "$log" "$t|$z|$s"
+}
+
+# The app's lines that decide a download a window is asked to let begin
+# (browser_macos's judge_download).
+DL_DECIDED='a download allowed: |refused a download a frame inside the page started|refused a download from an address a download may not come from|refused an automatic download: '
+
+# dl_mark LOG: how many lines LOG has now, to look at what comes after.
+dl_mark() { plain_log "$1" | wc -l | tr -d ' '; }
+# dl_after LOG MARK: LOG's lines after MARK.
+dl_after() { plain_log "$1" | tail -n "+$(($2 + 1))"; }
+# dl_count_after LOG MARK PATTERN: how many of LOG's lines after MARK match
+# PATTERN, an extended regular expression.
+dl_count_after() { dl_after "$1" "$2" | grep -cE "$3"; }
+# dl_decided_after LOG MARK N: at least N downloads decided after MARK.
+dl_decided_after() { [ "$(dl_count_after "$1" "$2" "$DL_DECIDED")" -ge "$3" ]; }
+# dl_finished_after LOG MARK N: at least N downloads finished after MARK.
+dl_finished_after() { [ "$(dl_count_after "$1" "$2" 'a download finished')" -ge "$3" ]; }
+# dl_placed_after LOG MARK: a download was given its place after MARK.
+dl_placed_after() { [ "$(dl_count_after "$1" "$2" 'a download placed')" -ge 1 ]; }
+
+# dl_record WHAT LOG MARK: measured, not gated: what WebKit said of each
+# navigation after MARK (debug lines, which the downloads mode turns on),
+# and how the window decided each download, in order, without their times.
+dl_record() {
+  local lines
+  lines="$(dl_after "$2" "$3" | grep -E "a navigation action|$DL_DECIDED" | sed -E 's/^[^ ]+ +//; s/  +/ /g' | cut -c 1-260)"
+  printf '  MEASURE  %s:\n' "$1"
+  if [ -n "$lines" ]; then printf '%s\n' "$lines" | sed 's/^/             /'; else printf '             (nothing in the log)\n'; fi
+}
+
+# dl_popover WHEN: the downloads list, as its popover shows it, kept in the logs.
+dl_popover() {
+  "$APPCTL" downloads-list "$PID" >"$LOGS/downloads-list-$1.txt" 2>&1 || true
+  cat "$LOGS/downloads-list-$1.txt"
+}
+
+# dl_click TEXT WHAT: click the page's link TEXT with the mouse, as a person
+# does.
+dl_click() {
+  "$APPCTL" click-web "$PID" "$1" none left || bad "$2" "no link '$1' to click: $(page_text)"
+}
+
+# dl_saved_is ORIGINAL: exactly one file saved since downloads-new.txt,
+# byte for byte ORIGINAL; its name, printed.
+dl_saved_is() {
+  local saved
+  saved="$(dl_since "$LOGS/downloads-new.txt")"
+  [ -n "$saved" ] && [ "$(printf '%s\n' "$saved" | grep -c .)" = 1 ] && cmp -s "$DOWNLOADS/$saved" "$1" && printf '%s\n' "$saved"
+}
+
+# dl_how CASE: how a hidden frame of dl_policy's tries to download.
+dl_how() {
+  case "$1" in
+    b) echo "a script's click() on a link marked for downloading, on load" ;;
+    c) echo "its own address set to a file, on load" ;;
+    *) echo "a meta refresh to a file" ;;
+  esac
+}
+
+# dl_policy LOG T: the window's rule for downloads, on pages this Mac serves
+# over http with T in their addresses, in the application running as PID,
+# whose log is LOG; see the top of this section.
+dl_policy() {
+  local begun="$SECONDS"
+  dl_frames "$1" "$2"
+  dl_automatic "$1" "$2"
+  dl_meta "$1" "$2"
+  printf '  MEASURE  the window'"'"'s rule for downloads: its checks took %s s\n' "$((SECONDS - begun))"
+}
+
+# dl_frames LOG T: dl_policy's hidden frames from another origin, which
+# subframe-downloads-allowed runs alone.
+dl_frames() {
+  local log="$1" t="$2" page mark frames saved n f
+  for f in frame-b frame-c frame-d; do
+    head -c 20000 /dev/urandom >"$DL_DIR/$f-$t.bin"
+  done
+  cat >"$DL_DIR/frame-b-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>b</title>
+<a id="f" href="/frame-b-$t.bin?t=$t" download="syndeo-frame-b-$t.bin">f</a>
+<script>addEventListener('load', function () { document.getElementById('f').click(); });</script>
+EOF
+  cat >"$DL_DIR/frame-c-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>c</title>
+<script>addEventListener('load', function () { location.href = '/frame-c-$t.bin?t=$t'; });</script>
+EOF
+  cat >"$DL_DIR/frame-d-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>d</title>
+<meta http-equiv="refresh" content="0; url=/frame-d-$t.bin?t=$t">
+EOF
+  for f in b c d; do
+    # The frame from another origin: localhost, the page 127.0.0.1.
+    cat >"$DL_DIR/frames-$f-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>A hidden frame</title>
+<h1>SYNDEO-FRAME-$f-PAGE</h1>
+<iframe hidden src="http://localhost:$DL_HTTP/frame-$f-$t.html?t=$t"></iframe>
+EOF
+  done
+
+  # A hidden frame from another origin, trying to download as it loads: by
+  # a script's click() on a link marked for downloading (b), by setting its
+  # own address to a file (c), and by a meta refresh to one (d).
+  dl_new >"$LOGS/downloads-new.txt"
+  frames="$(dl_mark "$log")"
+  for f in b c d; do
+    mark="$(dl_mark "$log")"
+    page="http://127.0.0.1:$DL_HTTP/frames-$f-$t.html?t=$t"
+    visit "$page" "$page" "SYNDEO-FRAME-$f-PAGE" "download page: a page with a hidden frame from another origin opens ($f)"
+    # Until the window is asked, or the origin has served the file and the
+    # window has had time to be asked.
+    wait_for 8 dl_decided_after "$log" "$mark" 1 || true
+    sleep 2
+    dl_record "($f, in a hidden frame from another origin) $(dl_how "$f"); the origin was asked for the file $(dl_heard "/frame-$f-$t.bin") time(s)" "$log" "$mark"
+  done
+  saved="$(dl_since "$LOGS/downloads-new.txt")"
+  n="$(dl_count_after "$log" "$frames" 'refused a download a frame inside the page started')"
+  must "$([ -z "$saved" ] && [ "$n" -ge 1 ] && [ "$(dl_count_after "$log" "$frames" 'a download allowed: ')" = 0 ] && echo yes)" \
+    "downloads: a hidden cross-origin iframe that tries to download on load saves nothing, by a script's click(), its own address or a meta refresh; the log says each that reached the window was refused as a frame's ($n)" \
+    "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_after "$log" "$frames" | grep -E "$DL_DECIDED" | sed -E 's/^[^ ]+ +//' | cut -c 1-160 | tr '\n' '|')"
+}
+
+# dl_automatic LOG T: dl_policy's page trying three automatic downloads, and
+# what the person asks for on it, which automatic-downloads-unlimited runs
+# alone.
+dl_automatic() {
+  local log="$1" t="$2" page mark saved n f
+  local blocked=$'syndeo.download-detail\tBlocked: this page tried to download more files'
+  for f in auto-1 auto-2 auto-3 person plain pressed; do
+    head -c 20000 /dev/urandom >"$DL_DIR/$f-$t.bin"
+  done
+  cat >"$DL_DIR/auto-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>Automatic downloads</title>
+<h1>SYNDEO-AUTOMATIC-PAGE</h1>
+<p><a id="one" href="/auto-1-$t.bin?t=$t" download="syndeo-auto-1-$t.bin">first</a>
+<a id="two" href="/auto-2-$t.bin?t=$t" download="syndeo-auto-2-$t.bin">second</a></p>
+<p><a href="/person-$t.bin?t=$t" download="syndeo-person-$t.bin">Download it yourself</a></p>
+<p><a href="/plain-$t.bin?t=$t">A file by a plain link</a></p>
+<p><a href="/pressed-$t.bin?t=$t" download="syndeo-pressed-$t.bin">Press it to download</a></p>
+<script>
+addEventListener('load', function () {
+  document.getElementById('one').click();
+  setTimeout(function () {
+    document.getElementById('two').dispatchEvent(new MouseEvent('click',
+      { bubbles: true, cancelable: true, view: window, button: 0, buttons: 1, detail: 1 }));
+  }, 800);
+  setTimeout(function () { location.href = '/auto-3-$t.bin?t=$t'; }, 1600);
+});
+</script>
+EOF
+
+  # A page trying three automatic downloads as it loads: a script's click()
+  # on a link marked for downloading, a click it makes up as a MouseEvent,
+  # and its address set to a file.
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  page="http://127.0.0.1:$DL_HTTP/auto-$t.html?t=$t"
+  visit "$page" "$page" 'SYNDEO-AUTOMATIC-PAGE' "download page: a page that tries three automatic downloads as it loads opens"
+  wait_for 15 dl_decided_after "$log" "$mark" 3 || true
+  wait_for 10 dl_finished_after "$log" "$mark" 1 || true
+  sleep 1
+  saved="$(dl_since "$LOGS/downloads-new.txt")"
+  n="$(dl_count_after "$log" "$mark" 'refused an automatic download: ')"
+  must "$(dl_saved_is "$DL_DIR/auto-1-$t.bin" >/dev/null && [ "$n" -ge 2 ] && echo yes)" \
+    "downloads: a page that tries three automatic downloads on load saves one, its first, and the log says the others were refused as automatic ($n)" \
+    "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_after "$log" "$mark" | grep -E "$DL_DECIDED" | sed -E 's/^[^ ]+ +//' | cut -c 1-160 | tr '\n' '|')"
+  must "$(dl_popover blocked | grep -qxF "$blocked" && echo yes)" \
+    "downloads: a page that tries three automatic downloads on load: the downloads list shows them blocked, saying \"Blocked: this page tried to download more files\"" \
+    "the list: $(tr '\n\t' '| ' <"$LOGS/downloads-list-blocked.txt" | head -c 400)"
+  dl_record "(b, b2, c) on a page the person opened, in order: a script's click() on a link marked for downloading, a MouseEvent the script made up, its address set to a file" "$log" "$mark"
+
+  # What the person asks for, on that page, whose automatic download is
+  # spent: a link marked for downloading they click, and a plain link to a
+  # file; and, measured, one pressed through Accessibility.
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  dl_click "Download it yourself" "downloads: a person's click on a link marked for downloading"
+  wait_for 20 dl_finished_after "$log" "$mark" 1 || true
+  must "$(dl_saved_is "$DL_DIR/person-$t.bin" >/dev/null && echo yes)" \
+    "downloads: a person's click on a link marked for downloading saves the file, byte for byte, on a page whose automatic download is spent" \
+    "saved: $(dl_since "$LOGS/downloads-new.txt" | tr '\n' '|'); the app: $(dl_said "$log")"
+  dl_record "(a) a person's click with the mouse on a link marked for downloading" "$log" "$mark"
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  dl_click "A file by a plain link" "downloads: a person's click on a plain link to a file"
+  wait_for 20 dl_finished_after "$log" "$mark" 1 || true
+  must "$(dl_saved_is "$DL_DIR/plain-$t.bin" >/dev/null && echo yes)" \
+    "downloads: a person's click on a plain link to a file saves it, byte for byte, on that page" \
+    "saved: $(dl_since "$LOGS/downloads-new.txt" | tr '\n' '|'); the app: $(dl_said "$log")"
+  dl_record "(a) a person's click with the mouse on a plain link to a file" "$log" "$mark"
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  "$APPCTL" press-web "$PID" "Press it to download" || true
+  wait_for 10 dl_decided_after "$log" "$mark" 1 || true
+  sleep 2
+  printf '  MEASURE  (a) a link marked for downloading pressed through Accessibility (AXPress, as VoiceOver presses it), on that page: %s\n' \
+    "$([ -n "$(dl_since "$LOGS/downloads-new.txt")" ] && echo 'saved' || echo 'nothing saved')"
+  dl_record "(a) pressed through Accessibility" "$log" "$mark"
+}
+
+# dl_meta LOG T: dl_policy's meta refresh to a file, measured.
+dl_meta() {
+  local log="$1" t="$2" page mark
+  head -c 20000 /dev/urandom >"$DL_DIR/meta-$t.bin"
+  cat >"$DL_DIR/meta-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>A meta refresh</title>
+<meta http-equiv="refresh" content="1; url=/meta-$t.bin?t=$t">
+<h1>SYNDEO-META-PAGE</h1>
+EOF
+
+  # A meta refresh to a file, on a page the person opened: measured.
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  page="http://127.0.0.1:$DL_HTTP/meta-$t.html?t=$t"
+  visit "$page" "$page" 'SYNDEO-META-PAGE' "download page: a page with a meta refresh to a file opens"
+  wait_for 10 dl_decided_after "$log" "$mark" 1 || true
+  sleep 2
+  printf '  MEASURE  (d) a meta refresh to a file, on a page the person opened: %s\n' \
+    "$([ -n "$(dl_since "$LOGS/downloads-new.txt")" ] && echo 'saved, as its one automatic download' || echo 'nothing saved')"
+  dl_record "(d) a meta refresh to a file" "$log" "$mark"
+}
+
+# dl_slow_stopped PATH: the origin logged that the client went away before
+# the last byte of PATH, its slow file.
+dl_slow_stopped() {
+  python3 -I -c 'import json, sys
+sys.exit(0 if any(e.get("path") == sys.argv[2] and e.get("slow") == "stopped" for e in map(json.loads, open(sys.argv[1], encoding="utf-8"))) else 1)' \
+    "$LOGS/downloads-origin.jsonl" "$1"
+}
+
+# dl_clear LOG T: Clear Browsing Data and the downloads, on a page this Mac
+# serves over http with T in its address, in the application running as
+# PID, whose log is LOG; see the top of this section.
+dl_clear() {
+  local log="$1" t="$2" page mark listed kept stopped=no begun="$SECONDS" tab=$'\t'
+  head -c 30000 /dev/urandom >"$DL_DIR/kept-$t.bin"
+  head -c 6000000 /dev/urandom >"$DL_DIR/slow-$t.bin"
+  cat >"$DL_DIR/clear-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>Downloads to clear</title>
+<h1>SYNDEO-CLEAR-PAGE</h1>
+<p><a href="/kept-$t.bin?t=$t" download="syndeo-kept-$t.bin">Download one to keep</a></p>
+<p><a href="/slow-$t.bin?t=$t" download="syndeo-slow-$t.bin">Download one slowly</a></p>
+EOF
+  page="http://127.0.0.1:$DL_HTTP/clear-$t.html?t=$t"
+  visit "$page" "$page" 'SYNDEO-CLEAR-PAGE' "download page: a page with a file to keep and a slow one opens"
+
+  # One finished, and one still coming in.
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  dl_click "Download one to keep" "downloads: before Clear Browsing Data, a file downloaded"
+  wait_for 20 dl_finished_after "$log" "$mark" 1 || true
+  kept="$(dl_saved_is "$DL_DIR/kept-$t.bin")"
+  must "$([ -n "$kept" ] && echo yes)" "downloads: before Clear Browsing Data, a file is downloaded, byte for byte" \
+    "saved: $(dl_since "$LOGS/downloads-new.txt" | tr '\n' '|'); the app: $(dl_said "$log")"
+  dl_new >"$LOGS/downloads-before-slow.txt"
+  mark="$(dl_mark "$log")"
+  dl_click "Download one slowly" "downloads: before Clear Browsing Data, a slow file"
+  wait_for 15 dl_placed_after "$log" "$mark" || true
+  sleep 2
+  printf '  MEASURE  a download still coming in, in ~/Downloads: %s; the origin was asked for it %s time(s)\n' \
+    "$(dl_since "$LOGS/downloads-before-slow.txt" | while IFS= read -r f; do printf '%s, %s bytes so far; ' "$f" "$(wc -c <"$DOWNLOADS/$f" | tr -d ' ')"; done)" \
+    "$(dl_heard "/slow-$t.bin")"
+  listed="$(dl_popover before-clear)"
+  # The finished one by its name, the one coming in by how far it has got:
+  # "N of M".
+  must "$([ -n "$kept" ] && printf '%s\n' "$listed" | grep -qxF "syndeo.download-name${tab}$kept" &&
+    printf '%s\n' "$listed" | grep -qE "^syndeo.download-detail${tab}[0-9.]+ [KMG]?B of " &&
+    ! dl_slow_stopped "/slow-$t.bin" && echo yes)" \
+    "downloads: before Clear Browsing Data, the downloads list shows the download finished and the one still coming in" \
+    "the list: $(printf '%s' "$listed" | tr '\n\t' '| ' | head -c 400); the slow one $(dl_slow_stopped "/slow-$t.bin" && echo 'had already stopped' || echo 'was coming in')"
+
+  # Clear Browsing Data, as a person asks for it.
+  settings_open "clearing downloads"
+  if "$APPCTL" press "$PID" syndeo.clear; then ok "Settings > Clear Browsing Data… is pressed (downloads)"; else bad "Clear Browsing Data… (downloads)" "no button to press"; fi
+  if wait_for 10 "$APPCTL" press "$PID" syndeo.clear-confirm; then ok "and asks first; Clear is pressed (downloads)"; else bad "Clear Browsing Data (downloads)" "no Clear in a sheet to press"; fi
+  if wait_for 40 sh -c '"$1" value "$2" syndeo.clear-status | grep -q "^Browsing data cleared"' _ "$APPCTL" "$PID"; then
+    ok "Settings says the browsing data is cleared (downloads)"
+  else
+    bad "Clear Browsing Data (downloads)" "Settings says: $("$APPCTL" value "$PID" syndeo.clear-status)"
+  fi
+  settings_close "after clearing downloads"
+  wait_for 10 dl_slow_stopped "/slow-$t.bin" && stopped=yes
+  # Time for anything still to arrive, were it still coming.
+  sleep 3
+  must "$([ "$stopped" = yes ] && [ "$(dl_new)" = "$(cat "$LOGS/downloads-before-slow.txt")" ] && echo yes)" \
+    "downloads: Clear Browsing Data cancels the download still coming in: the origin sees it stop, and nothing of it is left in ~/Downloads, partial or whole" \
+    "the origin $([ "$stopped" = yes ] && echo 'saw it stop' || echo 'did not see it stop'); new in ~/Downloads since: $(dl_new | LC_ALL=C comm -13 "$LOGS/downloads-before-slow.txt" - | tr '\n' '|'); the app: $(dl_said "$log")"
+  must "$([ -n "$kept" ] && cmp -s "$DOWNLOADS/$kept" "$DL_DIR/kept-$t.bin" && echo yes)" \
+    "downloads: Clear Browsing Data leaves the files already downloaded in ~/Downloads, byte for byte" "$(ls -l "$DOWNLOADS/$kept" 2>&1)"
+  listed="$(dl_popover after-clear)"
+  must "$(printf '%s\n' "$listed" | grep -q '^syndeo.downloads-none' && ! printf '%s\n' "$listed" | grep -q '^syndeo.download-' && echo yes)" \
+    "downloads: Clear Browsing Data empties the downloads list: it says nothing has been downloaded" \
+    "the list: $(printf '%s' "$listed" | tr '\n\t' '| ' | head -c 400)"
+  printf '  MEASURE  Clear Browsing Data, as the app logs it: %s\n' \
+    "$(dl_after "$log" "$mark" | grep -E 'downloads cleared|partial file' | sed -E 's/^[^ ]+ +//; s/  +/ /g' | cut -c 1-200 | tr '\n' '|')"
+  printf '  MEASURE  Clear Browsing Data and the downloads: its checks took %s s\n' "$((SECONDS - begun))"
 }
 
 # dl_leftover: nothing of the application left running for the next step.
@@ -4272,12 +4641,18 @@ downloads() {
   printf "\ndownloads, in a person's window: %s\n" "$app"
   security dump-trust-settings >"$LOGS/trust-before-downloads.txt" 2>&1 || true
   dl_snapshot
+  # What WebKit says of every navigation, logged at debug for
+  # syndeo_app::navigation alone, for dl_policy's record; every other
+  # line as the app and its proxy log by default.
+  OPEN_ENV=(--env "SYNDEO_LOG=syndeo_app=info,syndeo_webkit=info,syndeo_proxy=info,syndeo_net=info,syndeo_app::navigation=debug")
   if started "$app" downloads; then
+    OPEN_ENV=()
     helper_of "$app" downloads
     browses downloads
     downloads_checks "$LOGS/app-downloads.stderr"
     stopped downloads
   fi
+  OPEN_ENV=()
   dl_origin_stop
   dl_leftover
   dl_put_back
@@ -4291,7 +4666,7 @@ downloads() {
 # agents_downloads LOG: agent-downloads' checks, with agents on and ci-agent
 # allowed for the session, in the application whose log is LOG.
 agents_downloads() {
-  local log="$1" t page out st tab link begun refused
+  local log="$1" t page out st tab link begun refused frames
   dl_origin || return 1
   t="$(token)"
   head -c 100000 /dev/urandom >"$DL_DIR/agent-$t.bin"
@@ -4309,6 +4684,16 @@ EOF
   tab="$(answered "$out" result.tab)"
   must "$([ -n "$tab" ] && [ "$(answered "$out" result.title)" = 'Agent downloads' ] && echo yes)" \
     "agent: a page with a file to download opens in a tab of the agent's" "$(head -c 300 "$out")"
+  # Its window in front: no Downloads button in its sidebar.
+  agent "$LOGS/agent-dl-select.json" "{\"cmd\":\"select\",\"tab\":${tab:-1}}"
+  "$APPCTL" activate "$PID" >/dev/null || true
+  sleep 1
+  frames="$("$APPCTL" frames "$PID" 'Controlled by “ci-agent”' 2>&1)"
+  printf '%s\n' "$frames" >"$LOGS/agent-dl-frames.txt"
+  must "$(printf '%s\n' "$frames" | grep -q '^page ' && printf '%s\n' "$frames" | grep -q '^indicator ' &&
+    ! printf '%s\n' "$frames" | grep -q '^downloads ' && echo yes)" \
+    "agent downloads: the agent's window has no Downloads button in its sidebar, the person's downloads not being its to see" \
+    "$(tr '\n' ';' <"$LOGS/agent-dl-frames.txt" | head -c 400)"
 
   out="$LOGS/agent-dl-goto.json"
   agent "$out" "{\"cmd\":\"goto\",\"tab\":${tab:-1},\"url\":\"http://127.0.0.1:$DL_HTTP/agent-$t.bin?t=$t\"}"

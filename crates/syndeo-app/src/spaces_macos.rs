@@ -10,6 +10,7 @@
 //! colour) in the item's tag. What they do to the tabs is the application's
 //! (`app_macos`).
 
+use crate::sidebar_model::Shows;
 use crate::spaces::{self, Layout};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
@@ -391,12 +392,16 @@ impl SpaceBar {
     }
 
     /// Show `layout`'s spaces, the current one ringed, with New Space and
-    /// New Folder; or, where `spaces` is false, as in an agent's window,
-    /// which ignores them, none of them. And whether anything is
-    /// downloading, in the downloads button's tint. Made again only when
-    /// one of those changed.
-    pub fn reload(&self, layout: &Layout, spaces: bool) {
+    /// New Folder; or, where `shows` has no spaces, as in an agent's window,
+    /// which ignores them, none of them. And the downloads button where
+    /// `shows` has the downloads, tinted while anything is downloading.
+    /// Made again only when one of those changed.
+    pub fn reload(&self, layout: &Layout, shows: Shows) {
         let mtm = self.mtm();
+        let spaces = shows.spaces;
+        // The person's downloads, which an agent's window does not show
+        // (`downloads_macos::show` refuses there too).
+        self.ivars().downloads.setHidden(!shows.downloads);
         let busy = crate::downloads_macos::receiving() > 0;
         let shown: Shown = (
             layout

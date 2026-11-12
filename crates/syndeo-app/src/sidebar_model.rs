@@ -25,7 +25,8 @@
 //!   turn, for each group marked, however many times it was.
 //! - **An agent's windows are its own** (`Owner`, `shows`). Nothing of the
 //!   person's is in them: no favorite, to see or to load in the agent's tab,
-//!   and no space, folder or space's name. And they ignore spaces: every one
+//!   no space, folder or space's name, and no downloads button, whose list
+//!   is the person's downloads. And they ignore spaces: every one
 //!   of the agent's tabs is listed whatever space the person is in, so that
 //!   the person always sees them.
 
@@ -62,15 +63,20 @@ pub struct Shows {
     /// folders, the spaces' switcher at the foot, and only that space's tabs
     /// listed. Without them, every tab of the group is listed, in no folder.
     pub spaces: bool,
+    /// The person's downloads: the button at the sidebar's foot, and the
+    /// list it shows (`downloads_macos`).
+    pub downloads: bool,
 }
 
 /// What a sidebar in a window of `owner`'s shows: everything in the
-/// person's; in an agent's, neither the person's favorites nor their spaces.
+/// person's; in an agent's, neither the person's favorites, nor their
+/// spaces, nor their downloads.
 pub fn shows(owner: Owner) -> Shows {
     let persons = owner == Owner::Person;
     Shows {
         favorites: persons,
         spaces: persons,
+        downloads: persons,
     }
 }
 
@@ -371,16 +377,18 @@ mod tests {
             persons(),
             Shows {
                 favorites: true,
-                spaces: true
+                spaces: true,
+                downloads: true
             }
         );
         assert_eq!(
             agents(),
             Shows {
                 favorites: false,
-                spaces: false
+                spaces: false,
+                downloads: false
             },
-            "no favorite to see or load, and no space, folder or space's name"
+            "no favorite to see or load, no space, folder or space's name, and no downloads"
         );
     }
 
