@@ -145,7 +145,10 @@ Each mutant runs in exactly one CI job: macos-agents runs the agent-*
 mutants, beside its gate, and those in MACOS_AGENTS; macos-app runs the
 rest. Which go where is by their measured times, so that neither job nears
 its 60 minutes: CI 39937222216 took 51m06s for macos-app with its twelve,
-which there took 1061 s between them, and 16m36s for macos-agents.
+which there took 1061 s between them, and 16m36s for macos-agents; CI
+43128672146 took 48m for macos-app with its six and the route bar's checks,
+which now run in macos-routes, and 42m for macos-agents with its
+twenty-two, which took 31.2 minutes between them.
 """
 import os
 import sys
@@ -490,11 +493,17 @@ MUTANTS = {
 }
 
 
-# The application's mutants macos-agents runs: the eight that took longest in
-# CI 39937222216 (seconds each, its build included): no-pinning-delegate 138,
+# The application's mutants macos-agents runs: four of the eight that took
+# longest in CI 39937222216 (seconds each, its build included):
 # direct-for-every-host 124, websocket-headers-stripped 104,
-# no-navigation-policy 102, zoned-links-followed 98, asked-any-scheme 96,
-# never-retry-direct 94 and direct-for-every-name 87; 843 s of the 1061.
+# zoned-links-followed 98 and direct-for-every-name 87. The other four,
+# no-pinning-delegate 138, no-navigation-policy 102, asked-any-scheme 96 and
+# never-retry-direct 94, run in macos-app again since the route bar's checks
+# have a job of their own (macos-routes): in CI 43128672146 they took 21.1
+# minutes of macos-app's 48, and macos-agents' twenty-two mutants 31.2 of
+# its 42, those four 451 s of it (145, 105, 99 and 102), which leaves each
+# job about 34 minutes. They are caught by checks macos-app's launch step
+# runs, on whose passing its mutants wait.
 # And download-challenge-unpinned, which needs nothing of macos-app's but
 # the Syndeo.app every job assembles: macos-agents runs its mutants whatever
 # its gate before them did, where macos-app skips its own once its launch
@@ -520,13 +529,9 @@ MUTANTS = {
 # 56 s there, its build 21 s of it (agent-tabs-follow-spaces, CI
 # 43109023131), and this one stops at its first failed check.
 MACOS_AGENTS = {
-    "no-pinning-delegate",
     "direct-for-every-host",
     "websocket-headers-stripped",
-    "no-navigation-policy",
     "zoned-links-followed",
-    "asked-any-scheme",
-    "never-retry-direct",
     "direct-for-every-name",
     "download-challenge-unpinned",
     "sidebar-rows-in-every-window",

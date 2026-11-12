@@ -326,14 +326,14 @@ jobs:
     # applications ask it to open, opened through the proxy or refused, and
     # opened by one; passkeys reported unavailable, asking nothing; its last
     # window closed and brought back by opening it again, quit as the Quit
-    # menu item would, and opened again; six mutants, each of which the
-    # test has to catch (the other twenty-two are macos-agents'); a copy whose proxy cannot start, which has to refuse
-    # to browse; and the route bar against what WebKit does, the proxy's
-    # cache keeping nothing from this Mac, and Clear Browsing Data; and the
+    # menu item would, and opened again; ten mutants, each of which the
+    # test has to catch (the other eighteen are macos-agents'); a copy
+    # whose proxy cannot start, which has to refuse to browse; and the
     # sidebar's rows, made only in the window in front, one a tab, and what
     # it shows as the person changes spaces. Unsigned
     # with a Developer ID, and with no secrets: a pull request never signs.
-    # (Tabs, and its look in light and dark, run in macos-agents.) Then,
+    # (Tabs, and its look in light and dark, run in macos-agents; the route
+    # bar, the proxy's cache and Clear Browsing Data in macos-routes.) Then,
     # reported and not gated, how long
     # github.com takes to show in WebKit by itself and through the proxy, and
     # what this runner allows an onboarding test to do.
@@ -386,15 +386,18 @@ jobs:
         run: bash ci/test-app.sh refuse "$PWD/dist-broken/Syndeo.app"
 
       # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
-      # mutants.py names macos-app): the schemes a new tab may open, the
-      # address field's guard for typing, Reload asking the origin, and Clear
-      # Browsing Data forgetting closed tabs and the session, and cancelling
-      # the downloads and emptying their list, and a sidebar taking out of
-      # its list only the rows it arranges, without which an empty space's
-      # new tab lists nothing. The other
-      # twenty-two run in macos-agents, by their measured times (mutants.py,
-      # MACOS_AGENTS), so that neither job nears its 60 minutes; each mutant
-      # runs in exactly one, which mutants.py --check requires. Each is built
+      # mutants.py names macos-app): the pinning delegate, the main frame's
+      # navigation policy, the schemes a new tab may open, the schemes
+      # another application may ask Syndeo to open, the address field's
+      # guard for typing, a page macOS refused through the proxy retried
+      # directly, Reload asking the origin, and Clear Browsing Data
+      # forgetting closed tabs and the session, and cancelling the downloads
+      # and emptying their list, and a sidebar taking out of its list only
+      # the rows it arranges, without which an empty space's new tab lists
+      # nothing. The other eighteen run in macos-agents, by their measured
+      # times (mutants.py, MACOS_AGENTS), so that neither job nears its 60
+      # minutes; each mutant runs in exactly one, which mutants.py --check
+      # requires. Each is built
       # from this tree, the app and its helper, which is then put back, and
       # the test has to catch each by the checks meant to, with every other
       # check passing.
@@ -444,21 +447,6 @@ jobs:
           printf '\nmutants:\n'
           printf '  %s\n' "${results[@]}"
           [ "$wrong" = 0 ]
-
-      # The route bar, gated against what WebKit actually does: each address
-      # typed, from a fresh WebKit state and with a fresh token. For Direct
-      # and Through Syndeo, the way WebKit went (by which process the origin
-      # saw, or the proxy's own count) and what the bar says are both
-      # required to be what the app's rule says; for Local, where the way
-      # varies, the bar's label, and the proxy's cache taking nothing. Every
-      # route measured before and each range's edges. Then the proxy caching
-      # nothing from this Mac, and Clear Browsing Data.
-      # For the time it gates it aliases addresses on lo0 and adds a
-      # single-label name to /etc/hosts, and it fails if it cannot put those,
-      # or the trust settings, back exactly as they were.
-      - name: The route bar against WebKit's routes, the proxy's cache, and Clear Browsing Data
-        if: always()
-        run: bash ci/test-app.sh routes "$PWD/dist/Syndeo.app"
 
       # WebSockets through Syndeo, carried and kept from its cache; WebRTC
       # around it, as the start page says; public servers measured, not
@@ -537,6 +525,72 @@ jobs:
           path: ${{ runner.temp }}/syndeo-app-test/
           if-no-files-found: warn
 
+  macos-routes:
+    name: Syndeo.app's route bar, against what WebKit does
+    # The route bar against what WebKit does, the proxy's cache keeping
+    # nothing from this Mac, and Clear Browsing Data (ci/test-app.sh
+    # routes), on a disposable runner of their own: in macos-app they took
+    # 21.1 minutes of its 48 (CI 43128672146), one slow runner from its 60.
+    # They need nothing of what macos-app's other steps leave: only the
+    # Syndeo.app assembled here as macos-app assembles it. They clear
+    # Syndeo's WebKit caches and storage first, start their own origin, and
+    # put lo0, /etc/hosts and the trust settings back. Unsigned with a
+    # Developer ID, and with no secrets: a pull request never signs.
+    # Forty-five minutes: the route bar took 20.9 to 21.2 minutes in CI
+    # 43087367296, 43109023131, 43116681046 and 43128672146, and the same
+    # build, cached as here, 4.0 to 5.7 in macos-agents.
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      SYNDEO_ALLOW_APP_TEST: "yes"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      # Cached as macos-agents is: keyed macos-app, and saving nothing.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-app
+          save-if: false
+
+      - name: Build the app and its helper
+        run: cargo build --release --locked --target aarch64-apple-darwin -p syndeo-app -p syndeo-proxy
+
+      - name: Assemble Syndeo.app, then sign it ad hoc, the helper first
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          mkdir -p dist
+          bash ci/package-macos-app.sh "$version" target/aarch64-apple-darwin/release dist
+          codesign --force --sign - --options runtime dist/Syndeo.app/Contents/Helpers/syndeo-proxy
+          codesign --force --sign - --options runtime dist/Syndeo.app
+          codesign --verify --strict --verbose=2 dist/Syndeo.app
+
+      # The route bar, gated against what WebKit actually does: each address
+      # typed, from a fresh WebKit state and with a fresh token. For Direct
+      # and Through Syndeo, the way WebKit went (by which process the origin
+      # saw, or the proxy's own count) and what the bar says are both
+      # required to be what the app's rule says; for Local, where the way
+      # varies, the bar's label, and the proxy's cache taking nothing. Every
+      # route measured before and each range's edges. Then the proxy caching
+      # nothing from this Mac, and Clear Browsing Data.
+      # For the time it gates it aliases addresses on lo0 and adds a
+      # single-label name to /etc/hosts, and it fails if it cannot put those,
+      # or the trust settings, back exactly as they were. It runs whatever
+      # any other job's checks do, being in a job of its own.
+      - name: The route bar against WebKit's routes, the proxy's cache, and Clear Browsing Data
+        run: bash ci/test-app.sh routes "$PWD/dist/Syndeo.app"
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-routes-logs
+          path: ${{ runner.temp }}/syndeo-app-test/
+          if-no-files-found: warn
+
   macos-26-app:
     name: Syndeo.app on macOS 26, where macOS lets its preloaded sites through Syndeo
     # What macOS 15 refuses through Syndeo's proxy, and Syndeo.app then sends
@@ -595,7 +649,7 @@ jobs:
     # MCP; root refused; and nothing of the person's in an agent's window,
     # which lists its tabs whatever space the person is in. ci/test-app.sh
     # agents says each check. Then an agent's tab downloading nothing;
-    # twenty-two of the mutants (the agents' eight, eight of the
+    # eighteen of the mutants (the agents' eight, four of the
     # application's, the downloads' three and the sidebar's three); and tabs
     # and its look, light and dark.
     runs-on: macos-15
@@ -643,12 +697,11 @@ jobs:
       # what a grant allows, the socket's peer being this user, an agent's
       # tab being its window's own, an agent's tabs kept out of the session
       # and of Recently Closed, and listed in its window whatever space the
-      # person is in — and, moved from macos-app by their
-      # measured times, the pinning delegate, the main frame's navigation
-      # policy, the schemes another application may ask Syndeo to open, the
-      # bar's rule for names, the refusal of a link to an IPv6 address with
-      # a zone, a WebSocket carried rather than stripped of its Upgrade, and
-      # the hosts sent directly; an agent's tab refusing downloads; a
+      # person is in — and, moved from macos-app by their measured times,
+      # the bar's rule for names, the refusal of a link to an IPv6 address
+      # with a zone, a WebSocket carried rather than stripped of its
+      # Upgrade, and only the hosts macOS refused through the proxy sent
+      # directly; an agent's tab refusing downloads; a
       # download's TLS challenges answered as its window's are, whose checks
       # macos-app's downloads step runs too; a frame inside a page let to
       # download, and a page let to download by itself without limit, each
