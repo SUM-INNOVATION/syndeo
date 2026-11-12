@@ -326,11 +326,12 @@ jobs:
     # applications ask it to open, opened through the proxy or refused, and
     # opened by one; passkeys reported unavailable, asking nothing; its last
     # window closed and brought back by opening it again, quit as the Quit
-    # menu item would, and opened again; five mutants, each of which the
+    # menu item would, and opened again; six mutants, each of which the
     # test has to catch (the other twenty-two are macos-agents'); a copy whose proxy cannot start, which has to refuse
     # to browse; and the route bar against what WebKit does, the proxy's
     # cache keeping nothing from this Mac, and Clear Browsing Data; and the
-    # sidebar's rows, made only in the window in front, one a tab. Unsigned
+    # sidebar's rows, made only in the window in front, one a tab, and what
+    # it shows as the person changes spaces. Unsigned
     # with a Developer ID, and with no secrets: a pull request never signs.
     # (Tabs, and its look in light and dark, run in macos-agents.) Then,
     # reported and not gated, how long
@@ -388,7 +389,9 @@ jobs:
       # mutants.py names macos-app): the schemes a new tab may open, the
       # address field's guard for typing, Reload asking the origin, and Clear
       # Browsing Data forgetting closed tabs and the session, and cancelling
-      # the downloads and emptying their list. The other
+      # the downloads and emptying their list, and a sidebar taking out of
+      # its list only the rows it arranges, without which an empty space's
+      # new tab lists nothing. The other
       # twenty-two run in macos-agents, by their measured times (mutants.py,
       # MACOS_AGENTS), so that neither job nears its 60 minutes; each mutant
       # runs in exactly one, which mutants.py --check requires. Each is built
@@ -503,7 +506,12 @@ jobs:
           bash ci/test-pageload.sh "$PWD/dist/Syndeo.app/Contents/Helpers/syndeo-proxy" 5
           https://www.rust-lang.org/ measure-only:https://github.com/
 
-      # The sidebar, with 30 tabs, each opened as another application asks
+      # The sidebar as the person changes spaces, in an opening of its own
+      # with two spaces, the second empty: Next Space into it, Previous
+      # Space, a space's emoji and Delete Space each leave every window's
+      # sidebar showing the space then current, its name, its tabs and New
+      # Tab (in CI 43092994068 an empty space's new tab listed nothing).
+      # Then the sidebar with 30 tabs, each opened as another application asks
       # and each brought to the front by its row: the window in front lists
       # them all, and the app holds one row for each tab, made once, between
       # all its windows, not one in each window (N, not N²), which only the
@@ -513,7 +521,7 @@ jobs:
       # kept behind each tab would make it, by a ceiling measured with
       # margin. The footprint with 10, 30 and 50 tabs, each visited, and how
       # long opening and visiting took, measured, kept in sidebar.txt.
-      - name: The sidebar's rows, one a tab in the window in front, and the app's memory with 10, 30 and 50 tabs
+      - name: The sidebar as spaces change, its rows, one a tab in the window in front, and the app's memory with 10, 30 and 50 tabs
         if: always()
         run: bash ci/test-app.sh sidebar "$PWD/dist/Syndeo.app"
 

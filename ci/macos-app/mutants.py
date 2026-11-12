@@ -514,6 +514,11 @@ MUTANTS = {
 # downloads step 51 s before it gated the rule), downloads-kept-after-clear
 # (dl_clear, 59 s in macos-app in 43100625418) runs in macos-app, whose
 # downloads step the rule's checks make 85 s longer.
+# spaces-take-out-unlisted runs in macos-app, as every mutant not named
+# here does: macos-agents was at about 44 minutes with its twenty-two, and
+# macos-app about 41.5 with its five; a mutant of sidebar_model.rs took
+# 56 s there, its build 21 s of it (agent-tabs-follow-spaces, CI
+# 43109023131), and this one stops at its first failed check.
 MACOS_AGENTS = {
     "no-pinning-delegate",
     "direct-for-every-host",
