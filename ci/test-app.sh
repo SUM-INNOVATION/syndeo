@@ -901,6 +901,13 @@ settings_close() {
 # chosen ENGINE: the stored search engine is ENGINE.
 chosen() { [ "$(defaults read "$ID" SearchEngine 2>/dev/null)" = "$1" ]; }
 
+# setting KEY: what Syndeo keeps under KEY, quoted, or "not set": the value
+# alone, never the line defaults logs on stderr for a key that is missing.
+setting() {
+  local value
+  if value="$(defaults read "$ID" "$1" 2>/dev/null)"; then printf "'%s'" "$value"; else printf 'not set'; fi
+}
+
 # searching LOG: Settings offers the six choices, DuckDuckGo chosen before
 # anyone chose; with Off, a word is refused and nothing is sent; with
 # DuckDuckGo, words typed are sent nowhere, and leaving the field sends
@@ -908,16 +915,16 @@ chosen() { [ "$(defaults read "$ID" SearchEngine 2>/dev/null)" = "$1" ]; }
 # with them encoded, through the proxy; and nothing of what was searched for
 # is in a log.
 searching() {
-  local log="$1" before items query='syndeo search & test' expected='https://duckduckgo.com/?q=syndeo+search+%26+test'
-  must "$(defaults read "$ID" SearchEngine >/dev/null 2>&1 && echo no || echo yes)" "no search engine has been chosen yet" "$(defaults read "$ID" SearchEngine 2>&1)"
+  local log="$1" before items said query='syndeo search & test' expected='https://duckduckgo.com/?q=syndeo+search+%26+test'
+  must "$(defaults read "$ID" SearchEngine >/dev/null 2>&1 && echo no || echo yes)" "no search engine has been chosen yet" "it is $(setting SearchEngine)"
   settings_open "search"
   must "$([ "$("$APPCTL" value "$PID" syndeo.search)" = DuckDuckGo ] && echo yes)" \
     "Settings shows DuckDuckGo as the search engine, before anyone chose one" "it shows '$("$APPCTL" value "$PID" syndeo.search)'"
   items="$("$APPCTL" popup-items "$PID" syndeo.search | tr '\n' '|')"
   must "$([ "$items" = 'DuckDuckGo|Startpage|Brave Search|Google|Bing|Off — Syndeo does not search|' ] && echo yes)" \
     "it offers DuckDuckGo, Startpage, Brave Search, Google, Bing and Off" "$items"
-  "$APPCTL" pick "$PID" syndeo.search "Off — Syndeo does not search" || bad "choosing Off" "no such item to choose"
-  if wait_for 5 chosen off; then ok "choosing Off is kept"; else bad "choosing Off" "the setting is '$(defaults read "$ID" SearchEngine 2>&1)'"; fi
+  said="$("$APPCTL" pick "$PID" syndeo.search "Off — Syndeo does not search")" || bad "choosing Off" "${said:-appctl pick failed, saying nothing}"
+  if wait_for 5 chosen off; then ok "choosing Off is kept"; else bad "choosing Off" "the setting is $(setting SearchEngine)"; fi
   settings_close "search off"
   counted "before a word, with search off"
   before="$COUNTED"
@@ -926,8 +933,8 @@ searching() {
   must "$([ -n "$before" ] && [ "$COUNTED" = "$before" ] && echo yes)" "and nothing was sent: the proxy's count stayed at ${before:-?}" "now ${COUNTED:-?}"
 
   settings_open "search on"
-  "$APPCTL" pick "$PID" syndeo.search "DuckDuckGo" || bad "choosing DuckDuckGo" "no such item to choose"
-  if wait_for 5 chosen duckduckgo; then ok "choosing DuckDuckGo is kept"; else bad "choosing DuckDuckGo" "the setting is '$(defaults read "$ID" SearchEngine 2>&1)'"; fi
+  said="$("$APPCTL" pick "$PID" syndeo.search "DuckDuckGo")" || bad "choosing DuckDuckGo" "${said:-appctl pick failed, saying nothing}"
+  if wait_for 5 chosen duckduckgo; then ok "choosing DuckDuckGo is kept"; else bad "choosing DuckDuckGo" "the setting is $(setting SearchEngine)"; fi
   settings_close "search on"
   counted "before typing words"
   before="$COUNTED"
@@ -2713,7 +2720,7 @@ agents_on() {
     "on: the socket is 600 and this user's, in a folder only this user may enter (700)" \
     "folder $(mode_of "$dir"), socket $(mode_of "$AGENT_SOCK"), owner $(stat -f %u "$AGENT_SOCK" 2>&1)"
   must "$(access_says syndeo.agent-status 'On' && echo yes)" "on: and Agent Access says so" "$("$APPCTL" value "$PID" syndeo.agent-status)"
-  must "$([ "$(defaults read "$ID" AgentControl 2>/dev/null)" = 1 ] && echo yes)" "on: the setting is kept" "$(defaults read "$ID" AgentControl 2>&1)"
+  must "$([ "$(defaults read "$ID" AgentControl 2>/dev/null)" = 1 ] && echo yes)" "on: the setting is kept" "it is $(setting AgentControl)"
   access_close
 }
 
@@ -3020,7 +3027,7 @@ agents_off_again() {
   "$APPCTL" press "$PID" syndeo.agent-switch || bad "off: Agent Access's switch is pressed" "no syndeo.agent-switch to press"
   if wait_for 10 sh -c '! test -e "$1"' _ "$AGENT_SOCK"; then ok "off: turned off in Agent Access, the socket is gone"; else bad "off: turned off in Agent Access, the socket is gone" "$(ls -la "$AGENT_SOCK" 2>&1)"; fi
   must "$(access_says syndeo.agent-status 'Off' && [ "$(defaults read "$ID" AgentControl 2>/dev/null)" = 0 ] && echo yes)" \
-    "off: Agent Access says so, and the setting is kept off" "$("$APPCTL" value "$PID" syndeo.agent-status); setting $(defaults read "$ID" AgentControl 2>&1)"
+    "off: Agent Access says so, and the setting is kept off" "$("$APPCTL" value "$PID" syndeo.agent-status); setting $(setting AgentControl)"
   access_close
   agent "$out" '{"cmd":"status"}'
   st=$?

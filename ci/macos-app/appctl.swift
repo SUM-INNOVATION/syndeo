@@ -48,9 +48,12 @@
 //                                that has a Dock icon, sorted, one a line
 //   appctl pick <pid> <id> <title>    open the pop-up button with that identifier in
 //                                pid's front window and choose its item <title>, as
-//                                a person would; exits 1 if there is no such item
+//                                a person would, until its menu has closed and the
+//                                pop-up shows <title>, in up to three attempts;
+//                                exits 1, saying what each attempt found, if not
 //   appctl popup-items <pid> <id>     open that pop-up, print each item's title, one a
-//                                line, and close it again choosing nothing
+//                                line, and close it again choosing nothing; exits 1,
+//                                saying why, if its menu does not open or close
 //   appctl press-near <pid> <text> <id>   press the element with that identifier in
 //                                the first of pid's windows (a dialog, a tab) whose
 //                                text contains <text>; exits 1 if there is none
@@ -612,22 +615,62 @@ func menuItem(_ pid: Int32, _ menu: String, _ title: String) -> AXUIElement? {
     menuItems(pid, menu).first { oneLine(attribute($0, kAXTitleAttribute)) == title }
 }
 
-/// Open the pop-up button with identifier `id` in pid's front window, and
-/// wait for its items.
-func openPopUp(_ pid: Int32, _ id: String) -> (AXUIElement, [AXUIElement])? {
-    guard let popup = identified(pid, id),
-          AXUIElementPerformAction(popup, kAXPressAction as CFString) == .success else { return nil }
-    let app = AXUIElementCreateApplication(pid)
+/// The menu of pop-up button `popup` while it is open, and its items: under
+/// the button, or under the application. Never one of the menu bar's, which
+/// Accessibility shows under the application, closed, with all their items:
+/// taken for the pop-up's before its own showed, the Apple menu once made
+/// pick find no such item at once.
+func popUpMenu(_ pid: Int32, _ popup: AXUIElement) -> (AXUIElement, [AXUIElement])? {
+    for root in [popup, AXUIElementCreateApplication(pid)] {
+        for menu in all(root, depth: 3, { role($0) == "AXMenu" }) {
+            if let parent = asElement(attribute(menu, kAXParentAttribute)), role(parent) == "AXMenuBarItem" { continue }
+            let items = children(menu).filter { role($0) == "AXMenuItem" }
+            if !items.isEmpty { return (menu, items) }
+        }
+    }
+    return nil
+}
+
+/// Close the menu of `popup`, choosing nothing: Cancel, or Escape if the menu
+/// does not take Cancel. Whether it closed within 3 seconds.
+func closePopUp(_ pid: Int32, _ popup: AXUIElement) -> Bool {
     for _ in 0..<30 {
-        // Its menu, while open: under the button, or under the application.
-        for root in [popup, app] {
-            if let menu = find(root, depth: 3, { (attribute($0, kAXRoleAttribute) as? String) == "AXMenu" }) {
-                let items = children(menu).filter { (attribute($0, kAXRoleAttribute) as? String) == "AXMenuItem" }
-                if !items.isEmpty { return (menu, items) }
-            }
+        guard let (menu, _) = popUpMenu(pid, popup) else { return true }
+        if AXUIElementPerformAction(menu, kAXCancelAction as CFString) != .success {
+            key(pid, 53, "\u{1b}")
         }
         usleep(100_000)
     }
+    return popUpMenu(pid, popup) == nil
+}
+
+/// Open the pop-up button with identifier `id` in pid's front window, and
+/// wait up to 3 seconds for its items; a menu of it still open, from a
+/// command before, is closed first. The button, its menu and items; or nil,
+/// with why in `why`.
+func openPopUp(_ pid: Int32, _ id: String, why: inout String) -> (popup: AXUIElement, menu: AXUIElement, items: [AXUIElement])? {
+    guard activate(pid) else {
+        why = "pid \(pid) could not be brought to the front"
+        return nil
+    }
+    guard let popup = identified(pid, id) else {
+        why = "no pop-up button \(id) in the front window"
+        return nil
+    }
+    guard closePopUp(pid, popup) else {
+        why = "its menu, open from before, did not close"
+        return nil
+    }
+    let pressed = AXUIElementPerformAction(popup, kAXPressAction as CFString)
+    guard pressed == .success else {
+        why = "pressing it failed (AXError \(pressed.rawValue))"
+        return nil
+    }
+    for _ in 0..<30 {
+        if let (menu, items) = popUpMenu(pid, popup) { return (popup, menu, items) }
+        usleep(100_000)
+    }
+    why = "its menu did not open within 3 seconds"
     return nil
 }
 
@@ -799,20 +842,54 @@ case "apps" where args.count == 2:
         .compactMap { $0.bundleIdentifier }
     print(Set(ids).sorted().joined(separator: "\n"))
 case "pick" where args.count == 5:
-    guard let pid = Int32(args[2]), activate(pid), let (menu, items) = openPopUp(pid, args[3]) else { exit(1) }
-    guard let item = items.first(where: { oneLine(attribute($0, kAXTitleAttribute)) == args[4] }) else {
-        _ = AXUIElementPerformAction(menu, kAXCancelAction as CFString)
+    // In up to three attempts, each opening the menu afresh: the item
+    // pressed, then within 3 seconds its menu closed and the pop-up showing
+    // it. Otherwise what each attempt found.
+    guard let pid = Int32(args[2]) else { exit(2) }
+    let title = args[4]
+    var failures: [String] = []
+    for attempt in 1...3 {
+        if attempt > 1 { usleep(500_000) }
+        var why = ""
+        guard let (popup, _, items) = openPopUp(pid, args[3], why: &why) else {
+            failures.append("attempt \(attempt): \(why)")
+            continue
+        }
+        guard let item = items.first(where: { oneLine(attribute($0, kAXTitleAttribute)) == title }) else {
+            let titles = items.map { oneLine(attribute($0, kAXTitleAttribute)) }
+            failures.append("attempt \(attempt): no item '\(title)' in its menu: \(titles.joined(separator: " | "))")
+            _ = closePopUp(pid, popup)
+            continue
+        }
+        let pressed = AXUIElementPerformAction(item, kAXPressAction as CFString)
+        guard pressed == .success else {
+            failures.append("attempt \(attempt): pressing '\(title)' failed (AXError \(pressed.rawValue))")
+            _ = closePopUp(pid, popup)
+            continue
+        }
+        for _ in 0..<30 {
+            if popUpMenu(pid, popup) == nil, oneLine(attribute(popup, kAXValueAttribute)) == title { exit(0) }
+            usleep(100_000)
+        }
+        let open = popUpMenu(pid, popup) == nil ? "" : ", its menu still open"
+        failures.append("attempt \(attempt): '\(title)' pressed, and the pop-up shows '\(oneLine(attribute(popup, kAXValueAttribute)))'\(open)")
+        _ = closePopUp(pid, popup)
+    }
+    print(failures.joined(separator: "; "))
+    exit(1)
+case "popup-items" where args.count == 4:
+    guard let pid = Int32(args[2]) else { exit(2) }
+    var why = ""
+    guard let (popup, _, items) = openPopUp(pid, args[3], why: &why) else {
+        print(why)
         exit(1)
     }
-    exit(AXUIElementPerformAction(item, kAXPressAction as CFString) == .success ? 0 : 1)
-case "popup-items" where args.count == 4:
-    guard let pid = Int32(args[2]), activate(pid), let (menu, items) = openPopUp(pid, args[3]) else { exit(1) }
     for item in items {
         print(oneLine(attribute(item, kAXTitleAttribute)))
     }
-    // Closed by Cancel, or by Escape if the menu does not take Cancel.
-    if AXUIElementPerformAction(menu, kAXCancelAction as CFString) != .success {
-        key(pid, 53, "\u{1b}")
+    guard closePopUp(pid, popup) else {
+        print("its menu did not close")
+        exit(1)
     }
 case "press-near" where args.count == 5:
     guard let pid = Int32(args[2]) else { exit(2) }
