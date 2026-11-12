@@ -309,7 +309,7 @@ inspect() {
   # pipefail would otherwise report as the check failing.
   local signature
   signature="$(pkgutil --check-signature "$pkg" 2>&1)"
-  if printf '%s\n' "$signature" | grep -q 'Status: no signature'; then
+  if grep -q 'Status: no signature' <<<"$signature"; then
     ok "the package carries no signature"
   else
     bad "package signature" "$(printf '%s\n' "$signature" | sed -n 2p)"
@@ -322,9 +322,9 @@ inspect() {
   problems=""
   for f in "$payload/Syndeo.app" "$payload/Syndeo.app/Contents/Helpers/syndeo-proxy"; do
     out="$(codesign -dv --verbose=2 "$f" 2>&1)"
-    if printf '%s\n' "$out" | grep -q '^Authority=Developer ID'; then
+    if grep -q '^Authority=Developer ID' <<<"$out"; then
       problems="$problems ${f##*/} carries a Developer ID;"
-    elif ! printf '%s\n' "$out" | grep -q '^Signature=adhoc'; then
+    elif ! grep -q '^Signature=adhoc' <<<"$out"; then
       problems="$problems ${f##*/} is not signed ad hoc;"
     fi
   done
@@ -385,10 +385,14 @@ code_problems() {
   last="$(printf '%s\n' "$out" | sed -n 's/^Authority=//p' | tail -n 1)"
   developer_id Application "$first" "$team" || problems="$problems signed by '${first:-nobody}';"
   [ "$last" = "Apple Root CA" ] || problems="$problems not chained to Apple Root CA;"
-  printf '%s\n' "$out" | grep -qx "TeamIdentifier=$team" ||
+  # Each line is looked for in a here-string, never piped from printf, which
+  # writes a line at a time: grep -q stops at the line it looks for, printf
+  # is killed by SIGPIPE if a line is still to be written, and pipefail then
+  # fails the check with its line there. st_pipes keeps this script so.
+  grep -qx "TeamIdentifier=$team" <<<"$out" ||
     problems="$problems TeamIdentifier '$(printf '%s\n' "$out" | sed -n 's/^TeamIdentifier=//p')';"
-  printf '%s\n' "$out" | grep -qE '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' || problems="$problems no hardened runtime;"
-  printf '%s\n' "$out" | grep -q '^Timestamp=' || problems="$problems no secure timestamp;"
+  grep -qE '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' <<<"$out" || problems="$problems no hardened runtime;"
+  grep -q '^Timestamp=' <<<"$out" || problems="$problems no secure timestamp;"
   entitlements_are "$(codesign -d --entitlements - --xml "$path" 2>/dev/null)" "" ||
     problems="$problems has entitlements, and no shipped executable may;"
   printf '%s' "${problems# }"
@@ -435,9 +439,9 @@ signed_bundle() {
 accepted() {
   local path="$1" type="$2" origin="$3" out problems
   out="$(spctl -a -vv -t "$type" "$path" 2>&1)" && problems='' || problems=" rejected;"
-  printf '%s\n' "$out" | grep -qxF "$path: accepted" || problems="${problems:- not accepted;}"
-  printf '%s\n' "$out" | grep -qx 'source=Notarized Developer ID' || problems="$problems $(printf '%s\n' "$out" | grep -m1 '^source=' || echo 'no source');"
-  printf '%s\n' "$out" | grep -qxF "origin=$origin" || problems="$problems from another origin;"
+  grep -qxF "$path: accepted" <<<"$out" || problems="${problems:- not accepted;}"
+  grep -qx 'source=Notarized Developer ID' <<<"$out" || problems="$problems $(grep -m1 '^source=' <<<"$out" || echo 'no source');"
+  grep -qxF "origin=$origin" <<<"$out" || problems="$problems from another origin;"
   printf '%s' "${problems# }"
 }
 
@@ -467,11 +471,11 @@ signed_state() {
   first="$(printf '%s\n' "$chain" | head -n 1)"
   last="$(printf '%s\n' "$chain" | tail -n 1)"
   problems=""
-  printf '%s\n' "$out" | grep -qx 'Status: signed by a developer certificate issued by Apple for distribution' ||
-    problems="$problems $(printf '%s\n' "$out" | grep -m1 '^Status:' || echo 'no status');"
+  grep -qx 'Status: signed by a developer certificate issued by Apple for distribution' <<<"$out" ||
+    problems="$problems $(grep -m1 '^Status:' <<<"$out" || echo 'no status');"
   developer_id Installer "$first" "$team" || problems="$problems signed by '${first:-nobody}';"
   [ "$last" = "Apple Root CA" ] || problems="$problems chained to '${last:-nothing}', not Apple Root CA;"
-  printf '%s\n' "$out" | grep -q '^Signed with a trusted timestamp' || problems="$problems no trusted timestamp;"
+  grep -q '^Signed with a trusted timestamp' <<<"$out" || problems="$problems no trusted timestamp;"
   if [ -z "$problems" ]; then
     ok "the package: Developer ID Installer of $team, chained to Apple Root CA, with a trusted timestamp"
   else
@@ -506,7 +510,7 @@ exactly() {
   have="$(cd "$dir" && ls -A | LC_ALL=C sort)"
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    printf '%s\n' "$want" | grep -qxF -- "$f" || problems="$problems unexpected $f;"
+    grep -qxF -- "$f" <<<"$want" || problems="$problems unexpected $f;"
   done <<<"$have"
   while IFS= read -r f; do
     if [ ! -e "$dir/$f" ]; then
@@ -604,8 +608,8 @@ launched() {
   # ordinary keychain, presence unenforced, the passphrase required.
   home="$(mktemp -d "$inspect_work/keystore-home.XXXXXX")"
   out="$(SYNDEO_HOME="$home" HOME="$home" bounded "$seconds" "$tree/syndeo-keystore" status)" && status=0 || status=$?
-  if [ "$status" = 0 ] && printf '%s\n' "$out" | grep -qx 'presence enforced    false' &&
-    printf '%s\n' "$out" | grep -qx 'passphrase required  true'; then
+  if [ "$status" = 0 ] && grep -qx 'presence enforced    false' <<<"$out" &&
+    grep -qx 'passphrase required  true' <<<"$out"; then
     ok "syndeo-keystore status: platform presence unenforced, the passphrase required"
   elif [ "$status" = 0 ]; then
     bad "syndeo-keystore status" "does not report platform presence unenforced and the passphrase required: $(printf '%s' "$out" | grep -E '^(presence enforced|passphrase required)' | tr '\n' ';')"
@@ -841,6 +845,20 @@ st_said_run() {
   wait
 }
 
+# st_pipes: nothing in this script pipes into a grep that stops at a match,
+# grep -q or grep -m. Its writer, with a line still to write, is killed by
+# SIGPIPE, and pipefail counts the grep as failing with its line there: the
+# self-test of signed-binaries once found "syndeo — no secure timestamp" so.
+# What such a grep reads comes from a here-string instead.
+st_pipes() {
+  printf '\n  this script: what a grep -q looks in, read whole\n'
+  local piped
+  piped="$(grep -nE '(^|[^|])\|[[:space:]]*grep[[:space:]]+(-[[:alnum:]]*[qm]|--quiet|--silent|--max-count)' "$here/verify-pkg.sh" |
+    grep -vE '^[0-9]+:[[:space:]]*#')"
+  expect "no grep -q or grep -m reads from a pipe, where it would kill the writer at its match" test -z "$piped"
+  [ -z "$piped" ] || printf '%s\n' "$piped" | sed 's/^/          | /'
+}
+
 # What ci/test-pkg-install.sh does with what a package's scripts say, which
 # otherwise only a real install exercises. Every installer it runs is asked
 # for -dumplog, whose output is kept per invocation. note_said() looks there
@@ -853,10 +871,10 @@ st_harness() {
   local runs out ok d
   runs="$(grep -nE '(^|[^-[:alnum:]_./])(/usr/sbin/)?installer +-' "$here/test-pkg-install.sh" | grep -vE '^[0-9]+: *#')"
   ok=no
-  if [ -n "$runs" ] && ! printf '%s\n' "$runs" | grep -qv -- ' -dumplog '; then ok=yes; fi
+  if [ -n "$runs" ] && ! grep -qv -- ' -dumplog ' <<<"$runs"; then ok=yes; fi
   expect "test-pkg-install.sh runs installer, and always with -dumplog" test "$ok" = yes
   ok=no
-  if ! grep -nE '(^|[^_[:alnum:]])said "' "$here/test-pkg-install.sh" | grep -qv 'note_said'; then ok=yes; fi
+  if ! grep -nE '(^|[^_[:alnum:]])said "' "$here/test-pkg-install.sh" | grep -v 'note_said' >/dev/null; then ok=yes; fi
   expect "test-pkg-install.sh decides nothing on a logged line: only note_said remains" test "$ok" = yes
 
   local decision='syndeo preinstall: upgrading from 0.0.1 to 0.0.2'
@@ -868,7 +886,7 @@ installer: The upgrade was successful.
 " "" "$decision")"
   ok=no
   if [ "$(printf '%s\n' "$out" | sed -n 2p)" = "seen in the -dumplog output" ] &&
-    printf '%s\n' "$out" | grep -qxF "seen in the -dumplog output: $decision"; then ok=yes; fi
+    grep -qxF "seen in the -dumplog output: $decision" <<<"$out"; then ok=yes; fi
   expect "note_said() sees a prefixed line in the invocation's -dumplog output, with nothing in install.log" test "$ok" = yes
 
   out="$(st_said_run "installer: The upgrade was successful.
@@ -892,7 +910,7 @@ installer: The upgrade was successful.
 " "" "$decision")"
   ok=no
   if [ "$(printf '%s\n' "$out" | sed -n 1p)" = "status 0" ] && [ "$(printf '%s\n' "$out" | sed -n 2p)" = "not seen" ] &&
-    printf '%s\n' "$out" | grep -qxF "not seen: $decision"; then ok=yes; fi
+    grep -qxF "not seen: $decision" <<<"$out"; then ok=yes; fi
   expect "note_said() records a line seen nowhere, and does not fail" test "$ok" = yes
 
   d="$T/said-delta"
@@ -1838,37 +1856,37 @@ st_installed_mode() {
   printf '\n  this script: installed\n'
   st_new; st_app_installed 0.1.7
   out="$(inst 0.1.7)"
-  expect "installed: a complete installation passes" eval "printf '%s' \"\$out\" | grep -q '[1-9][0-9]* passed, 0 failed'"
+  expect "installed: a complete installation passes" eval "grep -q '[1-9][0-9]* passed, 0 failed' <<<\"\$out\""
   printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
   st_new; st_app_installed 0.1.7 yes
   out="$(inst 0.1.7)"
-  expect "installed: a stapled one too" eval "printf '%s' \"\$out\" | grep -q '[1-9][0-9]* passed, 0 failed'"
+  expect "installed: a stapled one too" eval "grep -q '[1-9][0-9]* passed, 0 failed' <<<\"\$out\""
   st_new; st_app_installed 0.1.7; st_bin; printf 'install.sh\n' >"$R/usr/local/bin/syndeo"
   out="$(inst 0.1.7)"
-  expect "installed: a command install.sh put in /usr/local/bin is not the package's" eval "printf '%s' \"\$out\" | grep -q '[1-9][0-9]* passed, 0 failed'"
+  expect "installed: a command install.sh put in /usr/local/bin is not the package's" eval "grep -q '[1-9][0-9]* passed, 0 failed' <<<\"\$out\""
   st_new; st_app_installed 0.0.2
   out="$(inst 0.1.7)"
-  expect "installed: another version fails" eval "printf '%s' \"\$out\" | grep -q \"receipt — version '0.0.2'\""
+  expect "installed: another version fails" eval "grep -q \"receipt — version '0.0.2'\" <<<\"\$out\""
   st_new; st_app_installed 0.0.2
   out="$(inst 0.0.2 --helper-says 0.0.2)"
-  expect "installed: --helper-says, the version a stand-in's helper reports: passes" eval "printf '%s' \"\$out\" | grep -q '[1-9][0-9]* passed, 0 failed'"
+  expect "installed: --helper-says, the version a stand-in's helper reports: passes" eval "grep -q '[1-9][0-9]* passed, 0 failed' <<<\"\$out\""
   out="$(inst 0.0.2 --helper-says 0.1.7)"
-  expect "installed: --helper-says another version than the helper's: fails" eval "printf '%s' \"\$out\" | grep -q \"not 'syndeo-proxy 0.1.7'\""
+  expect "installed: --helper-says another version than the helper's: fails" eval "grep -q \"not 'syndeo-proxy 0.1.7'\" <<<\"\$out\""
   st_new; st_app_installed 0.1.7; echo x >"$A/Contents/Resources/extra"; st_sign
   out="$(inst 0.1.7)"
-  expect "installed: a file more in the bundle fails" eval "printf '%s' \"\$out\" | grep -q 'extra: is not part of Syndeo.app'"
+  expect "installed: a file more in the bundle fails" eval "grep -q 'extra: is not part of Syndeo.app' <<<\"\$out\""
   st_new; st_app 0.0.3; st_app_receipt 0.0.2
   out="$(inst 0.0.3)"
-  expect "installed: after a failed upgrade, it fails on the receipt" eval "printf '%s' \"\$out\" | grep -q \"receipt — version '0.0.2'\""
+  expect "installed: after a failed upgrade, it fails on the receipt" eval "grep -q \"receipt — version '0.0.2'\" <<<\"\$out\""
   st_new; st_app_installed 0.1.7; st_legacy 0.1.6
   out="$(inst 0.1.7)"
-  expect "installed: the v0.1.x receipt and its layout still there fail" eval "printf '%s' \"\$out\" | grep -q 'com.sum.syndeo.pkg 0.1.6 is still recorded' && printf '%s' \"\$out\" | grep -q 'v0.1.x layout — still there: $D'"
+  expect "installed: the v0.1.x receipt and its layout still there fail" eval "grep -q 'com.sum.syndeo.pkg 0.1.6 is still recorded' <<<\"\$out\" && grep -q 'v0.1.x layout — still there: $D' <<<\"\$out\""
   st_new; st_app_installed 0.1.7; st_links
   out="$(inst 0.1.7)"
-  expect "installed: a link into the v0.1.x layout fails" eval "printf '%s' \"\$out\" | grep -q 'v0.1.x layout — still there: $R/usr/local/bin/syndeo '"
+  expect "installed: a link into the v0.1.x layout fails" eval "grep -q 'v0.1.x layout — still there: $R/usr/local/bin/syndeo ' <<<\"\$out\""
   st_new
   out="$(inst 0.1.7)"
-  expect "installed: nothing installed fails" eval "printf '%s' \"\$out\" | grep -q 'there is no receipt for com.sum.syndeo.app'"
+  expect "installed: nothing installed fails" eval "grep -q 'there is no receipt for com.sum.syndeo.app' <<<\"\$out\""
 }
 
 # loc_case NAME accepted|refused LOCATION: an app receipt whose location
@@ -1892,9 +1910,9 @@ loc_case() {
   out="$(inst 0.0.2)"
   verdict=yes
   if [ "$want" = accepted ]; then
-    printf '%s' "$out" | grep -q '[1-9][0-9]* passed, 0 failed' || verdict=no
+    grep -q '[1-9][0-9]* passed, 0 failed' <<<"$out" || verdict=no
   else
-    printf '%s\n' "$out" | grep 'FAIL' | grep -qF 'does not say the bundle is in Applications' || verdict=no
+    grep 'FAIL' <<<"$out" | grep -F 'does not say the bundle is in Applications' >/dev/null || verdict=no
   fi
   expect "location: $name: installed $want" test "$verdict" = yes
 
@@ -2180,12 +2198,12 @@ st_inspect() {
   SOURCE_DATE_EPOCH=1 "$builder" 0.0.1 "$app" "$d/out" >/dev/null 2>&1
   pkg="$d/out/Syndeo-0.0.1.pkg"
   out="$(bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --app "$app" 2>&1)"
-  expect "inspect: a package built from the bundle passes" eval "printf '%s' \"\$out\" | grep -q '[1-9][0-9]* passed, 0 failed'"
+  expect "inspect: a package built from the bundle passes" eval "grep -q '[1-9][0-9]* passed, 0 failed' <<<\"\$out\""
   printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
 
   st_fake_app "$d/other" 0.0.1 other || expect "inspect: another stand-in assembled" false
   out="$(bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --app "$d/other/app/Syndeo.app" 2>&1)"
-  expect "inspect: a payload other than the bundle named fails" eval "printf '%s' \"\$out\" | grep -q 'provenance — the payload.s Syndeo.app differs'"
+  expect "inspect: a payload other than the bundle named fails" eval "grep -q 'provenance — the payload.s Syndeo.app differs' <<<\"\$out\""
 
   rm -rf "$d/unsigned" && mkdir -p "$d/unsigned"
   bash "$assembler" 0.0.1 "$d/bins" "$d/unsigned" >/dev/null
@@ -2197,9 +2215,9 @@ st_inspect() {
 
   rm -rf "$d/expanded" && pkgutil --expand "$pkg" "$d/expanded"
   out="$(bash "$here/verify-pkg.sh" package-info "$d/expanded/Syndeo.pkg/PackageInfo" 0.0.1 2>&1)"
-  expect "package-info: what pkgbuild wrote for the bundle passes" eval "printf '%s' \"\$out\" | grep -q '1 passed, 0 failed'"
+  expect "package-info: what pkgbuild wrote for the bundle passes" eval "grep -q '1 passed, 0 failed' <<<\"\$out\""
   out="$(bash "$here/verify-pkg.sh" package-info "$d/expanded/Syndeo.pkg/PackageInfo" 0.0.2 2>&1)"
-  expect "package-info: another version fails" eval "printf '%s' \"\$out\" | grep -q '0 passed, 1 failed'"
+  expect "package-info: another version fails" eval "grep -q '0 passed, 1 failed' <<<\"\$out\""
 
   mkdir -p "$d/faulty"
   local w
@@ -2208,7 +2226,7 @@ st_inspect() {
     bash "$here/pkg-test-fault.sh" "$pkg" "$d/faulty/Syndeo-0.0.1.pkg" "$w" "$d/faulty/marker" >"$d/faulty/log" 2>&1
     expect "pkg-test-fault.sh: a fault at $w, and nothing else changed" test "$?" = 0
     out="$(bash "$here/verify-pkg.sh" inspect "$d/faulty/Syndeo-0.0.1.pkg" 0.0.1 --app "$app" 2>&1)"
-    expect "inspect: a package with a test fault at $w fails" eval "printf '%s' \"\$out\" | grep -q 'postinstall — differs from the template'"
+    expect "inspect: a package with a test fault at $w fails" eval "grep -q 'postinstall — differs from the template' <<<\"\$out\""
   done
   expect "pkg-test-fault.sh: refuses anything but a 0.0.x stand-in" eval "cp '$pkg' '$d/faulty/Syndeo-0.1.7.pkg' && ! bash '$here/pkg-test-fault.sh' '$d/faulty/Syndeo-0.1.7.pkg' '$d/faulty/y.pkg' entry '$d/faulty/m' >/dev/null 2>&1 && ! [ -e '$d/faulty/y.pkg' ]"
 
@@ -2221,7 +2239,7 @@ st_inspect() {
     mkdir -p "$d/edited"
     pkgutil --flatten "$d/edit" "$d/edited/Syndeo-0.0.1.pkg"
     out="$(bash "$here/verify-pkg.sh" inspect "$d/edited/Syndeo-0.0.1.pkg" 0.0.1 --app "$app" 2>&1)"
-    expect "inspect: $label fails" eval "printf '%s' \"\$out\" | grep -q -- '$text'"
+    expect "inspect: $label fails" eval "grep -q -- '$text' <<<\"\$out\""
   }
   edit_case "overwrite-permissions true" Syndeo.pkg/PackageInfo 'overwrite-permissions="false"' 'overwrite-permissions="true"' "overwrite-permissions)"
   edit_case "a relocatable bundle" Syndeo.pkg/PackageInfo '<relocate/>' '<relocate><bundle id="com.sum.syndeo"/></relocate>' "count(/pkg-info/relocate/\\*)"
@@ -2233,7 +2251,7 @@ st_inspect() {
 
   cp "$pkg" "$d/renamed.pkg"
   out="$(bash "$here/verify-pkg.sh" inspect "$d/renamed.pkg" 0.0.1 --app "$app" 2>&1)"
-  expect "inspect: a misnamed package fails" eval "printf '%s' \"\$out\" | grep -q 'renamed.pkg is not Syndeo-0.0.1.pkg'"
+  expect "inspect: a misnamed package fails" eval "grep -q 'renamed.pkg is not Syndeo-0.0.1.pkg' <<<\"\$out\""
   st_signed "$pkg" "$app"
 }
 
@@ -2330,9 +2348,9 @@ EOF
     out="$(env "$@" PATH="$T/fast:$bin:$PATH" STANDIN_MARKS="$T/marks" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF \
       bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --app "$app" 2>&1)"
     if [ "$fails" = 0 ]; then
-      expect "signed inspect: $label" eval "printf '%s' \"\$out\" | grep -q '[1-9][0-9]* passed, 0 failed'"
+      expect "signed inspect: $label" eval "grep -q '[1-9][0-9]* passed, 0 failed' <<<\"\$out\""
     else
-      expect "signed inspect: $label" eval "printf '%s' \"\$out\" | grep -q ' passed, $fails failed' && printf '%s' \"\$out\" | grep 'FAIL' | grep -qF -- \"\$text\""
+      expect "signed inspect: $label" eval "grep -q ' passed, $fails failed' <<<\"\$out\" && grep 'FAIL' <<<\"\$out\" | grep -F -- \"\$text\" >/dev/null"
     fi
     printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
   }
@@ -2348,7 +2366,7 @@ EOF
   signed_case "the bundle signed as another identifier" 1 "Syndeo.app — signed as 'com.example.other', not com.sum.syndeo;" STANDIN_APP_IDENTIFIER=com.example.other
   signed_case "the bundle's ticket not stapled" 1 "Syndeo.app's notarization ticket — stapler validate fails, in every attempt" STANDIN_APP_STAPLED=no
   signed_case "the bundle's ticket validating only on the second attempt, after a lost connection: passes" 0 "" STANDIN_APP_STAPLED=once
-  expect "  ... and each attempt is shown, the first failing" eval "printf '%s' \"\$out\" | grep -qF '[exit 68] (attempt 1 of 5)' && printf '%s' \"\$out\" | grep -qF '[exit 0] (attempt 2 of 5)'"
+  expect "  ... and each attempt is shown, the first failing" eval "grep -qF '[exit 68] (attempt 1 of 5)' <<<\"\$out\" && grep -qF '[exit 0] (attempt 2 of 5)' <<<\"\$out\""
   signed_case "Gatekeeper rejects the bundle" 1 "Gatekeeper, Syndeo.app — rejected;" STANDIN_APP_SPCTL=rejected
   signed_case "Gatekeeper: the bundle Developer ID, not notarized" 1 "Gatekeeper, Syndeo.app — source=Developer ID;" "STANDIN_APP_SOURCE=Developer ID"
   signed_case "the package signed by another team" 1 "package signature — signed by 'Developer ID Installer: Other Org (ZZ99ZZ99ZZ)';" "STANDIN_PKG_SIGNER=Developer ID Installer: Other Org (ZZ99ZZ99ZZ)" "STANDIN_ORIGIN=Developer ID Installer: Other Org (ZZ99ZZ99ZZ)"
@@ -2374,9 +2392,9 @@ EOF
       bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)"
     if [ "$fails" = 0 ]; then
       # Seven signatures, seven runs, and the keystore's status.
-      expect "signed-binaries: $label" eval "printf '%s' \"\$out\" | grep -q '15 passed, 0 failed'"
+      expect "signed-binaries: $label" eval "grep -q '15 passed, 0 failed' <<<\"\$out\""
     else
-      expect "signed-binaries: $label" eval "printf '%s' \"\$out\" | grep -q ' passed, $fails failed' && printf '%s' \"\$out\" | grep 'FAIL' | grep -qF -- \"\$text\""
+      expect "signed-binaries: $label" eval "grep -q ' passed, $fails failed' <<<\"\$out\" && grep 'FAIL' <<<\"\$out\" | grep -F -- \"\$text\" >/dev/null"
     fi
     printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
   }
@@ -2402,11 +2420,11 @@ EOF
   binaries_case "the keystore claiming platform presence" 1 "syndeo-keystore status — does not report platform presence unenforced and the passphrase required" STANDIN_PRESENCE=true
   binaries_case "the keystore not requiring the passphrase" 1 "syndeo-keystore status — does not report platform presence unenforced and the passphrase required" STANDIN_PASSPHRASE_REQUIRED=false
   out="$(env -u MACOS_TEAM_ID SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)" && status=0 || status=$?
-  expect "signed-binaries: without MACOS_TEAM_ID, refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs MACOS_TEAM_ID'"
+  expect "signed-binaries: without MACOS_TEAM_ID, refused" eval "[ $status = 2 ] && grep -q 'needs MACOS_TEAM_ID' <<<\"\$out\""
   out="$(SYNDEO_EXPECT_SIGNED=no MACOS_TEAM_ID=AB12CD34EF bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)" && status=0 || status=$?
-  expect "signed-binaries: SYNDEO_EXPECT_SIGNED=no, refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs SYNDEO_EXPECT_SIGNED=yes'"
+  expect "signed-binaries: SYNDEO_EXPECT_SIGNED=no, refused" eval "[ $status = 2 ] && grep -q 'needs SYNDEO_EXPECT_SIGNED=yes' <<<\"\$out\""
   out="$(PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.2 2>&1)" && status=0 || status=$?
-  expect "signed-binaries: a tarball of another version, refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'is not syndeo-0.0.2-aarch64-apple-darwin.tar.gz'"
+  expect "signed-binaries: a tarball of another version, refused" eval "[ $status = 1 ] && grep -q 'is not syndeo-0.0.2-aarch64-apple-darwin.tar.gz' <<<\"\$out\""
 
   # The stand-in tarball's own syndeo-proxy, as the helper of a bundle whose
   # signature's paths the stand-in codesign answers for.
@@ -2424,9 +2442,9 @@ EOF
     out="$(env "$@" PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=AB12CD34EF \
       bash "$here/verify-pkg.sh" signed-app "$a" 0.0.1 --tarball "$tgz" 2>&1)"
     if [ "$fails" = 0 ]; then
-      expect "signed-app: $label" eval "printf '%s' \"\$out\" | grep -q '5 passed, 0 failed'"
+      expect "signed-app: $label" eval "grep -q '5 passed, 0 failed' <<<\"\$out\""
     else
-      expect "signed-app: $label" eval "printf '%s' \"\$out\" | grep -q ' passed, $fails failed' && printf '%s' \"\$out\" | grep 'FAIL' | grep -qF -- \"\$text\""
+      expect "signed-app: $label" eval "grep -q ' passed, $fails failed' <<<\"\$out\" && grep 'FAIL' <<<\"\$out\" | grep -F -- \"\$text\" >/dev/null"
     fi
     printf '%s\n' "$out" | grep FAIL | sed 's/^/          | /'
   }
@@ -2442,14 +2460,14 @@ EOF
   cp "$sa/out/Syndeo.app/Contents/Helpers/syndeo-proxy" "$sa/other/Syndeo.app/Contents/Helpers/syndeo-proxy"
   app_case "a bundle without its signature's paths" 1 "bundle — " "$sa/other/Syndeo.app"
   out="$(env -u MACOS_TEAM_ID SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" signed-app "$sa/out/Syndeo.app" 0.0.1 --tarball "$tgz" 2>&1)" && status=0 || status=$?
-  expect "signed-app: without MACOS_TEAM_ID, refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs MACOS_TEAM_ID'"
+  expect "signed-app: without MACOS_TEAM_ID, refused" eval "[ $status = 2 ] && grep -q 'needs MACOS_TEAM_ID' <<<\"\$out\""
 
   out="$(PATH="$bin:$PATH" SYNDEO_EXPECT_SIGNED=no bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --app "$app" 2>&1)"
-  expect "inspect: SYNDEO_EXPECT_SIGNED=no, of a package whose bundle is signed: fails" eval "printf '%s' \"\$out\" | grep -q 'carries a Developer ID'"
+  expect "inspect: SYNDEO_EXPECT_SIGNED=no, of a package whose bundle is signed: fails" eval "grep -q 'carries a Developer ID' <<<\"\$out\""
   out="$(env -u MACOS_TEAM_ID SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --app "$app" 2>&1)" && status=0 || status=$?
-  expect "inspect: SYNDEO_EXPECT_SIGNED=yes without MACOS_TEAM_ID is refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs MACOS_TEAM_ID'"
+  expect "inspect: SYNDEO_EXPECT_SIGNED=yes without MACOS_TEAM_ID is refused" eval "[ $status = 2 ] && grep -q 'needs MACOS_TEAM_ID' <<<\"\$out\""
   out="$(SYNDEO_EXPECT_SIGNED=yes MACOS_TEAM_ID=ab12cd34ef bash "$here/verify-pkg.sh" inspect "$pkg" 0.0.1 --app "$app" 2>&1)" && status=0 || status=$?
-  expect "inspect: SYNDEO_EXPECT_SIGNED=yes with a malformed MACOS_TEAM_ID is refused" eval "[ $status = 2 ] && printf '%s' \"\$out\" | grep -q 'needs MACOS_TEAM_ID'"
+  expect "inspect: SYNDEO_EXPECT_SIGNED=yes with a malformed MACOS_TEAM_ID is refused" eval "[ $status = 2 ] && grep -q 'needs MACOS_TEAM_ID' <<<\"\$out\""
 }
 
 # st_tools: what the macOS cases build once: a program that waits, for a
@@ -2493,6 +2511,7 @@ self_test() {
   mkdir -p "$T/render"
   st_render "$T/render"
   st_harness
+  st_pipes
   st_launchservices
   st_came_up
   st_release
@@ -2535,25 +2554,25 @@ st_release() {
     "[ $status = 0 ] && [ \"\$(sed 's/^[0-9a-f]*  //' '$d/dist/SHA256SUMS')\" = '$named' ] && (cd '$d/dist' && shasum -a 256 -c SHA256SUMS >/dev/null)"
   fresh; rm "$d/dist/syndeo-$v-aarch64-unknown-linux-gnu.tar.gz"
   rel sums "$d/dist" "$v"
-  expect "sums: a tarball missing: refused, nothing written" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'missing syndeo-$v-aarch64-unknown-linux-gnu.tar.gz' && [ ! -e '$d/dist/SHA256SUMS' ]"
+  expect "sums: a tarball missing: refused, nothing written" eval "[ $status = 1 ] && grep -q 'missing syndeo-$v-aarch64-unknown-linux-gnu.tar.gz' <<<\"\$out\" && [ ! -e '$d/dist/SHA256SUMS' ]"
   fresh; mv "$d/dist/syndeo-$v-x86_64-unknown-linux-gnu.tar.gz" "$d/dist/syndeo-0.9.0-x86_64-unknown-linux-gnu.tar.gz"
   rel sums "$d/dist" "$v"
-  expect "sums: one of another version: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected syndeo-0.9.0-x86_64-unknown-linux-gnu.tar.gz' && printf '%s' \"\$out\" | grep -q 'missing syndeo-$v-x86_64'"
+  expect "sums: one of another version: refused" eval "[ $status = 1 ] && grep -q 'unexpected syndeo-0.9.0-x86_64-unknown-linux-gnu.tar.gz' <<<\"\$out\" && grep -q 'missing syndeo-$v-x86_64' <<<\"\$out\""
   fresh; echo extra >"$d/dist/syndeo-$v-x86_64-apple-darwin.tar.gz"
   rel sums "$d/dist" "$v"
-  expect "sums: an extra asset: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected syndeo-$v-x86_64-apple-darwin.tar.gz'"
+  expect "sums: an extra asset: refused" eval "[ $status = 1 ] && grep -q 'unexpected syndeo-$v-x86_64-apple-darwin.tar.gz' <<<\"\$out\""
   fresh; echo old >"$d/dist/SHA256SUMS"
   rel sums "$d/dist" "$v"
-  expect "sums: a SHA256SUMS already there: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected SHA256SUMS'"
+  expect "sums: a SHA256SUMS already there: refused" eval "[ $status = 1 ] && grep -q 'unexpected SHA256SUMS' <<<\"\$out\""
   fresh; mv "$d/dist/Syndeo-$v.pkg" "$d/dist/syndeo-$v-aarch64-apple-darwin.pkg"
   rel sums "$d/dist" "$v"
-  expect "sums: the package under the old name the v0.1.x packages had: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected syndeo-$v-aarch64-apple-darwin.pkg' && printf '%s' \"\$out\" | grep -q 'missing Syndeo-$v.pkg'"
+  expect "sums: the package under the old name the v0.1.x packages had: refused" eval "[ $status = 1 ] && grep -q 'unexpected syndeo-$v-aarch64-apple-darwin.pkg' <<<\"\$out\" && grep -q 'missing Syndeo-$v.pkg' <<<\"\$out\""
   fresh; : >"$d/dist/Syndeo-$v.pkg"
   rel sums "$d/dist" "$v"
-  expect "sums: an empty package: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'pkg is not a non-empty regular file'"
+  expect "sums: an empty package: refused" eval "[ $status = 1 ] && grep -q 'pkg is not a non-empty regular file' <<<\"\$out\""
   fresh; rm "$d/dist/Syndeo-$v.pkg"; mkdir "$d/dist/Syndeo-$v.pkg"
   rel sums "$d/dist" "$v"
-  expect "sums: a directory for the package: refused" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'pkg is not a non-empty regular file'"
+  expect "sums: a directory for the package: refused" eval "[ $status = 1 ] && grep -q 'pkg is not a non-empty regular file' <<<\"\$out\""
   fresh
   rel sums "$d/dist" 0.9
   expect "sums: a malformed version: refused" test "$status" = 2
@@ -2574,40 +2593,40 @@ st_release() {
   expect "check: notes that differ only in trailing blank lines: pass" test "$status" = 0
   draft; rm "$d/draft/Syndeo-$v.pkg"
   rel check "$d/draft" "$v" --against "$d/dist"
-  expect "check: the package missing from the draft: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'missing Syndeo-$v.pkg'"
+  expect "check: the package missing from the draft: fails" eval "[ $status = 1 ] && grep -q 'missing Syndeo-$v.pkg' <<<\"\$out\""
   draft; echo stale >"$d/draft/Syndeo-0.9.0.pkg"
   rel check "$d/draft" "$v" --against "$d/dist"
-  expect "check: a stale asset in the draft: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'unexpected Syndeo-0.9.0.pkg'"
+  expect "check: a stale asset in the draft: fails" eval "[ $status = 1 ] && grep -q 'unexpected Syndeo-0.9.0.pkg' <<<\"\$out\""
   draft; printf 'syndeo-%s-aarch64-apple-darwin.tar.gx\n' "$v" >"$d/draft/syndeo-$v-aarch64-apple-darwin.tar.gz"
   rel check "$d/draft" "$v" --against "$d/dist"
-  expect "check: an asset changed in one byte, same size: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'syndeo-$v-aarch64-apple-darwin.tar.gz — differs from what was built'"
+  expect "check: an asset changed in one byte, same size: fails" eval "[ $status = 1 ] && grep -q 'syndeo-$v-aarch64-apple-darwin.tar.gz — differs from what was built' <<<\"\$out\""
   draft
   for f in "$d/dist/SHA256SUMS" "$d/draft/SHA256SUMS"; do
     printf '%s\n' "$(sed -n 1p "$f")" "$(sed -n 3p "$f")" "$(sed -n 2p "$f")" "$(sed -n 4p "$f")" >"$f.new" && mv "$f.new" "$f"
   done
   rel check "$d/draft" "$v" --against "$d/dist"
-  expect "check: SHA256SUMS out of order, though it verifies: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'SHA256SUMS — does not list exactly the four'"
+  expect "check: SHA256SUMS out of order, though it verifies: fails" eval "[ $status = 1 ] && grep -q 'SHA256SUMS — does not list exactly the four' <<<\"\$out\""
   draft
   for f in "$d/dist/SHA256SUMS" "$d/draft/SHA256SUMS"; do sed -i.bak '1s/^./0/;1s/^0/f/' "$f" && rm "$f.bak"; done
   rel check "$d/draft" "$v" --against "$d/dist"
-  expect "check: a SHA256SUMS that does not verify: fails" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'SHA256SUMS — does not list exactly the four'"
+  expect "check: a SHA256SUMS that does not verify: fails" eval "[ $status = 1 ] && grep -q 'SHA256SUMS — does not list exactly the four' <<<\"\$out\""
   draft; bash "$here/release-notes.sh" "$v" yes >"$d/draft-notes.md"
   rel check "$d/draft" "$v" --against "$d/dist" --notes "$d/notes.md" "$d/draft-notes.md"
-  expect "check: notes claiming signing for an unsigned build: fail" eval "[ $status = 1 ] && printf '%s' \"\$out\" | grep -q 'notes — differ from the expected'"
+  expect "check: notes claiming signing for an unsigned build: fail" eval "[ $status = 1 ] && grep -q 'notes — differ from the expected' <<<\"\$out\""
 
   out="$(bash "$here/release-notes.sh" "$v" no)"
-  expect "notes, unsigned: both routes, the package's exact name, Syndeo.app alone, its uninstaller, and the signing state as it is" eval "printf '%s' \"\$out\" | grep -qF 'install.sh | sh' &&
-    printf '%s' \"\$out\" | grep -qF 'sudo installer -pkg Syndeo-$v.pkg -target /' &&
-    printf '%s' \"\$out\" | grep -qF 'shasum -a 256 -c SHA256SUMS --ignore-missing' &&
-    printf '%s' \"\$out\" | grep -qF 'sudo /bin/sh /Applications/Syndeo.app/Contents/Resources/uninstall.sh' &&
-    printf '%s' \"\$out\" | grep -qF 'and nothing else: the command-line tools come' &&
-    printf '%s' \"\$out\" | grep -qF 'ad-hoc signed, with no Developer ID, and not notarized' &&
-    printf '%s' \"\$out\" | grep -qF 'The installer package is unsigned' && ! printf '%s' \"\$out\" | grep -qF 'stapled'"
+  expect "notes, unsigned: both routes, the package's exact name, Syndeo.app alone, its uninstaller, and the signing state as it is" eval "grep -qF 'install.sh | sh' <<<\"\$out\" &&
+    grep -qF 'sudo installer -pkg Syndeo-$v.pkg -target /' <<<\"\$out\" &&
+    grep -qF 'shasum -a 256 -c SHA256SUMS --ignore-missing' <<<\"\$out\" &&
+    grep -qF 'sudo /bin/sh /Applications/Syndeo.app/Contents/Resources/uninstall.sh' <<<\"\$out\" &&
+    grep -qF 'and nothing else: the command-line tools come' <<<\"\$out\" &&
+    grep -qF 'ad-hoc signed, with no Developer ID, and not notarized' <<<\"\$out\" &&
+    grep -qF 'The installer package is unsigned' <<<\"\$out\" && ! grep -qF 'stapled' <<<\"\$out\""
   out="$(bash "$here/release-notes.sh" "$v" yes)"
-  expect "notes, signed: Developer ID and notarized, the package's ticket stapled, and no unsigned claim" eval "printf '%s' \"\$out\" | grep -qF 'signed with a Developer ID and notarized' &&
-    printf '%s' \"\$out\" | grep -qF 'ticket stapled' && ! printf '%s' \"\$out\" | grep -qF 'unsigned' && ! printf '%s' \"\$out\" | grep -qF 'ad-hoc'"
+  expect "notes, signed: Developer ID and notarized, the package's ticket stapled, and no unsigned claim" eval "grep -qF 'signed with a Developer ID and notarized' <<<\"\$out\" &&
+    grep -qF 'ticket stapled' <<<\"\$out\" && ! grep -qF 'unsigned' <<<\"\$out\" && ! grep -qF 'ad-hoc' <<<\"\$out\""
   out="$(bash "$here/release-notes.sh" 0.1.5 no)"
-  expect "notes: the CHANGELOG's section for the version, when it has one" eval "printf '%s' \"\$out\" | grep -qF 'Wasmtime 48.0.2 → 48.0.4'"
+  expect "notes: the CHANGELOG's section for the version, when it has one" eval "grep -qF 'Wasmtime 48.0.2 → 48.0.4' <<<\"\$out\""
   expect "notes: a malformed version, or signed neither yes nor no, is refused" eval "! bash '$here/release-notes.sh' 0.1 no >/dev/null 2>&1 && ! bash '$here/release-notes.sh' 0.1.5 maybe >/dev/null 2>&1"
 }
 
