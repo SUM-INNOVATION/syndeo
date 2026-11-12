@@ -163,7 +163,10 @@
 # agent-tabs-follow-spaces, with the person's favorites and spaces written
 # first, an agent's window showing no favorite tile and its tab's menu
 # offering no Add to Favorites, and its tabs still listed after the person
-# switches spaces (apart:). Any other failure is a failure.
+# switches spaces (apart:). For spaces-take-out-unlisted, with the sidebar's
+# two spaces written first and no session, sidebar's spaces check, to its
+# first failure: what each space shows after Next Space, Previous Space,
+# its emoji and Delete Space (spaces:). Any other failure is a failure.
 #
 # agents, which gates programs on this Mac driving Syndeo with the person's
 # leave: see the section of that name below.
@@ -297,7 +300,14 @@
 # tabs-memory.txt. It removes the setting it made and the session.
 #
 # sidebar, which gates the sidebar's rows being made only in the window in
-# front of its tab group, and measures the app's memory with many tabs. On
+# front of its tab group, and what the sidebar shows as the person changes
+# spaces, and measures the app's memory with many tabs. First, in an
+# opening of its own with two spaces, the second empty (sidebar_spaces):
+# Next Space into the empty one opens a tab there whose sidebar shows that
+# space's name, its row and New Tab; Previous Space, the second space's
+# emoji pressed in the switcher, and Delete Space each show the space then
+# current, its name and its tabs, the one in front marked, and New Tab; and
+# the app then holds one row a tab of the window in front. Then, on
 # pages this Mac serves (sidebar-1.html to sidebar-50.html, each titled
 # "Sidebar page I"), each asked for by another application, as `open -a`
 # asks, so that each opens in a tab of its own, in front, after the last;
@@ -1662,6 +1672,7 @@ mutant() {
     agent-downloads-allowed) intended='^agent downloads:' ;;
     favorites-in-agent-windows) intended='^apart: an agent.s (window shows no favorite tiles|tab.s own menu offers no Add to Favorites)' ;;
     agent-tabs-follow-spaces) intended='^apart: after the person switches spaces, an agent.s window still lists all its tabs$' ;;
+    spaces-take-out-unlisted) intended='^spaces: ' ;;
     download-challenge-unpinned) intended='^downloads: a file an https page links ' ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
@@ -1677,6 +1688,12 @@ mutant() {
   # The person's favorites and spaces, for those an agent's window has to
   # show none of, and ignore.
   case "$name" in favorites-in-agent-windows | agent-tabs-follow-spaces) apart_defaults ;; esac
+  # Two spaces, the second empty, for the sidebar's spaces check.
+  case "$name" in spaces-*)
+    rm -f "$session"
+    defaults write "$ID" SyndeoSpaces -string "$SIDEBAR_SPACES"
+    ;;
+  esac
   if started "$app" "mutant-$name"; then
     helper_of "$app" "mutant-$name"
     browses "mutant-$name"
@@ -1693,6 +1710,7 @@ mutant() {
       direct-for-every-host | never-retry-direct) preloaded "$log" ;;
       download-*) downloads_checks "$log" ;;
       sidebar-* | backdrop-*) sidebar_rounds "$app" "$log" "$SIDEBAR_GATE" ;;
+      spaces-*) sidebar_spaces "$app" "$log" first ;;
       *) policy "$log" ;;
     esac
   fi
@@ -1704,6 +1722,11 @@ mutant() {
   dl_put_back
   defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
   case "$name" in favorites-in-agent-windows | agent-tabs-follow-spaces) apart_forget ;; esac
+  case "$name" in spaces-*)
+    defaults delete "$ID" SyndeoSpaces >/dev/null 2>&1 || true
+    rm -f "$session"
+    ;;
+  esac
   # What it kept, which a clear would have forgotten.
   [ "$name" = tabs-kept-after-clear ] && rm -f "$session"
   printf '\n'
@@ -4484,6 +4507,131 @@ sidebar_rounds() {
   return 0
 }
 
+# Two spaces, for sidebar_spaces: the first current, with a folder in it,
+# and the second empty. Written before the app opens and taken away once it
+# has quit.
+SIDEBAR_SPACES='{"spaces":[{"id":1,"name":"Sidebar home","hue":0,"icon":""},{"id":2,"name":"Sidebar away","hue":1,"icon":""}],"folders":[{"id":3,"name":"Sidebar folder","space":1,"collapsed":false}],"current":1,"next_id":4}'
+
+# spaces_rows: the front window's sidebar rows, New Tab's included, on one
+# line, each title then "|", the tab in front's marked "*".
+spaces_rows() { "$APPCTL" rows "$PID" | awk -F'\t' '{ printf "%s%s|", ($1 == "front" ? "*" : ""), $5 }'; }
+
+# spaces_shown ROWS NAME OTHER: the front window's sidebar lists exactly
+# ROWS, as spaces_rows prints them, under the space's name NAME, and says
+# nothing of OTHER, the other space's name.
+spaces_shown() {
+  local tree
+  [ "$(spaces_rows)" = "$1" ] || return 1
+  tree="$("$APPCTL" front-tree "$PID")"
+  printf '%s' "$tree" | grep -qF "$2" && ! printf '%s' "$tree" | grep -qF "$3"
+}
+
+# spaces_see WHAT ROWS NAME OTHER: within 10 s, spaces_shown ROWS NAME
+# OTHER; WHAT passes or fails by it, and so does this.
+spaces_see() {
+  if wait_for 10 spaces_shown "$2" "$3" "$4"; then
+    ok "$1"
+  else
+    bad "$1" "it lists: $(spaces_rows); it says: $("$APPCTL" front-tree "$PID" | grep -oE 'Sidebar (home|away)' | sort -u | tr '\n' ' ')"
+    return 1
+  fi
+}
+
+# spaces_held LOG N: the app last logged that it holds N tabs' rows.
+spaces_held() { [ "$(sidebar_field "$1" held)" = "$2" ]; }
+
+# spaces_everywhere NAME OTHER: every window Accessibility has, the tab in
+# front of each tab group, says NAME and none says OTHER.
+spaces_everywhere() {
+  local tree
+  tree="$("$APPCTL" ax-tree "$PID")"
+  printf '%s' "$tree" | grep -qF "$1" && ! printf '%s' "$tree" | grep -qF "$2"
+}
+
+# sidebar_spaces APP LOG: the sidebar as the person changes spaces, in the
+# app running with SIDEBAR_SPACES and no session. In CI 43092994068 and
+# 43101278032 the new tab of an empty space showed an empty list, no space's
+# name, no row and no New Tab, for as long as was looked (10 s): the rows
+# of the space left, handed to its sidebar and in no list there, were taken
+# out of that list, and AppKit's exception stopped the refresh. The start
+# page's tab goes to Sidebar page 1, and Sidebar page 2 opens beside it, as
+# another application asks, in the first space. Then:
+#   spaces: Next Space, into the empty second space, opens a tab there, whose
+#           sidebar shows that space's name, its row, in front, and New Tab;
+#   spaces: Previous Space shows the first space's name, its two tabs, the
+#           first in front, and New Tab;
+#   spaces: File > New Window opens a window of its own, in the first space;
+#   spaces: the second space's emoji, pressed in its switcher as a click
+#           presses it, opens a tab of that space there, whose sidebar shows
+#           the space's name, its row and New Tab; and the other window's
+#           sidebar follows: no window says the first space's name;
+#   spaces: Delete Space, of the second, current, moves its tabs to the
+#           first, whose name every window then says, and none the second's;
+#           the window in front shows its two tabs, the first in front, and
+#           New Tab, with one space left in its switcher; and the app holds
+#           five tabs' rows, one a tab of the two windows, in the tab in
+#           front of each;
+#   spaces: and no sidebar refresh failed, as the app's log says.
+# Each within 10 s; the sidebar in front says nothing of the other space's
+# name. With STOP "first", as a mutant is run, it stops at the first of
+# those that fails, which every check after it would wait out.
+sidebar_spaces() {
+  local app="$1" log="$2" stop="${3:-}"
+  sidebar_pages || return 1
+  arrive "" 'Welcome to Syndeo' "spaces: the window shows the start page"
+  visit "http://127.0.0.1:$ORIGIN_PORT/sidebar-1.html" "http://127.0.0.1:$ORIGIN_PORT/sidebar-1.html" SYNDEO-SIDEBAR-1 \
+    "spaces: the first tab opens Sidebar page 1"
+  open -a "$app" "http://127.0.0.1:$ORIGIN_PORT/sidebar-2.html" || bad "spaces: Sidebar page 2 is asked for" "open -a failed"
+  spaces_see "spaces: the first space shows its name, its two tabs, the second in front, and New Tab" \
+    'Sidebar page 1|*Sidebar page 2|New Tab|' 'Sidebar home' 'Sidebar away' || [ "$stop" != first ] || return 1
+
+  choose Spaces "Next Space"
+  spaces_see "spaces: Next Space, into the empty second space, opens a tab there, whose sidebar shows that space's name, its row, in front, and New Tab" \
+    '*Welcome to Syndeo|New Tab|' 'Sidebar away' 'Sidebar home' || [ "$stop" != first ] || return 1
+  choose Spaces "Previous Space"
+  spaces_see "spaces: Previous Space shows the first space's name, its two tabs, the first in front, and New Tab" \
+    '*Sidebar page 1|Sidebar page 2|New Tab|' 'Sidebar home' 'Sidebar away' || [ "$stop" != first ] || return 1
+
+  choose File "New Window"
+  if wait_for 10 sh -c '[ "$("$1" titles "$2" | grep -c .)" = 2 ]' _ "$APPCTL" "$PID" &&
+    wait_for 10 spaces_shown '*Welcome to Syndeo|New Tab|' 'Sidebar home' 'Sidebar away'; then
+    ok "spaces: File > New Window opens a window of its own, in the first space"
+  else
+    bad "spaces: File > New Window opens a window of its own, in the first space" \
+      "windows: $("$APPCTL" titles "$PID" | tr '\n' '|'); it lists: $(spaces_rows)"
+  fi
+  if "$APPCTL" press-nth "$PID" syndeo.space 2 >/dev/null; then
+    spaces_see "spaces: the second space's emoji, pressed in the new window's switcher, opens a tab of that space there, whose sidebar shows its name, its row, in front, and New Tab" \
+      '*Welcome to Syndeo|New Tab|' 'Sidebar away' 'Sidebar home'
+  else
+    bad "spaces: the second space's emoji, pressed in the new window's switcher, opens a tab of that space there, whose sidebar shows its name, its row, in front, and New Tab" \
+      "no second syndeo.space to press: $("$APPCTL" ids "$PID" syndeo.space | tr '\t\n' ' |')"
+  fi
+  if wait_for 10 spaces_everywhere 'Sidebar away' 'Sidebar home'; then
+    ok "spaces: and the other window's sidebar follows: no window says the first space's name"
+  else
+    bad "spaces: and the other window's sidebar follows: no window says the first space's name" \
+      "they say: $("$APPCTL" ax-tree "$PID" | grep -oE 'Sidebar (home|away)' | sort | uniq -c | tr '\n' ' ')"
+  fi
+
+  choose Spaces "Delete Space"
+  spaces_see "spaces: Delete Space, of the second, current, moves its tabs to the first, whose name the window in front shows, with its two tabs, the first in front, and New Tab" \
+    '*Welcome to Syndeo|Welcome to Syndeo|New Tab|' 'Sidebar home' 'Sidebar away'
+  must "$(wait_for 10 spaces_everywhere 'Sidebar home' 'Sidebar away' && echo yes)" \
+    "spaces: and every window says the first space's name, none the second's" \
+    "they say: $("$APPCTL" ax-tree "$PID" | grep -oE 'Sidebar (home|away)' | sort | uniq -c | tr '\n' ' ')"
+  must "$([ "$("$APPCTL" ids "$PID" syndeo.space | grep -c .)" = 1 ] && echo yes)" \
+    "spaces: and the switcher has one space left" "$("$APPCTL" ids "$PID" syndeo.space | tr '\t\n' ' |')"
+  if wait_for 10 spaces_held "$log" 5; then
+    ok "spaces: the app holds five tabs' rows, one a tab, in the tab in front of each window"
+  else
+    bad "spaces: the app holds five tabs' rows, one a tab, in the tab in front of each window" \
+      "it holds $(sidebar_field "$log" held); last: $(plain_log "$log" | grep 'sidebar rows' | tail -n 1)"
+  fi
+  must "$(! grep -qF 'a sidebar refresh failed' "$log" && echo yes)" "spaces: and no sidebar refresh failed, as the app's log says" \
+    "$(plain_log "$log" | grep -F 'a sidebar refresh failed' | head -n 2 | tr '\n' ' ')"
+}
+
 # sidebar APP: see the top of this script.
 sidebar_test() {
   local app log session="$HOME/Library/Application Support/Syndeo/session.txt"
@@ -4495,6 +4643,16 @@ sidebar_test() {
   # From no session, so that the start page's is the only tab.
   rm -f "$session"
   defaults delete "$ID" NSQuitAlwaysKeepsWindows >/dev/null 2>&1 || true
+  # Two spaces, switched between and one deleted, in an opening of its own.
+  defaults write "$ID" SyndeoSpaces -string "$SIDEBAR_SPACES"
+  if started "$app" sidebar-spaces; then
+    helper_of "$app" sidebar-spaces
+    browses sidebar-spaces
+    sidebar_spaces "$app" "$LOGS/app-sidebar-spaces.stderr"
+  fi
+  stopped sidebar-spaces
+  defaults delete "$ID" SyndeoSpaces >/dev/null 2>&1 || true
+  rm -f "$session"
   if started "$app" sidebar; then
     helper_of "$app" sidebar
     browses sidebar

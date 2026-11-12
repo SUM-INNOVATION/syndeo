@@ -120,6 +120,14 @@ tell the check taken out from the check in place.
   in the space current when it opened them, must then be seen gone from its
   sidebar once the person switches spaces: with AppKit's tab bar hidden,
   out of the person's sight.
+- spaces-take-out-unlisted: a sidebar takes out of its list every row and
+  folder it lets go of, whether or not the list arranges it, as it did
+  before. After a space switch, the tab brought to the front is handed the
+  rows of the space left, which are in no list; NSStackView raises an
+  exception for each, and the refresh stops with that tab's list empty (CI
+  43092994068, 43101278032; the exception seen in 43118870164). Next Space
+  into an empty space must then be seen showing no space's name, no row and
+  no New Tab in its new tab's sidebar.
 
 Each mutant runs in exactly one CI job: macos-agents runs the agent-*
 mutants, beside its gate, and those in MACOS_AGENTS; macos-app runs the
@@ -415,6 +423,13 @@ MUTANTS = {
             SIDEBAR_MODEL,
             "        .filter(|t| !shows.spaces || t.space == space)\n",
             "        .filter(|t| t.space == space)\n",
+        ),
+    ],
+    "spaces-take-out-unlisted": [
+        (
+            SIDEBAR_MODEL,
+            "        .filter(|k| listed.contains(k))\n",
+            "        .filter(|_| true)\n",
         ),
     ],
 }
