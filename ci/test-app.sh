@@ -813,18 +813,40 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-socketserver.ThreadingTCPServer.daemon_threads = True
-server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+class Server(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    # A client that hangs up, before its request is read or while it is
+    # answered, is no failure of this origin: a line in its log, and no
+    # traceback. Anything else still prints one, which fails the test.
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if not isinstance(error, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return super().handle_error(request, client_address)
+        print("a client hung up: %s:%s" % client_address[:2], type(error).__name__, error, flush=True)
+server = Server(("127.0.0.1", 0), Handler)
 print("port", server.server_address[1], flush=True)
 server.serve_forever()' "$dir" >"$LOGS/origin.log" 2>&1 &
   ORIGIN_PID=$!
   wait_for 10 grep -q '^port [0-9]' "$LOGS/origin.log" || { bad "loopback origin" "it did not start: $(head -c 200 "$LOGS/origin.log")"; return 1; }
   ORIGIN_PORT="$(sed -n 's/^port \([0-9][0-9]*\)$/\1/p' "$LOGS/origin.log" | head -n 1)"
 }
+# raised LOG: what the tracebacks in LOG raised, each told once: the line a
+# traceback ends with, its exception and message, and not the source or the
+# carets Python 3.13 and later print above it. For a traceback cut short,
+# the log's last line instead.
+raised() {
+  local said
+  said="$(awk '
+    /^Traceback \(most recent call last\):/ { t = 1; next }
+    t && /^[^ \t]/ { if (!seen[$0]++) printf "%s%s", (n++ ? "; " : ""), $0; t = 0 }' "$1")"
+  [ -n "$said" ] || said="a traceback with no exception after it; its log ends: $(tail -n 1 "$1")"
+  printf '%s' "${said:0:400}"
+}
+
 # origin_stop: stop the loopback origin, which has to be running until then
 # and stop for the SIGTERM sent, and nothing else. Reaped here, so the shell
 # does not report the stop it was asked for; any other end, or a traceback in
-# its log, is a failure.
+# its log, is a failure. A client hanging up prints none (see origin).
 origin_stop() {
   local status
   [ -n "$ORIGIN_PID" ] || return 0
@@ -839,7 +861,7 @@ origin_stop() {
     bad "loopback origin" "it had already ended, status $status, before it was stopped: $(tail -n 3 "$LOGS/origin.log" | tr '\n' ' ')"
   fi
   if grep -q 'Traceback' "$LOGS/origin.log"; then
-    bad "loopback origin" "it raised: $(grep -A3 'Traceback' "$LOGS/origin.log" | tail -n 1)"
+    bad "loopback origin" "it raised: $(raised "$LOGS/origin.log")"
   fi
   ORIGIN_PORT='' ORIGIN_PID=''
 }
@@ -1786,7 +1808,7 @@ route_origin_stop() {
     bad "routing origin" "it had already ended, status $?, before it was stopped: $(tail -n 3 "$LOGS/routes-origin.out" | tr '\n' ' ')"
   fi
   if grep -q 'Traceback' "$LOGS/routes-origin.out"; then
-    bad "routing origin" "it raised: $(grep -A3 'Traceback' "$LOGS/routes-origin.out" | tail -n 1)"
+    bad "routing origin" "it raised: $(raised "$LOGS/routes-origin.out")"
   fi
   ROUTE_PID=''
 }
@@ -2348,7 +2370,7 @@ realtime_origin_stop() {
     bad "realtime origin" "it had already ended, status $?, before it was stopped: $(tail -n 3 "$LOGS/realtime-origin.out" | tr '\n' ' ')"
   fi
   if grep -q 'Traceback' "$LOGS/realtime-origin.out"; then
-    bad "realtime origin" "it raised: $(grep -A3 'Traceback' "$LOGS/realtime-origin.out" | tail -n 1)"
+    bad "realtime origin" "it raised: $(raised "$LOGS/realtime-origin.out")"
   fi
   RT_PID=''
 }
@@ -4109,7 +4131,7 @@ dl_origin_stop() {
       bad "download origin" "it had already ended, status $?, before it was stopped: $(tail -n 3 "$LOGS/downloads-origin.out" | tr '\n' ' ')"
     fi
     if grep -q 'Traceback' "$LOGS/downloads-origin.out"; then
-      bad "download origin" "it raised: $(grep -A3 'Traceback' "$LOGS/downloads-origin.out" | tail -n 1)"
+      bad "download origin" "it raised: $(raised "$LOGS/downloads-origin.out")"
     fi
   fi
   case "$DL_TLS" in */syndeo-dl-tls.*) rm -rf -- "${DL_TLS:?}" ;; esac

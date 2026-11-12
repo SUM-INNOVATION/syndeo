@@ -41,6 +41,8 @@ import time
 import urllib.parse
 
 ME = os.getpid()
+# What a client hanging up on a connection raises here.
+HANGUPS = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
 GIF = bytes.fromhex(
     "47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b"
 )
@@ -150,6 +152,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        # A client that hangs up, before its request is read or while it is
+        # answered, is no failure of this origin: a line on stderr, and no
+        # traceback. Anything else still prints one, which fails the test.
+        error = sys.exc_info()[1]
+        if not isinstance(error, HANGUPS):
+            return super().handle_error(request, client_address)
+        print(f"a client hung up: {client_address[0]}:{client_address[1]} {type(error).__name__} {error}",
+              file=sys.stderr, flush=True)
 
 
 class Server6(Server):

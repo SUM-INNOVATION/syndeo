@@ -28,9 +28,10 @@ stopped meaning the client went away before the last byte.
 Every request is logged to <log> as one JSON line: its path, the t= of its
 query, which server took it (http or https), the connection it came on
 (numbered as accepted, over both servers), the certificate its connection
-presented (numbered from 1; 0 over http), and the address it came from; and
+presented (numbered from 1; 0 over http), and the address it came from;
 every TLS handshake, whether it succeeded, with the connection's number and
-its certificate's.
+its certificate's; and every error a connection raised, and its kind. A
+client hanging up is no failure; any other error also prints a traceback.
 """
 import http.server
 import itertools
@@ -50,6 +51,8 @@ LOCK = threading.Lock()
 CURRENT = threading.local()
 # How many TLS connections have been taken.
 SECURE = itertools.count(0)
+# What a client hanging up on a connection raises here.
+HANGUPS = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
 
 
 def log(entry):
@@ -163,8 +166,14 @@ class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
             secure.close()
 
     def handle_error(self, request, client_address):
-        # A client that goes away mid-answer is not this origin's failure.
-        log({"error": str(sys.exc_info()[1])[:160], "server": self.name})
+        # Every error is logged. A client that hangs up, before its request
+        # is read or while it is answered, is no failure of this origin, and
+        # prints no traceback; anything else still prints one, which fails
+        # the test.
+        error = sys.exc_info()[1]
+        log({"error": str(error)[:160], "kind": type(error).__name__, "server": self.name})
+        if not isinstance(error, HANGUPS):
+            super().handle_error(request, client_address)
 
 
 class Server6(Server):

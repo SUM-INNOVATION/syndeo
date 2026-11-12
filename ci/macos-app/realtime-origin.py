@@ -56,6 +56,8 @@ import time
 import urllib.parse
 
 ME = os.getpid()
+# What a client hanging up on a connection raises here.
+HANGUPS = (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 COOKIE = 0x2112A442
 LOG_LOCK = threading.Lock()
@@ -345,6 +347,16 @@ def stun(sock):
 class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        # A client that hangs up, before its request is read or while it is
+        # answered, is no failure of this origin: a line on stderr, and no
+        # traceback. Anything else still prints one, which fails the test.
+        error = sys.exc_info()[1]
+        if not isinstance(error, HANGUPS):
+            return super().handle_error(request, client_address)
+        print(f"a client hung up: {client_address[0]}:{client_address[1]} {type(error).__name__} {error}",
+              file=sys.stderr, flush=True)
 
 
 def main(argv):
