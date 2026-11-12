@@ -1997,7 +1997,7 @@ fault_case() {
 # 0.1.7 here, and the stand-ins are 0.0.1 to 0.0.3.
 st_decisions() {
   printf '\n  the decisions the real-runner test relies on, said exactly\n'
-  local p='syndeo preinstall: refusing:' label missing n
+  local p='syndeo preinstall: refusing:' label missing n published v
   decided=''
 
   # The first install, as a person makes it, with commands install.sh put in
@@ -2018,14 +2018,24 @@ st_decisions() {
   decision_case "reinstall" preinstall 0.1.7 0 "syndeo preinstall: reinstalling 0.1.7"
 
   # The published 0.2.0, stapled, under its receipt, and the real package
-  # over it. Here V is 0.2.1, as a release's is; a pull request's package,
-  # until it raises the version, is 0.2.0 itself, and reinstalls it.
+  # over it. Here V is 0.2.1, as a pull request's is until it raises the
+  # version; and 0.2.0 itself, as a pull request's was before 0.2.1, which
+  # reinstalled it.
   st_new; st_app_installed 0.2.0 yes
   decision_case "upgrade-from-0.2.0" preinstall 0.2.1 0 "syndeo preinstall: upgrading from 0.2.0 to 0.2.1"
   st_new; st_app_installed 0.2.0 yes
   decision_case "upgrade-from-0.2.0-as-0.2.0" preinstall 0.2.0 0 "syndeo preinstall: reinstalling 0.2.0"
   st_new; st_app 0.2.1; st_app_receipt 0.2.0 yes
   decision_case "upgrade-from-0.2.0-postinstall" postinstall 0.2.1 0 "syndeo postinstall: Syndeo.app 0.2.1 is installed in $R/Applications"
+  # The published 0.2.1 the same way. Here V is 0.3.0, as the next
+  # release's is; a pull request's package, until it raises the version, is
+  # 0.2.1 itself, and reinstalls it.
+  st_new; st_app_installed 0.2.1 yes
+  decision_case "upgrade-from-0.2.1" preinstall 0.3.0 0 "syndeo preinstall: upgrading from 0.2.1 to 0.3.0"
+  st_new; st_app_installed 0.2.1 yes
+  decision_case "upgrade-from-0.2.1-as-0.2.1" preinstall 0.2.1 0 "syndeo preinstall: reinstalling 0.2.1"
+  st_new; st_app 0.3.0; st_app_receipt 0.2.1 yes
+  decision_case "upgrade-from-0.2.1-postinstall" postinstall 0.3.0 0 "syndeo postinstall: Syndeo.app 0.3.0 is installed in $R/Applications"
 
   # The v0.1.x command-line package: 0.1.6, then 0.1.7.
   st_new; st_legacy 0.1.6; echo x >"$D/0.1.6/notes.txt"
@@ -2106,13 +2116,18 @@ st_decisions() {
 
   # Every install the runner makes whose outcome a script decides has its
   # case above, named after it: each literal label of refused, installed and
-  # install, and each failed_upgrade with the three it makes. The install on
+  # install, each failed_upgrade with the three it makes, and upgrade-from-V
+  # for each published package V that published_upgrade installs the real
+  # one over, read from the runner test's own PUBLISHED_APPS. The install on
   # another volume is Installer's own refusal; no script runs.
+  published="$(bash -c '. "$1" --source-only && printf "%s\n" $PUBLISHED_APPS' _ "$here/test-pkg-install.sh")"
   missing=''
+  [ -n "$published" ] || missing=" upgrade-from-V, test-pkg-install.sh's PUBLISHED_APPS being empty or unread"
   for label in $(
     {
       grep -oE '^[[:space:]]*(refused|installed|install|failed_install) [a-z0-9][a-z0-9.-]*' "$here/test-pkg-install.sh" | awk '{print $2}'
       grep -oE '^[[:space:]]*failed_upgrade [a-z0-9][a-z0-9.-]*' "$here/test-pkg-install.sh" | awk '{print $2; print $2 "-older-package"; print $2 "-newer-package"; print $2 "-the-same-package-again"}'
+      for v in $published; do echo "upgrade-from-$v"; done
     } | grep -vx 'another-volume' | sort -u
   ); do
     case " $decided " in *" $label "*) ;; *) missing="$missing $label" ;; esac

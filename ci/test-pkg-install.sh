@@ -28,17 +28,20 @@
 #    is its uninstaller; quit, nothing of it left running. Reinstalled.
 #    Installed on another volume: refused. Removed with its uninstaller,
 #    Syndeo's user data kept.
-# 2. The published Syndeo-0.2.0.pkg, downloaded and checked against its
-#    release's SHA256SUMS, installed: its receipt 0.2.0, and Syndeo.app 0.2.0
-#    byte for byte the bundle it carries, stapled ticket and all. A file of
-#    the person's planted in ~/Library/Application Support/Syndeo, and a
-#    search engine in Syndeo's preferences. <pkg> over it, as every 0.2.0
-#    customer upgrades (a pull request's <pkg>, until it raises the version,
-#    is 0.2.0 itself, and reinstalls it): its receipt, and its bundle byte
-#    for byte the one <pkg> carries, its signature and its uninstaller with
-#    it, nothing of 0.2.0's left; the person's file, the preferences and all
-#    Syndeo's user data byte for byte as they were, install.sh's commands
-#    untouched. Removed with its uninstaller, the user's data kept.
+# 2. The published Syndeo-0.2.0.pkg, then the published Syndeo-0.2.1.pkg
+#    (PUBLISHED_APPS), each in turn downloaded and checked against its
+#    release's SHA256SUMS, installed: its receipt that version, and
+#    Syndeo.app that version byte for byte the bundle it carries, stapled
+#    ticket and all. A file of the person's planted in
+#    ~/Library/Application Support/Syndeo, and a search engine in Syndeo's
+#    preferences. <pkg> over it, as every customer of that version upgrades
+#    (a pull request's <pkg>, until it raises the version, is 0.2.1 itself:
+#    it upgrades 0.2.0, and reinstalls 0.2.1): its receipt, and its bundle
+#    byte for byte the one <pkg> carries, its signature and its uninstaller
+#    with it, nothing of the published package's left; the person's file,
+#    the preferences and all Syndeo's user data byte for byte as they were,
+#    install.sh's commands untouched. Removed with its uninstaller, the
+#    user's data kept.
 # 3. The published v0.1.6 and v0.1.7 command-line packages, downloaded and
 #    checked against their releases' SHA256SUMS. Over 0.1.6, every kind of
 #    change to its installation is refused, nothing changed; then <pkg>
@@ -93,6 +96,10 @@ LIBEXEC=/usr/local/libexec
 D=/usr/local/libexec/syndeo
 ALT=/Volumes/SyndeoAltTest
 REPO_URL=https://github.com/SUM-INNOVATION/syndeo/releases/download
+# The published Syndeo.app packages a customer upgrades from, oldest first:
+# section 2 installs each and <pkg> over it, so run refuses a <pkg> older
+# than any of them.
+PUBLISHED_APPS="0.2.0 0.2.1"
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
 
 say() { printf '%s\n' "$*"; }
@@ -544,8 +551,8 @@ failed_install() {
   pass "$label: the install failed, as its fault makes it"
 }
 
-# published_install LABEL PKG: one of the published packages, v0.1.x or
-# 0.2.0, installed; what its scripts decide is their own, as published.
+# published_install LABEL PKG: one of the published packages, v0.1.x, 0.2.0
+# or 0.2.1, installed; what its scripts decide is their own, as published.
 published_install() {
   install "$1" "$2" || { sed 's/^/      | /' "$last_log.installer"; fail "$1: the published package did not install"; }
   pass "$1: installed"
@@ -916,7 +923,7 @@ gatekeeper() {
 # ------------------------------------------------------------------ run
 
 run() {
-  local pkg="$1" version="$2" st n q s1 s2 s3 f1 f3 trashed before
+  local pkg="$1" version="$2" st n q s1 s2 s3 f1 f3 trashed before v
   guard
   st="$(ST)"
   [ -e "$st" ] && refuse "$st exists: this runner has been used for this test before"
@@ -924,7 +931,9 @@ run() {
   present "$HOME/.Trash/Syndeo.app" && refuse "there is a Syndeo.app in the Trash already"
   mount | grep -q " on $ALT " && refuse "$ALT is already mounted"
   [ "$(syndeo_cmp "$version" 0.0.3)" = gt ] || refuse "$version is not newer than the stand-ins, 0.0.1 to 0.0.3"
-  [ "$(syndeo_cmp "$version" 0.2.0)" != lt ] || refuse "$version is older than the published 0.2.0, which it has to upgrade"
+  for v in $PUBLISHED_APPS; do
+    [ "$(syndeo_cmp "$version" "$v")" != lt ] || refuse "$version is older than the published $v, which it has to upgrade"
+  done
   REAL_VERSION="$version"
   mkdir -p "$st/logs"
   : >"$st/planted"
@@ -935,7 +944,7 @@ run() {
 
   say "Installing $pkg ($version) on this runner, again and again. It writes only:"
   pkgutil --payload-files "$pkg" | sed 's|^\.|  /Applications|'
-  say "The test also installs the published v0.1.6, v0.1.7 and 0.2.0 packages, install.sh's commands in $BIN,"
+  say "The test also installs the published v0.1.6, v0.1.7, 0.2.0 and 0.2.1 packages, install.sh's commands in $BIN,"
   say "stand-in packages 0.0.1 to 0.0.3, and a disk image mounted at $ALT; cleanup removes all of it."
   payload_app "$pkg" "$st/real-payload"
   s1="$(standin 0.0.1)" || fail "building the stand-in 0.0.1"
@@ -986,49 +995,8 @@ run() {
   section "removed with its uninstaller"
   uninstalled "$version"
 
-  section "2. the published Syndeo-0.2.0.pkg, upgraded, as every 0.2.0 customer's is"
-  old_release 0.2.0 Syndeo-0.2.0.pkg
-  local p020="$OLD_PKG" asd="$HOME/Library/Application Support/Syndeo" kept from data saved was now
-  payload_app "$p020" "$st/published-0.2.0"
-  published_install published-0.2.0 "$p020"
-  note_said "installing 0.2.0" >/dev/null
-  must "  ... its receipt, $APP_ID 0.2.0, and Syndeo.app 0.2.0" eval "receipt_is $APP_ID 0.2.0 && app_is 0.2.0"
-  was="$(cdhash "$APP")"
-  must "  ... byte for byte the bundle the published package carries, its stapled ticket among it (CDHash $was)" eval \
-    "[ -f '$APP/Contents/CodeResources' ] && same_bundle '$APP' '$st/published-0.2.0/Syndeo.pkg/Payload/Syndeo.app'"
-  # What a person who has used 0.2.0 has: a file of theirs where Syndeo
-  # keeps its data, and a search engine chosen in its Settings.
-  present "$asd" || plant dir "$asd" "$(id -un):$(id -gn)" 700
-  kept="$asd/kept-across-the-upgrade-from-0.2.0"
-  plant file "$kept" "a person's file, which no upgrade may touch
-" "$(id -un):$(id -gn)" 600
-  plant_default SearchEngine startpage
-  must "a file of the person's planted in $asd" still_planted "$kept"
-  must "  ... and SearchEngine startpage in Syndeo's preferences, $BUNDLE_ID" test "$(defaults read "$BUNDLE_ID" SearchEngine 2>/dev/null)" = startpage
-  data="$(settled_user_data)"
-  saved="$(prefs)"
-  # A release's <pkg> upgrades 0.2.0. A pull request's is 0.2.0 itself until
-  # it raises the version, and the preinstall decides on reinstalling it.
-  if [ "$(syndeo_cmp "$version" 0.2.0)" = gt ]; then from="upgrading from 0.2.0 to $version"; else from="reinstalling 0.2.0"; fi
-  installed upgrade-from-0.2.0 "$pkg" "$from" "$version"
-  note_said "Syndeo.app $version is installed in /Applications" >/dev/null
-  now="$(cdhash "$st/real-payload/Syndeo.pkg/Payload/Syndeo.app")"
-  must "  ... its receipt, $APP_ID $version" receipt_is "$APP_ID" "$version"
-  must "  ... Syndeo.app byte for byte the bundle the package under test carries: nothing of the published 0.2.0's left" \
-    same_bundle "$APP" "$st/real-payload/Syndeo.pkg/Payload/Syndeo.app"
-  must "  ... its code signature the package under test's (CDHash $now), not the published 0.2.0's ($was)" eval \
-    "[ -n '$now' ] && [ '$now' != '$was' ] && [ \"\$(cdhash '$APP')\" = '$now' ]"
-  must "  ... its uninstaller $version's" grep -qxF "EMBEDDED='$version'" "$APP/Contents/Resources/uninstall.sh"
-  must "  ... the person's file byte for byte, the very file planted" still_planted "$kept"
-  must "  ... Syndeo's preferences byte for byte as they were" prefs_kept "$saved"
-  must "  ... and all of Syndeo's user data byte for byte as it was" user_data_kept "$data"
-  must "  ... install.sh's commands in $BIN untouched" cli_untouched "$BIN"
-  uninstalled "$version"
-  unplant "$kept"
-  if [ -n "$(planted_meta "$asd")" ]; then unplant "$asd"; fi
-  unplant_default SearchEngine startpage
-  must "the person's file and preference, the test's own, removed again" eval \
-    "! present '$kept' && ! defaults read $BUNDLE_ID SearchEngine >/dev/null 2>&1"
+  section "2. the published Syndeo.app packages, ${PUBLISHED_APPS// /, }, each with the package under test over it"
+  for v in $PUBLISHED_APPS; do published_upgrade "$v" "$pkg" "$version"; done
 
   section "3. the published v0.1.x command-line packages"
   cli_remove "$BIN"
@@ -1191,6 +1159,68 @@ uninstalled() {
     { sed 's/^/      | /' "$log"; fail "the uninstaller failed"; }
   must "the uninstaller removed Syndeo.app $v, and its receipt" eval "! present '$APP' && no_receipt $APP_ID && grep -q 'removed Syndeo.app $v' '$log'"
   must "  ... the user's data kept, byte for byte" user_data_kept "$data"
+}
+
+# published_upgrade V PKG VERSION: the published Syndeo-V.pkg, downloaded and
+# checked against its release's SHA256SUMS, installed, exactly the bundle it
+# carries; a file of the person's and a preference planted; PKG, the package
+# under test, VERSION, over it, as every V customer upgrades: the receipt,
+# the bundle, its signature and its uninstaller PKG's, nothing of V's left,
+# and the person's data byte for byte; then removed with its uninstaller,
+# and what was planted removed again, the runner as it was before. A
+# release's PKG upgrades every V. A pull request's, until it raises the
+# version, is the newest published V itself, and the preinstall decides on
+# reinstalling it; a VERSION older than any V is refused before anything is
+# installed.
+published_upgrade() {
+  local v="$1" pkg="$2" version="$3" st asd kept from data saved was now
+  st="$(ST)"
+  asd="$HOME/Library/Application Support/Syndeo"
+  if [ "$(syndeo_cmp "$version" "$v")" = gt ]; then
+    from="upgrading from $v to $version"
+    section "the published Syndeo-$v.pkg, upgraded, as every $v customer's is"
+  else
+    from="reinstalling $v"
+    section "the published Syndeo-$v.pkg, reinstalled: the package under test is $v itself, until it raises the version"
+  fi
+  old_release "$v" "Syndeo-$v.pkg"
+  payload_app "$OLD_PKG" "$st/published-$v"
+  published_install "published-$v" "$OLD_PKG"
+  note_said "installing $v" >/dev/null
+  must "  ... its receipt, $APP_ID $v, and Syndeo.app $v" eval "receipt_is $APP_ID $v && app_is $v"
+  was="$(cdhash "$APP")"
+  must "  ... byte for byte the bundle the published package carries, its stapled ticket among it (CDHash $was)" eval \
+    "[ -f '$APP/Contents/CodeResources' ] && same_bundle '$APP' '$st/published-$v/Syndeo.pkg/Payload/Syndeo.app'"
+  # What a person who has used V has: a file of theirs where Syndeo keeps
+  # its data, and a search engine chosen in its Settings.
+  present "$asd" || plant dir "$asd" "$(id -un):$(id -gn)" 700
+  kept="$asd/kept-across-the-upgrade-from-$v"
+  plant file "$kept" "a person's file, which no upgrade may touch
+" "$(id -un):$(id -gn)" 600
+  plant_default SearchEngine startpage
+  must "a file of the person's planted in $asd" still_planted "$kept"
+  must "  ... and SearchEngine startpage in Syndeo's preferences, $BUNDLE_ID" test "$(defaults read "$BUNDLE_ID" SearchEngine 2>/dev/null)" = startpage
+  data="$(settled_user_data)"
+  saved="$(prefs)"
+  installed "upgrade-from-$v" "$pkg" "$from" "$version"
+  note_said "Syndeo.app $version is installed in /Applications" >/dev/null
+  now="$(cdhash "$st/real-payload/Syndeo.pkg/Payload/Syndeo.app")"
+  must "  ... its receipt, $APP_ID $version" receipt_is "$APP_ID" "$version"
+  must "  ... Syndeo.app byte for byte the bundle the package under test carries: nothing of the published $v's left" \
+    same_bundle "$APP" "$st/real-payload/Syndeo.pkg/Payload/Syndeo.app"
+  must "  ... its code signature the package under test's (CDHash $now), not the published $v's ($was)" eval \
+    "[ -n '$now' ] && [ '$now' != '$was' ] && [ \"\$(cdhash '$APP')\" = '$now' ]"
+  must "  ... its uninstaller $version's" grep -qxF "EMBEDDED='$version'" "$APP/Contents/Resources/uninstall.sh"
+  must "  ... the person's file byte for byte, the very file planted" still_planted "$kept"
+  must "  ... Syndeo's preferences byte for byte as they were" prefs_kept "$saved"
+  must "  ... and all of Syndeo's user data byte for byte as it was" user_data_kept "$data"
+  must "  ... install.sh's commands in $BIN untouched" cli_untouched "$BIN"
+  uninstalled "$version"
+  unplant "$kept"
+  if [ -n "$(planted_meta "$asd")" ]; then unplant "$asd"; fi
+  unplant_default SearchEngine startpage
+  must "the person's file and preference, the test's own, removed again" eval \
+    "! present '$kept' && ! defaults read $BUNDLE_ID SearchEngine >/dev/null 2>&1"
 }
 
 # forget_fails V: the uninstaller, as a stand-in pkgutil makes forgetting the
