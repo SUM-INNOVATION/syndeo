@@ -2393,7 +2393,12 @@ EOF
   binaries_case "another executable killed at launch" 1 "syndeo-proxy — --version: killed by signal 9 at launch" STANDIN_KILLED=syndeo-proxy
   binaries_case "an executable that says another version" 1 "syndeo-net — --version: said 'syndeo-net 9.9.9', not 'syndeo-net 0.0.1'" STANDIN_SAYS_OTHER=syndeo-net
   binaries_case "an executable that says its version and exits non-zero" 1 "syndeo-agent — --version: exited 3, saying 'syndeo-agent 0.0.1'" STANDIN_EXITS=syndeo-agent
-  binaries_case "an executable that does not finish" 1 "syndeo-ui — --version: did not finish in 2 seconds" STANDIN_HANGS=syndeo-ui SYNDEO_VERIFY_LAUNCH_SECONDS=2
+  # The limit applies to every stand-in in the case, not only the one that
+  # hangs (it sleeps 30 s). At 2 s, a stand-in that ought to finish was cut
+  # short too, in two gate runs on a busy Mac in November 2026: each is a
+  # freshly written executable, whose first launch macOS may scan first.
+  # 15 s leaves those their time and still ends the hang at half its length.
+  binaries_case "an executable that does not finish" 1 "syndeo-ui — --version: did not finish in 15 seconds" STANDIN_HANGS=syndeo-ui SYNDEO_VERIFY_LAUNCH_SECONDS=15
   binaries_case "the keystore claiming platform presence" 1 "syndeo-keystore status — does not report platform presence unenforced and the passphrase required" STANDIN_PRESENCE=true
   binaries_case "the keystore not requiring the passphrase" 1 "syndeo-keystore status — does not report platform presence unenforced and the passphrase required" STANDIN_PASSPHRASE_REQUIRED=false
   out="$(env -u MACOS_TEAM_ID SYNDEO_EXPECT_SIGNED=yes bash "$here/verify-pkg.sh" signed-binaries "$tgz" 0.0.1 2>&1)" && status=0 || status=$?
