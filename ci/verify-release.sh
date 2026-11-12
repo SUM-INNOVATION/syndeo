@@ -210,11 +210,15 @@ notarized_tool() {
   last="$(printf '%s\n' "$out" | sed -n 's/^Authority=//p' | tail -n 1)"
   developer_id "$first" "$TEAM" || problems="$problems signed by '${first:-nobody}';"
   [ "$last" = "Apple Root CA" ] || problems="$problems not chained to Apple Root CA;"
-  printf '%s\n' "$out" | grep -qx "TeamIdentifier=$TEAM" ||
+  # Each line is looked for in a here-string, never piped from printf, which
+  # writes a line at a time: grep -q stops at the line it looks for, printf
+  # is killed by SIGPIPE if a line is still to be written, and pipefail then
+  # fails the check with its line there.
+  grep -qx "TeamIdentifier=$TEAM" <<<"$out" ||
     problems="$problems TeamIdentifier '$(printf '%s\n' "$out" | sed -n 's/^TeamIdentifier=//p')';"
   codesign --verify --strict "$BIN/$b" >/dev/null 2>&1 || problems="$problems does not verify strictly;"
-  printf '%s\n' "$out" | grep -qE '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' || problems="$problems no hardened runtime;"
-  printf '%s\n' "$out" | grep -q '^Timestamp=' || problems="$problems no secure timestamp;"
+  grep -qE '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime[^)]*\)' <<<"$out" || problems="$problems no hardened runtime;"
+  grep -q '^Timestamp=' <<<"$out" || problems="$problems no secure timestamp;"
   # Read whole before it is looked at: grep -q stopping at its first match
   # would kill a writer still writing, and pipefail would then count the
   # pipeline as failed.
@@ -295,12 +299,12 @@ check_doctor() {
   os="$(uname -s)"
   note "the process model"
   doctor=$(SYNDEO_HOME="$HOME_DIR" "$BIN/syndeo" doctor 2>"$WORK/doctor.err")
-  if echo "$doctor" | grep -q 'NOT FOUND'; then
+  if grep -q 'NOT FOUND' <<<"$doctor"; then
     bad "the shell finds its sibling processes" "$(echo "$doctor" | grep 'NOT FOUND' | tr '\n' ' ')"
   else
     ok "the shell finds its sibling processes"
   fi
-  if echo "$doctor" | grep -q 'keystore .*initialized'; then
+  if grep -q 'keystore .*initialized' <<<"$doctor"; then
     ok "the keystore starts and answers"
   else
     bad "the keystore starts" "$(echo "$doctor" | grep -i keystore | head -1 | tr -s ' ')"
@@ -318,23 +322,23 @@ check_doctor() {
 
   # The boundaries are the keystore's own account of this session. 0.1.3
   # printed a fixed list whatever the platform or session could do.
-  if echo "$doctor" | grep -q 'the seed is forgotten on idleness, on sleep, and on screen lock'; then
+  if grep -q 'the seed is forgotten on idleness, on sleep, and on screen lock' <<<"$doctor"; then
     bad "doctor states facts, not a fixed list" "it prints 0.1.3's fixed seed-retention claim"
-  elif echo "$doctor" | grep -q 'no seed exists: the keystore is not initialized'; then
+  elif grep -q 'no seed exists: the keystore is not initialized' <<<"$doctor"; then
     ok "doctor says no seed exists, for a home with no keys"
   else
     bad "doctor states facts, not a fixed list" "no seed-retention line for an uninitialized keystore"
   fi
   if [ "$os" = Linux ]; then
-    if echo "$doctor" | grep -q 'on screen lock'; then
+    if grep -q 'on screen lock' <<<"$doctor"; then
       bad "no screen-lock claim on Linux" "$(echo "$doctor" | grep 'on screen lock' | head -1 | sed 's/^ *//')"
     else
       ok "doctor claims nothing about screen lock on Linux"
     fi
   fi
   if [ "$os" = Darwin ]; then
-    if echo "$doctor" | grep -q 'syndeo-webkit is outside that' \
-       && echo "$doctor" | grep -q 'localhost and loopback'; then
+    if grep -q 'syndeo-webkit is outside that' <<<"$doctor" \
+       && grep -q 'localhost and loopback' <<<"$doctor"; then
       ok "doctor says WebKit is outside the net process, and names the loopback bypass"
     else
       bad "the WebKit line" "doctor does not say WebKit is outside the net process, with its loopback bypass"
@@ -348,12 +352,12 @@ check_runtime() {
 
   note "fetching, and the cache"
   out=$(SYNDEO_HOME="$HOME_DIR" "$BIN/syndeo" browse https://www.rust-lang.org/ --twice 2>/dev/null)
-  if echo "$out" | grep -qE '^  200'; then
+  if grep -qE '^  200' <<<"$out"; then
     ok "fetches a page over the network"
   else
     bad "fetch" "no 200 in the output"
   fi
-  if echo "$out" | grep -q 'again   cache'; then
+  if grep -q 'again   cache' <<<"$out"; then
     ok "the second fetch is served from cache"
   else
     bad "cache hit" "the second fetch was not a hit"
@@ -362,7 +366,7 @@ check_runtime() {
   # The regression that nearly shipped: the hit is served and then forgotten,
   # because the process holding the cache is killed before it can write.
   stats=$(SYNDEO_HOME="$HOME_DIR" "$BIN/syndeo" stats 2>/dev/null | head -1)
-  if echo "$stats" | grep -qE 'hits [1-9]'; then
+  if grep -qE 'hits [1-9]' <<<"$stats"; then
     ok "the hit survives the process that served it"
   else
     bad "statistics persist" "$stats"
@@ -386,12 +390,12 @@ check_runtime() {
   wait "$proxy_pid" 2>/dev/null
 
   note "privacy defaults"
-  if "$BIN/syndeo-net" --help 2>&1 | grep -q 'doh:cloudflare'; then
+  if out="$("$BIN/syndeo-net" --help 2>&1)" && grep -q 'doh:cloudflare' <<<"$out"; then
     ok "DNS resolves over HTTPS by default"
   else
     bad "DoH default" "not the default"
   fi
-  if "$BIN/syndeo-net" --help 2>&1 | grep -q 'unpartitioned-cache'; then
+  if out="$("$BIN/syndeo-net" --help 2>&1)" && grep -q 'unpartitioned-cache' <<<"$out"; then
     ok "the cache is partitioned, with a documented opt-out"
   else
     bad "partitioning" "no opt-out flag"
@@ -706,7 +710,7 @@ self_test() {
   local out status
   out="$(env -u MACOS_TEAM_ID FAKE_LOG="$root/no-team.log" FAKE_OS=Darwin PATH="$stand_ins:$PATH" \
     SYNDEO_EXPECT_SIGNED=yes SYNDEO_INSTALLER="$root/no-such-installer" bash "$0" 0.1.3 2>&1)" && status=0 || status=$?
-  if [ "$status" = 2 ] && printf '%s' "$out" | grep -q 'needs MACOS_TEAM_ID'; then
+  if [ "$status" = 2 ] && grep -q 'needs MACOS_TEAM_ID' <<<"$out"; then
     printf '  ok    %s\n' "signed expected on macOS without MACOS_TEAM_ID: refused before anything runs"
   else
     printf '  WRONG %s; exit %s: %s\n' "signed expected on macOS without MACOS_TEAM_ID: refused before anything runs" "$status" "$(printf '%s' "$out" | tail -n 2 | tr '\n' ' ')"
