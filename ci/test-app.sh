@@ -159,7 +159,20 @@
 # agent-downloads-allowed, agent-downloads' checks (agent downloads:), after
 # the prompt; for download-challenge-unpinned, downloads' files arriving
 # over TLS connections of their own, their challenges answered with
-# Syndeo's authority (downloads:). Any other failure is a failure.
+# Syndeo's authority (downloads:). For favorites-in-agent-windows and
+# agent-tabs-follow-spaces, with the person's favorites and spaces written
+# first, an agent's window showing no favorite tile and its tab's menu
+# offering no Add to Favorites, and its tabs still listed after the person
+# switches spaces (apart:). For subframe-downloads-allowed, the window's
+# rule's hidden frames alone (downloads: a hidden cross-origin iframe); for
+# automatic-downloads-unlimited, its page trying three automatic downloads,
+# and what the person asks for there, alone (downloads: a page that tries
+# three automatic downloads); for downloads-kept-after-clear, Clear Browsing
+# Data and the downloads alone (downloads: Clear Browsing Data). For
+# spaces-take-out-unlisted, with the sidebar's two spaces written first and
+# no session, sidebar's spaces check, to its first failure: what each space
+# shows after Next Space, Previous Space, its emoji and Delete Space
+# (spaces:). Any other failure is a failure.
 #
 # agents, which gates programs on this Mac driving Syndeo with the person's
 # leave: see the section of that name below.
@@ -267,7 +280,8 @@
 #     with its history; Window > Pin Tab puts the tab first, its row
 #     marked with a pin; a secondary click on a tab's row
 #     opens Syndeo's menu for it, Unpin Tab for a pinned one, and its
-#     Duplicate Tab duplicates that tab;
+#     Duplicate Tab duplicates that tab; a Control-click on a row, which
+#     macOS makes a secondary click, opens the same menu, choosing no tab;
 #   - File > Close Other Tabs closes all but the pinned one, which says no to
 #     closing, and this one;
 #     History > Recently Closed lists them by title; ⇧⌘T opens the last one
@@ -292,7 +306,14 @@
 # tabs-memory.txt. It removes the setting it made and the session.
 #
 # sidebar, which gates the sidebar's rows being made only in the window in
-# front of its tab group, and measures the app's memory with many tabs. On
+# front of its tab group, and what the sidebar shows as the person changes
+# spaces, and measures the app's memory with many tabs. First, in an
+# opening of its own with two spaces, the second empty (sidebar_spaces):
+# Next Space into the empty one opens a tab there whose sidebar shows that
+# space's name, its row and New Tab; Previous Space, the second space's
+# emoji pressed in the switcher, and Delete Space each show the space then
+# current, its name and its tabs, the one in front marked, and New Tab; and
+# the app then holds one row a tab of the window in front. Then, on
 # pages this Mac serves (sidebar-1.html to sidebar-50.html, each titled
 # "Sidebar page I"), each asked for by another application, as `open -a`
 # asks, so that each opens in a tab of its own, in front, after the last;
@@ -388,6 +409,9 @@ APP_LOG=''
 # Arguments started hands the application through open, after --args when
 # set: none, unless a check says otherwise.
 OPEN_ARGS=()
+# Environment started gives the application, as open's --env options:
+# none, unless a check says otherwise.
+OPEN_ENV=()
 
 # What example.com's page itself says. Its <title> is "Example Domain", and
 # the window takes its title from the page through its controller, so that is
@@ -413,9 +437,9 @@ started() {
   # instance opened could otherwise be shown without this one fetching it.
   FRESH="fresh$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
   if [ -n "${3:-}" ]; then
-    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" -a "$app" "$3" || { bad "open ($round)" "open failed"; return 1; }
+    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" ${OPEN_ENV[@]+"${OPEN_ENV[@]}"} -a "$app" "$3" || { bad "open ($round)" "open failed"; return 1; }
   else
-    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" "$app" ${OPEN_ARGS[@]+"${OPEN_ARGS[@]}"} || { bad "open ($round)" "open failed"; return 1; }
+    open --stdout "$LOGS/app-$round.stdout" --stderr "$LOGS/app-$round.stderr" ${OPEN_ENV[@]+"${OPEN_ENV[@]}"} "$app" ${OPEN_ARGS[@]+"${OPEN_ARGS[@]}"} || { bad "open ($round)" "open failed"; return 1; }
   fi
   until=$((SECONDS + 30))
   while :; do
@@ -1655,7 +1679,13 @@ mutant() {
     direct-for-every-host) intended='^(https://example\.com stays Through Syndeo|and nothing was sent directly for it)$' ;;
     never-retry-direct) intended='^(on macOS [0-9]+, https://github\.com, on macOS.s HSTS preload list, opens|and the bar says Direct — not cached by Syndeo|and the log says it sent a host directly)' ;;
     agent-downloads-allowed) intended='^agent downloads:' ;;
+    favorites-in-agent-windows) intended='^apart: an agent.s (window shows no favorite tiles|tab.s own menu offers no Add to Favorites)' ;;
+    agent-tabs-follow-spaces) intended='^apart: after the person switches spaces, an agent.s window still lists all its tabs$' ;;
+    spaces-take-out-unlisted) intended='^spaces: ' ;;
     download-challenge-unpinned) intended='^downloads: a file an https page links ' ;;
+    subframe-downloads-allowed) intended='^downloads: a hidden cross-origin iframe ' ;;
+    automatic-downloads-unlimited) intended='^downloads: a page that tries three automatic downloads ' ;;
+    downloads-kept-after-clear) intended='^downloads: Clear Browsing Data ' ;;
     *) say "no mutant $name"; exit 2 ;;
   esac
   # What a mutant that downloads saves in ~/Downloads is removed again.
@@ -1667,6 +1697,15 @@ mutant() {
     mkdir -p "$(dirname "$session")"
     printf 'syndeo-session 1\nwindow\t0\ntab\t-\thttps://example.com/\tExample Domain\n' >"$session"
   fi
+  # The person's favorites and spaces, for those an agent's window has to
+  # show none of, and ignore.
+  case "$name" in favorites-in-agent-windows | agent-tabs-follow-spaces) apart_defaults ;; esac
+  # Two spaces, the second empty, for the sidebar's spaces check.
+  case "$name" in spaces-*)
+    rm -f "$session"
+    defaults write "$ID" SyndeoSpaces -string "$SIDEBAR_SPACES"
+    ;;
+  esac
   if started "$app" "mutant-$name"; then
     helper_of "$app" "mutant-$name"
     browses "mutant-$name"
@@ -1679,10 +1718,14 @@ mutant() {
       reload-from-cache) reload_gate ;;
       tabs-kept-after-clear) tabs_cleared "$session" ;;
       websocket-headers-stripped) realtime_origin && rt_through_syndeo ;;
-      agent-*) agents_mutant "$name" "$app" ;;
+      agent-* | favorites-in-agent-windows) agents_mutant "$name" "$app" ;;
       direct-for-every-host | never-retry-direct) preloaded "$log" ;;
-      download-*) downloads_checks "$log" ;;
+      download-*) dl_original "$log" ;;
+      subframe-downloads-allowed) dl_origin && dl_frames "$log" "$(token)" ;;
+      automatic-downloads-unlimited) dl_origin && dl_automatic "$log" "$(token)" ;;
+      downloads-kept-after-clear) dl_origin && dl_clear "$log" "$(token)" ;;
       sidebar-* | backdrop-*) sidebar_rounds "$app" "$log" "$SIDEBAR_GATE" ;;
+      spaces-*) sidebar_spaces "$app" "$log" first ;;
       *) policy "$log" ;;
     esac
   fi
@@ -1693,6 +1736,12 @@ mutant() {
   stopped "mutant-$name"
   dl_put_back
   defaults delete "$ID" AgentControl >/dev/null 2>&1 || true
+  case "$name" in favorites-in-agent-windows | agent-tabs-follow-spaces) apart_forget ;; esac
+  case "$name" in spaces-*)
+    defaults delete "$ID" SyndeoSpaces >/dev/null 2>&1 || true
+    rm -f "$session"
+    ;;
+  esac
   # What it kept, which a clear would have forgotten.
   [ "$name" = tabs-kept-after-clear ] && rm -f "$session"
   printf '\n'
@@ -2540,7 +2589,10 @@ realtime() {
 #            the session sends hosts directly, and its wait ends on the page
 #            loaded again (agents_direct);
 #   off:     turned off, the socket is gone and a client cannot reach Syndeo.
-# Then a round of an agent's tabs beside the person's (agents_tabs).
+# Then a round of an agent's tabs beside the person's (agents_tabs); and,
+# the person having favorites and two spaces, nothing of theirs in an agent's
+# window, which lists its tabs whatever space the person is in (apart:,
+# agents_apart).
 # Nothing of any address an agent opened is in a log. The trust settings are
 # as they were, no keystore was made, and the setting is removed again.
 AGENT_BIN='' AGENT_SOCK='' AGENT_T1='' AGENT_T2='' AGENT_BG=''
@@ -3102,11 +3154,177 @@ agents_tabs() {
   rm -f "$session"
 }
 
+# The person's favorites and spaces, as the app keeps them in its defaults,
+# written before it opens (apart_defaults) and taken away again once it has
+# quit (apart_forget): two spaces, the first current, with a folder in it,
+# and a favorite in each.
+APART_SPACES='{"spaces":[{"id":1,"name":"Apart home","hue":0,"icon":""},{"id":2,"name":"Apart work","hue":1,"icon":""}],"folders":[{"id":3,"name":"Apart folder","space":1,"collapsed":false}],"current":1,"next_id":4}'
+apart_defaults() {
+  defaults write "$ID" SyndeoSpaces -string "$APART_SPACES"
+  defaults write "$ID" SyndeoFavorites.1 -string '[{"address":"https://example.org/","title":"Apart favorite"}]'
+  defaults write "$ID" SyndeoFavorites.2 -string '[{"address":"https://example.net/","title":"Apart favorite two"}]'
+}
+apart_forget() {
+  local key
+  for key in SyndeoSpaces SyndeoFavorites.1 SyndeoFavorites.2; do
+    defaults delete "$ID" "$key" >/dev/null 2>&1 || true
+  done
+}
+
+# apart_front TAB: the agent chooses its tab TAB, and the app is brought to
+# the front: whether the window in front is then the agent's, saying who
+# controls it, within 10 s.
+apart_front() {
+  agent "$LOGS/agent-apart-select.json" "{\"cmd\":\"select\",\"tab\":${1:-1}}"
+  "$APPCTL" activate "$PID" >/dev/null || true
+  wait_for 10 sh -c '"$1" front-tree "$2" | grep -qF "$3"' _ "$APPCTL" "$PID" 'Controlled by “ci-agent”'
+}
+
+# apart_listed: within 10 s, the window in front lists the agent's two tabs
+# in its sidebar's rows, by their titles, and no other.
+apart_listed() {
+  wait_for 10 sh -c '[ "$("$1" tabs "$2" | cut -c 3- | LC_ALL=C sort | tr "\n" "|")" = "Agent test|Second|" ]' _ "$APPCTL" "$PID"
+}
+
+# agents_apart ROUND: nothing of the person's in an agent's window, and its
+# tabs listed whatever space the person is in (#70's review), in an
+# application already running as ROUND, opened after apart_defaults, with
+# agents on. The person opens a page; the agent, allowed for the session,
+# opens two tabs of its own.
+#   apart: the person's own window shows their favorites, as tiles, and their
+#          spaces: the switcher, the folder and the space's name. The agent's
+#          window, in front and listing its two tabs, shows no favorite
+#          tile, and none of the person's spaces: no switcher, folder or
+#          space's name; its tab's own menu offers no Add to Favorites and
+#          none of the person's folders. The person switches to their second
+#          space, from the Spaces menu, as the app's log and the layout it
+#          keeps say; the agent's window still lists both its tabs. New Tab
+#          in it shows the command bar, which suggests the person's tabs and
+#          favorites, over a window of the person's, brought to the front,
+#          not over the agent's.
+# The tab's menu comes before the switch, while the agent's window has rows
+# to open it from, whatever a mutant does to them after. The switch is read
+# from the app's log and kept layout: in CI 43092994068 and 43101278032 the
+# person's window in front after it, the new tab of the second space, never
+# showed that space's name. Measured, not gated: how many rows that window
+# lists then, and what it says of the spaces; and whether, after the menu
+# and the bar, a sidebar still changes when the agent's other tab is
+# brought to the front.
+agents_apart() {
+  local round="$1" log="$LOGS/app-$1.stderr" person first second items switched rows
+  if ! alive "${PID:-0}"; then
+    bad "apart: the application runs ($round)" "it does not"
+    return 1
+  fi
+  origin || return 1
+  person="http://example.com/?apart$FRESH"
+  visit "$person" "$person" "$EXAMPLE_BODY" "apart: the person's own page opens in their window"
+  if wait_for 10 "$APPCTL" ids "$PID" syndeo.favorite && "$APPCTL" ids "$PID" syndeo.space >/dev/null &&
+    "$APPCTL" ids "$PID" syndeo.folder >/dev/null && front | grep -qF 'Apart home'; then
+    ok "apart: the person's own window shows their favorites, as tiles, and their spaces: the switcher, the folder and the space's name"
+  else
+    bad "apart: the person's own window shows their favorites, as tiles, and their spaces: the switcher, the folder and the space's name" \
+      "$("$APPCTL" id-tree "$PID" | tr '\t\n' ' |' | head -c 600)"
+  fi
+
+  agent_bg "$LOGS/agent-apart-first.json" '{"cmd":"status"}'
+  wait_for 30 showing "$ASKING" || bad "apart: the agent is asked about" "no prompt"
+  press_in "$ASKING" allow-session || bad "apart: Allow for This Session is pressed" "no such button"
+  finished "$AGENT_BG" || bad "apart: the agent is allowed for the session" "$(head -c 200 "$LOGS/agent-apart-first.json")"
+  agent "$LOGS/agent-apart-open.json" "{\"cmd\":\"open\",\"url\":\"http://127.0.0.1:$ORIGIN_PORT/agent.html\"}"
+  agent "$LOGS/agent-apart-open2.json" "{\"cmd\":\"open\",\"url\":\"http://127.0.0.1:$ORIGIN_PORT/second.html\"}"
+  first="$(answered "$LOGS/agent-apart-open.json" result.tab)"
+  second="$(answered "$LOGS/agent-apart-open2.json" result.tab)"
+  must "$([ "$(answered "$LOGS/agent-apart-open.json" result.loaded)" = true ] &&
+    [ "$(answered "$LOGS/agent-apart-open2.json" result.loaded)" = true ] && echo yes)" \
+    "apart: the agent opens two tabs of its own" \
+    "$(head -c 200 "$LOGS/agent-apart-open.json"); $(head -c 200 "$LOGS/agent-apart-open2.json")"
+
+  # Its window in front, its sidebar shown: what would be there is.
+  if apart_front "$first" && apart_listed; then
+    ok "apart: the agent's window, chosen, is in front, listing its two tabs"
+  else
+    bad "apart: the agent's window, chosen, is in front, listing its two tabs" "tabs: $(tab_list); titles: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+  sleep 1
+  "$APPCTL" id-tree "$PID" >"$LOGS/agent-apart-ids.txt" 2>&1
+  "$APPCTL" count-ids "$PID" syndeo.favorite >"$LOGS/agent-apart-favorites.txt" 2>&1
+  "$APPCTL" front-tree "$PID" >"$LOGS/agent-apart-tree.txt" 2>&1
+  must "$("$APPCTL" ids "$PID" syndeo.favorite >/dev/null 2>&1 && echo no || echo yes)" \
+    "apart: an agent's window shows no favorite tiles, though the person has favorites" \
+    "$("$APPCTL" ids "$PID" syndeo.favorite | tr '\t\n' ' |')"
+  must "$(! "$APPCTL" ids "$PID" syndeo.space >/dev/null 2>&1 && ! "$APPCTL" ids "$PID" syndeo.folder >/dev/null 2>&1 &&
+    ! grep -qE 'Apart (home|work|folder)' "$LOGS/agent-apart-tree.txt" && echo yes)" \
+    "apart: an agent's window shows none of the person's spaces: no switcher, folder or space's name" \
+    "$(grep -E 'syndeo\.(space|folder)' "$LOGS/agent-apart-ids.txt" | tr '\t\n' ' |'); $(grep -E 'Apart (home|work|folder)' "$LOGS/agent-apart-tree.txt" | head -n 3 | tr '\t\n' ' |')"
+
+  items="$("$APPCTL" tab-menu "$PID" 1 | tr '\n' '|')"
+  printf '%s\n' "$items" >"$LOGS/agent-apart-tab-menu.txt"
+  must "$(printf '%s' "|$items" | grep -qF '|Close Tab|' && ! printf '%s' "|$items" | grep -qE 'Favorites|Folder' && echo yes)" \
+    "apart: an agent's tab's own menu offers no Add to Favorites, and none of the person's folders" "$items"
+
+  # The person switches spaces: the app says so, and keeps the second
+  # current. The agent's window lists its tabs still.
+  switched="$(grep -cF 'a space switched to' "$log")"
+  choose Spaces "Next Space"
+  if logged "$log" 'a space switched to' $((switched + 1)) &&
+    wait_for 10 sh -c 'defaults read "$1" SyndeoSpaces 2>/dev/null | grep -qF "\"current\":2"' _ "$ID"; then
+    ok "apart: the person switches to their second space, from the Spaces menu"
+  else
+    bad "apart: the person switches to their second space, from the Spaces menu" \
+      "log: $(grep -F 'space' "$log" | tail -n 2 | tr '\n' ' '); kept: $(defaults read "$ID" SyndeoSpaces 2>&1 | grep -oE '"current":[0-9]+')"
+  fi
+  "$APPCTL" titles "$PID" >"$LOGS/agent-apart-switched-titles.txt" 2>&1
+  "$APPCTL" front-tree "$PID" >"$LOGS/agent-apart-switched-front.txt" 2>&1
+  printf '  measured: after the switch, the window in front (%s) has %s sidebar rows and says of the spaces: %s\n' \
+    "$("$APPCTL" titles "$PID" | head -n 1)" "$("$APPCTL" rows "$PID" | grep -c .)" \
+    "$(grep -oE 'Apart (home|work)' "$LOGS/agent-apart-switched-front.txt" | sort -u | tr '\n' ' ')"
+  if apart_front "$first" && apart_listed; then
+    ok "apart: after the person switches spaces, an agent's window still lists all its tabs"
+  else
+    bad "apart: after the person switches spaces, an agent's window still lists all its tabs" "tabs: $(tab_list); front: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+
+  # New Tab, in the agent's window: the window under the bar is the
+  # person's, with an address field, not saying who controls it, and not at
+  # the agent's page.
+  apart_front "$first" || true
+  if "$APPCTL" new-tab-row "$PID" >/dev/null && wait_for 10 "$APPCTL" bar "$PID"; then
+    if wait_for 5 sh -c '"$1" value "$2" syndeo.address >/dev/null && ! "$1" front-tree "$2" | grep -qF "Controlled by" &&
+      ! "$1" value "$2" syndeo.address | grep -qF "127.0.0.1:$3"' _ "$APPCTL" "$PID" "$ORIGIN_PORT"; then
+      ok "apart: New Tab in an agent's window shows the command bar over the person's own window, brought to the front, not the agent's"
+    else
+      bad "apart: New Tab in an agent's window shows the command bar over the person's own window, brought to the front, not the agent's" \
+        "the window in front says '$(address)'; titles: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+    fi
+  else
+    bad "apart: New Tab in an agent's window shows the command bar over the person's own window, brought to the front, not the agent's" \
+      "no command bar shows: $("$APPCTL" titles "$PID" | tr '\n' '|')"
+  fi
+  "$APPCTL" bar-key "$PID" escape >/dev/null 2>&1 || true
+  wait_for 5 sh -c '! "$1" bar "$2"' _ "$APPCTL" "$PID" || true
+
+  # Measured: the agent's other tab brought to the front, its rows handed
+  # to it, which the app logs.
+  rows="$(grep -cF 'sidebar rows' "$log")"
+  apart_front "$second" || true
+  if logged "$log" 'sidebar rows' $((rows + 1)); then
+    printf '  measured: after the menu and the bar, a sidebar still changes: yes\n'
+  else
+    printf '  measured: after the menu and the bar, a sidebar still changes: no, none logged in 15 s\n'
+  fi
+}
+
 # agents_mutant NAME APP: the part of agents that mutant NAME has to fail,
 # with what it needs before it; the application is running.
 agents_mutant() {
   agent_paths "$2"
   case "$1" in
+    agent-tabs-follow-spaces | favorites-in-agent-windows)
+      agents_on
+      agents_apart "mutant-$1"
+      return
+      ;;
     agent-tabs-*)
       agents_tabs "$2" "mutant-$1"
       return
@@ -3177,13 +3395,18 @@ agents() {
     must "$([ ! -e "$AGENT_SOCK" ] && echo yes)" "after quitting, no socket is left" "$(ls -la "$AGENT_SOCK" 2>&1)"
   fi
   printf '\nagents, and the tabs Syndeo has\n'
+  # The person has favorites and spaces, which an agent's windows show none
+  # of (agents_apart, in the opening agents_tabs leaves running).
+  apart_defaults
   if started "$app" agents-tabs; then
     helper_of "$app" agents-tabs
     browses agents-tabs
     agents_tabs "$app" agents-tabs
+    agents_apart agents-tabs-again
     origin_stop
     stopped agents-tabs-again
   fi
+  apart_forget
   printf '\nwhat it left\n'
   must "$([ ! -e "$home/.keystore" ] && [ "$keystore_before" = absent ] && [ "$(keystore_item)" = absent ] && echo yes)" "no keystore, and no keychain item for one"
   security dump-trust-settings >"$LOGS/trust-after-agents.txt" 2>&1 || true
@@ -3454,7 +3677,7 @@ show_tab() {
 # tab's own menu, Close Other Tabs, Reopen Last Closed Tab and Recently
 # Closed, and Show All Tabs.
 tabbing() {
-  local log="$1" list last_closed items before
+  local log="$1" list last_closed items control_items before
   visit "$TP/tabs.html" "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "a page with links opens, by a public name"
   must "$(route_is 'Through Syndeo' && echo yes)" "and came through Syndeo" "the bar says '$("$APPCTL" value "$PID" syndeo.route)'"
   if wait_for 10 sh -c '[ "$("$1" titles "$2" | head -n 1)" = "Tabs test" ]' _ "$APPCTL" "$PID"; then
@@ -3575,6 +3798,13 @@ tabbing() {
   must "$(for want in 'Duplicate Tab' 'Pin Tab' 'Close Tab' 'Close Other Tabs' 'Move Tab to New Window' 'Show All Tabs'; do
       printf '%s' "|$items" | grep -qF "|$want|" || exit 1; done && echo yes)" \
     "a secondary click on a tab's row opens its own menu: Duplicate, Pin, Close, Close Other Tabs, Move to New Window, Show All" "$items"
+  # Control-click, on a tab behind: the same menu, and no tab chosen.
+  list="$(tab_list)"
+  control_items="$("$APPCTL" tab-menu-control "$PID" 3 | tr '\n' '|')"
+  sleep 1
+  must "$([ "$control_items" = "$items" ] && [ "$(tab_list)" = "$list" ] && echo yes)" \
+    "a Control-click on a tab's row, which macOS makes a secondary click, opens the same menu, and chooses no tab" \
+    "menu: $control_items; tabs before: $list; after: $(tab_list)"
   "$APPCTL" tab-menu "$PID" 2 "Duplicate Tab" >/dev/null || bad "the tab's menu > Duplicate Tab" "it could not be pressed"
   opens "$log" 7 "its Duplicate Tab duplicates that tab"
   arrive "$TP/tabs.html" 'SYNDEO-TABS-PAGE' "in front"
@@ -3724,8 +3954,36 @@ tabs_test() {
 #     (lo0's own link-local address, where the origin answers) is refused:
 #     nothing is saved, and the origin does not hear of it; one redirected
 #     to a file: address saves nothing;
+#   - the window's rule for downloads, on http pages of this Mac's
+#     (dl_policy):
+#     - a hidden frame from another origin (localhost, in a page of
+#       127.0.0.1's) that tries to download as it loads, by a script's
+#       click() on a link marked for downloading, by setting its own address
+#       to a file, or by a meta refresh to one, saves nothing, and the log
+#       says each that reached the window was refused as a frame's;
+#     - a page that tries three automatic downloads as it loads (a script's
+#       click(), a click it makes up as a MouseEvent, its address set to a
+#       file) saves one, its first; the log says the others were refused as
+#       automatic, and the downloads list shows them blocked: "Blocked: this
+#       page tried to download more files";
+#     - on that page, a person's click with the mouse on a link marked for
+#       downloading, and on a plain link to a file, each saves its file;
+#   - Clear Browsing Data (dl_clear), with one download finished and one
+#     still coming in (a slow file, which the downloads list is first seen
+#     to show beside the finished one): the one coming in is cancelled, the
+#     origin seeing it stop, and nothing of it is left in ~/Downloads; the
+#     finished file stays, byte for byte; and the downloads list says
+#     nothing has been downloaded;
 #   - nothing of a download's address is in the app's log or its proxy's.
-# Measured, not gated: whether each file saved has com.apple.quarantine,
+# Measured, not gated: what WebKit says of each navigation and how the
+# window decided each download, for each way a download begins (a person's
+# click, a press through Accessibility, a script's click() on load, a
+# MouseEvent made up, an address set to a file, a meta refresh, and each of
+# those in a hidden frame), the app logging every navigation at debug for
+# this mode; whether a meta refresh to a file downloads, as a page's one
+# automatic download; whether a download still coming in has its file in
+# ~/Downloads yet; how long the rule's checks and Clear Browsing Data's
+# take. And whether each file saved has com.apple.quarantine,
 # and what it says; whether WebKit asked the download about its redirect
 # within its own origin; what a download redirected to another origin
 # becomes; and which refused the zone and the file: address, the
@@ -3743,7 +4001,9 @@ tabs_test() {
 #   - a link marked for downloading that it clicks is refused, and its wait
 #     says so;
 #   - nothing is saved in ~/Downloads, no download began, and the log says
-#     each was refused in an agent's tab, with nothing of their addresses.
+#     each was refused in an agent's tab, with nothing of their addresses;
+#   - the agent's window, in front, has no Downloads button in its sidebar:
+#     the person's downloads are not shown there.
 # ~/Downloads is put back as it was, which is gated, as are the trust
 # settings.
 DOWNLOADS="$HOME/Downloads"
@@ -3897,12 +4157,14 @@ dl_said() { plain_log "$1" | grep -iE 'download' | tail -n 4 | cut -c 1-220 | tr
 # dl_count LOG TEXT: how many of LOG's lines have TEXT.
 dl_count() { plain_log "$1" | grep -cF "$2"; }
 
-# dl_press LOG TEXT: press the page's link TEXT, as a click would, and wait
-# up to 45 s for a download to end, as LOG says.
+# dl_press LOG TEXT: click the page's link TEXT with the mouse, as a person
+# does, whose downloads the window's rule always lets begin (a press through
+# Accessibility is measured in dl_policy), and wait up to 45 s for a
+# download to end, as LOG says.
 dl_press() {
   local ended
   ended="$(dl_ended "$1")"
-  "$APPCTL" press-web "$PID" "$2" || bad "download page: its link '$2' is pressed" "no such link: $(page_text)"
+  "$APPCTL" click-web "$PID" "$2" none left || bad "download page: its link '$2' is clicked" "no such link: $(page_text)"
   wait_for 45 dl_more "$1" "$ended" || true
 }
 
@@ -3957,12 +4219,12 @@ dl_file() {
   dl_quarantine "$(basename "$name")" "$name"
 }
 
-# downloads_checks LOG: downloads' checks, in the application running as PID,
-# whose log is LOG; see the top of this section.
-downloads_checks() {
-  local log="$1" t z s page saved before stopped refused
-  dl_origin tls || return 1
-  t="$(token)"; z="$(token)"; s="$(token)"
+# dl_links LOG T Z S: the files an https page links for downloading, and
+# the redirects no window may follow, in the application running as PID,
+# whose log is LOG, with the origin running over https; T, Z and S are the
+# tokens in their addresses. See the top of this section.
+dl_links() {
+  local log="$1" t="$2" z="$3" s="$4" page saved before stopped refused
   head -c 300000 /dev/urandom >"$DL_DIR/payload-$t.bin"
   head -c 200000 /dev/urandom >"$DL_DIR/second-$t.bin"
   head -c 1000 /dev/urandom >"$DL_DIR/zoned-$t.bin"
@@ -4034,9 +4296,331 @@ EOF
     "$(if [ "$(dl_count "$log" "refused a download's redirect")" -gt "$before" ]; then echo "the download's own redirect check"
     elif [ "$(plain_log "$log" | grep -c 'refused a page in a window scheme=file')" -gt "$refused" ]; then echo "the window's navigation policy, WebKit having made the redirect a navigation"
     else echo "WebKit, asking neither: $(dl_said "$log")"; fi)"
+}
 
-  must "$(! grep -qE "$t|$z|$s" "$log" && echo yes)" "downloads: nothing of a download's address is in the app's log or its proxy's" \
-    "$(grep -cE "$t|$z|$s" "$log") lines"
+# dl_unlogged LOG PATTERN: nothing matching PATTERN, the tokens in the
+# addresses downloaded from, is in LOG, the app's log and its proxy's.
+dl_unlogged() {
+  must "$(! grep -qE "$2" "$1" && echo yes)" "downloads: nothing of a download's address is in the app's log or its proxy's" \
+    "$(grep -cE "$2" "$1") lines"
+}
+
+# dl_original LOG: the checks download-challenge-unpinned is caught by, as
+# they were before the window's rule for downloads: the files an https page
+# links, the redirects, and nothing of their addresses logged.
+dl_original() {
+  local log="$1" t z s
+  dl_origin tls || return 1
+  t="$(token)"; z="$(token)"; s="$(token)"
+  dl_links "$log" "$t" "$z" "$s"
+  dl_unlogged "$log" "$t|$z|$s"
+}
+
+# downloads_checks LOG: downloads' checks, in the application running as PID,
+# whose log is LOG; see the top of this section.
+downloads_checks() {
+  local log="$1" t z s
+  dl_origin tls || return 1
+  t="$(token)"; z="$(token)"; s="$(token)"
+  dl_links "$log" "$t" "$z" "$s"
+  dl_policy "$log" "$t"
+  dl_clear "$log" "$t"
+  dl_unlogged "$log" "$t|$z|$s"
+}
+
+# The app's lines that decide a download a window is asked to let begin
+# (browser_macos's judge_download).
+DL_DECIDED='a download allowed: |refused a download a frame inside the page started|refused a download from an address a download may not come from|refused an automatic download: '
+
+# dl_mark LOG: how many lines LOG has now, to look at what comes after.
+dl_mark() { plain_log "$1" | wc -l | tr -d ' '; }
+# dl_after LOG MARK: LOG's lines after MARK.
+dl_after() { plain_log "$1" | tail -n "+$(($2 + 1))"; }
+# dl_count_after LOG MARK PATTERN: how many of LOG's lines after MARK match
+# PATTERN, an extended regular expression.
+dl_count_after() { dl_after "$1" "$2" | grep -cE "$3"; }
+# dl_decided_after LOG MARK N: at least N downloads decided after MARK.
+dl_decided_after() { [ "$(dl_count_after "$1" "$2" "$DL_DECIDED")" -ge "$3" ]; }
+# dl_finished_after LOG MARK N: at least N downloads finished after MARK.
+dl_finished_after() { [ "$(dl_count_after "$1" "$2" 'a download finished')" -ge "$3" ]; }
+# dl_placed_after LOG MARK: a download was given its place after MARK.
+dl_placed_after() { [ "$(dl_count_after "$1" "$2" 'a download placed')" -ge 1 ]; }
+
+# dl_record WHAT LOG MARK: measured, not gated: what WebKit said of each
+# navigation after MARK (debug lines, which the downloads mode turns on),
+# and how the window decided each download, in order, without their times.
+dl_record() {
+  local lines
+  lines="$(dl_after "$2" "$3" | grep -E "a navigation action|$DL_DECIDED" | sed -E 's/^[^ ]+ +//; s/  +/ /g' | cut -c 1-260)"
+  printf '  MEASURE  %s:\n' "$1"
+  if [ -n "$lines" ]; then printf '%s\n' "$lines" | sed 's/^/             /'; else printf '             (nothing in the log)\n'; fi
+}
+
+# dl_popover WHEN: the downloads list, as its popover shows it, kept in the logs.
+dl_popover() {
+  "$APPCTL" downloads-list "$PID" >"$LOGS/downloads-list-$1.txt" 2>&1 || true
+  cat "$LOGS/downloads-list-$1.txt"
+}
+
+# dl_click TEXT WHAT: click the page's link TEXT with the mouse, as a person
+# does.
+dl_click() {
+  "$APPCTL" click-web "$PID" "$1" none left || bad "$2" "no link '$1' to click: $(page_text)"
+}
+
+# dl_saved_is ORIGINAL: exactly one file saved since downloads-new.txt,
+# byte for byte ORIGINAL; its name, printed.
+dl_saved_is() {
+  local saved
+  saved="$(dl_since "$LOGS/downloads-new.txt")"
+  [ -n "$saved" ] && [ "$(printf '%s\n' "$saved" | grep -c .)" = 1 ] && cmp -s "$DOWNLOADS/$saved" "$1" && printf '%s\n' "$saved"
+}
+
+# dl_how CASE: how a hidden frame of dl_policy's tries to download.
+dl_how() {
+  case "$1" in
+    b) echo "a script's click() on a link marked for downloading, on load" ;;
+    c) echo "its own address set to a file, on load" ;;
+    *) echo "a meta refresh to a file" ;;
+  esac
+}
+
+# dl_policy LOG T: the window's rule for downloads, on pages this Mac serves
+# over http with T in their addresses, in the application running as PID,
+# whose log is LOG; see the top of this section.
+dl_policy() {
+  local begun="$SECONDS"
+  dl_frames "$1" "$2"
+  dl_automatic "$1" "$2"
+  dl_meta "$1" "$2"
+  printf '  MEASURE  the window'"'"'s rule for downloads: its checks took %s s\n' "$((SECONDS - begun))"
+}
+
+# dl_frames LOG T: dl_policy's hidden frames from another origin, which
+# subframe-downloads-allowed runs alone.
+dl_frames() {
+  local log="$1" t="$2" page mark frames saved n f
+  for f in frame-b frame-c frame-d; do
+    head -c 20000 /dev/urandom >"$DL_DIR/$f-$t.bin"
+  done
+  cat >"$DL_DIR/frame-b-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>b</title>
+<a id="f" href="/frame-b-$t.bin?t=$t" download="syndeo-frame-b-$t.bin">f</a>
+<script>addEventListener('load', function () { document.getElementById('f').click(); });</script>
+EOF
+  cat >"$DL_DIR/frame-c-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>c</title>
+<script>addEventListener('load', function () { location.href = '/frame-c-$t.bin?t=$t'; });</script>
+EOF
+  cat >"$DL_DIR/frame-d-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>d</title>
+<meta http-equiv="refresh" content="0; url=/frame-d-$t.bin?t=$t">
+EOF
+  for f in b c d; do
+    # The frame from another origin: localhost, the page 127.0.0.1.
+    cat >"$DL_DIR/frames-$f-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>A hidden frame</title>
+<h1>SYNDEO-FRAME-$f-PAGE</h1>
+<iframe hidden src="http://localhost:$DL_HTTP/frame-$f-$t.html?t=$t"></iframe>
+EOF
+  done
+
+  # A hidden frame from another origin, trying to download as it loads: by
+  # a script's click() on a link marked for downloading (b), by setting its
+  # own address to a file (c), and by a meta refresh to one (d).
+  dl_new >"$LOGS/downloads-new.txt"
+  frames="$(dl_mark "$log")"
+  for f in b c d; do
+    mark="$(dl_mark "$log")"
+    page="http://127.0.0.1:$DL_HTTP/frames-$f-$t.html?t=$t"
+    visit "$page" "$page" "SYNDEO-FRAME-$f-PAGE" "download page: a page with a hidden frame from another origin opens ($f)"
+    # Until the window is asked, or the origin has served the file and the
+    # window has had time to be asked.
+    wait_for 8 dl_decided_after "$log" "$mark" 1 || true
+    sleep 2
+    dl_record "($f, in a hidden frame from another origin) $(dl_how "$f"); the origin was asked for the file $(dl_heard "/frame-$f-$t.bin") time(s)" "$log" "$mark"
+  done
+  saved="$(dl_since "$LOGS/downloads-new.txt")"
+  n="$(dl_count_after "$log" "$frames" 'refused a download a frame inside the page started')"
+  must "$([ -z "$saved" ] && [ "$n" -ge 1 ] && [ "$(dl_count_after "$log" "$frames" 'a download allowed: ')" = 0 ] && echo yes)" \
+    "downloads: a hidden cross-origin iframe that tries to download on load saves nothing, by a script's click(), its own address or a meta refresh; the log says each that reached the window was refused as a frame's ($n)" \
+    "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_after "$log" "$frames" | grep -E "$DL_DECIDED" | sed -E 's/^[^ ]+ +//' | cut -c 1-160 | tr '\n' '|')"
+}
+
+# dl_automatic LOG T: dl_policy's page trying three automatic downloads, and
+# what the person asks for on it, which automatic-downloads-unlimited runs
+# alone.
+dl_automatic() {
+  local log="$1" t="$2" page mark saved n f
+  local blocked=$'syndeo.download-detail\tBlocked: this page tried to download more files'
+  for f in auto-1 auto-2 auto-3 person plain pressed; do
+    head -c 20000 /dev/urandom >"$DL_DIR/$f-$t.bin"
+  done
+  cat >"$DL_DIR/auto-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>Automatic downloads</title>
+<h1>SYNDEO-AUTOMATIC-PAGE</h1>
+<p><a id="one" href="/auto-1-$t.bin?t=$t" download="syndeo-auto-1-$t.bin">first</a>
+<a id="two" href="/auto-2-$t.bin?t=$t" download="syndeo-auto-2-$t.bin">second</a></p>
+<p><a href="/person-$t.bin?t=$t" download="syndeo-person-$t.bin">Download it yourself</a></p>
+<p><a href="/plain-$t.bin?t=$t">A file by a plain link</a></p>
+<p><a href="/pressed-$t.bin?t=$t" download="syndeo-pressed-$t.bin">Press it to download</a></p>
+<script>
+addEventListener('load', function () {
+  document.getElementById('one').click();
+  setTimeout(function () {
+    document.getElementById('two').dispatchEvent(new MouseEvent('click',
+      { bubbles: true, cancelable: true, view: window, button: 0, buttons: 1, detail: 1 }));
+  }, 800);
+  setTimeout(function () { location.href = '/auto-3-$t.bin?t=$t'; }, 1600);
+});
+</script>
+EOF
+
+  # A page trying three automatic downloads as it loads: a script's click()
+  # on a link marked for downloading, a click it makes up as a MouseEvent,
+  # and its address set to a file.
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  page="http://127.0.0.1:$DL_HTTP/auto-$t.html?t=$t"
+  visit "$page" "$page" 'SYNDEO-AUTOMATIC-PAGE' "download page: a page that tries three automatic downloads as it loads opens"
+  wait_for 15 dl_decided_after "$log" "$mark" 3 || true
+  wait_for 10 dl_finished_after "$log" "$mark" 1 || true
+  sleep 1
+  saved="$(dl_since "$LOGS/downloads-new.txt")"
+  n="$(dl_count_after "$log" "$mark" 'refused an automatic download: ')"
+  must "$(dl_saved_is "$DL_DIR/auto-1-$t.bin" >/dev/null && [ "$n" -ge 2 ] && echo yes)" \
+    "downloads: a page that tries three automatic downloads on load saves one, its first, and the log says the others were refused as automatic ($n)" \
+    "saved: $(printf '%s' "$saved" | tr '\n' '|'); the app: $(dl_after "$log" "$mark" | grep -E "$DL_DECIDED" | sed -E 's/^[^ ]+ +//' | cut -c 1-160 | tr '\n' '|')"
+  must "$(dl_popover blocked | grep -qxF "$blocked" && echo yes)" \
+    "downloads: a page that tries three automatic downloads on load: the downloads list shows them blocked, saying \"Blocked: this page tried to download more files\"" \
+    "the list: $(tr '\n\t' '| ' <"$LOGS/downloads-list-blocked.txt" | head -c 400)"
+  dl_record "(b, b2, c) on a page the person opened, in order: a script's click() on a link marked for downloading, a MouseEvent the script made up, its address set to a file" "$log" "$mark"
+
+  # What the person asks for, on that page, whose automatic download is
+  # spent: a link marked for downloading they click, and a plain link to a
+  # file; and, measured, one pressed through Accessibility.
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  dl_click "Download it yourself" "downloads: a person's click on a link marked for downloading"
+  wait_for 20 dl_finished_after "$log" "$mark" 1 || true
+  must "$(dl_saved_is "$DL_DIR/person-$t.bin" >/dev/null && echo yes)" \
+    "downloads: a person's click on a link marked for downloading saves the file, byte for byte, on a page whose automatic download is spent" \
+    "saved: $(dl_since "$LOGS/downloads-new.txt" | tr '\n' '|'); the app: $(dl_said "$log")"
+  dl_record "(a) a person's click with the mouse on a link marked for downloading" "$log" "$mark"
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  dl_click "A file by a plain link" "downloads: a person's click on a plain link to a file"
+  wait_for 20 dl_finished_after "$log" "$mark" 1 || true
+  must "$(dl_saved_is "$DL_DIR/plain-$t.bin" >/dev/null && echo yes)" \
+    "downloads: a person's click on a plain link to a file saves it, byte for byte, on that page" \
+    "saved: $(dl_since "$LOGS/downloads-new.txt" | tr '\n' '|'); the app: $(dl_said "$log")"
+  dl_record "(a) a person's click with the mouse on a plain link to a file" "$log" "$mark"
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  "$APPCTL" press-web "$PID" "Press it to download" || true
+  wait_for 10 dl_decided_after "$log" "$mark" 1 || true
+  sleep 2
+  printf '  MEASURE  (a) a link marked for downloading pressed through Accessibility (AXPress, as VoiceOver presses it), on that page: %s\n' \
+    "$([ -n "$(dl_since "$LOGS/downloads-new.txt")" ] && echo 'saved' || echo 'nothing saved')"
+  dl_record "(a) pressed through Accessibility" "$log" "$mark"
+}
+
+# dl_meta LOG T: dl_policy's meta refresh to a file, measured.
+dl_meta() {
+  local log="$1" t="$2" page mark
+  head -c 20000 /dev/urandom >"$DL_DIR/meta-$t.bin"
+  cat >"$DL_DIR/meta-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>A meta refresh</title>
+<meta http-equiv="refresh" content="1; url=/meta-$t.bin?t=$t">
+<h1>SYNDEO-META-PAGE</h1>
+EOF
+
+  # A meta refresh to a file, on a page the person opened: measured.
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  page="http://127.0.0.1:$DL_HTTP/meta-$t.html?t=$t"
+  visit "$page" "$page" 'SYNDEO-META-PAGE' "download page: a page with a meta refresh to a file opens"
+  wait_for 10 dl_decided_after "$log" "$mark" 1 || true
+  sleep 2
+  printf '  MEASURE  (d) a meta refresh to a file, on a page the person opened: %s\n' \
+    "$([ -n "$(dl_since "$LOGS/downloads-new.txt")" ] && echo 'saved, as its one automatic download' || echo 'nothing saved')"
+  dl_record "(d) a meta refresh to a file" "$log" "$mark"
+}
+
+# dl_slow_stopped PATH: the origin logged that the client went away before
+# the last byte of PATH, its slow file.
+dl_slow_stopped() {
+  python3 -I -c 'import json, sys
+sys.exit(0 if any(e.get("path") == sys.argv[2] and e.get("slow") == "stopped" for e in map(json.loads, open(sys.argv[1], encoding="utf-8"))) else 1)' \
+    "$LOGS/downloads-origin.jsonl" "$1"
+}
+
+# dl_clear LOG T: Clear Browsing Data and the downloads, on a page this Mac
+# serves over http with T in its address, in the application running as
+# PID, whose log is LOG; see the top of this section.
+dl_clear() {
+  local log="$1" t="$2" page mark listed kept stopped=no begun="$SECONDS" tab=$'\t'
+  head -c 30000 /dev/urandom >"$DL_DIR/kept-$t.bin"
+  head -c 6000000 /dev/urandom >"$DL_DIR/slow-$t.bin"
+  cat >"$DL_DIR/clear-$t.html" <<EOF
+<!doctype html><meta charset="utf-8"><title>Downloads to clear</title>
+<h1>SYNDEO-CLEAR-PAGE</h1>
+<p><a href="/kept-$t.bin?t=$t" download="syndeo-kept-$t.bin">Download one to keep</a></p>
+<p><a href="/slow-$t.bin?t=$t" download="syndeo-slow-$t.bin">Download one slowly</a></p>
+EOF
+  page="http://127.0.0.1:$DL_HTTP/clear-$t.html?t=$t"
+  visit "$page" "$page" 'SYNDEO-CLEAR-PAGE' "download page: a page with a file to keep and a slow one opens"
+
+  # One finished, and one still coming in.
+  dl_new >"$LOGS/downloads-new.txt"
+  mark="$(dl_mark "$log")"
+  dl_click "Download one to keep" "downloads: before Clear Browsing Data, a file downloaded"
+  wait_for 20 dl_finished_after "$log" "$mark" 1 || true
+  kept="$(dl_saved_is "$DL_DIR/kept-$t.bin")"
+  must "$([ -n "$kept" ] && echo yes)" "downloads: before Clear Browsing Data, a file is downloaded, byte for byte" \
+    "saved: $(dl_since "$LOGS/downloads-new.txt" | tr '\n' '|'); the app: $(dl_said "$log")"
+  dl_new >"$LOGS/downloads-before-slow.txt"
+  mark="$(dl_mark "$log")"
+  dl_click "Download one slowly" "downloads: before Clear Browsing Data, a slow file"
+  wait_for 15 dl_placed_after "$log" "$mark" || true
+  sleep 2
+  printf '  MEASURE  a download still coming in, in ~/Downloads: %s; the origin was asked for it %s time(s)\n' \
+    "$(dl_since "$LOGS/downloads-before-slow.txt" | while IFS= read -r f; do printf '%s, %s bytes so far; ' "$f" "$(wc -c <"$DOWNLOADS/$f" | tr -d ' ')"; done)" \
+    "$(dl_heard "/slow-$t.bin")"
+  listed="$(dl_popover before-clear)"
+  # The finished one by its name, the one coming in by how far it has got:
+  # "N of M".
+  must "$([ -n "$kept" ] && printf '%s\n' "$listed" | grep -qxF "syndeo.download-name${tab}$kept" &&
+    printf '%s\n' "$listed" | grep -qE "^syndeo.download-detail${tab}[0-9.]+ [KMG]?B of " &&
+    ! dl_slow_stopped "/slow-$t.bin" && echo yes)" \
+    "downloads: before Clear Browsing Data, the downloads list shows the download finished and the one still coming in" \
+    "the list: $(printf '%s' "$listed" | tr '\n\t' '| ' | head -c 400); the slow one $(dl_slow_stopped "/slow-$t.bin" && echo 'had already stopped' || echo 'was coming in')"
+
+  # Clear Browsing Data, as a person asks for it.
+  settings_open "clearing downloads"
+  if "$APPCTL" press "$PID" syndeo.clear; then ok "Settings > Clear Browsing Data… is pressed (downloads)"; else bad "Clear Browsing Data… (downloads)" "no button to press"; fi
+  if wait_for 10 "$APPCTL" press "$PID" syndeo.clear-confirm; then ok "and asks first; Clear is pressed (downloads)"; else bad "Clear Browsing Data (downloads)" "no Clear in a sheet to press"; fi
+  if wait_for 40 sh -c '"$1" value "$2" syndeo.clear-status | grep -q "^Browsing data cleared"' _ "$APPCTL" "$PID"; then
+    ok "Settings says the browsing data is cleared (downloads)"
+  else
+    bad "Clear Browsing Data (downloads)" "Settings says: $("$APPCTL" value "$PID" syndeo.clear-status)"
+  fi
+  settings_close "after clearing downloads"
+  wait_for 10 dl_slow_stopped "/slow-$t.bin" && stopped=yes
+  # Time for anything still to arrive, were it still coming.
+  sleep 3
+  must "$([ "$stopped" = yes ] && [ "$(dl_new)" = "$(cat "$LOGS/downloads-before-slow.txt")" ] && echo yes)" \
+    "downloads: Clear Browsing Data cancels the download still coming in: the origin sees it stop, and nothing of it is left in ~/Downloads, partial or whole" \
+    "the origin $([ "$stopped" = yes ] && echo 'saw it stop' || echo 'did not see it stop'); new in ~/Downloads since: $(dl_new | LC_ALL=C comm -13 "$LOGS/downloads-before-slow.txt" - | tr '\n' '|'); the app: $(dl_said "$log")"
+  must "$([ -n "$kept" ] && cmp -s "$DOWNLOADS/$kept" "$DL_DIR/kept-$t.bin" && echo yes)" \
+    "downloads: Clear Browsing Data leaves the files already downloaded in ~/Downloads, byte for byte" "$(ls -l "$DOWNLOADS/$kept" 2>&1)"
+  listed="$(dl_popover after-clear)"
+  must "$(printf '%s\n' "$listed" | grep -q '^syndeo.downloads-none' && ! printf '%s\n' "$listed" | grep -q '^syndeo.download-' && echo yes)" \
+    "downloads: Clear Browsing Data empties the downloads list: it says nothing has been downloaded" \
+    "the list: $(printf '%s' "$listed" | tr '\n\t' '| ' | head -c 400)"
+  printf '  MEASURE  Clear Browsing Data, as the app logs it: %s\n' \
+    "$(dl_after "$log" "$mark" | grep -E 'downloads cleared|partial file' | sed -E 's/^[^ ]+ +//; s/  +/ /g' | cut -c 1-200 | tr '\n' '|')"
+  printf '  MEASURE  Clear Browsing Data and the downloads: its checks took %s s\n' "$((SECONDS - begun))"
 }
 
 # dl_leftover: nothing of the application left running for the next step.
@@ -4057,12 +4641,18 @@ downloads() {
   printf "\ndownloads, in a person's window: %s\n" "$app"
   security dump-trust-settings >"$LOGS/trust-before-downloads.txt" 2>&1 || true
   dl_snapshot
+  # What WebKit says of every navigation, logged at debug for
+  # syndeo_app::navigation alone, for dl_policy's record; every other
+  # line as the app and its proxy log by default.
+  OPEN_ENV=(--env "SYNDEO_LOG=syndeo_app=info,syndeo_webkit=info,syndeo_proxy=info,syndeo_net=info,syndeo_app::navigation=debug")
   if started "$app" downloads; then
+    OPEN_ENV=()
     helper_of "$app" downloads
     browses downloads
     downloads_checks "$LOGS/app-downloads.stderr"
     stopped downloads
   fi
+  OPEN_ENV=()
   dl_origin_stop
   dl_leftover
   dl_put_back
@@ -4076,7 +4666,7 @@ downloads() {
 # agents_downloads LOG: agent-downloads' checks, with agents on and ci-agent
 # allowed for the session, in the application whose log is LOG.
 agents_downloads() {
-  local log="$1" t page out st tab link begun refused
+  local log="$1" t page out st tab link begun refused frames
   dl_origin || return 1
   t="$(token)"
   head -c 100000 /dev/urandom >"$DL_DIR/agent-$t.bin"
@@ -4094,6 +4684,16 @@ EOF
   tab="$(answered "$out" result.tab)"
   must "$([ -n "$tab" ] && [ "$(answered "$out" result.title)" = 'Agent downloads' ] && echo yes)" \
     "agent: a page with a file to download opens in a tab of the agent's" "$(head -c 300 "$out")"
+  # Its window in front: no Downloads button in its sidebar.
+  agent "$LOGS/agent-dl-select.json" "{\"cmd\":\"select\",\"tab\":${tab:-1}}"
+  "$APPCTL" activate "$PID" >/dev/null || true
+  sleep 1
+  frames="$("$APPCTL" frames "$PID" 'Controlled by “ci-agent”' 2>&1)"
+  printf '%s\n' "$frames" >"$LOGS/agent-dl-frames.txt"
+  must "$(printf '%s\n' "$frames" | grep -q '^page ' && printf '%s\n' "$frames" | grep -q '^indicator ' &&
+    ! printf '%s\n' "$frames" | grep -q '^downloads ' && echo yes)" \
+    "agent downloads: the agent's window has no Downloads button in its sidebar, the person's downloads not being its to see" \
+    "$(tr '\n' ';' <"$LOGS/agent-dl-frames.txt" | head -c 400)"
 
   out="$LOGS/agent-dl-goto.json"
   agent "$out" "{\"cmd\":\"goto\",\"tab\":${tab:-1},\"url\":\"http://127.0.0.1:$DL_HTTP/agent-$t.bin?t=$t\"}"
@@ -4292,6 +4892,131 @@ sidebar_rounds() {
   return 0
 }
 
+# Two spaces, for sidebar_spaces: the first current, with a folder in it,
+# and the second empty. Written before the app opens and taken away once it
+# has quit.
+SIDEBAR_SPACES='{"spaces":[{"id":1,"name":"Sidebar home","hue":0,"icon":""},{"id":2,"name":"Sidebar away","hue":1,"icon":""}],"folders":[{"id":3,"name":"Sidebar folder","space":1,"collapsed":false}],"current":1,"next_id":4}'
+
+# spaces_rows: the front window's sidebar rows, New Tab's included, on one
+# line, each title then "|", the tab in front's marked "*".
+spaces_rows() { "$APPCTL" rows "$PID" | awk -F'\t' '{ printf "%s%s|", ($1 == "front" ? "*" : ""), $5 }'; }
+
+# spaces_shown ROWS NAME OTHER: the front window's sidebar lists exactly
+# ROWS, as spaces_rows prints them, under the space's name NAME, and says
+# nothing of OTHER, the other space's name.
+spaces_shown() {
+  local tree
+  [ "$(spaces_rows)" = "$1" ] || return 1
+  tree="$("$APPCTL" front-tree "$PID")"
+  printf '%s' "$tree" | grep -qF "$2" && ! printf '%s' "$tree" | grep -qF "$3"
+}
+
+# spaces_see WHAT ROWS NAME OTHER: within 10 s, spaces_shown ROWS NAME
+# OTHER; WHAT passes or fails by it, and so does this.
+spaces_see() {
+  if wait_for 10 spaces_shown "$2" "$3" "$4"; then
+    ok "$1"
+  else
+    bad "$1" "it lists: $(spaces_rows); it says: $("$APPCTL" front-tree "$PID" | grep -oE 'Sidebar (home|away)' | sort -u | tr '\n' ' ')"
+    return 1
+  fi
+}
+
+# spaces_held LOG N: the app last logged that it holds N tabs' rows.
+spaces_held() { [ "$(sidebar_field "$1" held)" = "$2" ]; }
+
+# spaces_everywhere NAME OTHER: every window Accessibility has, the tab in
+# front of each tab group, says NAME and none says OTHER.
+spaces_everywhere() {
+  local tree
+  tree="$("$APPCTL" ax-tree "$PID")"
+  printf '%s' "$tree" | grep -qF "$1" && ! printf '%s' "$tree" | grep -qF "$2"
+}
+
+# sidebar_spaces APP LOG: the sidebar as the person changes spaces, in the
+# app running with SIDEBAR_SPACES and no session. In CI 43092994068 and
+# 43101278032 the new tab of an empty space showed an empty list, no space's
+# name, no row and no New Tab, for as long as was looked (10 s): the rows
+# of the space left, handed to its sidebar and in no list there, were taken
+# out of that list, and AppKit's exception stopped the refresh. The start
+# page's tab goes to Sidebar page 1, and Sidebar page 2 opens beside it, as
+# another application asks, in the first space. Then:
+#   spaces: Next Space, into the empty second space, opens a tab there, whose
+#           sidebar shows that space's name, its row, in front, and New Tab;
+#   spaces: Previous Space shows the first space's name, its two tabs, the
+#           first in front, and New Tab;
+#   spaces: File > New Window opens a window of its own, in the first space;
+#   spaces: the second space's emoji, pressed in its switcher as a click
+#           presses it, opens a tab of that space there, whose sidebar shows
+#           the space's name, its row and New Tab; and the other window's
+#           sidebar follows: no window says the first space's name;
+#   spaces: Delete Space, of the second, current, moves its tabs to the
+#           first, whose name every window then says, and none the second's;
+#           the window in front shows its two tabs, the first in front, and
+#           New Tab, with one space left in its switcher; and the app holds
+#           five tabs' rows, one a tab of the two windows, in the tab in
+#           front of each;
+#   spaces: and no sidebar refresh failed, as the app's log says.
+# Each within 10 s; the sidebar in front says nothing of the other space's
+# name. With STOP "first", as a mutant is run, it stops at the first of
+# those that fails, which every check after it would wait out.
+sidebar_spaces() {
+  local app="$1" log="$2" stop="${3:-}"
+  sidebar_pages || return 1
+  arrive "" 'Welcome to Syndeo' "spaces: the window shows the start page"
+  visit "http://127.0.0.1:$ORIGIN_PORT/sidebar-1.html" "http://127.0.0.1:$ORIGIN_PORT/sidebar-1.html" SYNDEO-SIDEBAR-1 \
+    "spaces: the first tab opens Sidebar page 1"
+  open -a "$app" "http://127.0.0.1:$ORIGIN_PORT/sidebar-2.html" || bad "spaces: Sidebar page 2 is asked for" "open -a failed"
+  spaces_see "spaces: the first space shows its name, its two tabs, the second in front, and New Tab" \
+    'Sidebar page 1|*Sidebar page 2|New Tab|' 'Sidebar home' 'Sidebar away' || [ "$stop" != first ] || return 1
+
+  choose Spaces "Next Space"
+  spaces_see "spaces: Next Space, into the empty second space, opens a tab there, whose sidebar shows that space's name, its row, in front, and New Tab" \
+    '*Welcome to Syndeo|New Tab|' 'Sidebar away' 'Sidebar home' || [ "$stop" != first ] || return 1
+  choose Spaces "Previous Space"
+  spaces_see "spaces: Previous Space shows the first space's name, its two tabs, the first in front, and New Tab" \
+    '*Sidebar page 1|Sidebar page 2|New Tab|' 'Sidebar home' 'Sidebar away' || [ "$stop" != first ] || return 1
+
+  choose File "New Window"
+  if wait_for 10 sh -c '[ "$("$1" titles "$2" | grep -c .)" = 2 ]' _ "$APPCTL" "$PID" &&
+    wait_for 10 spaces_shown '*Welcome to Syndeo|New Tab|' 'Sidebar home' 'Sidebar away'; then
+    ok "spaces: File > New Window opens a window of its own, in the first space"
+  else
+    bad "spaces: File > New Window opens a window of its own, in the first space" \
+      "windows: $("$APPCTL" titles "$PID" | tr '\n' '|'); it lists: $(spaces_rows)"
+  fi
+  if "$APPCTL" press-nth "$PID" syndeo.space 2 >/dev/null; then
+    spaces_see "spaces: the second space's emoji, pressed in the new window's switcher, opens a tab of that space there, whose sidebar shows its name, its row, in front, and New Tab" \
+      '*Welcome to Syndeo|New Tab|' 'Sidebar away' 'Sidebar home'
+  else
+    bad "spaces: the second space's emoji, pressed in the new window's switcher, opens a tab of that space there, whose sidebar shows its name, its row, in front, and New Tab" \
+      "no second syndeo.space to press: $("$APPCTL" ids "$PID" syndeo.space | tr '\t\n' ' |')"
+  fi
+  if wait_for 10 spaces_everywhere 'Sidebar away' 'Sidebar home'; then
+    ok "spaces: and the other window's sidebar follows: no window says the first space's name"
+  else
+    bad "spaces: and the other window's sidebar follows: no window says the first space's name" \
+      "they say: $("$APPCTL" ax-tree "$PID" | grep -oE 'Sidebar (home|away)' | sort | uniq -c | tr '\n' ' ')"
+  fi
+
+  choose Spaces "Delete Space"
+  spaces_see "spaces: Delete Space, of the second, current, moves its tabs to the first, whose name the window in front shows, with its two tabs, the first in front, and New Tab" \
+    '*Welcome to Syndeo|Welcome to Syndeo|New Tab|' 'Sidebar home' 'Sidebar away'
+  must "$(wait_for 10 spaces_everywhere 'Sidebar home' 'Sidebar away' && echo yes)" \
+    "spaces: and every window says the first space's name, none the second's" \
+    "they say: $("$APPCTL" ax-tree "$PID" | grep -oE 'Sidebar (home|away)' | sort | uniq -c | tr '\n' ' ')"
+  must "$([ "$("$APPCTL" ids "$PID" syndeo.space | grep -c .)" = 1 ] && echo yes)" \
+    "spaces: and the switcher has one space left" "$("$APPCTL" ids "$PID" syndeo.space | tr '\t\n' ' |')"
+  if wait_for 10 spaces_held "$log" 5; then
+    ok "spaces: the app holds five tabs' rows, one a tab, in the tab in front of each window"
+  else
+    bad "spaces: the app holds five tabs' rows, one a tab, in the tab in front of each window" \
+      "it holds $(sidebar_field "$log" held); last: $(plain_log "$log" | grep 'sidebar rows' | tail -n 1)"
+  fi
+  must "$(! grep -qF 'a sidebar refresh failed' "$log" && echo yes)" "spaces: and no sidebar refresh failed, as the app's log says" \
+    "$(plain_log "$log" | grep -F 'a sidebar refresh failed' | head -n 2 | tr '\n' ' ')"
+}
+
 # sidebar APP: see the top of this script.
 sidebar_test() {
   local app log session="$HOME/Library/Application Support/Syndeo/session.txt"
@@ -4303,6 +5028,16 @@ sidebar_test() {
   # From no session, so that the start page's is the only tab.
   rm -f "$session"
   defaults delete "$ID" NSQuitAlwaysKeepsWindows >/dev/null 2>&1 || true
+  # Two spaces, switched between and one deleted, in an opening of its own.
+  defaults write "$ID" SyndeoSpaces -string "$SIDEBAR_SPACES"
+  if started "$app" sidebar-spaces; then
+    helper_of "$app" sidebar-spaces
+    browses sidebar-spaces
+    sidebar_spaces "$app" "$LOGS/app-sidebar-spaces.stderr"
+  fi
+  stopped sidebar-spaces
+  defaults delete "$ID" SyndeoSpaces >/dev/null 2>&1 || true
+  rm -f "$session"
   if started "$app" sidebar; then
     helper_of "$app" sidebar
     browses sidebar

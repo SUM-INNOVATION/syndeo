@@ -19,6 +19,12 @@ Every response is no-store, so nothing can be served again from a cache
 instead of asking it. A file whose name ends .bin is
 application/octet-stream, which a browser downloads rather than shows.
 
+A file whose name starts slow- comes slowly, with its whole length in
+Content-Length: its first 64 KB at once, then 16 KB every quarter of a
+second, so that a download of a few megabytes is still coming in a minute
+later. Its end is logged: {"path", "slow": "finished" or "stopped", "sent"},
+stopped meaning the client went away before the last byte.
+
 Every request is logged to <log> as one JSON line: its path, the t= of its
 query, which server took it (http or https), the connection it came on
 (numbered as accepted, over both servers), the certificate its connection
@@ -85,7 +91,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with open(path, "rb") as f:
             body = f.read()
         kind = "application/octet-stream" if name.endswith(".bin") else "text/html; charset=utf-8"
+        if name.startswith("slow-"):
+            self.slowly(url.path, body, kind)
+            return
         self.answer(200, body, kind)
+
+    def slowly(self, path, body, kind):
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        sent = 0
+        try:
+            self.wfile.write(body[:65536])
+            self.wfile.flush()
+            sent = min(len(body), 65536)
+            while sent < len(body):
+                time.sleep(0.25)
+                self.wfile.write(body[sent:sent + 16384])
+                self.wfile.flush()
+                sent = min(len(body), sent + 16384)
+        except OSError:
+            log({"path": path, "slow": "stopped", "sent": sent, "server": self.server.name})
+            return
+        log({"path": path, "slow": "finished", "sent": sent, "server": self.server.name})
 
     def answer(self, status, body, kind, extra=()):
         self.send_response(status)

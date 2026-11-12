@@ -30,8 +30,10 @@ dispatch2 = "0.3"
 
 # The versions syndeo-webkit builds its web view configuration and pinning
 # delegate with: a different objc2 is a different `Retained<T>`, and the
-# types would not meet.
-objc2 = "0.6"
+# types would not meet. With `exception`, for `objc2::exception::catch`: an
+# exception AppKit raises while the sidebars are refreshed is caught and
+# logged (`browser_macos::refresh_pending`).
+objc2 = { version = "0.6", features = ["exception"] }
 objc2-foundation = "0.3"
 block2 = "0.6"
 # Only the classes this uses: the defaults would bring in bindings for

@@ -12,7 +12,11 @@
 //! this application's proxy, which it asks to clear down the pipe only it
 //! holds (`syndeo_webkit::owned::ProxyControl`). Every window stops loading
 //! first, and the proxy keeps nothing that was asked for before the clear,
-//! so a page still arriving cannot put back what was cleared.
+//! so a page still arriving cannot put back what was cleared. It also
+//! forgets the tabs closed and the session kept from the last quit, and the
+//! downloads: every download still coming in is cancelled, as loading is
+//! stopped, and the downloads list is emptied (`downloads_macos::forget_all`).
+//! Files already saved in ~/Downloads stay where they are.
 
 use crate::address::Search;
 use objc2::rc::Retained;
@@ -204,9 +208,10 @@ define_class!(
             alert.setMessageText(ns_string!("Clear browsing data?"));
             alert.setInformativeText(ns_string!(
                 "This removes cookies, website storage and cached pages from every Syndeo \
-                 window, empties Syndeo's own cache, and forgets recently closed tabs and the \
-                 tabs kept from when Syndeo last quit. Websites you are signed in to will sign \
-                 you out."
+                 window, empties Syndeo's own cache, forgets recently closed tabs and the tabs \
+                 kept from when Syndeo last quit, stops any download still coming in and \
+                 empties the downloads list. Files already downloaded stay in your Downloads \
+                 folder. Websites you are signed in to will sign you out."
             ));
             let clear = alert.addButtonWithTitle(ns_string!("Clear"));
             clear.setAccessibilityIdentifier(Some(ns_string!("syndeo.clear-confirm")));
@@ -362,6 +367,9 @@ impl SettingsController {
             }
             None => None,
         };
+        // Downloads, as loading: those still coming in cancelled, and the
+        // list emptied. The files already saved stay.
+        crate::downloads_macos::forget_all(mtm);
 
         // The proxy's cache, on a thread of its own: it can take a moment,
         // and the window keeps answering meanwhile.

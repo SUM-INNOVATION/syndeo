@@ -13,11 +13,94 @@
 //!   is in the list: a refresh makes rows only for tabs that have none yet,
 //!   and lets go of those whose tabs have gone (`diff_rows`). What a row
 //!   shows is changed on it, not by making it again.
+//! - **Taken out only of the list that has it.** Rows handed to another
+//!   window's sidebar are in no list until that sidebar shows them, and
+//!   AppKit's stack view raises an exception when told to take out a view it
+//!   does not arrange. So a refresh takes out of its list only the lines it
+//!   lets go of that the list arranges (`take_out`): after a space switch,
+//!   the tab brought to the front is handed the rows of the space left, and
+//!   lets go of them without their ever being in its list.
 //! - **At most once a turn.** Whatever asks for a refresh only marks the
 //!   group (`Pending`); the refresh runs once, at the end of the run loop's
 //!   turn, for each group marked, however many times it was.
+//! - **An agent's windows are its own** (`Owner`, `shows`). Nothing of the
+//!   person's is in them: no favorite, to see or to load in the agent's tab,
+//!   no space, folder or space's name, and no downloads button, whose list
+//!   is the person's downloads. And they ignore spaces: every one
+//!   of the agent's tabs is listed whatever space the person is in, so that
+//!   the person always sees them.
 
 use crate::spaces::Layout;
+
+/// Whose tab group a sidebar lists: the person's, or an agent's
+/// (`control_macos`), whose windows are its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    Person,
+    Agent,
+}
+
+impl Owner {
+    /// The owner of a tab group whose windows are `owners`': an agent's if
+    /// any of them is, since nothing of the person's may be shown where an
+    /// agent's tab is.
+    pub fn of_group(owners: impl IntoIterator<Item = Owner>) -> Owner {
+        if owners.into_iter().any(|owner| owner == Owner::Agent) {
+            Owner::Agent
+        } else {
+            Owner::Person
+        }
+    }
+}
+
+/// What a window's sidebar shows besides its tabs, and offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shows {
+    /// The person's favorites: shown as tiles, chosen to load in the tab,
+    /// and added to by dragging a tab's row there or from the tab's menu.
+    pub favorites: bool,
+    /// The person's spaces: the current space's name over its tabs, its
+    /// folders, the spaces' switcher at the foot, and only that space's tabs
+    /// listed. Without them, every tab of the group is listed, in no folder.
+    pub spaces: bool,
+    /// The person's downloads: the button at the sidebar's foot, and the
+    /// list it shows (`downloads_macos`).
+    pub downloads: bool,
+}
+
+/// What a sidebar in a window of `owner`'s shows: everything in the
+/// person's; in an agent's, neither the person's favorites, nor their
+/// spaces, nor their downloads.
+pub fn shows(owner: Owner) -> Shows {
+    let persons = owner == Owner::Person;
+    Shows {
+        favorites: persons,
+        spaces: persons,
+        downloads: persons,
+    }
+}
+
+/// What pressing a row or a tile of the sidebar with the primary button
+/// does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Press {
+    /// What a click there does: choose the tab, open the favorite, fold or
+    /// open the folder.
+    Usual,
+    /// Open its own menu, as a secondary click does.
+    Menu,
+}
+
+/// What a primary press does, `control` held or not: with Control, which
+/// macOS makes a secondary click, the row's or tile's own menu; otherwise
+/// what a click does.
+pub fn press(control: bool) -> Press {
+    if control {
+        Press::Menu
+    } else {
+        Press::Usual
+    }
+}
 
 /// A tab, as the sidebar's list needs it: `key` stands for its window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +115,7 @@ pub struct Tab<K> {
 /// One line of the sidebar's list, top to bottom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Item<K> {
-    /// The current space's name, over its tabs.
+    /// The current space's name, over its tabs; not in an agent's window.
     Header,
     /// A folder of the current space, by its id.
     Folder(u64),
@@ -48,17 +131,31 @@ pub enum Item<K> {
 /// each followed by its tabs unless it is folded; the pinned tabs in no
 /// folder; a rule, when there are both pinned and other tabs; the rest, in
 /// the order their windows are in; and New Tab.
-pub fn items<K: Copy>(tabs: &[Tab<K>], layout: &Layout) -> Vec<Item<K>> {
+///
+/// Without the spaces (`Shows::spaces`), as in an agent's window: every tab,
+/// whatever space is current, with no space's name and no folder; the
+/// pinned tabs, a rule, the rest and New Tab.
+pub fn items<K: Copy>(tabs: &[Tab<K>], layout: &Layout, shows: Shows) -> Vec<Item<K>> {
     let space = layout.current_space().id;
-    let here: Vec<&Tab<K>> = tabs.iter().filter(|t| t.space == space).collect();
-    let folders = layout.folders_of(space);
+    let here: Vec<&Tab<K>> = tabs
+        .iter()
+        .filter(|t| !shows.spaces || t.space == space)
+        .collect();
+    let folders = if shows.spaces {
+        layout.folders_of(space)
+    } else {
+        Vec::new()
+    };
     let in_folder = |tab: &Tab<K>| {
         tab.pinned
             && tab
                 .folder
                 .is_some_and(|id| folders.iter().any(|f| f.id == id))
     };
-    let mut items = vec![Item::Header];
+    let mut items = Vec::new();
+    if shows.spaces {
+        items.push(Item::Header);
+    }
     for folder in &folders {
         items.push(Item::Folder(folder.id));
         if folder.collapsed {
@@ -156,6 +253,21 @@ pub fn diff_rows<K: Copy + PartialEq>(have: &[K], want: &[K]) -> RowDiff<K> {
     }
 }
 
+/// Of the lines a sidebar lets go of, `going`, those to take out of its
+/// list, which arranges `listed` now: only those. A row or folder handed
+/// over from the sidebar of the window that was in front (`adopt`) is in no
+/// list until it is shown, and NSStackView raises an exception when told to
+/// take out a view it does not arrange ("is not (and has to be) in stack
+/// view"): the refresh stopped there, its window's list left empty, which
+/// is what CI 43092994068 and 43101278032 saw after a space switch.
+pub fn take_out<K: Copy + PartialEq>(going: &[K], listed: &[K]) -> Vec<K> {
+    going
+        .iter()
+        .copied()
+        .filter(|k| listed.contains(k))
+        .collect()
+}
+
 /// The groups waiting for their refresh: each once, however often it was
 /// asked for, in the order first asked; and whether a refresh is already
 /// scheduled to take them.
@@ -251,6 +363,102 @@ mod tests {
         }
     }
 
+    fn persons() -> Shows {
+        shows(Owner::Person)
+    }
+
+    fn agents() -> Shows {
+        shows(Owner::Agent)
+    }
+
+    #[test]
+    fn an_agents_window_shows_nothing_of_the_persons() {
+        assert_eq!(
+            persons(),
+            Shows {
+                favorites: true,
+                spaces: true,
+                downloads: true
+            }
+        );
+        assert_eq!(
+            agents(),
+            Shows {
+                favorites: false,
+                spaces: false,
+                downloads: false
+            },
+            "no favorite to see or load, no space, folder or space's name, and no downloads"
+        );
+    }
+
+    #[test]
+    fn a_control_click_is_a_secondary_click() {
+        assert_eq!(press(true), Press::Menu, "Control-click opens the menu");
+        assert_eq!(press(false), Press::Usual);
+    }
+
+    #[test]
+    fn a_group_with_an_agents_tab_is_the_agents() {
+        use Owner::{Agent, Person};
+        assert_eq!(Owner::of_group([Person, Person]), Person);
+        assert_eq!(Owner::of_group([Agent, Agent]), Agent);
+        assert_eq!(Owner::of_group([Person, Agent, Person]), Agent);
+        assert_eq!(Owner::of_group([]), Person);
+    }
+
+    /// The regression (#70's review): an agent's tabs were listed by the
+    /// current space, so the person switching spaces hid them from its
+    /// window, whose tab bar is hidden. Now every one is listed, whatever
+    /// space is current, and none of the person's folders or space's name.
+    #[test]
+    fn an_agents_tabs_are_all_listed_whatever_space_is_current() {
+        let mut layout = layout();
+        layout.folders = vec![Folder {
+            id: 7,
+            name: "Read".into(),
+            space: 1,
+            collapsed: false,
+        }];
+        // Made while the first space was current, and one in the second.
+        let tabs = vec![
+            tab(1, false),
+            Tab {
+                space: 2,
+                ..tab(2, false)
+            },
+            Tab {
+                folder: Some(7),
+                ..tab(3, true)
+            },
+        ];
+        let all = vec![
+            Item::Tab {
+                key: 3,
+                in_folder: false,
+            },
+            Item::Rule,
+            Item::Tab {
+                key: 1,
+                in_folder: false,
+            },
+            Item::Tab {
+                key: 2,
+                in_folder: false,
+            },
+            Item::NewTab,
+        ];
+        for current in [1, 2] {
+            layout.current = current;
+            assert_eq!(items(&tabs, &layout, agents()), all, "in space {current}");
+        }
+        // The person's, by contrast, are the current space's alone.
+        layout.current = 2;
+        assert_eq!(row_keys(&items(&tabs, &layout, persons())), vec![2]);
+        layout.current = 1;
+        assert_eq!(row_keys(&items(&tabs, &layout, persons())), vec![3, 1]);
+    }
+
     #[test]
     fn the_list_is_the_spaces_folders_pinned_tabs_a_rule_the_rest_and_new_tab() {
         let mut layout = layout();
@@ -292,7 +500,7 @@ mod tests {
             tab(6, false),
         ];
         assert_eq!(
-            items(&tabs, &layout),
+            items(&tabs, &layout, persons()),
             vec![
                 Item::Header,
                 Item::Folder(7),
@@ -323,9 +531,12 @@ mod tests {
     fn no_rule_without_pinned_tabs_and_new_tab_alone_without_tabs() {
         let layout = layout();
         let tabs = vec![tab(1, false), tab(2, false)];
-        assert_eq!(row_keys(&items(&tabs, &layout)), vec![1, 2]);
-        assert!(!items(&tabs, &layout).contains(&Item::Rule));
-        assert_eq!(items::<u32>(&[], &layout), vec![Item::Header, Item::NewTab]);
+        assert_eq!(row_keys(&items(&tabs, &layout, persons())), vec![1, 2]);
+        assert!(!items(&tabs, &layout, persons()).contains(&Item::Rule));
+        assert_eq!(
+            items::<u32>(&[], &layout, persons()),
+            vec![Item::Header, Item::NewTab]
+        );
     }
 
     #[test]
@@ -342,7 +553,7 @@ mod tests {
             ..tab(1, true)
         }];
         assert_eq!(
-            items(&tabs, &layout),
+            items(&tabs, &layout, persons()),
             vec![
                 Item::Header,
                 Item::Tab {
@@ -404,34 +615,58 @@ mod tests {
     }
 
     /// The sidebars of every window, as the application keeps them: the
-    /// rows each holds, by tab. A refresh of a group does what
-    /// `browser_macos::refresh_group` does with the plan; it says how many
-    /// rows it made.
+    /// rows each holds, by tab, and those its list arranges, as AppKit's
+    /// stack view has them. A refresh of a group does what
+    /// `browser_macos::refresh_group` and `Sidebar::show` do with the plan;
+    /// it says how many rows it made.
     #[derive(Default)]
     struct Sidebars {
         rows: HashMap<u32, Vec<u32>>,
+        lists: HashMap<u32, Vec<u32>>,
     }
 
     impl Sidebars {
+        /// A group of `windows`, each a tab of the first space.
         fn refresh(&mut self, windows: &[u32], front: u32, layout: &Layout) -> usize {
             let tabs: Vec<Tab<u32>> = windows.iter().map(|w| tab(*w, false)).collect();
-            let want = row_keys(&items(&tabs, layout));
-            let plan = plan_group(windows, Some(front), |w| {
+            self.refresh_tabs(&tabs, front, layout)
+        }
+
+        fn refresh_tabs(&mut self, tabs: &[Tab<u32>], front: u32, layout: &Layout) -> usize {
+            let windows: Vec<u32> = tabs.iter().map(|t| t.key).collect();
+            let want = row_keys(&items(tabs, layout, persons()));
+            let plan = plan_group(&windows, Some(front), |w| {
                 self.rows.get(&w).is_some_and(|r| !r.is_empty())
             });
             if let (Some(to), Some(from)) = (plan.front, plan.from) {
+                // `adopt`: the rows move to the front window's sidebar, out of
+                // the list that had them and into none.
                 let rows = self.rows.remove(&from).unwrap_or_default();
+                self.lists.remove(&from);
+                self.lists.remove(&to);
                 self.rows.insert(to, rows);
             }
             let mut made = 0;
-            for w in windows {
+            for w in &windows {
                 let held = self.rows.entry(*w).or_default();
+                let list = self.lists.entry(*w).or_default();
                 if plan.shows(*w) {
                     let diff = diff_rows(held, &want);
+                    for row in take_out(&diff.drop, list) {
+                        // NSStackView's rule: it takes out only what it
+                        // arranges, and raises an exception otherwise.
+                        let at = list
+                            .iter()
+                            .position(|line| *line == row)
+                            .expect("is not (and has to be) in stack view");
+                        list.remove(at);
+                    }
                     made += diff.make.len();
                     *held = want.clone();
+                    *list = want.clone();
                 } else {
                     held.clear();
+                    list.clear();
                 }
             }
             made
@@ -440,6 +675,92 @@ mod tests {
         fn held(&self) -> usize {
             self.rows.values().map(Vec::len).sum()
         }
+    }
+
+    /// The regression of CI 43092994068 and 43101278032: Next Space, into a
+    /// space with no tab, opens one there, in front of the tab group, whose
+    /// sidebar is handed the rows of the space left. They are in no list
+    /// there, and were taken out of it all the same: AppKit raised an
+    /// exception, and the refresh stopped with the list empty, no space's
+    /// name, no row and no New Tab. Now only what the list arranges is taken
+    /// out of it, and the new tab's sidebar lists the space's name, its row
+    /// and New Tab; going back, the first tab's lists its own.
+    #[test]
+    fn a_space_switched_to_lists_its_tab_and_new_tab_after_taking_out_only_what_its_list_has() {
+        let mut layout = layout();
+        let mut sidebars = Sidebars::default();
+        // A tab of the first space, in front, its row in its list.
+        let home = tab(1, false);
+        assert_eq!(sidebars.refresh_tabs(&[home], 1, &layout), 1);
+        assert_eq!(sidebars.lists[&1], vec![1]);
+
+        // Next Space, into the second, which has no tab: one opens there, in
+        // front, beside the first.
+        layout.current = 2;
+        let away = Tab {
+            space: 2,
+            ..tab(2, false)
+        };
+        let tabs = [home, away];
+        let plan = plan_group(&[1, 2], Some(2), |w| w == 1);
+        assert_eq!(
+            plan,
+            GroupPlan {
+                front: Some(2),
+                from: Some(1)
+            },
+            "the first tab's rows are handed to the new one's sidebar"
+        );
+        let shown = items(&tabs, &layout, persons());
+        assert_eq!(
+            shown,
+            vec![
+                Item::Header,
+                Item::Tab {
+                    key: 2,
+                    in_folder: false
+                },
+                Item::NewTab
+            ],
+            "the space's name, its tab and New Tab"
+        );
+        let diff = diff_rows(&[1], &row_keys(&shown));
+        assert_eq!(
+            diff,
+            RowDiff {
+                make: vec![2],
+                drop: vec![1]
+            }
+        );
+        assert_eq!(
+            take_out(&diff.drop, &[]),
+            Vec::<u32>::new(),
+            "the row handed over is in no list: nothing is taken out of one"
+        );
+        assert_eq!(sidebars.refresh_tabs(&tabs, 2, &layout), 1);
+        assert_eq!(
+            sidebars.lists[&2],
+            vec![2],
+            "the new tab's sidebar lists its row"
+        );
+        assert!(sidebars.lists[&1].is_empty());
+        assert_eq!(sidebars.held(), 1, "one row, in the window in front");
+
+        // Previous Space: the first tab back in front, its own row listed.
+        layout.current = 1;
+        assert_eq!(sidebars.refresh_tabs(&tabs, 1, &layout), 1);
+        assert_eq!(sidebars.lists[&1], vec![1]);
+        assert!(sidebars.lists[&2].is_empty());
+        assert_eq!(sidebars.held(), 1);
+    }
+
+    #[test]
+    fn what_a_list_arranges_is_taken_out_of_it_and_nothing_else() {
+        // A tab closed while its row is listed: taken out.
+        assert_eq!(take_out(&[4], &[3, 4, 5]), vec![4]);
+        // Rows and a folder handed over, in no list yet: none.
+        assert_eq!(take_out(&[1, 2], &[]), Vec::<u32>::new());
+        assert_eq!(take_out(&[1, 2, 7], &[2, 9]), vec![2]);
     }
 
     /// The regression this module exists for: a group of N tabs holds N

@@ -326,11 +326,12 @@ jobs:
     # applications ask it to open, opened through the proxy or refused, and
     # opened by one; passkeys reported unavailable, asking nothing; its last
     # window closed and brought back by opening it again, quit as the Quit
-    # menu item would, and opened again; four mutants, each of which the
-    # test has to catch (the other sixteen are macos-agents'); a copy whose proxy cannot start, which has to refuse
+    # menu item would, and opened again; six mutants, each of which the
+    # test has to catch (the other twenty-two are macos-agents'); a copy whose proxy cannot start, which has to refuse
     # to browse; and the route bar against what WebKit does, the proxy's
     # cache keeping nothing from this Mac, and Clear Browsing Data; and the
-    # sidebar's rows, made only in the window in front, one a tab. Unsigned
+    # sidebar's rows, made only in the window in front, one a tab, and what
+    # it shows as the person changes spaces. Unsigned
     # with a Developer ID, and with no secrets: a pull request never signs.
     # (Tabs, and its look in light and dark, run in macos-agents.) Then,
     # reported and not gated, how long
@@ -387,8 +388,11 @@ jobs:
       # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
       # mutants.py names macos-app): the schemes a new tab may open, the
       # address field's guard for typing, Reload asking the origin, and Clear
-      # Browsing Data forgetting closed tabs and the session. The other
-      # sixteen run in macos-agents, by their measured times (mutants.py,
+      # Browsing Data forgetting closed tabs and the session, and cancelling
+      # the downloads and emptying their list, and a sidebar taking out of
+      # its list only the rows it arranges, without which an empty space's
+      # new tab lists nothing. The other
+      # twenty-two run in macos-agents, by their measured times (mutants.py,
       # MACOS_AGENTS), so that neither job nears its 60 minutes; each mutant
       # runs in exactly one, which mutants.py --check requires. Each is built
       # from this tree, the app and its helper, which is then put back, and
@@ -472,9 +476,15 @@ jobs:
       # its origin has its own challenges answered with that authority, as
       # WebKit asks the download about it; downloads redirected to an
       # IPv6 address with a zone, or to a file: address, save nothing.
-      # Measured, not gated: whether a file saved is quarantined, and what a
-      # download redirected to another origin becomes. ~/Downloads is put
-      # back as it was.
+      # The window's rule for downloads: a hidden frame from another origin
+      # saves nothing; a page trying three automatic downloads as it loads
+      # saves one, and the list shows the rest blocked; a person's click on
+      # a link still saves its file. Clear Browsing Data cancels a download
+      # still coming in, leaving nothing of it, keeps the files already
+      # saved, and empties the list.
+      # Measured, not gated: whether a file saved is quarantined, what a
+      # download redirected to another origin becomes, and what WebKit says
+      # of each way a download begins. ~/Downloads is put back as it was.
       - name: Downloads, each on a TLS connection of its own answered as its window's are, and none where a window may not go
         if: always()
         run: bash ci/test-app.sh downloads "$PWD/dist/Syndeo.app"
@@ -496,7 +506,12 @@ jobs:
           bash ci/test-pageload.sh "$PWD/dist/Syndeo.app/Contents/Helpers/syndeo-proxy" 5
           https://www.rust-lang.org/ measure-only:https://github.com/
 
-      # The sidebar, with 30 tabs, each opened as another application asks
+      # The sidebar as the person changes spaces, in an opening of its own
+      # with two spaces, the second empty: Next Space into it, Previous
+      # Space, a space's emoji and Delete Space each leave every window's
+      # sidebar showing the space then current, its name, its tabs and New
+      # Tab (in CI 43092994068 an empty space's new tab listed nothing).
+      # Then the sidebar with 30 tabs, each opened as another application asks
       # and each brought to the front by its row: the window in front lists
       # them all, and the app holds one row for each tab, made once, between
       # all its windows, not one in each window (N, not N²), which only the
@@ -506,7 +521,7 @@ jobs:
       # kept behind each tab would make it, by a ceiling measured with
       # margin. The footprint with 10, 30 and 50 tabs, each visited, and how
       # long opening and visiting took, measured, kept in sidebar.txt.
-      - name: The sidebar's rows, one a tab in the window in front, and the app's memory with 10, 30 and 50 tabs
+      - name: The sidebar as spaces change, its rows, one a tab in the window in front, and the app's memory with 10, 30 and 50 tabs
         if: always()
         run: bash ci/test-app.sh sidebar "$PWD/dist/Syndeo.app"
 
@@ -577,10 +592,12 @@ jobs:
     # person gives it; the agent's pages in tabs of its own, through Syndeo's
     # proxy and pinned, saying who controls them; reading, acting, a
     # screenshot, JavaScript only with its own leave; Stop and Revoke All;
-    # MCP; and root refused. ci/test-app.sh agents says each check. Then an
-    # agent's tab downloading nothing; eighteen of the mutants (the agents'
-    # seven, eight of the application's, the downloads' one and the
-    # sidebar's two); and tabs and its look, light and dark.
+    # MCP; root refused; and nothing of the person's in an agent's window,
+    # which lists its tabs whatever space the person is in. ci/test-app.sh
+    # agents says each check. Then an agent's tab downloading nothing;
+    # twenty-two of the mutants (the agents' eight, eight of the
+    # application's, the downloads' three and the sidebar's three); and tabs
+    # and its look, light and dark.
     runs-on: macos-15
     timeout-minutes: 60
     env:
@@ -624,17 +641,21 @@ jobs:
       # Syndeo.app with one safeguard taken out at a time (ci/macos-app/
       # mutants.py names macos-agents): the agents' — the person's prompt,
       # what a grant allows, the socket's peer being this user, an agent's
-      # tab being its window's own, and an agent's tabs kept out of the
-      # session and of Recently Closed — and, moved from macos-app by their
+      # tab being its window's own, an agent's tabs kept out of the session
+      # and of Recently Closed, and listed in its window whatever space the
+      # person is in — and, moved from macos-app by their
       # measured times, the pinning delegate, the main frame's navigation
       # policy, the schemes another application may ask Syndeo to open, the
       # bar's rule for names, the refusal of a link to an IPv6 address with
       # a zone, a WebSocket carried rather than stripped of its Upgrade, and
       # the hosts sent directly; an agent's tab refusing downloads; a
       # download's TLS challenges answered as its window's are, whose checks
-      # macos-app's downloads step runs too; and the sidebar's rows made in
-      # every window of a tab group, not the one in front alone, and the
-      # window's backdrop drawn as a bitmap of its size. These run here
+      # macos-app's downloads step runs too; a frame inside a page let to
+      # download, and a page let to download by itself without limit, each
+      # caught by its own checks alone; and the sidebar's rows made in
+      # every window of a tab group, not the one in front alone, the
+      # window's backdrop drawn as a bitmap of its size, and an agent's
+      # window showing the person's favorites. These run here
       # because this step runs whatever the steps before it did. Built, run
       # and judged as macos-app's are.
       - name: Build each of its mutants, and require the test to catch it

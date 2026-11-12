@@ -54,6 +54,14 @@
 //   appctl press-near <pid> <text> <id>   press the element with that identifier in
 //                                the first of pid's windows (a dialog, a tab) whose
 //                                text contains <text>; exits 1 if there is none
+//   appctl downloads-list <pid>   press the front window's Downloads button, as a
+//                                click would, and print the list its popover shows,
+//                                a line for each of its labels: "identifier<TAB>text",
+//                                syndeo.downloads (its title), syndeo.download-name and
+//                                syndeo.download-detail for each download, or
+//                                syndeo.downloads-none; then press the button again,
+//                                closing it. Exits 1, saying what it found, if there
+//                                is no button, or the popover shows no list in 3 s
 //   appctl window-text <pid> <text>   all the text, whole, of the first of pid's
 //                                windows whose text contains <text>; exits 1 if none
 //   appctl frames <pid> [<text>]   where the parts of pid's front window are, as
@@ -134,6 +142,11 @@
 //                                each item of the menu it opens, one a line, then press
 //                                <title>, or close it choosing nothing; exits 1 if no menu
 //                                opened, or there is no such item
+//   appctl tab-menu-control <pid> <index>   the same, by a Control-click on the row, the
+//                                primary button pressed with Control held, which macOS
+//                                makes a secondary click: print each item of the menu it
+//                                opens, one a line, and close it choosing nothing; exits 1
+//                                if no menu opened
 import AppKit
 import ApplicationServices
 import CoreGraphics
@@ -809,6 +822,39 @@ case "press-near" where args.count == 5:
         }
     }
     exit(1)
+case "downloads-list" where args.count == 3:
+    guard let pid = Int32(args[2]), let window = frontWindow(of: pid) else { print("no front window"); exit(1) }
+    // Outside the page: a link in it that says Downloads is not the button.
+    guard let button = all(window, depth: 24, { role($0) == "AXButton" && says($0, "Downloads") }).first else {
+        print("no Downloads button in the front window")
+        exit(1)
+    }
+    guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else { print("the Downloads button did not press"); exit(1) }
+    // The popover's labels, wherever Accessibility puts the popover: in a
+    // window of pid's, or under the application.
+    func labels() -> [AXUIElement] {
+        let app = AXUIElementCreateApplication(pid)
+        var found: [AXUIElement] = []
+        for root in windows(of: pid) + [app] {
+            found = all(root, depth: 30) { identifier($0).hasPrefix("syndeo.download") }
+            if !found.isEmpty { break }
+        }
+        return found
+    }
+    var found: [AXUIElement] = []
+    for _ in 0..<30 {
+        found = labels()
+        if found.contains(where: { identifier($0) == "syndeo.downloads" }) { break }
+        usleep(100_000)
+    }
+    guard found.contains(where: { identifier($0) == "syndeo.downloads" }) else {
+        print("no downloads list in 3 s; the application's children: \(children(AXUIElementCreateApplication(pid)).map(role).joined(separator: " "))")
+        exit(1)
+    }
+    for label in found {
+        print("\(identifier(label))\t\(oneLine(attribute(label, kAXValueAttribute)))")
+    }
+    _ = AXUIElementPerformAction(button, kAXPressAction as CFString)
 case "frames" where args.count == 3 || args.count == 4:
     guard let pid = Int32(args[2]) else { exit(2) }
     guard let window = frontWindow(of: pid) else { print("no front window"); exit(1) }
@@ -1018,6 +1064,23 @@ case "tab-menu" where args.count == 4 || args.count == 5:
             exit(1)
         }
         exit(AXUIElementPerformAction(item, kAXPressAction as CFString) == .success ? 0 : 1)
+    }
+    if AXUIElementPerformAction(menu, kAXCancelAction as CFString) != .success {
+        key(pid, 53, "\u{1b}")
+    }
+case "tab-menu-control" where args.count == 4:
+    guard let pid = Int32(args[2]), let index = Int(args[3]), activate(pid) else { exit(1) }
+    let tabs = tabRows(pid)
+    guard index >= 1, index <= tabs.count, let box = frame(of: tabs[index - 1].element) else {
+        print("no tab \(args[3]) of \(tabs.count)")
+        exit(1)
+    }
+    // Where tab-menu clicks: on its title, away from the row's Close or pin.
+    let point = CGPoint(x: box.minX + box.width * 0.4, y: box.midY)
+    click(point, .left, .maskControl)
+    guard let (menu, items) = openMenu(pid, near: point) else { print("no menu opened"); exit(1) }
+    for item in items {
+        print(oneLine(attribute(item, kAXTitleAttribute)))
     }
     if AXUIElementPerformAction(menu, kAXCancelAction as CFString) != .success {
         key(pid, 53, "\u{1b}")

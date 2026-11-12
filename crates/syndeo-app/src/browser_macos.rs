@@ -17,8 +17,15 @@
 //!   address field says Direct for a page from one. A response a window
 //!   cannot show, or a link marked for downloading, becomes a download
 //!   (`downloads_macos`), which keeps the window's way of answering TLS
-//!   challenges (`Trust`); but an agent's tab downloads nothing: it refuses
-//!   both, leaves its page as it was, and its agent is told.
+//!   challenges (`Trust`), if the window's rule for downloads lets it
+//!   begin (`downloads::Gate`): only the main frame downloads, only from
+//!   the web's own addresses or a page's own `blob:` and `data:` files,
+//!   and a page by itself only once, until the person clicks in it or
+//!   navigates; a page's further tries are shown blocked in the downloads
+//!   list. What the person asks for always begins: the window watches for
+//!   their clicks in the page (`watch_people`). An agent's tab downloads
+//!   nothing: it refuses both, leaves its page as it was, and its agent is
+//!   told.
 //! - **Its UI delegate.** A page that asks for a new window gets a new tab,
 //!   made the way every other is, never a web view WebKit made for it. A
 //!   link followed with ⌘ or the middle button opens in a tab the same way,
@@ -36,10 +43,11 @@
 //! a window that cannot browse has no controller with a web view to do them,
 //! so they are disabled there.
 //!
-//! The controls themselves, the window's toolbar, are `chrome_macos`'s.
+//! The controls themselves, in the window's sidebar, are `chrome_macos`'s.
 
 use crate::address::{self, Route, Search, Typed};
 use crate::chrome_macos::Ui;
+use crate::downloads::{self, Asked, Verdict};
 use crate::downloads_macos;
 use crate::favorites;
 use crate::sidebar_macos::{self, FavoriteInfo, FavoriteTile, TabInfo};
@@ -52,8 +60,8 @@ use objc2::{
     define_class, msg_send, sel, DeclaredClass, MainThreadMarker, MainThreadOnly, Message,
 };
 use objc2_app_kit::{
-    NSControlTextEditingDelegate, NSEventModifierFlags, NSMenuItem, NSMenuItemValidation,
-    NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate,
+    NSControlTextEditingDelegate, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType,
+    NSMenuItem, NSMenuItemValidation, NSTextFieldDelegate, NSView, NSWindow, NSWindowDelegate,
 };
 use objc2_foundation::{
     ns_string, NSError, NSKeyValueObservingOptions, NSNotification, NSNumber,
@@ -61,9 +69,9 @@ use objc2_foundation::{
     NSURLAuthenticationChallenge, NSURLRequest, NSURL,
 };
 use objc2_web_kit::{
-    WKDownload, WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
-    WKNavigationResponse, WKNavigationResponsePolicy, WKNavigationType, WKUIDelegate, WKWebView,
-    WKWebViewConfiguration, WKWindowFeatures,
+    WKDownload, WKFrameInfo, WKNavigation, WKNavigationAction, WKNavigationActionPolicy,
+    WKNavigationDelegate, WKNavigationResponse, WKNavigationResponsePolicy, WKNavigationType,
+    WKUIDelegate, WKWebView, WKWebViewConfiguration, WKWindowFeatures,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -187,6 +195,13 @@ pub struct Ivars {
     /// window refused, being an agent's tab; until another navigation starts,
     /// or the agent is told (`take_refused_download`).
     download_refused: Cell<bool>,
+    /// The window's rule for downloads, and what it has seen to apply it:
+    /// the person's acts, the page's automatic download, the main frame's
+    /// navigation under way.
+    downloads: RefCell<downloads::Gate>,
+    /// What WebKit said of the main frame's navigation under way, for the
+    /// log of the download its response may become.
+    navigating: Cell<Option<Signals>>,
     /// The address the field shows when nobody is typing in it: the page's,
     /// as navigation reports it, an address that failed, or nothing for the
     /// start page. Kept apart from the field, so that what someone types is
@@ -266,9 +281,12 @@ define_class!(
 
     unsafe impl WKNavigationDelegate for BrowserController {
         /// A response a window can show is a page; one it cannot is a
-        /// download (`downloads_macos`). For the main frame, WebKit then
-        /// reports the page's loading as interrupted, which is not a
-        /// failure to show.
+        /// download (`downloads_macos`), if the window's rule lets it begin
+        /// (`judge_download`): for the main frame, from a navigation the
+        /// main frame began, and the person's or the page's one automatic
+        /// download; never for a frame inside the page. For the main frame,
+        /// WebKit then reports the page's loading as interrupted, which is
+        /// not a failure to show: the page stays as it was.
         #[unsafe(method(webView:decidePolicyForNavigationResponse:decisionHandler:))]
         fn decide_response_policy(
             &self,
@@ -287,8 +305,39 @@ define_class!(
                 if main_frame {
                     self.ivars().refused.set(true);
                 }
-                tracing::info!("a response that is not a page: downloading it");
-                WKNavigationResponsePolicy::Download
+                // The main frame's navigation, given up for a download or
+                // refused: no page comes of it.
+                let (navigating, signals) = if main_frame {
+                    (
+                        self.ivars().downloads.borrow_mut().take_navigation(),
+                        self.ivars().navigating.take(),
+                    )
+                } else {
+                    (None, None)
+                };
+                let url = unsafe { response.response() }.URL();
+                let scheme = url
+                    .as_ref()
+                    .and_then(|url| url.scheme())
+                    .map(|scheme| scheme.to_string().to_ascii_lowercase())
+                    .unwrap_or_default();
+                let target = url
+                    .as_ref()
+                    .and_then(|url| url.absoluteString())
+                    .map(|text| text.to_string())
+                    .unwrap_or_default();
+                let asked = Asked {
+                    main_frame: main_frame && navigating.is_none_or(|n| n.by_main_frame),
+                    scheme: &scheme,
+                    zoned: address::has_zone(&target),
+                    person: navigating.is_some_and(|n| n.person),
+                };
+                let name = || unsafe { response.response() }.suggestedFilename().map(|n| n.to_string());
+                if self.judge_download(&asked, "response", signals, name) {
+                    WKNavigationResponsePolicy::Download
+                } else {
+                    WKNavigationResponsePolicy::Cancel
+                }
             };
             handler.call((policy,));
         }
@@ -345,6 +394,9 @@ define_class!(
             let target = address_of(&request);
             // Refused wherever it would load, as typing it is.
             let zoned = address::has_zone(&target);
+            // What WebKit says of how it began, for the downloads' rule.
+            let signals = Signals::of(action);
+            signals.log(&scheme);
             // A link followed with ⌘ or the middle button: elsewhere, as a
             // new tab is made, or, for an address no tab may show, here,
             // where it is refused as any other.
@@ -355,23 +407,41 @@ define_class!(
                     return;
                 }
             }
-            // A link marked for downloading: a download, not a page; and in
-            // an agent's tab, nothing at all.
-            if !zoned && unsafe { action.shouldPerformDownload() } {
+            // A link marked for downloading: a download, not a page, if the
+            // window's rule lets it begin (`judge_download`): in the main
+            // frame, and the person's or the page's one automatic download;
+            // and in an agent's tab, nothing at all.
+            if !zoned && signals.marked {
                 self.ivars().refused.set(main_frame);
                 if self.refuses_downloads() {
                     self.refuse_download(main_frame);
                     handler.call((WKNavigationActionPolicy::Cancel,));
                     return;
                 }
-                handler.call((WKNavigationActionPolicy::Download,));
-                tracing::info!("a link marked for downloading");
+                let asked = Asked {
+                    main_frame: signals.in_main_frame(),
+                    scheme: &scheme,
+                    zoned,
+                    person: downloads::clicked(signals.buttons),
+                };
+                let name = || request.URL().and_then(|url| url.lastPathComponent()).map(|n| n.to_string());
+                let allowed = self.judge_download(&asked, "link", Some(signals), name);
+                handler.call((if allowed { WKNavigationActionPolicy::Download } else { WKNavigationActionPolicy::Cancel },));
                 return;
             }
             let allowed = address::may_load(&scheme, zoned, main_frame);
             if !allowed && main_frame {
                 self.ivars().refused.set(true);
                 tracing::info!(scheme = %scheme, zoned, "refused a page in a window");
+            }
+            if allowed && main_frame {
+                // Who began it: for the download its response may become,
+                // and the page it may bring.
+                self.ivars()
+                    .downloads
+                    .borrow_mut()
+                    .navigation(signals.source_main != Some(false), downloads::clicked(signals.buttons));
+                self.ivars().navigating.set(Some(signals));
             }
             handler.call((if allowed { WKNavigationActionPolicy::Allow } else { WKNavigationActionPolicy::Cancel },));
             if zoned && main_frame {
@@ -398,6 +468,11 @@ define_class!(
 
         #[unsafe(method(webView:didCommitNavigation:))]
         fn did_commit(&self, _webview: &WKWebView, _navigation: Option<&WKNavigation>) {
+            // Another page, for the downloads' rule: the person's act is
+            // spent, and a page the person brought may have its automatic
+            // download.
+            self.ivars().downloads.borrow_mut().page_came();
+            self.ivars().navigating.set(None);
             // Another page: the last one's icon goes, and any still coming.
             self.ivars().page.set(self.ivars().page.get() + 1);
             if let Some(badge) = &*self.ivars().badge.borrow() {
@@ -572,6 +647,7 @@ define_class!(
 
         #[unsafe(method(syndeoBack:))]
         fn back(&self, _sender: Option<&AnyObject>) {
+            self.person_acted();
             if let Some(web) = &*self.ivars().web.borrow() {
                 unsafe { web.view.goBack() };
             }
@@ -579,6 +655,7 @@ define_class!(
 
         #[unsafe(method(syndeoForward:))]
         fn forward(&self, _sender: Option<&AnyObject>) {
+            self.person_acted();
             if let Some(web) = &*self.ivars().web.borrow() {
                 unsafe { web.view.goForward() };
             }
@@ -644,9 +721,15 @@ define_class!(
             tracing::info!("the page's address copied");
         }
 
-        /// A favorite's tile: its page, in this tab.
+        /// A favorite's tile: its page, in this tab; never in an agent's,
+        /// which shows no favorite (`sidebar_model::shows`), so that none of
+        /// the person's pages loads where an agent can read it.
         #[unsafe(method(syndeoOpenFavorite:))]
         fn open_favorite(&self, sender: Option<&AnyObject>) {
+            if !self.shows().favorites {
+                tracing::info!("a favorite refused in an agent's tab");
+                return;
+            }
             if let Some(tile) = sender.and_then(|s| s.downcast_ref::<FavoriteTile>()) {
                 self.go(&tile.address());
             }
@@ -704,9 +787,12 @@ define_class!(
         }
 
         /// A tab's row dragged to the favorites: this tab's page, added, if
-        /// it is not one already.
+        /// it is not one already; never an agent's tab's.
         #[unsafe(method(syndeoAddFavorite:))]
         fn add_favorite(&self, _sender: Option<&AnyObject>) {
+            if !self.shows().favorites {
+                return;
+            }
             let address = self.ivars().shown.borrow().clone();
             let title = self
                 .window()
@@ -723,9 +809,12 @@ define_class!(
         }
 
         /// A tab's menu > Add to Favorites, or Remove from Favorites: this
-        /// tab's page.
+        /// tab's page; not offered for an agent's tab.
         #[unsafe(method(syndeoToggleFavorite:))]
         fn toggle_favorite(&self, _sender: Option<&AnyObject>) {
+            if !self.shows().favorites {
+                return;
+            }
             let address = self.ivars().shown.borrow().clone();
             let title = self.window().map(|w| w.title().to_string()).unwrap_or_default();
             let mut kept = sidebar_macos::favorites_read(crate::spaces_macos::current());
@@ -857,6 +946,159 @@ fn click_of(action: &WKNavigationAction) -> tabs::Click {
     }
 }
 
+/// What WebKit says of a navigation that bears on who began it: its kind,
+/// the mouse buttons and keys of the click that caused it, which frame
+/// began it and which it is for, and whether it is a link marked for
+/// downloading. Never its address.
+#[derive(Clone, Copy, Debug)]
+struct Signals {
+    kind: &'static str,
+    /// `buttonNumber`: the mask of mouse buttons, 1 the left.
+    buttons: isize,
+    /// `modifierFlags`, as AppKit's bits.
+    keys: usize,
+    /// Whether the frame that began it, and the one it is for, is the main
+    /// frame; none when WebKit names no frame.
+    source_main: Option<bool>,
+    target_main: Option<bool>,
+    /// `shouldPerformDownload`.
+    marked: bool,
+}
+
+impl Default for Signals {
+    fn default() -> Self {
+        Signals {
+            kind: "unknown",
+            buttons: 0,
+            keys: 0,
+            source_main: None,
+            target_main: None,
+            marked: false,
+        }
+    }
+}
+
+impl Signals {
+    fn of(action: &WKNavigationAction) -> Signals {
+        let main = |frame: Option<Retained<WKFrameInfo>>| frame.map(|f| unsafe { f.isMainFrame() });
+        let kind = match unsafe { action.navigationType() } {
+            WKNavigationType::LinkActivated => "link",
+            WKNavigationType::FormSubmitted => "form",
+            WKNavigationType::BackForward => "back-forward",
+            WKNavigationType::Reload => "reload",
+            WKNavigationType::FormResubmitted => "form-again",
+            WKNavigationType::Other => "other",
+            _ => "unknown",
+        };
+        Signals {
+            kind,
+            buttons: unsafe { action.buttonNumber() },
+            keys: unsafe { action.modifierFlags() }.0,
+            source_main: main(unsafe { action.sourceFrame() }),
+            target_main: main(unsafe { action.targetFrame() }),
+            marked: unsafe { action.shouldPerformDownload() },
+        }
+    }
+
+    /// Begun by the main frame, for the main frame: a frame WebKit does not
+    /// name is taken as the main frame, as for a load the window asked for.
+    fn in_main_frame(&self) -> bool {
+        self.source_main != Some(false) && self.target_main != Some(false)
+    }
+
+    /// For the record of what WebKit says, at debug level for
+    /// `syndeo_app::navigation` (`SYNDEO_LOG`), which ci/test-app.sh's
+    /// downloads mode turns on: every navigation, with its scheme.
+    fn log(&self, scheme: &str) {
+        tracing::debug!(
+            target: "syndeo_app::navigation",
+            kind = %self.kind,
+            buttons = self.buttons,
+            keys = self.keys,
+            source = %frame_word(self.source_main),
+            target = %frame_word(self.target_main),
+            marked = self.marked,
+            scheme = %scheme,
+            "a navigation action"
+        );
+    }
+}
+
+/// A frame, in words for the log.
+fn frame_word(main: Option<bool>) -> &'static str {
+    match main {
+        Some(true) => "main",
+        Some(false) => "inner",
+        None => "none",
+    }
+}
+
+thread_local! {
+    /// The application's watch for the person's acts in a page, once made.
+    static WATCHING: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
+}
+
+/// `kVK_Return`, `kVK_ANSI_KeypadEnter` and `kVK_Space`: the keys that press
+/// a link or a button that has the keys.
+const PRESSING_KEYS: [u16; 3] = [36, 76, 49];
+
+/// Watch, for the whole application, once, for the person's acts in a page:
+/// a mouse button pressed over a window's web view, or Return, Enter or
+/// Space pressed while its web view has the keys. Each is told to that
+/// window's controller, for its downloads (`downloads::Gate`): what the
+/// person does in a page lets its downloads begin beyond its one automatic
+/// download. Only events AppKit hands this application count, which a page
+/// cannot make; the event goes on as it came.
+fn watch_people(mtm: MainThreadMarker) {
+    if WATCHING.with(|watching| watching.borrow().is_some()) {
+        return;
+    }
+    let seen = block2::RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
+        person_in_page(mtm, unsafe { event.as_ref() });
+        event.as_ptr()
+    });
+    let mask = NSEventMask::LeftMouseDown
+        | NSEventMask::RightMouseDown
+        | NSEventMask::OtherMouseDown
+        | NSEventMask::KeyDown;
+    let monitor = unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &seen) };
+    WATCHING.with(|watching| *watching.borrow_mut() = monitor);
+}
+
+/// If `event` is the person's act in a window's page, tell its controller.
+fn person_in_page(mtm: MainThreadMarker, event: &NSEvent) {
+    let Some(window) = event.window(mtm) else {
+        return;
+    };
+    let Some(controller) = controller_of(&window) else {
+        return;
+    };
+    let Some(view) = controller.web_view() else {
+        return;
+    };
+    let in_page = if event.r#type() == NSEventType::KeyDown {
+        PRESSING_KEYS.contains(&event.keyCode())
+            && window
+                .firstResponder()
+                .and_then(|responder| responder.downcast::<NSView>().ok())
+                .is_some_and(|keys| keys.isDescendantOf(&view))
+    } else {
+        // Whatever is under the pointer, in the window: the page, or
+        // something over it.
+        window.contentView().is_some_and(|content| {
+            let at = event.locationInWindow();
+            let at = unsafe { content.superview() }
+                .map_or(at, |frame| frame.convertPoint_fromView(at, None));
+            content
+                .hitTest(at)
+                .is_some_and(|hit| hit.isDescendantOf(&view))
+        })
+    };
+    if in_page {
+        controller.person_acted();
+    }
+}
+
 /// The controller of `window`, if it is a browser window.
 pub fn controller_of(window: &NSWindow) -> Option<Retained<BrowserController>> {
     let delegate = window.delegate()?;
@@ -940,10 +1182,24 @@ fn refresh_pending() {
     let (mut made, mut dropped, mut handed) = (0, 0, 0);
     let groups = sidebar_model::unique_by(asked, |w| group_key(w));
     for window in &groups {
-        let (m, d, h) = refresh_group(window);
-        made += m;
-        dropped += d;
-        handed += usize::from(h);
+        // An exception AppKit raises, as NSStackView does when told to take
+        // out a view it does not arrange, would otherwise unwind out of this
+        // block to NSApplication, which reports it to the system's log alone:
+        // the sidebar left half shown, and nothing in this log (CI
+        // 43092994068). Caught here, it is logged, and the other groups are
+        // still refreshed.
+        match objc2::exception::catch(std::panic::AssertUnwindSafe(|| refresh_group(window))) {
+            Ok((m, d, h)) => {
+                made += m;
+                dropped += d;
+                handed += usize::from(h);
+            }
+            Err(exception) => {
+                let reason =
+                    exception.map_or_else(|| "no reason given".to_string(), |e| e.to_string());
+                tracing::warn!(%reason, "a sidebar refresh failed");
+            }
+        }
     }
     if made + dropped + handed > 0 {
         tracing::info!(
@@ -1011,6 +1267,10 @@ fn refresh_group(window: &NSWindow) -> (usize, usize, bool) {
         handed = true;
     }
 
+    // An agent's tab group shows nothing of the person's, and all its tabs.
+    let owner =
+        sidebar_model::Owner::of_group(windows.iter().map(|w| crate::control_macos::owner_of(w)));
+    let shows = sidebar_model::shows(owner);
     let (mut made, mut dropped) = (0, 0);
     let mut shown: Option<(Vec<TabInfo>, Vec<FavoriteInfo>, crate::spaces::Layout)> = None;
     for (i, w) in windows.iter().enumerate() {
@@ -1022,7 +1282,7 @@ fn refresh_group(window: &NSWindow) -> (usize, usize, bool) {
             continue;
         }
         let (tabs, favorites, layout) =
-            shown.get_or_insert_with(|| tabs_now(&windows, &controllers, &front));
+            shown.get_or_insert_with(|| tabs_now(&windows, &controllers, &front, shows));
         let by_key: HashMap<usize, &TabInfo> =
             tabs.iter().map(|t| (key_of(&*t.window), t)).collect();
         let listed: Vec<sidebar_model::Tab<usize>> = tabs
@@ -1034,8 +1294,8 @@ fn refresh_group(window: &NSWindow) -> (usize, usize, bool) {
                 folder: t.folder,
             })
             .collect();
-        let items = sidebar_model::items(&listed, layout);
-        let (m, d) = sidebar.show(&items, &by_key, favorites, layout);
+        let items = sidebar_model::items(&listed, layout, shows);
+        let (m, d) = sidebar.show(&items, &by_key, favorites, layout, shows);
         made += m;
         dropped += d;
         // The backdrop takes the current space's colours.
@@ -1068,11 +1328,13 @@ fn hand_on(window: &NSWindow, sidebar: &sidebar_macos::Sidebar) {
 
 /// The group's tabs as they are now, `front` the one in front; the current
 /// space's favorites, each with the icon of an open tab of its site, if one
-/// has one; and the spaces.
+/// has one, where `shows` has them, and none for an agent's group; and the
+/// spaces.
 fn tabs_now(
     windows: &[Retained<NSWindow>],
     controllers: &[Option<Retained<BrowserController>>],
     front: &NSWindow,
+    shows: sidebar_model::Shows,
 ) -> (Vec<TabInfo>, Vec<FavoriteInfo>, crate::spaces::Layout) {
     let tabs: Vec<TabInfo> = windows
         .iter()
@@ -1102,6 +1364,7 @@ fn tabs_now(
     let favorites: Vec<FavoriteInfo> =
         sidebar_macos::favorites_read(crate::spaces_macos::current())
             .into_iter()
+            .filter(|_| shows.favorites)
             .map(|favorite| {
                 let host = favorites::host(&favorite.address);
                 let icon = host.and_then(|host| {
@@ -1277,6 +1540,7 @@ impl BrowserController {
         let this = Self::alloc(mtm).set_ivars(Ivars::default());
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
         *this.ivars().web.borrow_mut() = Some(Web { view, pinner });
+        watch_people(mtm);
         this
     }
 
@@ -1404,6 +1668,15 @@ impl BrowserController {
     /// The folder the tab is in, if any.
     pub fn folder(&self) -> Option<u64> {
         self.ivars().folder.get()
+    }
+
+    /// What this tab's sidebar shows and offers of the person's: nothing in
+    /// an agent's tab (`sidebar_model::shows`), nor in a window that is gone.
+    pub fn shows(&self) -> sidebar_model::Shows {
+        let owner = self.window().map_or(sidebar_model::Owner::Agent, |window| {
+            crate::control_macos::owner_of(&window)
+        });
+        sidebar_model::shows(owner)
     }
 
     /// Put the tab in a folder, pinning it if it is not, or take it out.
@@ -1570,6 +1843,9 @@ impl BrowserController {
             item.setTitle(&NSString::from_str(title));
         }
         if action == Some(sel!(syndeoToggleFavorite:)) {
+            if !self.shows().favorites {
+                return false;
+            }
             let address = self.ivars().shown.borrow().clone();
             let kept = sidebar_macos::favorites_read(crate::spaces_macos::current())
                 .iter()
@@ -1621,6 +1897,7 @@ impl BrowserController {
     /// answer) rather than serve its own fresh copy. A plain `reload` let the
     /// proxy answer from its cache without asking (PR #36's journey).
     fn reload(&self) {
+        self.person_acted();
         let failed = self.ivars().failed.borrow().clone();
         match failed {
             Some(address) => self.go(&address),
@@ -1690,6 +1967,56 @@ impl BrowserController {
         self.ivars().download_refused.set(false);
     }
 
+    /// The person acted in this window: clicked in its page, or asked it to
+    /// go somewhere. For its downloads (`downloads::Gate`).
+    fn person_acted(&self) {
+        self.ivars().downloads.borrow_mut().person_acted();
+    }
+
+    /// Whether a download may begin, by the window's rule
+    /// (`downloads::Gate`). Logged with how it was asked (`via`: a link
+    /// marked for downloading, or a response), what WebKit said of how it
+    /// began (`signals`, when known), and its scheme; nothing else of its
+    /// address. A page's automatic download after its one is shown blocked
+    /// in the downloads list, in one row for the page, named by `name`.
+    fn judge_download(
+        &self,
+        asked: &Asked,
+        via: &'static str,
+        signals: Option<Signals>,
+        name: impl FnOnce() -> Option<String>,
+    ) -> bool {
+        let verdict = self.ivars().downloads.borrow_mut().judge(asked);
+        let what = match verdict {
+            Verdict::Allowed { by_person: true } => "a download allowed: the person started it",
+            Verdict::Allowed { by_person: false } => {
+                "a download allowed: the page's one automatic download"
+            }
+            Verdict::Subframe => "refused a download a frame inside the page started",
+            Verdict::Scheme => "refused a download from an address a download may not come from",
+            Verdict::Automatic => "refused an automatic download: the page has had its one",
+        };
+        let s = signals.unwrap_or_default();
+        tracing::info!(
+            via,
+            scheme = %asked.scheme,
+            kind = %s.kind,
+            buttons = s.buttons,
+            keys = s.keys,
+            source = %frame_word(s.source_main),
+            target = %frame_word(s.target_main),
+            marked = s.marked,
+            "{what}"
+        );
+        if verdict == Verdict::Automatic {
+            let row = self.ivars().downloads.borrow().blocked_row();
+            let name = downloads::safe_name(&name().unwrap_or_default());
+            let id = downloads_macos::blocked(self.mtm(), &name, row);
+            self.ivars().downloads.borrow_mut().set_blocked_row(id);
+        }
+        matches!(verdict, Verdict::Allowed { .. })
+    }
+
     /// The window's web view, routed through the proxy and pinned by this
     /// controller; none in a window that cannot browse, or once it closed.
     pub fn web_view(&self) -> Option<Retained<WKWebView>> {
@@ -1740,8 +2067,14 @@ impl BrowserController {
         self.show_route(None);
     }
 
-    /// Load `request`, as a page asked for it.
+    /// Load `request`, as a page asked for it: asked of the window, which
+    /// is the person's act, for its downloads (`downloads::Gate`).
     pub fn load(&self, request: &NSURLRequest) {
+        self.person_acted();
+        self.load_request(request);
+    }
+
+    fn load_request(&self, request: &NSURLRequest) {
         self.forget_refused_download();
         if let Some(web) = &*self.ivars().web.borrow() {
             unsafe { web.view.loadRequest(request) };
@@ -1880,7 +2213,8 @@ impl BrowserController {
             return;
         };
         *self.ivars().retried.borrow_mut() = Some(address);
-        self.load(&NSURLRequest::requestWithURL(&url));
+        // Syndeo's own doing, not the person's: the page earns no download.
+        self.load_request(&NSURLRequest::requestWithURL(&url));
     }
 
     /// The address of the page in the web view, or nothing.
@@ -2001,8 +2335,8 @@ impl BrowserController {
     }
 }
 
-/// The window's content, `webview` under the toolbar's controls, which send
-/// to `controller`: see `chrome_macos`.
+/// The window's content, `webview` beside the sidebar's controls, which
+/// send to `controller`: see `chrome_macos`.
 pub fn browser_content(
     mtm: MainThreadMarker,
     frame: NSRect,

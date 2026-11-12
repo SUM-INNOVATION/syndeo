@@ -93,6 +93,18 @@ back.
   A file an https page links, on a TLS connection of its own with a
   certificate the window has not been shown, must then be seen not
   arriving, its challenge left to macOS.
+- subframe-downloads-allowed: a window's rule for downloads lets a frame
+  inside the page download as the main frame does, held only to the scheme
+  and the automatic cap. A hidden frame from another origin, trying to
+  download as it loads, must then be seen saving a file.
+- automatic-downloads-unlimited: a page may download by itself as often as
+  it likes, not once until the person clicks in it or navigates. A page
+  trying three automatic downloads as it loads must then be seen saving
+  more than its first, and the downloads list not showing them blocked.
+- downloads-kept-after-clear: Clear Browsing Data leaves the downloads as
+  they were: the one still coming in goes on, and the list keeps them all.
+  The origin must then be seen still sending the slow file after the clear,
+  and the list still showing what was downloaded.
 
 Not a mutant: a download's own redirect check, which WebKit asks only of a
 redirect within the download's origin, which the check allows. One to
@@ -110,6 +122,24 @@ tell the check taken out from the check in place.
   30 tabs, each visited, the app's footprint must then be seen growing past
   ci/test-app.sh's SIDEBAR_GROWTH (it grew 139.0 MB, against 61.4 and 59.5
   without it, in CI 42545865986, 42542418306 and 42542420916).
+- favorites-in-agent-windows: an agent's window shows the person's
+  favorites, as the person's windows do, and offers to add to them: tiles
+  in its sidebar, which load the person's page in the agent's tab, where
+  the agent can read it, and Add to Favorites in its tab's menu. Both must
+  then be seen in the agent's window while the person has favorites.
+- agent-tabs-follow-spaces: an agent's window lists only the tabs of the
+  space current when the person looks, as the person's windows do. Its tabs,
+  in the space current when it opened them, must then be seen gone from its
+  sidebar once the person switches spaces: with AppKit's tab bar hidden,
+  out of the person's sight.
+- spaces-take-out-unlisted: a sidebar takes out of its list every row and
+  folder it lets go of, whether or not the list arranges it, as it did
+  before. After a space switch, the tab brought to the front is handed the
+  rows of the space left, which are in no list; NSStackView raises an
+  exception for each, and the refresh stops with that tab's list empty (CI
+  43092994068, 43101278032; the exception seen in 43118870164). Next Space
+  into an empty space must then be seen showing no space's name, no row and
+  no New Tab in its new tab's sidebar.
 
 Each mutant runs in exactly one CI job: macos-agents runs the agent-*
 mutants, beside its gate, and those in MACOS_AGENTS; macos-app runs the
@@ -127,6 +157,7 @@ PROXY = "crates/syndeo-proxy/src/main.rs"
 CONTROL = "crates/syndeo-app/src/control_macos.rs"
 APP = "crates/syndeo-app/src/app_macos.rs"
 DOWNLOADS = "crates/syndeo-app/src/downloads_macos.rs"
+DOWNLOAD_RULE = "crates/syndeo-app/src/downloads.rs"
 SIDEBAR_MODEL = "crates/syndeo-app/src/sidebar_model.rs"
 CHROME = "crates/syndeo-app/src/chrome_macos.rs"
 
@@ -159,6 +190,9 @@ MUTANTS = {
             "            let target = address_of(&request);\n"
             "            // Refused wherever it would load, as typing it is.\n"
             "            let zoned = address::has_zone(&target);\n"
+            "            // What WebKit says of how it began, for the downloads' rule.\n"
+            "            let signals = Signals::of(action);\n"
+            "            signals.log(&scheme);\n"
             "            // A link followed with ⌘ or the middle button: elsewhere, as a\n"
             "            // new tab is made, or, for an address no tab may show, here,\n"
             "            // where it is refused as any other.\n"
@@ -169,23 +203,41 @@ MUTANTS = {
             "                    return;\n"
             "                }\n"
             "            }\n"
-            "            // A link marked for downloading: a download, not a page; and in\n"
-            "            // an agent's tab, nothing at all.\n"
-            "            if !zoned && unsafe { action.shouldPerformDownload() } {\n"
+            "            // A link marked for downloading: a download, not a page, if the\n"
+            "            // window's rule lets it begin (`judge_download`): in the main\n"
+            "            // frame, and the person's or the page's one automatic download;\n"
+            "            // and in an agent's tab, nothing at all.\n"
+            "            if !zoned && signals.marked {\n"
             "                self.ivars().refused.set(main_frame);\n"
             "                if self.refuses_downloads() {\n"
             "                    self.refuse_download(main_frame);\n"
             "                    handler.call((WKNavigationActionPolicy::Cancel,));\n"
             "                    return;\n"
             "                }\n"
-            "                handler.call((WKNavigationActionPolicy::Download,));\n"
-            "                tracing::info!(\"a link marked for downloading\");\n"
+            "                let asked = Asked {\n"
+            "                    main_frame: signals.in_main_frame(),\n"
+            "                    scheme: &scheme,\n"
+            "                    zoned,\n"
+            "                    person: downloads::clicked(signals.buttons),\n"
+            "                };\n"
+            "                let name = || request.URL().and_then(|url| url.lastPathComponent()).map(|n| n.to_string());\n"
+            "                let allowed = self.judge_download(&asked, \"link\", Some(signals), name);\n"
+            "                handler.call((if allowed { WKNavigationActionPolicy::Download } else { WKNavigationActionPolicy::Cancel },));\n"
             "                return;\n"
             "            }\n"
             "            let allowed = address::may_load(&scheme, zoned, main_frame);\n"
             "            if !allowed && main_frame {\n"
             "                self.ivars().refused.set(true);\n"
             "                tracing::info!(scheme = %scheme, zoned, \"refused a page in a window\");\n"
+            "            }\n"
+            "            if allowed && main_frame {\n"
+            "                // Who began it: for the download its response may become,\n"
+            "                // and the page it may bring.\n"
+            "                self.ivars()\n"
+            "                    .downloads\n"
+            "                    .borrow_mut()\n"
+            "                    .navigation(signals.source_main != Some(false), downloads::clicked(signals.buttons));\n"
+            "                self.ivars().navigating.set(Some(signals));\n"
             "            }\n"
             "            handler.call((if allowed { WKNavigationActionPolicy::Allow } else { WKNavigationActionPolicy::Cancel },));\n"
             "            if zoned && main_frame {\n"
@@ -363,6 +415,27 @@ MUTANTS = {
             "            let answer: (isize, *mut AnyObject) = (1, std::ptr::null_mut());\n",
         ),
     ],
+    "subframe-downloads-allowed": [
+        (
+            DOWNLOAD_RULE,
+            "        if !asked.main_frame {\n",
+            "        if false && !asked.main_frame {\n",
+        ),
+    ],
+    "automatic-downloads-unlimited": [
+        (
+            DOWNLOAD_RULE,
+            "        if self.automatic_spent {\n",
+            "        if false && self.automatic_spent {\n",
+        ),
+    ],
+    "downloads-kept-after-clear": [
+        (
+            SETTINGS,
+            "        crate::downloads_macos::forget_all(mtm);\n",
+            "",
+        ),
+    ],
     "sidebar-rows-in-every-window": [
         (
             SIDEBAR_MODEL,
@@ -393,6 +466,27 @@ MUTANTS = {
             "        }\n",
         ),
     ],
+    "favorites-in-agent-windows": [
+        (
+            SIDEBAR_MODEL,
+            "        favorites: persons,\n",
+            "        favorites: true,\n",
+        ),
+    ],
+    "agent-tabs-follow-spaces": [
+        (
+            SIDEBAR_MODEL,
+            "        .filter(|t| !shows.spaces || t.space == space)\n",
+            "        .filter(|t| t.space == space)\n",
+        ),
+    ],
+    "spaces-take-out-unlisted": [
+        (
+            SIDEBAR_MODEL,
+            "        .filter(|k| listed.contains(k))\n",
+            "        .filter(|_| true)\n",
+        ),
+    ],
 }
 
 
@@ -408,6 +502,23 @@ MUTANTS = {
 # 26m13s, download-challenge-unpinned 105 s of it).
 # And the sidebar's, which macos-agents runs whatever its earlier steps did,
 # while macos-app's mutants wait on its launch passing.
+# And favorites-in-agent-windows, by measured times: in CI 43092994068 it
+# took 61 s in macos-app, which took 53m (43m without the ten minutes its
+# logs' upload spent retrying) against macos-agents' 48m (38m).
+# And two of the window's rule for downloads' three, each running only the
+# checks meant to catch it (test-app.sh's dl_frames and dl_automatic): they
+# ran all of dl_policy, 97 s and 101 s, in CI 43100625418, and 102 s and
+# 110 s in 43107749350 on a slower runner, whose macos-agents took 45m11s
+# with downloads-kept-after-clear too (75 s), to macos-app's 42m26s. With
+# #75's two (CI 43109023131: macos-app 39m32s, macos-agents 39m12s, the
+# downloads step 51 s before it gated the rule), downloads-kept-after-clear
+# (dl_clear, 59 s in macos-app in 43100625418) runs in macos-app, whose
+# downloads step the rule's checks make 85 s longer.
+# spaces-take-out-unlisted runs in macos-app, as every mutant not named
+# here does: macos-agents was at about 44 minutes with its twenty-two, and
+# macos-app about 41.5 with its five; a mutant of sidebar_model.rs took
+# 56 s there, its build 21 s of it (agent-tabs-follow-spaces, CI
+# 43109023131), and this one stops at its first failed check.
 MACOS_AGENTS = {
     "no-pinning-delegate",
     "direct-for-every-host",
@@ -420,6 +531,9 @@ MACOS_AGENTS = {
     "download-challenge-unpinned",
     "sidebar-rows-in-every-window",
     "backdrop-draws-bitmap",
+    "subframe-downloads-allowed",
+    "automatic-downloads-unlimited",
+    "favorites-in-agent-windows",
 }
 
 JOBS = ("macos-app", "macos-agents")
